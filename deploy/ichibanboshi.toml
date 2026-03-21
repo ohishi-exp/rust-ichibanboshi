@@ -1,0 +1,17 @@
+port = 3100
+bind_addr = "0.0.0.0"
+log_dir = "/opt/ichibanboshi/logs"
+
+[database]
+host = "172.18.21.102"
+instance = "softec"
+database = "CAPE#01"
+user = "pbi"
+password = "test"
+trust_server_certificate = true
+
+[auth]
+jwt_secret = ""
+
+[cors]
+allowed_origins = ["https://ichibanboshi.mtamaramu.com", "https://rust-ichiban.mtamaramu.com", "http://localhost:3000"]

@@ -33,13 +33,12 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<(), Box<
         .allow_methods(AllowMethods::any())
         .allow_headers(AllowHeaders::any());
 
-    // 認証が必要なルート
+    // 売上データルート（Cloudflare Access Service Token で保護済み）
     let api_routes = Router::new()
         .route("/sales/monthly", get(routes::sales::monthly))
         .route("/sales/by-department", get(routes::sales::by_department))
         .route("/sales/by-customer", get(routes::sales::by_customer))
-        .route("/sales/yoy", get(routes::sales::yoy))
-        .layer(middleware::from_fn(auth::require_jwt));
+        .route("/sales/yoy", get(routes::sales::yoy));
 
     // スキーマ調査ルート（一時的 — 認証なし）
     let schema_routes = Router::new()

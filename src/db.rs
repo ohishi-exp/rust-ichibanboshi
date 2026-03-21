@@ -1,6 +1,6 @@
 use bb8::Pool;
 use bb8_tiberius::ConnectionManager;
-use tiberius::Config as TiberiusConfig;
+use tiberius::{Config as TiberiusConfig, EncryptionLevel};
 
 use crate::config::DatabaseConfig;
 
@@ -28,13 +28,23 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<DbPool, Box<dyn std:
         ));
     }
 
-    // TLS — trust self-signed certs (on-premise SQL Server)
+    // TLS — PHP の encrypt=optional 相当。オンプレ SQL Server は暗号化不要
     if config.trust_server_certificate {
-        tib_config.trust_cert();
+        tib_config.encryption(EncryptionLevel::NotSupported);
     }
 
-    let manager = ConnectionManager::new(tib_config);
-    let pool = Pool::builder().max_size(4).build(manager).await?;
+    // 名前付きインスタンスの場合は using_named_connection() で SQL Browser 経由接続
+    let manager = if config.port.is_none() && !config.instance.is_empty() {
+        ConnectionManager::new(tib_config).using_named_connection()
+    } else {
+        ConnectionManager::new(tib_config)
+    };
+
+    let pool = Pool::builder()
+        .max_size(4)
+        .connection_timeout(std::time::Duration::from_secs(30))
+        .build(manager)
+        .await?;
 
     tracing::info!(
         "SQL Server pool created: {}\\{} / {}",
@@ -42,6 +52,18 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<DbPool, Box<dyn std:
         config.instance,
         config.database
     );
+
+    // 起動時に接続テスト
+    match pool.get().await {
+        Ok(mut conn) => {
+            conn.simple_query("SELECT 1").await?;
+            tracing::info!("SQL Server connection test: OK");
+        }
+        Err(e) => {
+            tracing::error!("SQL Server connection test FAILED: {e}");
+            return Err(format!("DB connection failed: {e}").into());
+        }
+    }
 
     Ok(pool)
 }

@@ -1,0 +1,15 @@
+[Unit]
+Description=Ichibanboshi Sales API - 一番星売上データAPI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/ichibanboshi/ichibanboshi --console --config /opt/ichibanboshi/ichibanboshi.toml
+WorkingDirectory=/opt/ichibanboshi
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
