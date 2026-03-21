@@ -1,0 +1,103 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+  <?define Manufacturer = 'Ohishi ALC' ?>
+  <?define ProductName = 'Ichibanboshi Sales API' ?>
+  <?define UpgradeCode = '9E4F2A8B-7C1D-4B6E-A3F5-2D8E6B9C1A4F' ?>
+
+  <Product
+    Id='*'
+    Name='$(var.ProductName)'
+    UpgradeCode='$(var.UpgradeCode)'
+    Manufacturer='$(var.Manufacturer)'
+    Language='1033'
+    Codepage='1252'
+    Version='$(var.Version)'>
+
+    <Package
+      InstallerVersion='450'
+      Compressed='yes'
+      InstallScope='perMachine'
+      Description='一番星 SQL Server 売上データ API — Windows Service'
+      Manufacturer='$(var.Manufacturer)' />
+
+    <MajorUpgrade
+      Schedule='afterInstallInitialize'
+      DowngradeErrorMessage='A newer version of [ProductName] is already installed.' />
+
+    <MediaTemplate EmbedCab='yes' />
+
+    <!-- Directory structure -->
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='ProgramFiles64Folder' Name='PFiles'>
+        <Directory Id='APPLICATIONFOLDER' Name='IchibanboshiSales'>
+          <Directory Id='LogFolder' Name='logs' />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- Application files -->
+    <DirectoryRef Id='APPLICATIONFOLDER'>
+      <Component Id='IchibanboshiExeComp' Guid='1A2B3C4D-5E6F-7890-ABCD-EF1234500001' Win64='yes'>
+        <File
+          Id='IchibanboshiExe'
+          Name='ichibanboshi.exe'
+          DiskId='1'
+          Source='target\release\ichibanboshi.exe'
+          KeyPath='yes' />
+
+        <ServiceInstall
+          Id='IchibanboshiServiceInstall'
+          Type='ownProcess'
+          Vital='yes'
+          Name='IchibanboshiSales'
+          DisplayName='Ichibanboshi Sales API'
+          Description='一番星 SQL Server から売上データを取得し HTTP API で提供するサービス'
+          Start='auto'
+          Account='LocalSystem'
+          ErrorControl='normal'
+          Interactive='no' />
+
+        <ServiceControl
+          Id='IchibanboshiServiceControl'
+          Name='IchibanboshiSales'
+          Start='install'
+          Stop='both'
+          Remove='uninstall'
+          Wait='yes' />
+      </Component>
+
+      <!-- Config file (NeverOverwrite to preserve user edits on upgrade) -->
+      <Component Id='ConfigFileComp' Guid='1A2B3C4D-5E6F-7890-ABCD-EF1234500002' Win64='yes' NeverOverwrite='yes'>
+        <File
+          Id='ConfigFile'
+          Name='ichibanboshi.toml'
+          DiskId='1'
+          Source='config\ichibanboshi.default.toml'
+          KeyPath='yes' />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Create logs directory -->
+    <DirectoryRef Id='LogFolder'>
+      <Component Id='LogFolderComp' Guid='1A2B3C4D-5E6F-7890-ABCD-EF1234500003' Win64='yes'>
+        <CreateFolder />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Feature definition -->
+    <Feature
+      Id='MainFeature'
+      Title='Ichibanboshi Sales API'
+      Description='一番星売上データ API サービス'
+      Level='1'
+      ConfigurableDirectory='APPLICATIONFOLDER'
+      AllowAdvertise='no'
+      Display='expand'
+      Absent='disallow'>
+      <ComponentRef Id='IchibanboshiExeComp' />
+      <ComponentRef Id='ConfigFileComp' />
+      <ComponentRef Id='LogFolderComp' />
+    </Feature>
+  </Product>
+</Wix>

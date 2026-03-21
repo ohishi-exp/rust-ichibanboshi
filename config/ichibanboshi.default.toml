@@ -1,0 +1,17 @@
+port = 3100
+bind_addr = "127.0.0.1"
+log_dir = ""
+
+[database]
+host = "localhost"
+instance = "softec"
+database = "CAPE#01"
+user = "pbi"
+password = "test"
+trust_server_certificate = true
+
+[auth]
+jwt_secret = ""
+
+[cors]
+allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
