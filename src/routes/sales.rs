@@ -432,11 +432,17 @@ pub async fn yoy(
 pub struct DailySales {
     pub date: String,
     pub weekday: String,
+    /// 税抜金額+税抜割増+税抜実費-値引（月計テーブルと一致する値）
     pub own_sales: i64,
     pub charter_sales: i64,
     pub total_sales: i64,
+    /// 金額+割増+実費-値引（税処理混在、参考値）
+    pub own_sales_raw: i64,
+    pub charter_sales_raw: i64,
+    pub total_sales_raw: i64,
     pub transport_count: i32,
     pub prev_year_total: i64,
+    pub prev_year_total_raw: i64,
 }
 
 #[derive(Deserialize)]
@@ -481,11 +487,13 @@ pub async fn daily(
 
     let mut conn = pool.get().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // 今年
+    // 今年 — 税抜(月計一致) + raw(金額ベース) を同時取得
     let query = format!(
         "SELECT [売上年月日], \
-         SUM(CASE WHEN [傭車先C] = '      ' OR [傭車先C] IS NULL THEN ISNULL([金額], 0) ELSE 0 END), \
-         SUM(CASE WHEN [傭車先C] <> '      ' AND [傭車先C] IS NOT NULL THEN ISNULL([金額], 0) ELSE 0 END), \
+         SUM(ISNULL([税抜金額],0)+ISNULL([税抜割増],0)+ISNULL([税抜実費],0)-ISNULL([値引],0)), \
+         SUM(ISNULL([税抜傭車金額],0)+ISNULL([税抜傭車割増],0)+ISNULL([税抜傭車実費],0)-ISNULL([傭車値引],0)), \
+         SUM(ISNULL([金額],0)+ISNULL([割増],0)+ISNULL([実費],0)-ISNULL([値引],0)), \
+         SUM(ISNULL([傭車金額],0)+ISNULL([傭車割増],0)+ISNULL([傭車実費],0)-ISNULL([傭車値引],0)), \
          COUNT(*) \
          FROM [運転日報明細] \
          WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} \
@@ -507,10 +515,13 @@ pub async fn daily(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // 前年同月
+    // 前年同月 — 両方取得
     let prev_query = format!(
         "SELECT [売上年月日], \
-         SUM(ISNULL([金額], 0)) \
+         SUM(ISNULL([税抜金額],0)+ISNULL([税抜割増],0)+ISNULL([税抜実費],0)-ISNULL([値引],0) \
+            +ISNULL([税抜傭車金額],0)+ISNULL([税抜傭車割増],0)+ISNULL([税抜傭車実費],0)-ISNULL([傭車値引],0)), \
+         SUM(ISNULL([金額],0)+ISNULL([割増],0)+ISNULL([実費],0)-ISNULL([値引],0) \
+            +ISNULL([傭車金額],0)+ISNULL([傭車割増],0)+ISNULL([傭車実費],0)-ISNULL([傭車値引],0)) \
          FROM [運転日報明細] \
          WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} \
          GROUP BY [売上年月日] \
@@ -531,13 +542,14 @@ pub async fn daily(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // 前年データを日(dd)でマッピング
+    // 前年データを日(dd)でマッピング (税抜, raw)
     let mut prev_map = std::collections::HashMap::new();
+    let mut prev_raw_map = std::collections::HashMap::new();
     for row in &prev_rows {
         let dt: chrono::NaiveDateTime = row.get(0).unwrap_or_default();
         let day = dt.format("%d").to_string();
-        let total = get_i64(row, 1);
-        prev_map.insert(day, total);
+        prev_map.insert(day.clone(), get_i64(row, 1));
+        prev_raw_map.insert(day, get_i64(row, 2));
     }
 
     let weekdays = ["日", "月", "火", "水", "木", "金", "土"];
@@ -546,8 +558,10 @@ pub async fn daily(
         .iter()
         .map(|row| {
             let dt: chrono::NaiveDateTime = row.get(0).unwrap_or_default();
-            let own = get_i64(row, 1);
-            let charter = get_i64(row, 2);
+            let own = get_i64(row, 1);         // 税抜自車
+            let charter = get_i64(row, 2);     // 税抜傭車
+            let own_raw = get_i64(row, 3);     // raw自車
+            let charter_raw = get_i64(row, 4); // raw傭車
             let day = dt.format("%d").to_string();
             let wd = dt.weekday().num_days_from_sunday() as usize;
             DailySales {
@@ -556,8 +570,12 @@ pub async fn daily(
                 own_sales: own,
                 charter_sales: charter,
                 total_sales: own + charter,
-                transport_count: get_i32(row, 3),
+                own_sales_raw: own_raw,
+                charter_sales_raw: charter_raw,
+                total_sales_raw: own_raw + charter_raw,
+                transport_count: get_i32(row, 5),
                 prev_year_total: prev_map.get(&day).copied().unwrap_or(0),
+                prev_year_total_raw: prev_raw_map.get(&day).copied().unwrap_or(0),
             }
         })
         .collect();
