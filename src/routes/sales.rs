@@ -442,20 +442,37 @@ pub struct DailySales {
 #[derive(Deserialize)]
 pub struct DailyQuery {
     pub month: Option<String>,
+    /// billing: 請求(0,1) / non_billing: 非請求(0,2) / all: 全て
+    pub mode: Option<String>,
 }
 
-/// GET /api/sales/daily?month=2025-04 — 日別売上（運転日報明細から集計）+ 前年同日
+/// GET /api/sales/daily?month=2025-04&mode=billing — 日別売上 + 前年同日
+/// mode: billing (請求K IN 0,1), non_billing (請求K IN 0,2), all (全て, デフォルト)
 pub async fn daily(
     Extension(pool): Extension<DbPool>,
     Query(params): Query<DailyQuery>,
 ) -> Result<Json<ApiResponse<Vec<DailySales>>>, StatusCode> {
     let month = params.month.unwrap_or_else(|| "2026-03".to_string());
+    let mode = params.mode.unwrap_or_else(|| "all".to_string());
     let from_date = format!("{}-01", month);
     let parts: Vec<&str> = month.split('-').collect();
     let y: i32 = parts[0].parse().unwrap_or(2026);
     let m: i32 = parts[1].parse().unwrap_or(3);
     let (ny, nm) = if m >= 12 { (y + 1, 1) } else { (y, m + 1) };
     let to_date = format!("{}-{:02}-01", ny, nm);
+
+    // 請求K フィルタ
+    let billing_filter = match mode.as_str() {
+        "billing" => "AND [請求K] IN ('0', '1')",
+        "non_billing" => "AND [請求K] IN ('0', '2')",
+        _ => "",
+    };
+
+    let mode_label = match mode.as_str() {
+        "billing" => "請求+請求のみ",
+        "non_billing" => "請求+非請求",
+        _ => "全て",
+    };
 
     // 前年同月の期間
     let prev_from = format!("{}-{:02}-01", y - 1, m);
@@ -465,18 +482,20 @@ pub async fn daily(
     let mut conn = pool.get().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     // 今年
+    let query = format!(
+        "SELECT [売上年月日], \
+         SUM(CASE WHEN [傭車先C] = '      ' OR [傭車先C] IS NULL THEN ISNULL([金額], 0) ELSE 0 END), \
+         SUM(CASE WHEN [傭車先C] <> '      ' AND [傭車先C] IS NOT NULL THEN ISNULL([金額], 0) ELSE 0 END), \
+         COUNT(*) \
+         FROM [運転日報明細] \
+         WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} \
+         GROUP BY [売上年月日] \
+         ORDER BY [売上年月日]",
+        billing_filter
+    );
+
     let stream = conn
-        .query(
-            "SELECT [売上年月日], \
-             SUM(CASE WHEN [傭車先C] = '      ' OR [傭車先C] IS NULL THEN ISNULL([金額], 0) ELSE 0 END), \
-             SUM(CASE WHEN [傭車先C] <> '      ' AND [傭車先C] IS NOT NULL THEN ISNULL([金額], 0) ELSE 0 END), \
-             COUNT(*) \
-             FROM [運転日報明細] \
-             WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 \
-             GROUP BY [売上年月日] \
-             ORDER BY [売上年月日]",
-            &[&from_date.as_str(), &to_date.as_str()],
-        )
+        .query(&query, &[&from_date.as_str(), &to_date.as_str()])
         .await
         .map_err(|e| {
             tracing::error!("Query error: {e}");
@@ -489,16 +508,18 @@ pub async fn daily(
     })?;
 
     // 前年同月
+    let prev_query = format!(
+        "SELECT [売上年月日], \
+         SUM(ISNULL([金額], 0)) \
+         FROM [運転日報明細] \
+         WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} \
+         GROUP BY [売上年月日] \
+         ORDER BY [売上年月日]",
+        billing_filter
+    );
+
     let prev_stream = conn
-        .query(
-            "SELECT [売上年月日], \
-             SUM(ISNULL([金額], 0)) \
-             FROM [運転日報明細] \
-             WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 \
-             GROUP BY [売上年月日] \
-             ORDER BY [売上年月日]",
-            &[&prev_from.as_str(), &prev_to.as_str()],
-        )
+        .query(&prev_query, &[&prev_from.as_str(), &prev_to.as_str()])
         .await
         .map_err(|e| {
             tracing::error!("Query error (prev): {e}");
@@ -542,7 +563,7 @@ pub async fn daily(
         .collect();
 
     Ok(Json(ApiResponse {
-        source_table: "運転日報明細".to_string(),
+        source_table: format!("運転日報明細 [{}]", mode_label),
         data,
     }))
 }
