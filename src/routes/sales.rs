@@ -317,6 +317,170 @@ pub async fn by_customer(
     }))
 }
 
+// ── 得意先別前年同期比ランキング ──
+
+#[derive(Serialize, Clone)]
+pub struct CustomerYoy {
+    pub customer_code: String,
+    pub customer_name: String,
+    pub current_total: i64,
+    pub prev_total: i64,
+    pub diff: i64,
+    pub yoy_percent: f64,
+}
+
+#[derive(Serialize)]
+pub struct CustomerYoyResponse {
+    pub positive: Vec<CustomerYoy>,
+    pub negative: Vec<CustomerYoy>,
+    pub min_prev: i64,
+    pub months: i64,
+}
+
+#[derive(Deserialize)]
+pub struct CustomerYoyQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: Option<usize>,
+    pub min_prev: Option<i64>,
+}
+
+/// GET /api/sales/customer-yoy — 得意先別 YoY% ランキング（増加/減少）
+pub async fn customer_yoy(
+    Extension(pool): Extension<DbPool>,
+    Query(params): Query<CustomerYoyQuery>,
+) -> Result<Json<ApiResponse<CustomerYoyResponse>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2025-04".to_string());
+    let to = params.to.unwrap_or_else(|| "2026-03".to_string());
+    let limit = params.limit.unwrap_or(10).min(50);
+
+    // 期間の月数を計算して min_prev を自動調整（月あたり約4万 = 年間50万相当）
+    let from_parts: Vec<&str> = from.split('-').collect();
+    let to_parts: Vec<&str> = to.split('-').collect();
+    let from_y = from_parts[0].parse::<i32>().unwrap_or(2025);
+    let from_m = from_parts.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(4);
+    let to_y = to_parts[0].parse::<i32>().unwrap_or(2026);
+    let to_m = to_parts.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(3);
+    let months = ((to_y - from_y) * 12 + (to_m - from_m) + 1).max(1) as i64;
+    let min_prev = params.min_prev.unwrap_or(months * 40_000); // 月あたり4万円
+
+    let from_date = format!("{}-01", from);
+    let to_date = format!("{}-01", to);
+
+    // 前年の期間を計算
+    let prev_from = format!(
+        "{}-{}-01",
+        from.split('-').next().unwrap_or("2024").parse::<i32>().unwrap_or(2024) - 1,
+        from.split('-').nth(1).unwrap_or("04")
+    );
+    let prev_to = format!(
+        "{}-{}-01",
+        to.split('-').next().unwrap_or("2025").parse::<i32>().unwrap_or(2025) - 1,
+        to.split('-').nth(1).unwrap_or("03")
+    );
+
+    let mut conn = pool.get().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let sql = "SELECT m.[得意先C], ISNULL(c.[得意先N], ''), \
+               SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) \
+               FROM [得意先別月計] m \
+               LEFT JOIN [得意先ﾏｽﾀ] c ON m.[得意先C] = c.[得意先C] AND m.[得意先H] = c.[得意先H] \
+               WHERE m.[年月度] >= @P1 AND m.[年月度] <= @P2 \
+               GROUP BY m.[得意先C], c.[得意先N]";
+
+    // 今期
+    let stream = conn
+        .query(sql, &[&from_date.as_str(), &to_date.as_str()])
+        .await
+        .map_err(|e| {
+            tracing::error!("Query error (current): {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let cur_rows = stream.into_first_result().await.map_err(|e| {
+        tracing::error!("Result error (current): {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // 前年
+    let prev_stream = conn
+        .query(sql, &[&prev_from.as_str(), &prev_to.as_str()])
+        .await
+        .map_err(|e| {
+            tracing::error!("Query error (prev): {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let prev_rows = prev_stream.into_first_result().await.map_err(|e| {
+        tracing::error!("Result error (prev): {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // 今期マップ: code -> (name, total)
+    let mut cur_map = std::collections::HashMap::<String, (String, i64)>::new();
+    for row in &cur_rows {
+        let code = decode_cp932(row, 0);
+        let name = decode_cp932(row, 1);
+        let total = get_i64(row, 2);
+        cur_map.insert(code, (name, total));
+    }
+
+    // 前年マップ: code -> (name, total)
+    let mut prev_map = std::collections::HashMap::<String, (String, i64)>::new();
+    for row in &prev_rows {
+        let code = decode_cp932(row, 0);
+        let name = decode_cp932(row, 1);
+        let total = get_i64(row, 2);
+        prev_map.insert(code, (name, total));
+    }
+
+    // マージして YoY% 計算
+    let mut all_codes: std::collections::HashSet<String> = cur_map.keys().cloned().collect();
+    all_codes.extend(prev_map.keys().cloned());
+
+    let entries: Vec<CustomerYoy> = all_codes
+        .into_iter()
+        .filter_map(|code| {
+            let (cur_name, cur_total) = cur_map.get(&code).cloned().unwrap_or_default();
+            let (prev_name, prev_total) = prev_map.get(&code).cloned().unwrap_or_default();
+            let name = if !cur_name.is_empty() { cur_name } else { prev_name };
+
+            if prev_total < min_prev {
+                return None;
+            }
+
+            let diff = cur_total - prev_total;
+            let pct = (diff as f64 / prev_total as f64) * 100.0;
+            let pct = (pct * 10.0).round() / 10.0;
+
+            Some(CustomerYoy {
+                customer_code: code,
+                customer_name: name,
+                current_total: cur_total,
+                prev_total,
+                diff,
+                yoy_percent: pct,
+            })
+        })
+        .collect();
+
+    // positive: 前年売上 降順（大口から）
+    let mut pos: Vec<CustomerYoy> = entries.iter().filter(|e| e.yoy_percent > 0.0).cloned().collect();
+    pos.sort_by(|a, b| b.prev_total.cmp(&a.prev_total));
+    let positive: Vec<CustomerYoy> = pos.into_iter().take(limit).collect();
+
+    // negative: YoY% 昇順 → 同率なら前年売上 降順
+    let mut neg: Vec<CustomerYoy> = entries.iter().filter(|e| e.yoy_percent < 0.0).cloned().collect();
+    neg.sort_by(|a, b| {
+        a.yoy_percent.partial_cmp(&b.yoy_percent).unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.prev_total.cmp(&a.prev_total))
+    });
+    let negative: Vec<CustomerYoy> = neg.into_iter().take(limit).collect();
+
+    Ok(Json(ApiResponse {
+        source_table: "得意先別月計 + 得意先ﾏｽﾀ".to_string(),
+        data: CustomerYoyResponse { positive, negative, min_prev, months },
+    }))
+}
+
 // ── 前年同月比較 ──
 
 #[derive(Serialize)]
@@ -738,5 +902,103 @@ pub async fn customer_trend(
     Ok(Json(ApiResponse {
         source_table: "得意先別月計 + 得意先ﾏｽﾀ".to_string(),
         data,
+    }))
+}
+
+// ── 得意先別月別売上詳細（通年） ──
+
+#[derive(Serialize)]
+pub struct CustomerDetailMonth {
+    pub year_month: String,
+    pub own_sales: i64,
+    pub charter_sales: i64,
+    pub total_sales: i64,
+    pub transport_count: i32,
+}
+
+#[derive(Serialize)]
+pub struct CustomerDetailResponse {
+    pub customer_code: String,
+    pub customer_name: String,
+    pub months: Vec<CustomerDetailMonth>,
+}
+
+#[derive(Deserialize)]
+pub struct CustomerDetailQuery {
+    pub code: String,
+}
+
+/// GET /api/sales/customer-detail?code=XXXXXX — 特定得意先の全期間月別売上
+pub async fn customer_detail(
+    Extension(pool): Extension<DbPool>,
+    Query(params): Query<CustomerDetailQuery>,
+) -> Result<Json<ApiResponse<CustomerDetailResponse>>, StatusCode> {
+    let code = params.code;
+
+    let mut conn = pool.get().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // 得意先名を取得
+    let name_stream = conn
+        .query(
+            "SELECT TOP 1 ISNULL(c.[得意先N], '') \
+             FROM [得意先ﾏｽﾀ] c \
+             WHERE c.[得意先C] = @P1",
+            &[&code.as_str()],
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Query error (name): {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let name_rows = name_stream.into_first_result().await.map_err(|e| {
+        tracing::error!("Result error (name): {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let customer_name = name_rows.first().map(|r| decode_cp932(r, 0)).unwrap_or_default();
+
+    // 全期間の月別売上
+    let stream = conn
+        .query(
+            "SELECT m.[年月度], \
+             SUM(ISNULL(m.[自車売上], 0)), SUM(ISNULL(m.[傭車売上], 0)), SUM(ISNULL(m.[輸送回数], 0)) \
+             FROM [得意先別月計] m \
+             WHERE m.[得意先C] = @P1 \
+             GROUP BY m.[年月度] \
+             ORDER BY m.[年月度]",
+            &[&code.as_str()],
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Query error (detail): {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let rows = stream.into_first_result().await.map_err(|e| {
+        tracing::error!("Result error (detail): {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let months: Vec<CustomerDetailMonth> = rows
+        .iter()
+        .map(|row| {
+            let dt: chrono::NaiveDateTime = row.get(0).unwrap_or_default();
+            let own = get_i64(row, 1);
+            let charter = get_i64(row, 2);
+            CustomerDetailMonth {
+                year_month: dt.format("%Y-%m").to_string(),
+                own_sales: own,
+                charter_sales: charter,
+                total_sales: own + charter,
+                transport_count: get_i64(row, 3) as i32,
+            }
+        })
+        .collect();
+
+    Ok(Json(ApiResponse {
+        source_table: "得意先別月計 + 得意先ﾏｽﾀ".to_string(),
+        data: CustomerDetailResponse {
+            customer_code: code,
+            customer_name,
+            months,
+        },
     }))
 }
