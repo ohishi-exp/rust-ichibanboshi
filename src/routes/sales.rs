@@ -617,7 +617,11 @@ pub struct DailySales {
     pub charter_sales_raw: i64,
     pub total_sales_raw: i64,
     pub transport_count: i32,
+    pub prev_year_own: i64,
+    pub prev_year_charter: i64,
     pub prev_year_total: i64,
+    pub prev_year_own_raw: i64,
+    pub prev_year_charter_raw: i64,
     pub prev_year_total_raw: i64,
 }
 
@@ -626,6 +630,8 @@ pub struct DailyQuery {
     pub month: Option<String>,
     /// billing: 請求(0,1) / non_billing: 非請求(0,2) / all: 全て
     pub mode: Option<String>,
+    /// 除外する部門名（部分一致）
+    pub exclude_dept: Option<String>,
 }
 
 /// GET /api/sales/daily?month=2025-04&mode=billing — 日別売上 + 前年同日
@@ -636,6 +642,7 @@ pub async fn daily(
 ) -> Result<Json<ApiResponse<Vec<DailySales>>>, StatusCode> {
     let month = params.month.unwrap_or_else(|| "2026-03".to_string());
     let mode = params.mode.unwrap_or_else(|| "all".to_string());
+    let exclude_dept = params.exclude_dept;
     let from_date = format!("{}-01", month);
     let parts: Vec<&str> = month.split('-').collect();
     let y: i32 = parts[0].parse().unwrap_or(2026);
@@ -650,11 +657,21 @@ pub async fn daily(
         _ => "",
     };
 
+    // 部門除外フィルタ（受注部門で除外）
+    let dept_filter = if exclude_dept.is_some() {
+        "AND [受注部門] NOT IN (SELECT [部門C] FROM [部門ﾏｽﾀ] WHERE [部門N] LIKE @P3)"
+    } else {
+        ""
+    };
+
     let mode_label = match mode.as_str() {
         "billing" => "請求+請求のみ",
         "non_billing" => "請求+非請求",
         _ => "全て",
     };
+
+    let dept_label = exclude_dept.as_deref().unwrap_or("");
+    let exclude_pattern = exclude_dept.as_ref().map(|d| format!("%{}%", d)).unwrap_or_default();
 
     // 前年同月の期間
     let prev_from = format!("{}-{:02}-01", y - 1, m);
@@ -672,60 +689,56 @@ pub async fn daily(
          SUM(ISNULL([傭車金額],0)+ISNULL([傭車割増],0)+ISNULL([傭車実費],0)-ISNULL([傭車値引],0)), \
          COUNT(*) \
          FROM [運転日報明細] \
-         WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} \
+         WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} {} \
          GROUP BY [売上年月日] \
          ORDER BY [売上年月日]",
-        billing_filter
+        billing_filter, dept_filter
     );
 
-    let stream = conn
-        .query(&query, &[&from_date.as_str(), &to_date.as_str()])
-        .await
-        .map_err(|e| {
-            tracing::error!("Query error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let rows = stream.into_first_result().await.map_err(|e| {
-        tracing::error!("Result error: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // 前年同月 — 両方取得
     let prev_query = format!(
         "SELECT [売上年月日], \
-         SUM(ISNULL([税抜金額],0)+ISNULL([税抜割増],0)+ISNULL([税抜実費],0)-ISNULL([値引],0) \
-            +ISNULL([税抜傭車金額],0)+ISNULL([税抜傭車割増],0)+ISNULL([税抜傭車実費],0)-ISNULL([傭車値引],0)), \
-         SUM(ISNULL([金額],0)+ISNULL([割増],0)+ISNULL([実費],0)-ISNULL([値引],0) \
-            +ISNULL([傭車金額],0)+ISNULL([傭車割増],0)+ISNULL([傭車実費],0)-ISNULL([傭車値引],0)) \
+         SUM(ISNULL([税抜金額],0)+ISNULL([税抜割増],0)+ISNULL([税抜実費],0)-ISNULL([値引],0)), \
+         SUM(ISNULL([税抜傭車金額],0)+ISNULL([税抜傭車割増],0)+ISNULL([税抜傭車実費],0)-ISNULL([傭車値引],0)), \
+         SUM(ISNULL([金額],0)+ISNULL([割増],0)+ISNULL([実費],0)-ISNULL([値引],0)), \
+         SUM(ISNULL([傭車金額],0)+ISNULL([傭車割増],0)+ISNULL([傭車実費],0)-ISNULL([傭車値引],0)) \
          FROM [運転日報明細] \
-         WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} \
+         WHERE [売上年月日] >= @P1 AND [売上年月日] < @P2 {} {} \
          GROUP BY [売上年月日] \
          ORDER BY [売上年月日]",
-        billing_filter
+        billing_filter, dept_filter
     );
 
-    let prev_stream = conn
-        .query(&prev_query, &[&prev_from.as_str(), &prev_to.as_str()])
-        .await
-        .map_err(|e| {
-            tracing::error!("Query error (prev): {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // exclude_dept の有無でパラメータを切り替え
+    let (rows, prev_rows) = if exclude_dept.is_some() {
+        let stream = conn.query(&query, &[&from_date.as_str(), &to_date.as_str(), &exclude_pattern.as_str()])
+            .await.map_err(|e| { tracing::error!("Query error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let cur = stream.into_first_result().await.map_err(|e| { tracing::error!("Result error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    let prev_rows = prev_stream.into_first_result().await.map_err(|e| {
-        tracing::error!("Result error (prev): {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        let prev_stream = conn.query(&prev_query, &[&prev_from.as_str(), &prev_to.as_str(), &exclude_pattern.as_str()])
+            .await.map_err(|e| { tracing::error!("Query error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let prev = prev_stream.into_first_result().await.map_err(|e| { tracing::error!("Result error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        (cur, prev)
+    } else {
+        let stream = conn.query(&query, &[&from_date.as_str(), &to_date.as_str()])
+            .await.map_err(|e| { tracing::error!("Query error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let cur = stream.into_first_result().await.map_err(|e| { tracing::error!("Result error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    // 前年データを日(dd)でマッピング (税抜, raw)
+        let prev_stream = conn.query(&prev_query, &[&prev_from.as_str(), &prev_to.as_str()])
+            .await.map_err(|e| { tracing::error!("Query error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let prev = prev_stream.into_first_result().await.map_err(|e| { tracing::error!("Result error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        (cur, prev)
+    };
+
+    // 前年データを日(dd)でマッピング (own, charter, own_raw, charter_raw)
     let mut prev_map = std::collections::HashMap::new();
-    let mut prev_raw_map = std::collections::HashMap::new();
     for row in &prev_rows {
         let dt: chrono::NaiveDateTime = row.get(0).unwrap_or_default();
         let day = dt.format("%d").to_string();
-        prev_map.insert(day.clone(), get_i64(row, 1));
-        prev_raw_map.insert(day, get_i64(row, 2));
+        let own = get_i64(row, 1);
+        let charter = get_i64(row, 2);
+        let own_raw = get_i64(row, 3);
+        let charter_raw = get_i64(row, 4);
+        prev_map.insert(day, (own, charter, own_raw, charter_raw));
     }
 
     let weekdays = ["日", "月", "火", "水", "木", "金", "土"];
@@ -750,14 +763,22 @@ pub async fn daily(
                 charter_sales_raw: charter_raw,
                 total_sales_raw: own_raw + charter_raw,
                 transport_count: get_i32(row, 5),
-                prev_year_total: prev_map.get(&day).copied().unwrap_or(0),
-                prev_year_total_raw: prev_raw_map.get(&day).copied().unwrap_or(0),
+                prev_year_own: prev_map.get(&day).map(|v| v.0).unwrap_or(0),
+                prev_year_charter: prev_map.get(&day).map(|v| v.1).unwrap_or(0),
+                prev_year_total: prev_map.get(&day).map(|v| v.0 + v.1).unwrap_or(0),
+                prev_year_own_raw: prev_map.get(&day).map(|v| v.2).unwrap_or(0),
+                prev_year_charter_raw: prev_map.get(&day).map(|v| v.3).unwrap_or(0),
+                prev_year_total_raw: prev_map.get(&day).map(|v| v.2 + v.3).unwrap_or(0),
             }
         })
         .collect();
 
     Ok(Json(ApiResponse {
-        source_table: format!("運転日報明細 [{}]", mode_label),
+        source_table: if dept_label.is_empty() {
+            format!("運転日報明細 [{}]", mode_label)
+        } else {
+            format!("運転日報明細 [{}, {}除く]", mode_label, dept_label)
+        },
         data,
     }))
 }
