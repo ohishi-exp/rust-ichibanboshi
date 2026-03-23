@@ -59,6 +59,8 @@ pub struct MonthlySales {
     pub charter_sales: i64,
     pub total_sales: i64,
     pub transport_count: i32,
+    pub prev_year_own: i64,
+    pub prev_year_charter: i64,
     pub prev_year_total: i64,
 }
 
@@ -66,6 +68,8 @@ pub struct MonthlySales {
 pub struct MonthlyQuery {
     pub from: Option<String>,
     pub to: Option<String>,
+    /// 除外する部門名（部分一致）。指定時は部門別月計から集計
+    pub exclude_dept: Option<String>,
 }
 
 /// GET /api/sales/monthly — 全社月別売上推移（種別C=99）+ 前年同月
@@ -75,6 +79,7 @@ pub async fn monthly(
 ) -> Result<Json<ApiResponse<Vec<MonthlySales>>>, StatusCode> {
     let from = params.from.unwrap_or_else(|| "2025-04".to_string());
     let to = params.to.unwrap_or_else(|| "2026-03".to_string());
+    let exclude_dept = params.exclude_dept;
     let from_date = format!("{}-01", from);
     let to_date = format!("{}-01", to);
 
@@ -92,53 +97,58 @@ pub async fn monthly(
 
     let mut conn = pool.get().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // 今年のデータ
-    let stream = conn
-        .query(
+    // exclude_dept 指定時は部門別月計から除外集計
+    let (source_table, rows, prev_rows) = if let Some(ref dept) = exclude_dept {
+        let exclude_pattern = format!("%{}%", dept);
+
+        let sql_cur = "SELECT m.[年月度], \
+             SUM(ISNULL(m.[自車売上], 0)), SUM(ISNULL(m.[傭車売上], 0)), SUM(ISNULL(m.[輸送回数], 0)) \
+             FROM [部門別月計] m \
+             LEFT JOIN [部門ﾏｽﾀ] d ON m.[部門C] = d.[部門C] \
+             WHERE m.[年月度] >= @P1 AND m.[年月度] <= @P2 \
+               AND ISNULL(d.[部門N], '') NOT LIKE @P3 \
+             GROUP BY m.[年月度] \
+             ORDER BY m.[年月度]";
+
+        let stream = conn.query(sql_cur, &[&from_date.as_str(), &to_date.as_str(), &exclude_pattern.as_str()])
+            .await.map_err(|e| { tracing::error!("Query error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let cur = stream.into_first_result().await.map_err(|e| { tracing::error!("Result error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        let prev_stream = conn.query(sql_cur, &[&prev_from.as_str(), &prev_to.as_str(), &exclude_pattern.as_str()])
+            .await.map_err(|e| { tracing::error!("Query error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let prev = prev_stream.into_first_result().await.map_err(|e| { tracing::error!("Result error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+
+        (format!("部門別月計 ({}除く)", dept), cur, prev)
+    } else {
+        let stream = conn.query(
             "SELECT [年月度], [自車売上], [傭車売上], [輸送回数] \
              FROM [種別別月計] \
              WHERE [種別C] = '99' AND [年月度] >= @P1 AND [年月度] <= @P2 \
              ORDER BY [年月度]",
             &[&from_date.as_str(), &to_date.as_str()],
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Query error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        ).await.map_err(|e| { tracing::error!("Query error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let cur = stream.into_first_result().await.map_err(|e| { tracing::error!("Result error: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    let rows = stream.into_first_result().await.map_err(|e| {
-        tracing::error!("Result error: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // 前年のデータ
-    let prev_stream = conn
-        .query(
-            "SELECT [年月度], ISNULL([自車売上], 0) + ISNULL([傭車売上], 0) as total \
+        let prev_stream = conn.query(
+            "SELECT [年月度], ISNULL([自車売上], 0), ISNULL([傭車売上], 0) \
              FROM [種別別月計] \
              WHERE [種別C] = '99' AND [年月度] >= @P1 AND [年月度] <= @P2 \
              ORDER BY [年月度]",
             &[&prev_from.as_str(), &prev_to.as_str()],
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Query error (prev): {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        ).await.map_err(|e| { tracing::error!("Query error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        let prev = prev_stream.into_first_result().await.map_err(|e| { tracing::error!("Result error (prev): {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
-    let prev_rows = prev_stream.into_first_result().await.map_err(|e| {
-        tracing::error!("Result error (prev): {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        ("種別別月計 (種別C=99)".to_string(), cur, prev)
+    };
 
-    // 前年データを月(MM)でマッピング
+    // 前年データを月(MM)でマッピング (own, charter)
     let mut prev_map = std::collections::HashMap::new();
     for row in &prev_rows {
         let dt: chrono::NaiveDateTime = row.get(0).unwrap_or_default();
         let month = dt.format("%m").to_string();
-        let total = get_i64(row, 1);
-        prev_map.insert(month, total);
+        let own = get_i64(row, 1);
+        let charter = get_i64(row, 2);
+        prev_map.insert(month, (own, charter));
     }
 
     let data: Vec<MonthlySales> = rows
@@ -154,13 +164,15 @@ pub async fn monthly(
                 charter_sales: charter,
                 total_sales: own + charter,
                 transport_count: get_i32(row, 3),
-                prev_year_total: prev_map.get(&month).copied().unwrap_or(0),
+                prev_year_own: prev_map.get(&month).map(|v| v.0).unwrap_or(0),
+                prev_year_charter: prev_map.get(&month).map(|v| v.1).unwrap_or(0),
+                prev_year_total: prev_map.get(&month).map(|v| v.0 + v.1).unwrap_or(0),
             }
         })
         .collect();
 
     Ok(Json(ApiResponse {
-        source_table: "種別別月計 (種別C=99)".to_string(),
+        source_table,
         data,
     }))
 }
