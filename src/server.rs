@@ -40,7 +40,9 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<(), Box<
         .route("/sales/by-customer", get(routes::sales::by_customer))
         .route("/sales/yoy", get(routes::sales::yoy))
         .route("/sales/daily", get(routes::sales::daily))
-        .route("/sales/customer-trend", get(routes::sales::customer_trend));
+        .route("/sales/customer-trend", get(routes::sales::customer_trend))
+        .route("/sales/customer-yoy", get(routes::sales::customer_yoy))
+        .route("/sales/customer-detail", get(routes::sales::customer_detail));
 
     // スキーマ調査ルート（一時的 — 認証なし）
     let schema_routes = Router::new()

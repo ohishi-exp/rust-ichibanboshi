@@ -86,16 +86,16 @@
 ## デプロイ
 
 ```bash
-# ohishi-data (Ubuntu) に systemd サービスとしてデプロイ
+# これだけで ビルド → scp → 自動再起動 まで完了
 ./deploy.sh
-
-# musl スタティックリンク（GLIBC バージョン不一致回避）
-cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 - **実行先**: `ohishi-data.tailea945d.ts.net` (ubuntu / Ohishi55)
-- **インストール先**: `/opt/ichibanboshi/`
+- **インストール先**: `/opt/ichibanboshi/`（ubuntu 所有、sudo 不要）
 - **サービス**: `systemctl status ichibanboshi`
+- **自動再起動**: `ichibanboshi-watcher.path` (systemd PathModified) がバイナリ変更を検知 → 自動 restart
+- **ビルド**: musl スタティックリンク（GLIBC バージョン不一致回避）
+- deploy.sh の流れ: `cargo build --release --target x86_64-unknown-linux-musl` → `scp /tmp` → `mv` → PathModified で自動 restart
 
 ## Cloudflare Access
 
@@ -109,3 +109,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 - **URL**: `https://nuxt-ichibanboshi.m-tama-ramu.workers.dev`
 - **テナント制限**: `NUXT_ALLOWED_TENANT_ID` (wrangler secret)
 - **認証**: rust-alc-api の Google OAuth → JWT
+
+## ワークスペース構成
+
+- `nuxt-ichibanboshi/` → `/home/yhonda/js/nuxt-ichibanboshi` (symlink)
+- `.vscode/settings.json` で `git.scanRepositories` にフロントエンドリポジトリを登録
