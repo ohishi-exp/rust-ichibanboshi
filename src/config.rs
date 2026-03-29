@@ -168,15 +168,14 @@ impl Config {
 
     /// Load from standard locations (service mode)
     pub fn load_default_locations() -> Result<Self, Box<dyn std::error::Error>> {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let exe_config = exe_dir.join("ichibanboshi.toml");
-                if exe_config.exists() {
-                    let content = std::fs::read_to_string(&exe_config)?;
-                    info!("Loaded config from {}", exe_config.display());
-                    return Ok(toml::from_str(&content)?);
-                }
-            }
+        let exe_config = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("ichibanboshi.toml")));
+
+        if let Some(path) = exe_config.filter(|p| p.exists()) {
+            let content = std::fs::read_to_string(&path)?;
+            info!("Loaded config from {}", path.display());
+            return Ok(toml::from_str(&content)?);
         }
 
         // Fall back to defaults

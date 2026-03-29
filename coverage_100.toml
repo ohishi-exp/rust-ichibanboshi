@@ -1,0 +1,23 @@
+# 100% カバレッジ達成済みファイルの登録簿
+#
+# ここに登録されたファイルは CI で 100% を維持しているか検証される。
+# カバレッジが落ちた場合 CI が fail する。
+#
+# DB 不要 — 全て MockRepo / 純粋関数テストでカバー
+#
+# 確認: bash scripts/check_coverage_100.sh
+
+[[files]]
+path = "src/auth.rs"
+
+[[files]]
+path = "src/config.rs"
+
+[[files]]
+path = "src/routes/health.rs"
+
+[[files]]
+path = "src/routes/sales.rs"
+
+[[files]]
+path = "src/routes/schema.rs"
