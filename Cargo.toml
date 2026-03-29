@@ -8,7 +8,12 @@ description = "一番星 SQL Server sales data API — Windows Service with Clou
 name = "ichibanboshi"
 path = "src/main.rs"
 
+[lib]
+name = "rust_ichibanboshi"
+path = "src/lib.rs"
+
 [dependencies]
+async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"
@@ -29,6 +34,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
 
 [profile.release]
 opt-level = 2

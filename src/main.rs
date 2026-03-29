@@ -1,13 +1,5 @@
-mod auth;
-mod config;
-mod db;
-mod routes;
-mod server;
-#[cfg(windows)]
-mod service;
-
 use clap::Parser;
-use config::AppArgs;
+use rust_ichibanboshi::config::{AppArgs, Config};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = AppArgs::parse();
@@ -17,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         #[cfg(windows)]
         {
-            service::run_service().map_err(|e| {
+            rust_ichibanboshi::service::run_service().map_err(|e| {
                 eprintln!("Failed to start as service: {e}");
                 eprintln!("Hint: Use --console flag to run in console mode");
                 Box::new(e) as Box<dyn std::error::Error>
@@ -38,7 +30,7 @@ fn run_console(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config = config::Config::from_args_and_file(&args)?;
+    let config = Config::from_args_and_file(&args)?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -50,7 +42,7 @@ fn run_console(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
             shutdown_trigger.cancel();
         });
 
-        server::run(config, shutdown).await
+        rust_ichibanboshi::server::run(config, shutdown).await
     })?;
 
     Ok(())

@@ -1,21 +1,16 @@
 use axum::http::StatusCode;
 use axum::Extension;
 
-use crate::db::DbPool;
+use crate::repo::{DynRepo, RepoError};
 
 /// GET /health — DB 接続確認
-pub async fn health(Extension(pool): Extension<DbPool>) -> Result<&'static str, StatusCode> {
-    let mut conn = pool.get().await.map_err(|e| {
-        tracing::error!("DB pool error: {e}");
+pub async fn health(Extension(repo): Extension<DynRepo>) -> Result<&'static str, StatusCode> {
+    repo.health_check().await.map_err(|e| {
+        match &e {
+            RepoError::PoolError => tracing::error!("DB pool error"),
+            RepoError::QueryError(msg) => tracing::error!("DB query error: {msg}"),
+        }
         StatusCode::SERVICE_UNAVAILABLE
     })?;
-
-    conn.simple_query("SELECT 1")
-        .await
-        .map_err(|e| {
-            tracing::error!("DB query error: {e}");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
-
     Ok("OK")
 }
