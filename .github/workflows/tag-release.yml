@@ -1,0 +1,12 @@
+name: Tag Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ippoan/ci-workflows/.github/workflows/tag-release.yml@main
+    secrets: inherit
