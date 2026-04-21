@@ -452,7 +452,7 @@ impl AppRepo for TiberiusRepo {
              WHERE m.[年月度] >= @P1 AND m.[年月度] <= @P2 \
              GROUP BY m.[得意先C], c.[得意先N] \
              ORDER BY SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) DESC",
-            limit.min(30)
+            limit.min(50)
         );
         let top_stream = conn.query(&top_query, &[&from, &to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
         let top_rows = top_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
