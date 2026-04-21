@@ -73,6 +73,17 @@ pub trait AppRepo: Send + Sync {
         &self,
         code: &str,
     ) -> Result<(String, Vec<RawCustomerDetailRow>), RepoError>;
+
+    async fn customer_yoy_by_dept_data(
+        &self,
+        from: &str,
+        to: &str,
+        prev_from: &str,
+        prev_to: &str,
+        department_code: Option<&str>,
+    ) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError>;
+
+    async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -507,6 +518,96 @@ impl AppRepo for TiberiusRepo {
             transport_count: get_i64(r, 3),
         }).collect()))
     }
+
+    async fn customer_yoy_by_dept_data(
+        &self,
+        from: &str,
+        to: &str,
+        prev_from: &str,
+        prev_to: &str,
+        department_code: Option<&str>,
+    ) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 月計テーブルとの完全一致条件: 請求K IN ('0','2')、自車/傭車の売上計算
+        // 運転日報明細から [受注部門] でグルーピングして営業所×得意先の売上を算出
+        let base_select = "SELECT t.[受注部門], ISNULL(d.[部門N], ''), \
+                             t.[得意先C], ISNULL(c.[得意先N], ''), \
+                             SUM(ISNULL(t.[税抜金額],0) + ISNULL(t.[税抜割増],0) + ISNULL(t.[税抜実費],0) - ISNULL(t.[値引],0)) \
+                             + SUM(ISNULL(t.[税抜傭車金額],0) + ISNULL(t.[税抜傭車割増],0) + ISNULL(t.[税抜傭車実費],0) - ISNULL(t.[傭車値引],0)) \
+                           FROM [運転日報明細] t \
+                           LEFT JOIN [部門ﾏｽﾀ] d ON t.[受注部門] = d.[部門C] \
+                           LEFT JOIN [得意先ﾏｽﾀ] c ON t.[得意先C] = c.[得意先C] \
+                           WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+                             AND t.[請求K] IN ('0','2')";
+        let group_order = " GROUP BY t.[受注部門], d.[部門N], t.[得意先C], c.[得意先N]";
+
+        let (cur_rows, prev_rows) = if let Some(dept) = department_code {
+            let sql = format!(
+                "{} AND t.[受注部門] = @P3 {}",
+                base_select, group_order
+            );
+            let stream = conn
+                .query(&sql, &[&from, &to, &dept])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let c = stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev_stream = conn
+                .query(&sql, &[&prev_from, &prev_to, &dept])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let p = prev_stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            (c, p)
+        } else {
+            let sql = format!("{}{}", base_select, group_order);
+            let stream = conn
+                .query(&sql, &[&from, &to])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let c = stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev_stream = conn
+                .query(&sql, &[&prev_from, &prev_to])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let p = prev_stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            (c, p)
+        };
+
+        Ok((
+            Self::rows_to_customer_dept(&cur_rows),
+            Self::rows_to_customer_dept(&prev_rows),
+        ))
+    }
+
+    async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let stream = conn
+            .simple_query(
+                "SELECT [部門C], ISNULL([部門N], '') FROM [部門ﾏｽﾀ] ORDER BY [部門C]",
+            )
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|row| (decode_cp932(row, 0), decode_cp932(row, 1)))
+            .collect())
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -531,5 +632,17 @@ impl TiberiusRepo {
             map.insert(decode_cp932(row, 0), (decode_cp932(row, 1), get_i64(row, 2)));
         }
         map
+    }
+
+    fn rows_to_customer_dept(rows: &[tiberius::Row]) -> Vec<RawCustomerDeptRow> {
+        rows.iter()
+            .map(|r| RawCustomerDeptRow {
+                department_code: decode_cp932(r, 0),
+                department_name: decode_cp932(r, 1),
+                customer_code: decode_cp932(r, 2),
+                customer_name: decode_cp932(r, 3),
+                total: get_i64(r, 4),
+            })
+            .collect()
     }
 }

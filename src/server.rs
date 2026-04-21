@@ -45,6 +45,14 @@ pub async fn run(
         )
         .route("/sales/customer-yoy", get(routes::sales::customer_yoy))
         .route(
+            "/sales/customer-yoy-by-dept",
+            get(routes::sales::customer_yoy_by_dept),
+        )
+        .route(
+            "/sales/departments",
+            get(routes::sales::list_departments_handler),
+        )
+        .route(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
         );

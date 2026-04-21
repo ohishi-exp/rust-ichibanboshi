@@ -430,3 +430,154 @@ fn test_mode_label() {
     assert_eq!(mode_label("all"), "全て");
     assert_eq!(mode_label("unknown"), "全て");
 }
+
+// ══════════════════════════════════════════════════════════════
+// customer-yoy-by-dept: rows_to_dept_customer_map
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_rows_to_dept_customer_map_basic() {
+    let rows = vec![
+        RawCustomerDeptRow {
+            department_code: "01".into(),
+            department_name: "本社".into(),
+            customer_code: "A".into(),
+            customer_name: "顧客A".into(),
+            total: 1_000_000,
+        },
+        RawCustomerDeptRow {
+            department_code: "02".into(),
+            department_name: "大阪".into(),
+            customer_code: "B".into(),
+            customer_name: "顧客B".into(),
+            total: 500_000,
+        },
+    ];
+    let map = rows_to_dept_customer_map(&rows);
+    assert_eq!(map.len(), 2);
+    let v = map.get(&("01".into(), "A".into())).cloned().unwrap();
+    assert_eq!(v.0, "本社");
+    assert_eq!(v.1, "顧客A");
+    assert_eq!(v.2, 1_000_000);
+}
+
+#[test]
+fn test_rows_to_dept_customer_map_empty() {
+    assert!(rows_to_dept_customer_map(&[]).is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════
+// customer-yoy-by-dept: calc_yoy_with_dept_entries
+// ══════════════════════════════════════════════════════════════
+
+fn make_dept_map(entries: &[(&str, &str, &str, &str, i64)]) -> std::collections::HashMap<(String, String), (String, String, i64)> {
+    let mut map = HashMap::new();
+    for (dc, dn, cc, cn, total) in entries {
+        map.insert(
+            ((*dc).to_string(), (*cc).to_string()),
+            ((*dn).to_string(), (*cn).to_string(), *total),
+        );
+    }
+    map
+}
+
+#[test]
+fn test_calc_yoy_with_dept_entries_growth() {
+    let cur = make_dept_map(&[("01", "本社", "A", "顧客A", 1_200_000)]);
+    let prev = make_dept_map(&[("01", "本社", "A", "顧客A", 1_000_000)]);
+    let entries = calc_yoy_with_dept_entries(&cur, &prev, 0);
+    assert_eq!(entries.len(), 1);
+    let e = &entries[0];
+    assert_eq!(e.department_code, "01");
+    assert_eq!(e.department_name, "本社");
+    assert_eq!(e.customer_code, "A");
+    assert_eq!(e.current_total, 1_200_000);
+    assert_eq!(e.prev_total, 1_000_000);
+    assert_eq!(e.diff, 200_000);
+    assert!((e.yoy_percent - 20.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_calc_yoy_with_dept_entries_filter_min_prev() {
+    let cur = make_dept_map(&[("01", "本社", "A", "顧客A", 100)]);
+    let prev = make_dept_map(&[("01", "本社", "A", "顧客A", 100)]);
+    // min_prev=1000 → filtered out
+    let entries = calc_yoy_with_dept_entries(&cur, &prev, 1000);
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn test_calc_yoy_with_dept_entries_prev_only_uses_prev_names() {
+    let cur = HashMap::new();
+    let prev = make_dept_map(&[("01", "本社", "A", "顧客A", 500_000)]);
+    let entries = calc_yoy_with_dept_entries(&cur, &prev, 0);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].department_name, "本社");
+    assert_eq!(entries[0].customer_name, "顧客A");
+    assert_eq!(entries[0].current_total, 0);
+    assert_eq!(entries[0].prev_total, 500_000);
+    assert_eq!(entries[0].diff, -500_000);
+}
+
+#[test]
+fn test_calc_yoy_with_dept_entries_distinct_by_dept() {
+    // 同じ顧客コードでも営業所が違えば別エントリ
+    let cur = make_dept_map(&[
+        ("01", "本社", "A", "顧客A", 1_000),
+        ("02", "大阪", "A", "顧客A", 2_000),
+    ]);
+    let prev = make_dept_map(&[
+        ("01", "本社", "A", "顧客A", 800),
+        ("02", "大阪", "A", "顧客A", 3_000),
+    ]);
+    let entries = calc_yoy_with_dept_entries(&cur, &prev, 0);
+    assert_eq!(entries.len(), 2);
+}
+
+// ══════════════════════════════════════════════════════════════
+// split_and_sort_yoy_with_dept
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_split_and_sort_yoy_with_dept_basic() {
+    let entries = vec![
+        CustomerYoyWithDept { department_code: "01".into(), department_name: "本社".into(), customer_code: "A".into(), customer_name: "A".into(), current_total: 120, prev_total: 100, diff: 20, yoy_percent: 20.0 },
+        CustomerYoyWithDept { department_code: "01".into(), department_name: "本社".into(), customer_code: "B".into(), customer_name: "B".into(), current_total: 80, prev_total: 100, diff: -20, yoy_percent: -20.0 },
+        CustomerYoyWithDept { department_code: "02".into(), department_name: "大阪".into(), customer_code: "C".into(), customer_name: "C".into(), current_total: 100, prev_total: 100, diff: 0, yoy_percent: 0.0 },
+    ];
+    let (pos, neg) = split_and_sort_yoy_with_dept(entries, 10);
+    assert_eq!(pos.len(), 1);
+    assert_eq!(pos[0].customer_code, "A");
+    assert_eq!(neg.len(), 1);
+    assert_eq!(neg[0].customer_code, "B");
+}
+
+#[test]
+fn test_split_and_sort_yoy_with_dept_limit() {
+    let entries: Vec<CustomerYoyWithDept> = (0..20)
+        .map(|i| CustomerYoyWithDept {
+            department_code: "01".into(),
+            department_name: "本社".into(),
+            customer_code: format!("{:03}", i),
+            customer_name: format!("顧客{}", i),
+            current_total: 100 + i as i64,
+            prev_total: 100,
+            diff: i as i64,
+            yoy_percent: i as f64,
+        })
+        .collect();
+    let (pos, _) = split_and_sort_yoy_with_dept(entries, 5);
+    assert_eq!(pos.len(), 5);
+}
+
+#[test]
+fn test_split_and_sort_yoy_with_dept_neg_sort_by_percent() {
+    let entries = vec![
+        CustomerYoyWithDept { department_code: "01".into(), department_name: "D1".into(), customer_code: "A".into(), customer_name: "A".into(), current_total: 0, prev_total: 100, diff: -100, yoy_percent: -100.0 },
+        CustomerYoyWithDept { department_code: "01".into(), department_name: "D1".into(), customer_code: "B".into(), customer_name: "B".into(), current_total: 90, prev_total: 100, diff: -10, yoy_percent: -10.0 },
+    ];
+    let (_, neg) = split_and_sort_yoy_with_dept(entries, 10);
+    assert_eq!(neg.len(), 2);
+    // 最も減少率が大きいものが先頭
+    assert_eq!(neg[0].customer_code, "A");
+}
