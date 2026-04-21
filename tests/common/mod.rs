@@ -95,6 +95,17 @@ impl AppRepo for MockRepo {
             RawCustomerDetailRow { year_month: dt(2025, 4, 1), own_sales: 100, charter_sales: 50, transport_count: 10 },
         ]))
     }
+
+    async fn customer_yoy_by_dept_data(&self, _from: &str, _to: &str, _prev_from: &str, _prev_to: &str, _dept: Option<&str>) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError> {
+        Ok((
+            vec![RawCustomerDeptRow { department_code: "01".into(), department_name: "本社".into(), customer_code: "A".into(), customer_name: "顧客A".into(), total: 1_200_000 }],
+            vec![RawCustomerDeptRow { department_code: "01".into(), department_name: "本社".into(), customer_code: "A".into(), customer_name: "顧客A".into(), total: 1_000_000 }],
+        ))
+    }
+
+    async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
+        Ok(vec![("01".into(), "本社".into()), ("02".into(), "大阪".into())])
+    }
 }
 
 // ── ErrorRepo: 全メソッドがエラーを返す ──
@@ -115,6 +126,8 @@ impl AppRepo for ErrorRepo {
     async fn daily(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str) -> Result<(Vec<RawDailyRow>, Vec<RawDailyPrevRow>), RepoError> { Err(RepoError::PoolError) }
     async fn customer_trend_data(&self, _: &str, _: &str, _: i32) -> Result<(Vec<(String, String)>, Vec<RawCustomerMonthlyRow>), RepoError> { Err(RepoError::PoolError) }
     async fn customer_detail_data(&self, _: &str) -> Result<(String, Vec<RawCustomerDetailRow>), RepoError> { Err(RepoError::PoolError) }
+    async fn customer_yoy_by_dept_data(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError> { Err(RepoError::PoolError) }
+    async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> { Err(RepoError::PoolError) }
 }
 
 // ── QueryErrorRepo: QueryError を返す ──
@@ -135,6 +148,8 @@ impl AppRepo for QueryErrorRepo {
     async fn daily(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str) -> Result<(Vec<RawDailyRow>, Vec<RawDailyPrevRow>), RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn customer_trend_data(&self, _: &str, _: &str, _: i32) -> Result<(Vec<(String, String)>, Vec<RawCustomerMonthlyRow>), RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn customer_detail_data(&self, _: &str) -> Result<(String, Vec<RawCustomerDetailRow>), RepoError> { Err(RepoError::QueryError("test".into())) }
+    async fn customer_yoy_by_dept_data(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError> { Err(RepoError::QueryError("test".into())) }
+    async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> { Err(RepoError::QueryError("test".into())) }
 }
 
 // ── ヘルパー ──
@@ -153,6 +168,8 @@ pub fn build_app(repo: DynRepo) -> Router {
         .route("/sales/daily", get(routes::sales::daily))
         .route("/sales/customer-trend", get(routes::sales::customer_trend))
         .route("/sales/customer-yoy", get(routes::sales::customer_yoy))
+        .route("/sales/customer-yoy-by-dept", get(routes::sales::customer_yoy_by_dept))
+        .route("/sales/departments", get(routes::sales::list_departments_handler))
         .route("/sales/customer-detail", get(routes::sales::customer_detail));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))

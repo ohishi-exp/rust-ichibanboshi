@@ -132,6 +132,18 @@ pub struct RawCustomerDetailRow {
     pub transport_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RawCustomerDeptRow {
+    pub department_code: String,
+    pub department_name: String,
+    pub customer_code: String,
+    pub customer_name: String,
+    pub total: i64,
+}
+
+/// (department_code, customer_code) → (department_name, customer_name, total)
+pub type DeptCustomerTotalMap = HashMap<(String, String), (String, String, i64)>;
+
 // ══════════════════════════════════════════════════════════════
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
@@ -169,6 +181,34 @@ pub struct CustomerDetailMonth { pub year_month: String, pub own_sales: i64, pub
 #[derive(Serialize, Debug)]
 pub struct CustomerDetailResponse { pub customer_code: String, pub customer_name: String, pub months: Vec<CustomerDetailMonth> }
 
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CustomerYoyWithDept {
+    pub department_code: String,
+    pub department_name: String,
+    pub customer_code: String,
+    pub customer_name: String,
+    pub current_total: i64,
+    pub prev_total: i64,
+    pub diff: i64,
+    pub yoy_percent: f64,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct DepartmentOption {
+    pub department_code: String,
+    pub department_name: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct CustomerYoyByDeptResponse {
+    pub positive: Vec<CustomerYoyWithDept>,
+    pub negative: Vec<CustomerYoyWithDept>,
+    pub months: i64,
+    pub min_prev: i64,
+    pub department_code: Option<String>,
+    pub departments: Vec<DepartmentOption>,
+}
+
 // ══════════════════════════════════════════════════════════════
 // Query パラメータ
 // ══════════════════════════════════════════════════════════════
@@ -189,6 +229,8 @@ pub struct DailyQuery { pub month: Option<String>, pub mode: Option<String>, pub
 pub struct CustomerTrendQuery { pub from: Option<String>, pub to: Option<String>, pub limit: Option<i32> }
 #[derive(Deserialize)]
 pub struct CustomerDetailQuery { pub code: String }
+#[derive(Deserialize)]
+pub struct CustomerYoyByDeptQuery { pub from: Option<String>, pub to: Option<String>, pub limit: Option<usize>, pub min_prev: Option<i64>, pub department_code: Option<String> }
 
 // ══════════════════════════════════════════════════════════════
 // ロジック層 (純粋関数)
@@ -405,5 +447,143 @@ pub async fn customer_detail(Extension(repo): Extension<DynRepo>, Query(params):
     Ok(Json(ApiResponse {
         source_table: "得意先別月計 + 得意先ﾏｽﾀ".to_string(),
         data: CustomerDetailResponse { customer_code: params.code, customer_name, months: build_customer_detail(&raw) },
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// customer-yoy-by-dept (営業所×得意先の前年同期比)
+// ══════════════════════════════════════════════════════════════
+
+/// Raw 行リストを (営業所, 得意先) キーの DeptCustomerTotalMap に変換
+pub fn rows_to_dept_customer_map(rows: &[RawCustomerDeptRow]) -> DeptCustomerTotalMap {
+    let mut map: DeptCustomerTotalMap = HashMap::new();
+    for r in rows {
+        map.insert(
+            (r.department_code.clone(), r.customer_code.clone()),
+            (r.department_name.clone(), r.customer_name.clone(), r.total),
+        );
+    }
+    map
+}
+
+/// current / prev の DeptCustomerTotalMap を突き合わせて前年同期比エントリ生成
+pub fn calc_yoy_with_dept_entries(
+    cur_map: &DeptCustomerTotalMap,
+    prev_map: &DeptCustomerTotalMap,
+    min_prev: i64,
+) -> Vec<CustomerYoyWithDept> {
+    let mut all_keys: HashSet<(String, String)> = cur_map.keys().cloned().collect();
+    all_keys.extend(prev_map.keys().cloned());
+    all_keys
+        .into_iter()
+        .filter_map(|key| {
+            let cur = cur_map.get(&key).cloned().unwrap_or_default();
+            let prev = prev_map.get(&key).cloned().unwrap_or_default();
+            let (dept_code, cust_code) = key;
+            let dept_name = if !cur.0.is_empty() { cur.0 } else { prev.0 };
+            let cust_name = if !cur.1.is_empty() { cur.1 } else { prev.1 };
+            let cur_total = cur.2;
+            let prev_total = prev.2;
+            if prev_total < min_prev {
+                return None;
+            }
+            let diff = cur_total - prev_total;
+            let pct = ((diff as f64 / prev_total as f64) * 1000.0).round() / 10.0;
+            Some(CustomerYoyWithDept {
+                department_code: dept_code,
+                department_name: dept_name,
+                customer_code: cust_code,
+                customer_name: cust_name,
+                current_total: cur_total,
+                prev_total,
+                diff,
+                yoy_percent: pct,
+            })
+        })
+        .collect()
+}
+
+pub fn split_and_sort_yoy_with_dept(
+    entries: Vec<CustomerYoyWithDept>,
+    limit: usize,
+) -> (Vec<CustomerYoyWithDept>, Vec<CustomerYoyWithDept>) {
+    let mut pos: Vec<_> = entries.iter().filter(|e| e.yoy_percent > 0.0).cloned().collect();
+    pos.sort_by(|a, b| b.prev_total.cmp(&a.prev_total));
+    let mut neg: Vec<_> = entries.iter().filter(|e| e.yoy_percent < 0.0).cloned().collect();
+    neg.sort_by(|a, b| {
+        a.yoy_percent
+            .partial_cmp(&b.yoy_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.prev_total.cmp(&a.prev_total))
+    });
+    (pos.into_iter().take(limit).collect(), neg.into_iter().take(limit).collect())
+}
+
+pub async fn customer_yoy_by_dept(
+    Extension(repo): Extension<DynRepo>,
+    Query(params): Query<CustomerYoyByDeptQuery>,
+) -> Result<Json<ApiResponse<CustomerYoyByDeptResponse>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2025-04".to_string());
+    let to = params.to.unwrap_or_else(|| "2026-03".to_string());
+    let limit = params.limit.unwrap_or(10).min(50);
+    let months = calc_months(&from, &to);
+    let min_prev = params.min_prev.unwrap_or(months * 40_000);
+    let from_date = format!("{}-01", from);
+    let to_date = format!("{}-01", to);
+    let (prev_from, prev_to) = calc_prev_period(&from, &to);
+
+    let dept_code = params
+        .department_code
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let (cur_rows, prev_rows) = repo
+        .customer_yoy_by_dept_data(
+            &from_date,
+            &to_date,
+            &prev_from,
+            &prev_to,
+            dept_code.as_deref(),
+        )
+        .await
+        .map_err(map_repo_err)?;
+
+    let cur_map = rows_to_dept_customer_map(&cur_rows);
+    let prev_map = rows_to_dept_customer_map(&prev_rows);
+    let entries = calc_yoy_with_dept_entries(&cur_map, &prev_map, min_prev);
+    let (positive, negative) = split_and_sort_yoy_with_dept(entries, limit);
+
+    let departments = repo
+        .list_departments()
+        .await
+        .map_err(map_repo_err)?
+        .into_iter()
+        .map(|(code, name)| DepartmentOption { department_code: code, department_name: name })
+        .collect();
+
+    Ok(Json(ApiResponse {
+        source_table: "運転日報明細 + 部門ﾏｽﾀ + 得意先ﾏｽﾀ".to_string(),
+        data: CustomerYoyByDeptResponse {
+            positive,
+            negative,
+            months,
+            min_prev,
+            department_code: dept_code,
+            departments,
+        },
+    }))
+}
+
+pub async fn list_departments_handler(
+    Extension(repo): Extension<DynRepo>,
+) -> Result<Json<ApiResponse<Vec<DepartmentOption>>>, StatusCode> {
+    let rows = repo.list_departments().await.map_err(map_repo_err)?;
+    Ok(Json(ApiResponse {
+        source_table: "部門ﾏｽﾀ".to_string(),
+        data: rows
+            .into_iter()
+            .map(|(code, name)| DepartmentOption { department_code: code, department_name: name })
+            .collect(),
     }))
 }
