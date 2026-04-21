@@ -23,6 +23,7 @@ pub trait AppRepo: Send + Sync {
         prev_from: &str,
         prev_to: &str,
         exclude_dept: Option<&str>,
+        include_dept: Option<&str>,
     ) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError>;
 
     async fn by_department(
@@ -252,10 +253,34 @@ impl AppRepo for TiberiusRepo {
         prev_from: &str,
         prev_to: &str,
         exclude_dept: Option<&str>,
+        include_dept: Option<&str>,
     ) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
 
-        if let Some(dept) = exclude_dept {
+        if let Some(code) = include_dept {
+            // 指定された営業所コードで絞り込み（部門別月計）
+            let sql = "SELECT m.[年月度], \
+                 SUM(ISNULL(m.[自車売上], 0)), SUM(ISNULL(m.[傭車売上], 0)), SUM(ISNULL(m.[輸送回数], 0)) \
+                 FROM [部門別月計] m \
+                 WHERE m.[年月度] >= @P1 AND m.[年月度] <= @P2 \
+                   AND m.[部門C] = @P3 \
+                 GROUP BY m.[年月度] \
+                 ORDER BY m.[年月度]";
+
+            let stream = conn.query(sql, &[&from, &to, &code])
+                .await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let cur = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+            let prev_stream = conn.query(sql, &[&prev_from, &prev_to, &code])
+                .await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev = prev_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+            Ok((
+                format!("部門別月計 (部門C={})", code),
+                Self::rows_to_monthly(&cur),
+                Self::rows_to_monthly(&prev),
+            ))
+        } else if let Some(dept) = exclude_dept {
             let exclude_pattern = format!("%{}%", dept);
             let sql = "SELECT m.[年月度], \
                  SUM(ISNULL(m.[自車売上], 0)), SUM(ISNULL(m.[傭車売上], 0)), SUM(ISNULL(m.[輸送回数], 0)) \

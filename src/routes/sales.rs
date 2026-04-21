@@ -214,7 +214,7 @@ pub struct CustomerYoyByDeptResponse {
 // ══════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
-pub struct MonthlyQuery { pub from: Option<String>, pub to: Option<String>, pub exclude_dept: Option<String> }
+pub struct MonthlyQuery { pub from: Option<String>, pub to: Option<String>, pub exclude_dept: Option<String>, pub include_dept: Option<String> }
 #[derive(Deserialize)]
 pub struct PeriodQuery { pub from: Option<String>, pub to: Option<String> }
 #[derive(Deserialize)]
@@ -369,7 +369,7 @@ pub async fn monthly(Extension(repo): Extension<DynRepo>, Query(params): Query<M
     let from_date = format!("{}-01", from);
     let to_date = format!("{}-01", to);
     let (prev_from, prev_to) = calc_prev_period(&from, &to);
-    let (source_table, current, prev) = repo.monthly(&from_date, &to_date, &prev_from, &prev_to, params.exclude_dept.as_deref()).await.map_err(map_repo_err)?;
+    let (source_table, current, prev) = repo.monthly(&from_date, &to_date, &prev_from, &prev_to, params.exclude_dept.as_deref(), params.include_dept.as_deref()).await.map_err(map_repo_err)?;
     Ok(Json(ApiResponse { source_table, data: build_monthly_sales(&current, &prev) }))
 }
 
