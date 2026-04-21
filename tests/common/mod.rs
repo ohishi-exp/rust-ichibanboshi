@@ -45,7 +45,7 @@ impl AppRepo for MockRepo {
         })
     }
 
-    async fn monthly(&self, _from: &str, _to: &str, _prev_from: &str, _prev_to: &str, _exclude: Option<&str>) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> {
+    async fn monthly(&self, _from: &str, _to: &str, _prev_from: &str, _prev_to: &str, _exclude: Option<&str>, _include: Option<&str>) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> {
         Ok(("種別別月計 (種別C=99)".into(), vec![
             RawMonthlyRow { year_month: dt(2025, 4, 1), own_sales: 1_000_000, charter_sales: 500_000, transport_count: 50 },
         ], vec![
@@ -118,7 +118,7 @@ impl AppRepo for ErrorRepo {
     async fn list_tables(&self) -> Result<Vec<TableInfo>, RepoError> { Err(RepoError::PoolError) }
     async fn list_columns(&self, _: &str) -> Result<Vec<ColumnInfo>, RepoError> { Err(RepoError::PoolError) }
     async fn sample_data(&self, _: &str, _: i32) -> Result<SampleRow, RepoError> { Err(RepoError::PoolError) }
-    async fn monthly(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> { Err(RepoError::PoolError) }
+    async fn monthly(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>, _: Option<&str>) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> { Err(RepoError::PoolError) }
     async fn by_department(&self, _: &str, _: &str) -> Result<Vec<RawDepartmentRow>, RepoError> { Err(RepoError::PoolError) }
     async fn by_customer(&self, _: &str, _: &str, _: i32) -> Result<Vec<RawCustomerRow>, RepoError> { Err(RepoError::PoolError) }
     async fn customer_yoy_data(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(CodeTotalMap, CodeTotalMap), RepoError> { Err(RepoError::PoolError) }
@@ -140,7 +140,7 @@ impl AppRepo for QueryErrorRepo {
     async fn list_tables(&self) -> Result<Vec<TableInfo>, RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn list_columns(&self, _: &str) -> Result<Vec<ColumnInfo>, RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn sample_data(&self, _: &str, _: i32) -> Result<SampleRow, RepoError> { Err(RepoError::QueryError("test".into())) }
-    async fn monthly(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> { Err(RepoError::QueryError("test".into())) }
+    async fn monthly(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>, _: Option<&str>) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn by_department(&self, _: &str, _: &str) -> Result<Vec<RawDepartmentRow>, RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn by_customer(&self, _: &str, _: &str, _: i32) -> Result<Vec<RawCustomerRow>, RepoError> { Err(RepoError::QueryError("test".into())) }
     async fn customer_yoy_data(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(CodeTotalMap, CodeTotalMap), RepoError> { Err(RepoError::QueryError("test".into())) }
