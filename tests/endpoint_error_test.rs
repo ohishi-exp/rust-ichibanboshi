@@ -228,3 +228,47 @@ async fn test_sales_customer_detail_ok() {
     let res = app.oneshot(Request::builder().uri("/api/sales/customer-detail?code=000001").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+// ── customer-yoy-by-dept / departments ──
+
+#[tokio::test]
+async fn test_sales_customer_yoy_by_dept_ok() {
+    let app = common::build_app(common::mock_repo());
+    let res = app.oneshot(Request::builder().uri("/api/sales/customer-yoy-by-dept?from=2025-04&to=2026-03").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_sales_customer_yoy_by_dept_with_department_code_ok() {
+    let app = common::build_app(common::mock_repo());
+    let res = app.oneshot(Request::builder().uri("/api/sales/customer-yoy-by-dept?from=2025-04&to=2026-03&department_code=01").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_sales_customer_yoy_by_dept_pool_error() {
+    let app = common::build_app(common::error_repo());
+    let res = app.oneshot(Request::builder().uri("/api/sales/customer-yoy-by-dept").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_sales_customer_yoy_by_dept_query_error() {
+    let app = common::build_app(common::query_error_repo());
+    let res = app.oneshot(Request::builder().uri("/api/sales/customer-yoy-by-dept").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_sales_departments_ok() {
+    let app = common::build_app(common::mock_repo());
+    let res = app.oneshot(Request::builder().uri("/api/sales/departments").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_sales_departments_pool_error() {
+    let app = common::build_app(common::error_repo());
+    let res = app.oneshot(Request::builder().uri("/api/sales/departments").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
