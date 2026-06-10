@@ -13,6 +13,9 @@ name = "rust_ichibanboshi"
 path = "src/lib.rs"
 
 [dependencies]
+# JWT 検証ロジックの SoT (rust-alc-api #410 で leaf crate 化)。手動コピー時代の
+# 検証 drift (env claim 未対応等、本 repo #4) の再発防止として git dep で追従する
+alc-auth-jwt = { git = "https://github.com/ippoan/rust-alc-api", branch = "main" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

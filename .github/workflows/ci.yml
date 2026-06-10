@@ -42,3 +42,25 @@ jobs:
           path: /tmp/llvm-cov-cache/text-*.txt
           retention-days: 7
           if-no-files-found: ignore
+
+  # CI green 後に squash merge する。org 標準の ci-workflows auto-merge.yml は
+  # GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY) を必須とするが
+  # ohishi-exp org には未設定のため、claude-skills 型の self-contained job で
+  # 代替する。needs: [test] により coverage gate 完走後にしか merge されない
+  # (branch protection 不要)。release.yml は tag trigger のみなので merge actor
+  # が github-actions[bot] でも下流 workflow への影響は無い。TAG_RELEASE_PAT
+  # (org secret) があればそちらを優先し、merge push を実 user actor にする。
+  # ohishi-exp に App credential が入ったら reusable 呼び出しに戻すこと。
+  auto-merge:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Squash merge after CI green
+        env:
+          GH_TOKEN: ${{ secrets.TAG_RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --squash "$PR_URL"
