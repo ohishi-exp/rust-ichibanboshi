@@ -42,3 +42,17 @@ jobs:
           path: /tmp/llvm-cov-cache/text-*.txt
           retention-days: 7
           if-no-files-found: ignore
+
+  # CI green 後に squash auto-merge を queue する (org 標準の caller-composed
+  # pattern、go-cloudrun-proxy / rust-flickr と同形)。deploy job は本 repo の
+  # ci.yml に無い (本番反映は手元 ./deploy.sh) ため needs は test のみ。
+  auto-merge:
+    if: github.event_name == 'pull_request'
+    needs: [test]
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    # auto-merge.yml は GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY、
+    # org secrets) を必須とするため secrets: inherit が必要。
+    secrets: inherit
+    permissions:
+      contents: write
+      pull-requests: write
