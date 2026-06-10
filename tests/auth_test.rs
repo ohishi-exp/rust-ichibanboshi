@@ -37,6 +37,7 @@ fn test_verify_token_with_org_slug() {
         tenant_id: Uuid::new_v4(),
         role: "member".to_string(),
         org_slug: Some("my-org".to_string()),
+        env: None,
         iat: Utc::now().timestamp(),
         exp: Utc::now().timestamp() + 3600,
     };
@@ -67,6 +68,7 @@ fn test_verify_expired_token() {
         tenant_id: Uuid::new_v4(),
         role: "admin".to_string(),
         org_slug: None,
+        env: None,
         iat: Utc::now().timestamp() - 7200,
         exp: Utc::now().timestamp() - 3600,
     };
@@ -113,10 +115,7 @@ fn build_auth_test_app() -> Router {
 #[tokio::test]
 async fn test_require_jwt_no_header() {
     let app = build_auth_test_app();
-    let req = Request::builder()
-        .uri("/test")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
@@ -180,6 +179,7 @@ async fn test_require_jwt_expired_token() {
         tenant_id: Uuid::new_v4(),
         role: "admin".to_string(),
         org_slug: None,
+        env: None,
         iat: Utc::now().timestamp() - 7200,
         exp: Utc::now().timestamp() - 3600,
     };

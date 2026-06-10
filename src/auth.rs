@@ -113,6 +113,9 @@ mod tests {
 
     const SECRET: &str = "test-secret";
 
+    /// STAGING_MODE を触る/読むテストの直列化 (set_var はプロセス全体に効くため)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn make_token(env: Option<&str>) -> String {
         let now = chrono::Utc::now().timestamp();
         let claims = AppClaims {
@@ -134,11 +137,9 @@ mod tests {
         .unwrap()
     }
 
-    // 以下のテストは STAGING_MODE 未設定 (= "prod") 前提。env::set_var による
-    // 切替はテスト並列実行で race するため行わない。
-
     #[test]
     fn verify_accepts_matching_env() {
+        let _g = ENV_LOCK.lock().unwrap();
         let token = make_token(Some("prod"));
         let secret = JwtSecret(SECRET.to_string());
         assert!(verify_access_token(&token, &secret).is_ok());
@@ -146,6 +147,7 @@ mod tests {
 
     #[test]
     fn verify_accepts_legacy_token_without_env() {
+        let _g = ENV_LOCK.lock().unwrap();
         let token = make_token(None);
         let secret = JwtSecret(SECRET.to_string());
         assert!(verify_access_token(&token, &secret).is_ok());
@@ -153,6 +155,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_cross_env_token() {
+        let _g = ENV_LOCK.lock().unwrap();
         let token = make_token(Some("staging"));
         let secret = JwtSecret(SECRET.to_string());
         let err = verify_access_token(&token, &secret).unwrap_err();
@@ -160,5 +163,14 @@ mod tests {
             err.kind(),
             jsonwebtoken::errors::ErrorKind::InvalidIssuer
         ));
+    }
+
+    #[test]
+    fn current_env_label_staging_mode() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("STAGING_MODE", "true");
+        assert_eq!(current_env_label(), "staging");
+        std::env::remove_var("STAGING_MODE");
+        assert_eq!(current_env_label(), "prod");
     }
 }
