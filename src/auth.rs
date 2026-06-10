@@ -1,39 +1,10 @@
 use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response, Extension};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// JWT シークレットのラッパー（rust-alc-api と同じ）
-#[derive(Clone)]
-pub struct JwtSecret(pub String);
-
-/// App JWT のクレーム（rust-alc-api と同じ構造）
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AppClaims {
-    pub sub: Uuid,
-    pub email: String,
-    pub name: String,
-    pub tenant_id: Uuid,
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub org_slug: Option<String>,
-    /// 発行環境 (staging/prod 分離、rust-alc-api #218)。旧 token 互換のため Option
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<String>,
-    pub iat: i64,
-    pub exp: i64,
-}
-
-/// 現在の環境ラベル (rust-alc-api `current_env_label()` と同じ判定)
-///
-/// `STAGING_MODE=true` → "staging"、それ以外 → "prod"。
-/// 本サービスは prod 運用のみだが、verify 側の比較基準として同じ規約に従う。
-pub fn current_env_label() -> &'static str {
-    match std::env::var("STAGING_MODE").as_deref() {
-        Ok("true") => "staging",
-        _ => "prod",
-    }
-}
+// JWT の claims / 検証は rust-alc-api の leaf crate `alc-auth-jwt` が SoT (本 repo #4)。
+// 手動コピーをやめて re-export することで、alc 側の検証仕様変更 (env claim 等) に
+// 自動追従する。既存の `crate::auth::...` import は無変更で通る。
+pub use alc_auth_jwt::{current_env_label, verify_access_token, AppClaims, JwtSecret};
 
 /// 認証済みユーザー情報
 #[derive(Debug, Clone)]
@@ -43,34 +14,6 @@ pub struct AuthUser {
     pub name: String,
     pub tenant_id: Uuid,
     pub role: String,
-}
-
-/// Access token を検証してクレームを返す
-pub fn verify_access_token(
-    token: &str,
-    secret: &JwtSecret,
-) -> Result<AppClaims, jsonwebtoken::errors::Error> {
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-
-    let token_data = decode::<AppClaims>(
-        token,
-        &DecodingKey::from_secret(secret.0.as_bytes()),
-        &validation,
-    )?;
-
-    // rust-alc-api #218: token の env claim と現在環境の一致を強制する
-    // (staging token を prod が受理しない)。旧 token 互換のため env 未設定は通す。
-    if let Some(token_env) = token_data.claims.env.as_deref() {
-        let expected = current_env_label();
-        if token_env != expected {
-            return Err(jsonwebtoken::errors::Error::from(
-                jsonwebtoken::errors::ErrorKind::InvalidIssuer,
-            ));
-        }
-    }
-
-    Ok(token_data.claims)
 }
 
 /// JWT 必須ミドルウェア
@@ -109,7 +52,7 @@ fn extract_bearer_token(req: &Request) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
     const SECRET: &str = "test-secret";
 
@@ -136,6 +79,9 @@ mod tests {
         )
         .unwrap()
     }
+
+    // alc-auth-jwt への contract test — 依存先の env claim 検証仕様 (rust-alc-api #218)
+    // が将来の更新で変わったら本 repo の CI で気付けるよう re-export 経由で固定する。
 
     #[test]
     fn verify_accepts_matching_env() {
