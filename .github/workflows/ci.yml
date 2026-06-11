@@ -53,9 +53,13 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: [test]
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
-    # auto-merge.yml は GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY、
-    # org secrets) を必須とするため secrets: inherit が必要。
-    secrets: inherit
+    # auto-merge.yml は GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY)
+    # を必須とする。reusable が **別 org (ippoan)** にあるため `secrets: inherit`
+    # は効かない (inherit は同一 org / enterprise 内の reusable にしか secret を
+    # 渡さない)。ohishi-exp org secret を named secret として明示的に渡す。
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
     permissions:
       contents: write
       pull-requests: write
