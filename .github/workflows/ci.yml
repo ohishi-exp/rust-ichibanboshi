@@ -43,24 +43,23 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # CI green 後に squash merge する。org 標準の ci-workflows auto-merge.yml は
-  # GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY) を必須とするが
-  # ohishi-exp org には未設定のため、claude-skills 型の self-contained job で
-  # 代替する。needs: [test] により coverage gate 完走後にしか merge されない
-  # (branch protection 不要)。release.yml は tag trigger のみなので merge actor
-  # が github-actions[bot] でも下流 workflow への影響は無い。TAG_RELEASE_PAT
-  # (org secret) があればそちらを優先し、merge push を実 user actor にする。
-  # ohishi-exp に App credential が入ったら reusable 呼び出しに戻すこと。
+  # CI green 後に squash auto-merge を queue する (org 標準の caller-composed
+  # pattern、go-cloudrun-proxy / rust-flickr と同形)。ohishi-exp org に
+  # CI_APP_ID / CI_APP_PRIVATE_KEY が投入されたため self-contained job から
+  # reusable に復帰 (Refs ippoan/secrets-inventory-gcp#51 — App installation
+  # token mode 経由で sync 投入)。deploy job は本 repo の ci.yml に無い
+  # (本番反映は手元 ./deploy.sh) ため needs は test のみ。
   auto-merge:
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    if: github.event_name == 'pull_request'
     needs: [test]
-    runs-on: ubuntu-latest
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    # auto-merge.yml は GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY)
+    # を必須とする。reusable が **別 org (ippoan)** にあるため `secrets: inherit`
+    # は効かない (inherit は同一 org / enterprise 内の reusable にしか secret を
+    # 渡さない)。ohishi-exp org secret を named secret として明示的に渡す。
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
     permissions:
       contents: write
       pull-requests: write
-    steps:
-      - name: Squash merge after CI green
-        env:
-          GH_TOKEN: ${{ secrets.TAG_RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge --squash "$PR_URL"
