@@ -55,7 +55,8 @@ pub async fn run(
         .route(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
-        );
+        )
+        .route("/surcharge/base", get(routes::surcharge::surcharge_base));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
