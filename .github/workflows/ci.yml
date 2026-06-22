@@ -43,16 +43,80 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # main への merge (push) で musl binary を build → Cloudflare Tunnel SSH 経由で
+  # ohishi-data に自動 deploy する (Refs #14)。GitHub Actions runner は Tailscale
+  # 網に居ないので、deploy.sh の Tailscale 経路ではなく cloudflared access ssh を
+  # ProxyCommand にした SSH で到達し、CF Access service token で認証する。
+  # deploy ロジックは deploy.sh (手動 fallback) と scripts/deploy-remote.sh を共有。
+  deploy:
+    name: Deploy to ohishi-data (CF Tunnel SSH)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build musl release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Write deploy SSH key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy over Cloudflare Tunnel SSH
+        env:
+          DEPLOY_SSH_HOST: ${{ vars.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_PROXY_COMMAND: "cloudflared access ssh --hostname %h"
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          if [ -z "$DEPLOY_SSH_HOST" ]; then
+            echo "::error::vars.DEPLOY_SSH_HOST is not set — configure repo/org variable" >&2
+            exit 1
+          fi
+          # ~ は env で展開されないので run step 内で $HOME を使って絶対 path 化する
+          export DEPLOY_SSH_KEY_FILE="$HOME/.ssh/deploy_key"
+          bash scripts/deploy-remote.sh
+
   # CI green 後に squash auto-merge を queue する (org 標準の caller-composed
   # pattern、go-cloudrun-proxy / rust-flickr と同形)。ohishi-exp org に
   # CI_APP_ID / CI_APP_PRIVATE_KEY が投入されたため self-contained job から
   # reusable に復帰 (Refs ippoan/secrets-inventory-gcp#51 — App installation
-  # token mode 経由で sync 投入)。deploy job は本 repo の ci.yml に無い
-  # (本番反映は手元 ./deploy.sh) ため needs は test のみ。
+  # token mode 経由で sync 投入)。deploy job は push (merge 後) のみ走るので
+  # auto-merge (PR run) とは排他、needs は test のみで良い。
   auto-merge:
     if: github.event_name == 'pull_request'
     needs: [test]
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    # deploy job は push (refs/heads/main) 限定 trigger なので PR run の auto-merge
+    # とは排他で並走しない (= merge -> branch 削除で deploy が cancel される race は
+    # 起きない)。auto-merge.yml の deploy gate 静的検査は DAG だけ見て trigger 排他を
+    # 判別できず deploy を needs 未配線として loud fail するので、明示的に除外する。
+    with:
+      deploy_gate_ignore: 'deploy'
     # auto-merge.yml は GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY)
     # を必須とする。reusable が **別 org (ippoan)** にあるため `secrets: inherit`
     # は効かない (inherit は同一 org / enterprise 内の reusable にしか secret を
