@@ -21,3 +21,6 @@ path = "src/routes/sales.rs"
 
 [[files]]
 path = "src/routes/schema.rs"
+
+[[files]]
+path = "src/routes/surcharge.rs"
