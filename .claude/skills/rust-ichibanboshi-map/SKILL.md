@@ -29,12 +29,17 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/health.rs` | `/health` |
 | `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
+| `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
 
 ## entrypoint / Axum router (`src/server.rs::run`)
 
 - `/health`
 - `/api/sales/*`: `monthly` / `by-department` / `by-customer` / `yoy` / `daily` /
   `customer-trend` / `customer-yoy` / `customer-yoy-by-dept` / `departments` / `customer-detail`
+- `/api/surcharge/base`: 燃料サーチャージ基礎データ。`運転日報明細` の請求のみ行 (`請求K`='1'、
+  `kind=transport`/`all` で切替) を 得意先 / 積地県 / 卸地県 / 車種 / 売上年月日 / 運賃 / 請求日(入金予定)
+  に展開。県正規化 (`地域N` → 都道府県) は `normalize_prefecture` 純粋関数。残マスタ (燃費/距離/軽油価格/
+  対象得意先) は scope 外 (#12 残課題)。
 - `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
