@@ -111,6 +111,12 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: [test]
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    # deploy job は push (refs/heads/main) 限定 trigger なので PR run の auto-merge
+    # とは排他で並走しない (= merge -> branch 削除で deploy が cancel される race は
+    # 起きない)。auto-merge.yml の deploy gate 静的検査は DAG だけ見て trigger 排他を
+    # 判別できず deploy を needs 未配線として loud fail するので、明示的に除外する。
+    with:
+      deploy_gate_ignore: 'deploy'
     # auto-merge.yml は GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY)
     # を必須とする。reusable が **別 org (ippoan)** にあるため `secrets: inherit`
     # は効かない (inherit は同一 org / enterprise 内の reusable にしか secret を
