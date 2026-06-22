@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
+use crate::routes::surcharge::RawSurchargeRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
 #[async_trait]
@@ -85,6 +86,15 @@ pub trait AppRepo: Send + Sync {
     ) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError>;
 
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError>;
+
+    // ── surcharge (燃料サーチャージ基礎データ、#12) ──
+    async fn surcharge_base(
+        &self,
+        from: &str,
+        to: &str,
+        kind_filter: &str,
+        limit: i32,
+    ) -> Result<Vec<RawSurchargeRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -633,6 +643,49 @@ impl AppRepo for TiberiusRepo {
             .map(|row| (decode_cp932(row, 0), decode_cp932(row, 1)))
             .collect())
     }
+
+    async fn surcharge_base(
+        &self,
+        from: &str,
+        to: &str,
+        kind_filter: &str,
+        limit: i32,
+    ) -> Result<Vec<RawSurchargeRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 調査 #12 で実機検証した SELECT。請求対象行を県・車種付きで取り出す。
+        // 県正規化 (地域N → 都道府県) はロジック層 (normalize_prefecture) に任せ、
+        // ここでは 地域ﾏｽﾀ.地域N の生値を返す。運賃は #12 の確定式 金額+割増+実費。
+        let query = format!(
+            "SELECT TOP {} \
+             t.[請求K], t.[得意先C], ISNULL(c.[得意先N], ''), \
+             ISNULL(o.[地域N], ''), ISNULL(d.[地域N], ''), \
+             t.[車種C], ISNULL(v.[車種N], ''), \
+             t.[売上年月日], \
+             ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
+             t.[入金予定日] \
+             FROM [運転日報明細] t \
+             LEFT JOIN [得意先ﾏｽﾀ] c ON t.[得意先C] = c.[得意先C] \
+             LEFT JOIN [車種ﾏｽﾀ] v ON t.[車種C] = v.[車種C] \
+             LEFT JOIN [地域ﾏｽﾀ] o ON t.[発地域C] = o.[地域C] \
+             LEFT JOIN [地域ﾏｽﾀ] d ON t.[着地域C] = d.[地域C] \
+             WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 {} \
+             ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]",
+            limit.clamp(1, 10000),
+            kind_filter
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_surcharge(&rows))
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -667,6 +720,23 @@ impl TiberiusRepo {
                 customer_code: decode_cp932(r, 2),
                 customer_name: decode_cp932(r, 3),
                 total: get_i64(r, 4),
+            })
+            .collect()
+    }
+
+    fn rows_to_surcharge(rows: &[tiberius::Row]) -> Vec<RawSurchargeRow> {
+        rows.iter()
+            .map(|r| RawSurchargeRow {
+                request_kind: decode_cp932(r, 0),
+                customer_code: decode_cp932(r, 1),
+                customer_name: decode_cp932(r, 2),
+                origin_area_name: decode_cp932(r, 3),
+                dest_area_name: decode_cp932(r, 4),
+                vehicle_code: decode_cp932(r, 5),
+                vehicle_name: decode_cp932(r, 6),
+                sale_date: r.get(7).unwrap_or_default(),
+                fare: get_i64(r, 8),
+                billing_date: r.get(9),
             })
             .collect()
     }

@@ -12,6 +12,7 @@ use rust_ichibanboshi::repo::{AppRepo, DynRepo, RepoError};
 use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
+use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
 use uuid::Uuid;
 
 pub const TEST_JWT_SECRET: &str = "test-jwt-secret-ichibanboshi";
@@ -220,6 +221,42 @@ impl AppRepo for MockRepo {
             ("02".into(), "大阪".into()),
         ])
     }
+
+    async fn surcharge_base(
+        &self,
+        _from: &str,
+        _to: &str,
+        _kind_filter: &str,
+        _limit: i32,
+    ) -> Result<Vec<RawSurchargeRow>, RepoError> {
+        Ok(vec![
+            RawSurchargeRow {
+                request_kind: "1".into(),
+                customer_code: "000001".into(),
+                customer_name: "㈱田浦畜産".into(),
+                origin_area_name: "長崎県".into(),
+                dest_area_name: "福岡県".into(),
+                vehicle_code: "04".into(),
+                vehicle_name: "大型幌".into(),
+                sale_date: dt(2026, 6, 21),
+                fare: 65_000,
+                billing_date: Some(dt(2026, 7, 31)),
+            },
+            // エッジ: 未マップ地域 (000000)・車種未設定 (00)・入金予定日 NULL
+            RawSurchargeRow {
+                request_kind: "1".into(),
+                customer_code: "000002".into(),
+                customer_name: "㈱谷川商事".into(),
+                origin_area_name: "".into(),
+                dest_area_name: "".into(),
+                vehicle_code: "00".into(),
+                vehicle_name: "".into(),
+                sale_date: dt(2026, 6, 20),
+                fare: 840_000,
+                billing_date: None,
+            },
+        ])
+    }
 }
 
 // ── ErrorRepo: 全メソッドがエラーを返す ──
@@ -314,6 +351,15 @@ impl AppRepo for ErrorRepo {
         Err(RepoError::PoolError)
     }
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn surcharge_base(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<Vec<RawSurchargeRow>, RepoError> {
         Err(RepoError::PoolError)
     }
 }
@@ -412,6 +458,15 @@ impl AppRepo for QueryErrorRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn surcharge_base(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<Vec<RawSurchargeRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
 }
 
 // ── ヘルパー ──
@@ -444,7 +499,8 @@ pub fn build_app(repo: DynRepo) -> Router {
         .route(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
-        );
+        )
+        .route("/surcharge/base", get(routes::surcharge::surcharge_base));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))
