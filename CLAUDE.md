@@ -98,8 +98,36 @@
 
 ## デプロイ
 
+### CI 自動デプロイ (推奨、Refs #14)
+
+`main` への merge で `ci.yml` の `deploy` job が musl binary を build →
+**Cloudflare Tunnel SSH 経由**で `ohishi-data` に deploy → PathModified 自動 restart →
+`/health` 200 を確認する。GitHub Actions runner は Tailscale 網に居ないため、
+Tailscale ではなく `cloudflared access ssh` を `ProxyCommand` にした SSH で到達し、
+**CF Access service token** で認証する。
+
+- trigger: `push: branches: [main]` (= merge で本番反映)、`needs: [test]`
+- 実 deploy ロジックは手動 `deploy.sh` と `scripts/deploy-remote.sh` を共有
+  (host 名・proxy・鍵を env 化)
+- deploy 失敗 (build / SSH / health != 200) は job が **loud fail** する
+
+必要な GitHub secrets / variables (ohishi-exp repo or org):
+
+| 名前 | 種別 | 用途 |
+|---|---|---|
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | secret | CF Access service token (SSH 経路の認証) |
+| `DEPLOY_SSH_KEY` | secret | CI 専用 SSH 秘密鍵 (host の authorized_keys に公開鍵を登録) |
+| `DEPLOY_SSH_HOST` | variable | `ssh-rust-ichiban.mtamaramu.com` 等 (CF Tunnel SSH ingress hostname) |
+
+host 側 (一度きり): `cloudflared` Tunnel に SSH ingress
+(`ssh-rust-ichiban.mtamaramu.com` → `ssh://localhost:22`) を追加 → CF Access app +
+Service Auth ポリシーで保護 (CI 専用 token のみ許可) → deploy ユーザー
+(`ubuntu`) の `~/.ssh/authorized_keys` に CI 公開鍵を登録。
+
+### 手動 fallback (Tailscale 経路)
+
 ```bash
-# これだけで ビルド → scp → 自動再起動 まで完了
+# musl build → Tailscale SSH で deploy → 自動 restart
 ./deploy.sh
 ```
 
@@ -108,7 +136,7 @@
 - **サービス**: `systemctl status ichibanboshi`
 - **自動再起動**: `ichibanboshi-watcher.path` (systemd PathModified) がバイナリ変更を検知 → 自動 restart
 - **ビルド**: musl スタティックリンク（GLIBC バージョン不一致回避）
-- deploy.sh の流れ: `cargo build --release --target x86_64-unknown-linux-musl` → `scp /tmp` → `mv` → PathModified で自動 restart
+- `deploy.sh` / `scripts/deploy-remote.sh` の流れ: `cargo build --release --target x86_64-unknown-linux-musl` → `scp /tmp` → `mv`（アトミック） → PathModified で自動 restart → `/health` 疎通確認
 
 ## Cloudflare Access
 
