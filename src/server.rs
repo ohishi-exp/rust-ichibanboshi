@@ -39,10 +39,7 @@ pub async fn run(
         .route("/sales/by-customer", get(routes::sales::by_customer))
         .route("/sales/yoy", get(routes::sales::yoy))
         .route("/sales/daily", get(routes::sales::daily))
-        .route(
-            "/sales/customer-trend",
-            get(routes::sales::customer_trend),
-        )
+        .route("/sales/customer-trend", get(routes::sales::customer_trend))
         .route("/sales/customer-yoy", get(routes::sales::customer_yoy))
         .route(
             "/sales/customer-yoy-by-dept",
@@ -56,7 +53,8 @@ pub async fn run(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
         )
-        .route("/surcharge/base", get(routes::surcharge::surcharge_base));
+        .route("/surcharge/base", get(routes::surcharge::surcharge_base))
+        .route("/vehicles", get(routes::surcharge::vehicles));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))

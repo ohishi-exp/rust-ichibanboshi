@@ -222,6 +222,14 @@ impl AppRepo for MockRepo {
         ])
     }
 
+    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
+        Ok(vec![
+            ("04".into(), "大型幌".into()),
+            ("07".into(), "ﾄﾚｰﾗｰ".into()),
+            ("00".into(), "".into()), // 未設定 (車種N 空)
+        ])
+    }
+
     async fn surcharge_base(
         &self,
         _from: &str,
@@ -353,6 +361,9 @@ impl AppRepo for ErrorRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::PoolError)
     }
+    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
+        Err(RepoError::PoolError)
+    }
     async fn surcharge_base(
         &self,
         _: &str,
@@ -458,6 +469,9 @@ impl AppRepo for QueryErrorRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
     async fn surcharge_base(
         &self,
         _: &str,
@@ -500,7 +514,8 @@ pub fn build_app(repo: DynRepo) -> Router {
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
         )
-        .route("/surcharge/base", get(routes::surcharge::surcharge_base));
+        .route("/surcharge/base", get(routes::surcharge::surcharge_base))
+        .route("/vehicles", get(routes::surcharge::vehicles));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))

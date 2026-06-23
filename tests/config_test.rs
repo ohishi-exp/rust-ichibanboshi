@@ -14,7 +14,10 @@ fn test_config_defaults_from_empty_toml() {
     assert!(config.database.password.is_empty());
     assert!(config.database.port.is_none());
     assert!(config.auth.jwt_secret.is_empty());
-    assert_eq!(config.cors.allowed_origins, vec!["https://ichibanboshi.mtamaramu.com"]);
+    assert_eq!(
+        config.cors.allowed_origins,
+        vec!["https://ichibanboshi.mtamaramu.com"]
+    );
 }
 
 #[test]
@@ -167,7 +170,10 @@ fn test_auth_config_default() {
 fn test_cors_config_default() {
     let cors = rust_ichibanboshi::config::CorsConfig::default();
     assert_eq!(cors.allowed_origins.len(), 1);
-    assert_eq!(cors.allowed_origins[0], "https://ichibanboshi.mtamaramu.com");
+    assert_eq!(
+        cors.allowed_origins[0],
+        "https://ichibanboshi.mtamaramu.com"
+    );
 }
 
 #[test]
@@ -177,7 +183,11 @@ fn test_config_from_args_with_config_file() {
     std::fs::create_dir_all(&dir).unwrap();
     let config_path = dir.join("test_config.toml");
     let mut f = std::fs::File::create(&config_path).unwrap();
-    write!(f, "port = 7777\nbind_addr = \"10.0.0.1\"\n[auth]\njwt_secret = \"file-secret\"\n").unwrap();
+    write!(
+        f,
+        "port = 7777\nbind_addr = \"10.0.0.1\"\n[auth]\njwt_secret = \"file-secret\"\n"
+    )
+    .unwrap();
 
     let args = AppArgs {
         console: true,
@@ -204,7 +214,7 @@ fn test_config_from_args_with_config_file_and_overrides() {
     let args = AppArgs {
         console: true,
         config: Some(config_path.to_str().unwrap().to_string()),
-        port: Some(9999),        // override
+        port: Some(9999),                       // override
         bind_addr: Some("0.0.0.0".to_string()), // override
     };
     let config = Config::from_args_and_file(&args).unwrap();
@@ -224,7 +234,11 @@ fn test_load_default_locations_exe_adjacent() {
 
     {
         let mut f = std::fs::File::create(&config_path).unwrap();
-        std::io::Write::write_all(&mut f, b"port = 6666\n[auth]\njwt_secret = \"exe-adjacent\"\n").unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            b"port = 6666\n[auth]\njwt_secret = \"exe-adjacent\"\n",
+        )
+        .unwrap();
     }
 
     let config = Config::load_default_locations().unwrap();
