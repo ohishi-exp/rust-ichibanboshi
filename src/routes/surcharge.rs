@@ -53,6 +53,13 @@ pub struct RawSurchargeRow {
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
 
+/// 車種ﾏｽﾀ 1 件 (燃費マスタの車種ドロップダウン用)。
+#[derive(Serialize, Debug, PartialEq)]
+pub struct VehicleOption {
+    pub vehicle_code: String,
+    pub vehicle_name: String,
+}
+
 #[derive(Serialize, Debug, PartialEq)]
 pub struct SurchargeRow {
     /// 請求区分 (1=請求のみ / 0=通常運送 / 2=非請求)
@@ -154,6 +161,25 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
 // ══════════════════════════════════════════════════════════════
 // ハンドラ (薄い — param 解析 → repo → build → JSON)
 // ══════════════════════════════════════════════════════════════
+
+/// GET /api/vehicles — 車種ﾏｽﾀ (車種C, 車種N) の一覧。
+/// 燃料サーチャージ請求側 (nuxt-ichibanboshi-seikyu) の燃費マスタ編集 UI が
+/// 車種ドロップダウンの選択肢として取得する (車種C キーで燃費を登録)。
+pub async fn vehicles(
+    Extension(repo): Extension<DynRepo>,
+) -> Result<Json<ApiResponse<Vec<VehicleOption>>>, StatusCode> {
+    let rows = repo.vehicles().await.map_err(map_repo_err)?;
+    Ok(Json(ApiResponse {
+        source_table: "車種ﾏｽﾀ".to_string(),
+        data: rows
+            .into_iter()
+            .map(|(code, name)| VehicleOption {
+                vehicle_code: code,
+                vehicle_name: name,
+            })
+            .collect(),
+    }))
+}
 
 /// GET /api/surcharge/base
 pub async fn surcharge_base(

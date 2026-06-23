@@ -81,12 +81,25 @@ fn test_calc_months_minimum_one() {
 #[test]
 fn test_build_monthly_sales_with_prev() {
     let current = vec![
-        RawMonthlyRow { year_month: dt(2025, 4, 1), own_sales: 1_000_000, charter_sales: 500_000, transport_count: 50 },
-        RawMonthlyRow { year_month: dt(2025, 5, 1), own_sales: 1_200_000, charter_sales: 600_000, transport_count: 55 },
+        RawMonthlyRow {
+            year_month: dt(2025, 4, 1),
+            own_sales: 1_000_000,
+            charter_sales: 500_000,
+            transport_count: 50,
+        },
+        RawMonthlyRow {
+            year_month: dt(2025, 5, 1),
+            own_sales: 1_200_000,
+            charter_sales: 600_000,
+            transport_count: 55,
+        },
     ];
-    let prev = vec![
-        RawMonthlyRow { year_month: dt(2024, 4, 1), own_sales: 900_000, charter_sales: 400_000, transport_count: 0 },
-    ];
+    let prev = vec![RawMonthlyRow {
+        year_month: dt(2024, 4, 1),
+        own_sales: 900_000,
+        charter_sales: 400_000,
+        transport_count: 0,
+    }];
 
     let result = build_monthly_sales(&current, &prev);
 
@@ -112,9 +125,12 @@ fn test_build_monthly_sales_empty() {
 
 #[test]
 fn test_build_monthly_sales_no_prev() {
-    let current = vec![
-        RawMonthlyRow { year_month: dt(2025, 4, 1), own_sales: 100, charter_sales: 50, transport_count: 10 },
-    ];
+    let current = vec![RawMonthlyRow {
+        year_month: dt(2025, 4, 1),
+        own_sales: 100,
+        charter_sales: 50,
+        transport_count: 10,
+    }];
     let result = build_monthly_sales(&current, &[]);
     assert_eq!(result[0].prev_year_own, 0);
     assert_eq!(result[0].prev_year_charter, 0);
@@ -128,8 +144,20 @@ fn test_build_monthly_sales_no_prev() {
 #[test]
 fn test_build_department_sales() {
     let raw = vec![
-        RawDepartmentRow { department_code: "01".into(), department_name: "本社".into(), own_sales: 500, charter_sales: 200, transport_count: 10 },
-        RawDepartmentRow { department_code: "02".into(), department_name: "支店".into(), own_sales: 300, charter_sales: 100, transport_count: 5 },
+        RawDepartmentRow {
+            department_code: "01".into(),
+            department_name: "本社".into(),
+            own_sales: 500,
+            charter_sales: 200,
+            transport_count: 10,
+        },
+        RawDepartmentRow {
+            department_code: "02".into(),
+            department_name: "支店".into(),
+            own_sales: 300,
+            charter_sales: 100,
+            transport_count: 5,
+        },
     ];
     let result = build_department_sales(&raw);
     assert_eq!(result.len(), 2);
@@ -149,9 +177,13 @@ fn test_build_department_sales_empty() {
 
 #[test]
 fn test_build_customer_sales() {
-    let raw = vec![
-        RawCustomerRow { customer_code: "001".into(), customer_name: "得意先A".into(), own_sales: 1000, charter_sales: 500, transport_count: 20 },
-    ];
+    let raw = vec![RawCustomerRow {
+        customer_code: "001".into(),
+        customer_name: "得意先A".into(),
+        own_sales: 1000,
+        charter_sales: 500,
+        transport_count: 20,
+    }];
     let result = build_customer_sales(&raw);
     assert_eq!(result[0].total_sales, 1500);
     assert_eq!(result[0].transport_count, 20);
@@ -223,10 +255,38 @@ fn test_calc_yoy_entries_only_in_prev() {
 #[test]
 fn test_split_and_sort_yoy() {
     let entries = vec![
-        CustomerYoy { customer_code: "A".into(), customer_name: "A".into(), current_total: 120, prev_total: 100, diff: 20, yoy_percent: 20.0 },
-        CustomerYoy { customer_code: "B".into(), customer_name: "B".into(), current_total: 80, prev_total: 100, diff: -20, yoy_percent: -20.0 },
-        CustomerYoy { customer_code: "C".into(), customer_name: "C".into(), current_total: 50, prev_total: 200, diff: -150, yoy_percent: -75.0 },
-        CustomerYoy { customer_code: "D".into(), customer_name: "D".into(), current_total: 150, prev_total: 50, diff: 100, yoy_percent: 200.0 },
+        CustomerYoy {
+            customer_code: "A".into(),
+            customer_name: "A".into(),
+            current_total: 120,
+            prev_total: 100,
+            diff: 20,
+            yoy_percent: 20.0,
+        },
+        CustomerYoy {
+            customer_code: "B".into(),
+            customer_name: "B".into(),
+            current_total: 80,
+            prev_total: 100,
+            diff: -20,
+            yoy_percent: -20.0,
+        },
+        CustomerYoy {
+            customer_code: "C".into(),
+            customer_name: "C".into(),
+            current_total: 50,
+            prev_total: 200,
+            diff: -150,
+            yoy_percent: -75.0,
+        },
+        CustomerYoy {
+            customer_code: "D".into(),
+            customer_name: "D".into(),
+            current_total: 150,
+            prev_total: 50,
+            diff: 100,
+            yoy_percent: 200.0,
+        },
     ];
 
     let (pos, neg) = split_and_sort_yoy(entries, 10);
@@ -245,9 +305,30 @@ fn test_split_and_sort_yoy() {
 #[test]
 fn test_split_and_sort_yoy_with_limit() {
     let entries = vec![
-        CustomerYoy { customer_code: "A".into(), customer_name: "A".into(), current_total: 200, prev_total: 100, diff: 100, yoy_percent: 100.0 },
-        CustomerYoy { customer_code: "B".into(), customer_name: "B".into(), current_total: 150, prev_total: 100, diff: 50, yoy_percent: 50.0 },
-        CustomerYoy { customer_code: "C".into(), customer_name: "C".into(), current_total: 130, prev_total: 100, diff: 30, yoy_percent: 30.0 },
+        CustomerYoy {
+            customer_code: "A".into(),
+            customer_name: "A".into(),
+            current_total: 200,
+            prev_total: 100,
+            diff: 100,
+            yoy_percent: 100.0,
+        },
+        CustomerYoy {
+            customer_code: "B".into(),
+            customer_name: "B".into(),
+            current_total: 150,
+            prev_total: 100,
+            diff: 50,
+            yoy_percent: 50.0,
+        },
+        CustomerYoy {
+            customer_code: "C".into(),
+            customer_name: "C".into(),
+            current_total: 130,
+            prev_total: 100,
+            diff: 30,
+            yoy_percent: 30.0,
+        },
     ];
 
     let (pos, neg) = split_and_sort_yoy(entries, 2);
@@ -257,9 +338,14 @@ fn test_split_and_sort_yoy_with_limit() {
 
 #[test]
 fn test_split_and_sort_yoy_zero_percent_excluded() {
-    let entries = vec![
-        CustomerYoy { customer_code: "X".into(), customer_name: "X".into(), current_total: 100, prev_total: 100, diff: 0, yoy_percent: 0.0 },
-    ];
+    let entries = vec![CustomerYoy {
+        customer_code: "X".into(),
+        customer_name: "X".into(),
+        current_total: 100,
+        prev_total: 100,
+        diff: 0,
+        yoy_percent: 0.0,
+    }];
     let (pos, neg) = split_and_sort_yoy(entries, 10);
     assert!(pos.is_empty()); // 0% は positive でも negative でもない
     assert!(neg.is_empty());
@@ -272,13 +358,28 @@ fn test_split_and_sort_yoy_zero_percent_excluded() {
 #[test]
 fn test_build_yoy_comparison() {
     let current = vec![
-        RawMonthTotalRow { month: 1, total: 1_000_000 },
-        RawMonthTotalRow { month: 2, total: 1_200_000 },
-        RawMonthTotalRow { month: 3, total: 900_000 },
+        RawMonthTotalRow {
+            month: 1,
+            total: 1_000_000,
+        },
+        RawMonthTotalRow {
+            month: 2,
+            total: 1_200_000,
+        },
+        RawMonthTotalRow {
+            month: 3,
+            total: 900_000,
+        },
     ];
     let prev = vec![
-        RawMonthTotalRow { month: 1, total: 900_000 },
-        RawMonthTotalRow { month: 2, total: 1_200_000 },
+        RawMonthTotalRow {
+            month: 1,
+            total: 900_000,
+        },
+        RawMonthTotalRow {
+            month: 2,
+            total: 1_200_000,
+        },
     ];
 
     let result = build_yoy_comparison(&current, &prev);
@@ -308,12 +409,30 @@ fn test_build_yoy_comparison_empty() {
 fn test_build_daily_sales() {
     // 2025-04-01 は火曜日
     let current = vec![
-        RawDailyRow { date: dt(2025, 4, 1), own_sales: 100, charter_sales: 50, own_sales_raw: 110, charter_sales_raw: 55, transport_count: 10 },
-        RawDailyRow { date: dt(2025, 4, 2), own_sales: 200, charter_sales: 80, own_sales_raw: 220, charter_sales_raw: 88, transport_count: 15 },
+        RawDailyRow {
+            date: dt(2025, 4, 1),
+            own_sales: 100,
+            charter_sales: 50,
+            own_sales_raw: 110,
+            charter_sales_raw: 55,
+            transport_count: 10,
+        },
+        RawDailyRow {
+            date: dt(2025, 4, 2),
+            own_sales: 200,
+            charter_sales: 80,
+            own_sales_raw: 220,
+            charter_sales_raw: 88,
+            transport_count: 15,
+        },
     ];
-    let prev = vec![
-        RawDailyPrevRow { date: dt(2024, 4, 1), own_sales: 90, charter_sales: 40, own_sales_raw: 95, charter_sales_raw: 42 },
-    ];
+    let prev = vec![RawDailyPrevRow {
+        date: dt(2024, 4, 1),
+        own_sales: 90,
+        charter_sales: 40,
+        own_sales_raw: 95,
+        charter_sales_raw: 42,
+    }];
 
     let result = build_daily_sales(&current, &prev);
 
@@ -338,9 +457,14 @@ fn test_build_daily_sales_empty() {
 #[test]
 fn test_build_daily_sales_sunday() {
     // 2025-04-06 は日曜日
-    let current = vec![
-        RawDailyRow { date: dt(2025, 4, 6), own_sales: 0, charter_sales: 0, own_sales_raw: 0, charter_sales_raw: 0, transport_count: 0 },
-    ];
+    let current = vec![RawDailyRow {
+        date: dt(2025, 4, 6),
+        own_sales: 0,
+        charter_sales: 0,
+        own_sales_raw: 0,
+        charter_sales_raw: 0,
+        transport_count: 0,
+    }];
     let result = build_daily_sales(&current, &[]);
     assert_eq!(result[0].weekday, "日");
 }
@@ -356,11 +480,31 @@ fn test_build_customer_trend() {
         ("B".to_string(), "顧客B".to_string()),
     ];
     let monthly = vec![
-        RawCustomerMonthlyRow { customer_code: "A".into(), year_month: dt(2025, 4, 1), total: 1000 },
-        RawCustomerMonthlyRow { customer_code: "B".into(), year_month: dt(2025, 4, 1), total: 800 },
-        RawCustomerMonthlyRow { customer_code: "C".into(), year_month: dt(2025, 4, 1), total: 500 },
-        RawCustomerMonthlyRow { customer_code: "A".into(), year_month: dt(2025, 5, 1), total: 700 },
-        RawCustomerMonthlyRow { customer_code: "B".into(), year_month: dt(2025, 5, 1), total: 900 },
+        RawCustomerMonthlyRow {
+            customer_code: "A".into(),
+            year_month: dt(2025, 4, 1),
+            total: 1000,
+        },
+        RawCustomerMonthlyRow {
+            customer_code: "B".into(),
+            year_month: dt(2025, 4, 1),
+            total: 800,
+        },
+        RawCustomerMonthlyRow {
+            customer_code: "C".into(),
+            year_month: dt(2025, 4, 1),
+            total: 500,
+        },
+        RawCustomerMonthlyRow {
+            customer_code: "A".into(),
+            year_month: dt(2025, 5, 1),
+            total: 700,
+        },
+        RawCustomerMonthlyRow {
+            customer_code: "B".into(),
+            year_month: dt(2025, 5, 1),
+            total: 900,
+        },
     ];
 
     let result = build_customer_trend(&top, &monthly);
@@ -387,9 +531,17 @@ fn test_build_customer_trend_empty_top() {
 fn test_build_customer_trend_missing_month() {
     let top = vec![("A".to_string(), "顧客A".to_string())];
     let monthly = vec![
-        RawCustomerMonthlyRow { customer_code: "A".into(), year_month: dt(2025, 4, 1), total: 1000 },
+        RawCustomerMonthlyRow {
+            customer_code: "A".into(),
+            year_month: dt(2025, 4, 1),
+            total: 1000,
+        },
         // 5月はBのみ
-        RawCustomerMonthlyRow { customer_code: "B".into(), year_month: dt(2025, 5, 1), total: 500 },
+        RawCustomerMonthlyRow {
+            customer_code: "B".into(),
+            year_month: dt(2025, 5, 1),
+            total: 500,
+        },
     ];
 
     let result = build_customer_trend(&top, &monthly);
@@ -404,8 +556,18 @@ fn test_build_customer_trend_missing_month() {
 #[test]
 fn test_build_customer_detail() {
     let raw = vec![
-        RawCustomerDetailRow { year_month: dt(2025, 4, 1), own_sales: 100, charter_sales: 50, transport_count: 10 },
-        RawCustomerDetailRow { year_month: dt(2025, 5, 1), own_sales: 200, charter_sales: 80, transport_count: 15 },
+        RawCustomerDetailRow {
+            year_month: dt(2025, 4, 1),
+            own_sales: 100,
+            charter_sales: 50,
+            transport_count: 10,
+        },
+        RawCustomerDetailRow {
+            year_month: dt(2025, 5, 1),
+            own_sales: 200,
+            charter_sales: 80,
+            transport_count: 15,
+        },
     ];
     let result = build_customer_detail(&raw);
     assert_eq!(result.len(), 2);
@@ -470,7 +632,9 @@ fn test_rows_to_dept_customer_map_empty() {
 // customer-yoy-by-dept: calc_yoy_with_dept_entries
 // ══════════════════════════════════════════════════════════════
 
-fn make_dept_map(entries: &[(&str, &str, &str, &str, i64)]) -> std::collections::HashMap<(String, String), (String, String, i64)> {
+fn make_dept_map(
+    entries: &[(&str, &str, &str, &str, i64)],
+) -> std::collections::HashMap<(String, String), (String, String, i64)> {
     let mut map = HashMap::new();
     for (dc, dn, cc, cn, total) in entries {
         map.insert(
@@ -541,9 +705,36 @@ fn test_calc_yoy_with_dept_entries_distinct_by_dept() {
 #[test]
 fn test_split_and_sort_yoy_with_dept_basic() {
     let entries = vec![
-        CustomerYoyWithDept { department_code: "01".into(), department_name: "本社".into(), customer_code: "A".into(), customer_name: "A".into(), current_total: 120, prev_total: 100, diff: 20, yoy_percent: 20.0 },
-        CustomerYoyWithDept { department_code: "01".into(), department_name: "本社".into(), customer_code: "B".into(), customer_name: "B".into(), current_total: 80, prev_total: 100, diff: -20, yoy_percent: -20.0 },
-        CustomerYoyWithDept { department_code: "02".into(), department_name: "大阪".into(), customer_code: "C".into(), customer_name: "C".into(), current_total: 100, prev_total: 100, diff: 0, yoy_percent: 0.0 },
+        CustomerYoyWithDept {
+            department_code: "01".into(),
+            department_name: "本社".into(),
+            customer_code: "A".into(),
+            customer_name: "A".into(),
+            current_total: 120,
+            prev_total: 100,
+            diff: 20,
+            yoy_percent: 20.0,
+        },
+        CustomerYoyWithDept {
+            department_code: "01".into(),
+            department_name: "本社".into(),
+            customer_code: "B".into(),
+            customer_name: "B".into(),
+            current_total: 80,
+            prev_total: 100,
+            diff: -20,
+            yoy_percent: -20.0,
+        },
+        CustomerYoyWithDept {
+            department_code: "02".into(),
+            department_name: "大阪".into(),
+            customer_code: "C".into(),
+            customer_name: "C".into(),
+            current_total: 100,
+            prev_total: 100,
+            diff: 0,
+            yoy_percent: 0.0,
+        },
     ];
     let (pos, neg) = split_and_sort_yoy_with_dept(entries, 10);
     assert_eq!(pos.len(), 1);
@@ -573,8 +764,26 @@ fn test_split_and_sort_yoy_with_dept_limit() {
 #[test]
 fn test_split_and_sort_yoy_with_dept_neg_sort_by_percent() {
     let entries = vec![
-        CustomerYoyWithDept { department_code: "01".into(), department_name: "D1".into(), customer_code: "A".into(), customer_name: "A".into(), current_total: 0, prev_total: 100, diff: -100, yoy_percent: -100.0 },
-        CustomerYoyWithDept { department_code: "01".into(), department_name: "D1".into(), customer_code: "B".into(), customer_name: "B".into(), current_total: 90, prev_total: 100, diff: -10, yoy_percent: -10.0 },
+        CustomerYoyWithDept {
+            department_code: "01".into(),
+            department_name: "D1".into(),
+            customer_code: "A".into(),
+            customer_name: "A".into(),
+            current_total: 0,
+            prev_total: 100,
+            diff: -100,
+            yoy_percent: -100.0,
+        },
+        CustomerYoyWithDept {
+            department_code: "01".into(),
+            department_name: "D1".into(),
+            customer_code: "B".into(),
+            customer_name: "B".into(),
+            current_total: 90,
+            prev_total: 100,
+            diff: -10,
+            yoy_percent: -10.0,
+        },
     ];
     let (_, neg) = split_and_sort_yoy_with_dept(entries, 10);
     assert_eq!(neg.len(), 2);

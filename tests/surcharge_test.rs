@@ -228,3 +228,22 @@ async fn test_surcharge_base_query_error() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+// ══════════════════════════════════════════════════════════════
+// ハンドラ: GET /api/vehicles (車種ﾏｽﾀ)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_vehicles_ok() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/vehicles")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}

@@ -1,14 +1,17 @@
 use axum::extract::Query;
 use axum::http::StatusCode;
-use axum::Json;
 use axum::Extension;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::repo::{DynRepo, RepoError};
 
 /// テーブル名のバリデーション（SQL injection 防止）
 pub fn is_valid_table_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '#')
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '#')
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -77,6 +80,9 @@ pub async fn sample_data(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let data = repo.sample_data(&table, limit).await.map_err(map_repo_err)?;
+    let data = repo
+        .sample_data(&table, limit)
+        .await
+        .map_err(map_repo_err)?;
     Ok(Json(data))
 }
