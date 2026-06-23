@@ -90,6 +90,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             sale_date: dt(2026, 6, 21),
             fare: 65_000,
             billing_date: Some(dt(2026, 7, 31)),
+            subcontractor_code: "000000".into(),
         },
         RawSurchargeRow {
             request_kind: "1".into(),
@@ -102,6 +103,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             sale_date: dt(2026, 6, 20),
             fare: 840_000,
             billing_date: None,
+            subcontractor_code: "001234".into(),
         },
     ];
 
@@ -119,6 +121,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
     assert_eq!(first.sale_date, "2026-06-21");
     assert_eq!(first.fare, 65_000);
     assert_eq!(first.billing_date, Some("2026-07-31".to_string()));
+    assert_eq!(first.subcontractor_code, "000000"); // 自車
 
     // エッジ: 未マップ地域 → "?"、入金予定日 NULL → None
     let second = &rows[1];
@@ -126,6 +129,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
     assert_eq!(second.dest_prefecture, "?");
     assert_eq!(second.vehicle_name, "");
     assert_eq!(second.billing_date, None);
+    assert_eq!(second.subcontractor_code, "001234"); // 傭車
 }
 
 #[test]
