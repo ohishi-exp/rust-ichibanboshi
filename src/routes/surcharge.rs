@@ -47,6 +47,8 @@ pub struct RawSurchargeRow {
     pub fare: i64,
     /// `入金予定日` (請求日)。NULL の行があり得るため Option。
     pub billing_date: Option<NaiveDateTime>,
+    /// `傭車先C`。'000000' (6 桁ゼロ) なら自車、それ以外は傭車。
+    pub subcontractor_code: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -76,6 +78,8 @@ pub struct SurchargeRow {
     pub fare: i64,
     /// 請求日 (入金予定日)。NULL 行は null。
     pub billing_date: Option<String>,
+    /// 傭車先C ('000000' なら自車、それ以外は傭車)。消費側で自車/傭車を判定する。
+    pub subcontractor_code: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -154,6 +158,7 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             sale_date: r.sale_date.format("%Y-%m-%d").to_string(),
             fare: r.fare,
             billing_date: r.billing_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            subcontractor_code: r.subcontractor_code.clone(),
         })
         .collect()
 }
