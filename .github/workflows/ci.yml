@@ -25,14 +25,22 @@ jobs:
         with:
           shared-key: "ci"
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run tests
         run: cargo test
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       - name: Coverage regression check
         run: bash scripts/check_coverage_100.sh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       - name: Upload coverage text (artifact)
         if: always()
@@ -64,11 +72,16 @@ jobs:
         with:
           shared-key: "ci"
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build musl release binary
         run: cargo build --release --target x86_64-unknown-linux-musl
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       - name: Install cloudflared
         run: |
