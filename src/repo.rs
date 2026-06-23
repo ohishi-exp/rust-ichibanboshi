@@ -27,11 +27,8 @@ pub trait AppRepo: Send + Sync {
         include_dept: Option<&str>,
     ) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError>;
 
-    async fn by_department(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> Result<Vec<RawDepartmentRow>, RepoError>;
+    async fn by_department(&self, from: &str, to: &str)
+        -> Result<Vec<RawDepartmentRow>, RepoError>;
 
     async fn by_customer(
         &self,
@@ -86,6 +83,9 @@ pub trait AppRepo: Send + Sync {
     ) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError>;
 
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError>;
+
+    /// 車種ﾏｽﾀ (車種C, 車種N) の一覧。燃費マスタ (車種C キー) の編集 UI 用 (#12)。
+    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError>;
 
     // ── surcharge (燃料サーチャージ基礎データ、#12) ──
     async fn surcharge_base(
@@ -277,13 +277,23 @@ impl AppRepo for TiberiusRepo {
                  GROUP BY m.[年月度] \
                  ORDER BY m.[年月度]";
 
-            let stream = conn.query(sql, &[&from, &to, &code])
-                .await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let cur = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let stream = conn
+                .query(sql, &[&from, &to, &code])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let cur = stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
-            let prev_stream = conn.query(sql, &[&prev_from, &prev_to, &code])
-                .await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let prev = prev_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev_stream = conn
+                .query(sql, &[&prev_from, &prev_to, &code])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev = prev_stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
             Ok((
                 format!("部門別月計 (部門C={})", code),
@@ -301,13 +311,23 @@ impl AppRepo for TiberiusRepo {
                  GROUP BY m.[年月度] \
                  ORDER BY m.[年月度]";
 
-            let stream = conn.query(sql, &[&from, &to, &exclude_pattern.as_str()])
-                .await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let cur = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let stream = conn
+                .query(sql, &[&from, &to, &exclude_pattern.as_str()])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let cur = stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
-            let prev_stream = conn.query(sql, &[&prev_from, &prev_to, &exclude_pattern.as_str()])
-                .await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let prev = prev_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev_stream = conn
+                .query(sql, &[&prev_from, &prev_to, &exclude_pattern.as_str()])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev = prev_stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
             Ok((
                 format!("部門別月計 ({}除く)", dept),
@@ -315,23 +335,35 @@ impl AppRepo for TiberiusRepo {
                 Self::rows_to_monthly(&prev),
             ))
         } else {
-            let stream = conn.query(
-                "SELECT [年月度], [自車売上], [傭車売上], [輸送回数] \
+            let stream = conn
+                .query(
+                    "SELECT [年月度], [自車売上], [傭車売上], [輸送回数] \
                  FROM [種別別月計] \
                  WHERE [種別C] = '99' AND [年月度] >= @P1 AND [年月度] <= @P2 \
                  ORDER BY [年月度]",
-                &[&from, &to],
-            ).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let cur = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+                    &[&from, &to],
+                )
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let cur = stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
-            let prev_stream = conn.query(
-                "SELECT [年月度], ISNULL([自車売上], 0), ISNULL([傭車売上], 0) \
+            let prev_stream = conn
+                .query(
+                    "SELECT [年月度], ISNULL([自車売上], 0), ISNULL([傭車売上], 0) \
                  FROM [種別別月計] \
                  WHERE [種別C] = '99' AND [年月度] >= @P1 AND [年月度] <= @P2 \
                  ORDER BY [年月度]",
-                &[&prev_from, &prev_to],
-            ).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let prev = prev_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+                    &[&prev_from, &prev_to],
+                )
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let prev = prev_stream
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
             Ok((
                 "種別別月計 (種別C=99)".to_string(),
@@ -341,7 +373,11 @@ impl AppRepo for TiberiusRepo {
         }
     }
 
-    async fn by_department(&self, from: &str, to: &str) -> Result<Vec<RawDepartmentRow>, RepoError> {
+    async fn by_department(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RawDepartmentRow>, RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
         let stream = conn.query(
             "SELECT m.[部門C], ISNULL(d.[部門N], ''), \
@@ -353,17 +389,28 @@ impl AppRepo for TiberiusRepo {
              ORDER BY SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) DESC",
             &[&from, &to],
         ).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        Ok(rows.iter().map(|row| RawDepartmentRow {
-            department_code: decode_cp932(row, 0),
-            department_name: decode_cp932(row, 1),
-            own_sales: get_i64(row, 2),
-            charter_sales: get_i64(row, 3),
-            transport_count: get_i64(row, 4),
-        }).collect())
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|row| RawDepartmentRow {
+                department_code: decode_cp932(row, 0),
+                department_name: decode_cp932(row, 1),
+                own_sales: get_i64(row, 2),
+                charter_sales: get_i64(row, 3),
+                transport_count: get_i64(row, 4),
+            })
+            .collect())
     }
 
-    async fn by_customer(&self, from: &str, to: &str, limit: i32) -> Result<Vec<RawCustomerRow>, RepoError> {
+    async fn by_customer(
+        &self,
+        from: &str,
+        to: &str,
+        limit: i32,
+    ) -> Result<Vec<RawCustomerRow>, RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
         let query = format!(
             "SELECT TOP {} m.[得意先C], ISNULL(c.[得意先N], ''), \
@@ -375,18 +422,33 @@ impl AppRepo for TiberiusRepo {
              ORDER BY SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) DESC",
             limit.min(100)
         );
-        let stream = conn.query(&query, &[&from, &to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        Ok(rows.iter().map(|row| RawCustomerRow {
-            customer_code: decode_cp932(row, 0),
-            customer_name: decode_cp932(row, 1),
-            own_sales: get_i64(row, 2),
-            charter_sales: get_i64(row, 3),
-            transport_count: get_i64(row, 4),
-        }).collect())
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|row| RawCustomerRow {
+                customer_code: decode_cp932(row, 0),
+                customer_name: decode_cp932(row, 1),
+                own_sales: get_i64(row, 2),
+                charter_sales: get_i64(row, 3),
+                transport_count: get_i64(row, 4),
+            })
+            .collect())
     }
 
-    async fn customer_yoy_data(&self, from: &str, to: &str, prev_from: &str, prev_to: &str) -> Result<(CodeTotalMap, CodeTotalMap), RepoError> {
+    async fn customer_yoy_data(
+        &self,
+        from: &str,
+        to: &str,
+        prev_from: &str,
+        prev_to: &str,
+    ) -> Result<(CodeTotalMap, CodeTotalMap), RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
         let sql = "SELECT m.[得意先C], ISNULL(c.[得意先N], ''), \
                    SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) \
@@ -395,15 +457,33 @@ impl AppRepo for TiberiusRepo {
                    WHERE m.[年月度] >= @P1 AND m.[年月度] <= @P2 \
                    GROUP BY m.[得意先C], c.[得意先N]";
 
-        let stream = conn.query(sql, &[&from, &to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let cur_rows = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let prev_stream = conn.query(sql, &[&prev_from, &prev_to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let prev_rows = prev_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let stream = conn
+            .query(sql, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let cur_rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let prev_stream = conn
+            .query(sql, &[&prev_from, &prev_to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let prev_rows = prev_stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
-        Ok((Self::rows_to_code_total_map(&cur_rows), Self::rows_to_code_total_map(&prev_rows)))
+        Ok((
+            Self::rows_to_code_total_map(&cur_rows),
+            Self::rows_to_code_total_map(&prev_rows),
+        ))
     }
 
-    async fn yoy_data(&self, year: i32) -> Result<(Vec<RawMonthTotalRow>, Vec<RawMonthTotalRow>), RepoError> {
+    async fn yoy_data(
+        &self,
+        year: i32,
+    ) -> Result<(Vec<RawMonthTotalRow>, Vec<RawMonthTotalRow>), RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
         let current_from = format!("{}-01-01", year);
         let current_to = format!("{}-12-01", year);
@@ -417,22 +497,48 @@ impl AppRepo for TiberiusRepo {
                    GROUP BY MONTH([年月度]) \
                    ORDER BY MONTH([年月度])";
 
-        let stream = conn.query(sql, &[&current_from.as_str(), &current_to.as_str()]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let cur = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let stream2 = conn.query(sql, &[&prev_from.as_str(), &prev_to.as_str()]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let prev = stream2.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let stream = conn
+            .query(sql, &[&current_from.as_str(), &current_to.as_str()])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let cur = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let stream2 = conn
+            .query(sql, &[&prev_from.as_str(), &prev_to.as_str()])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let prev = stream2
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
         Ok((
-            cur.iter().map(|r| RawMonthTotalRow { month: get_i32(r, 0), total: get_i64(r, 1) }).collect(),
-            prev.iter().map(|r| RawMonthTotalRow { month: get_i32(r, 0), total: get_i64(r, 1) }).collect(),
+            cur.iter()
+                .map(|r| RawMonthTotalRow {
+                    month: get_i32(r, 0),
+                    total: get_i64(r, 1),
+                })
+                .collect(),
+            prev.iter()
+                .map(|r| RawMonthTotalRow {
+                    month: get_i32(r, 0),
+                    total: get_i64(r, 1),
+                })
+                .collect(),
         ))
     }
 
     async fn daily(
         &self,
-        from: &str, to: &str,
-        prev_from: &str, prev_to: &str,
-        billing_filter: &str, dept_filter: &str, exclude_pattern: &str,
+        from: &str,
+        to: &str,
+        prev_from: &str,
+        prev_to: &str,
+        billing_filter: &str,
+        dept_filter: &str,
+        exclude_pattern: &str,
     ) -> Result<(Vec<RawDailyRow>, Vec<RawDailyPrevRow>), RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
 
@@ -464,32 +570,74 @@ impl AppRepo for TiberiusRepo {
 
         let has_dept = !exclude_pattern.is_empty();
         let (cur_rows, prev_rows) = if has_dept {
-            let s = conn.query(&query, &[&from, &to, &exclude_pattern]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let c = s.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let ps = conn.query(&prev_query, &[&prev_from, &prev_to, &exclude_pattern]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let p = ps.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let s = conn
+                .query(&query, &[&from, &to, &exclude_pattern])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let c = s
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let ps = conn
+                .query(&prev_query, &[&prev_from, &prev_to, &exclude_pattern])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let p = ps
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
             (c, p)
         } else {
-            let s = conn.query(&query, &[&from, &to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let c = s.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let ps = conn.query(&prev_query, &[&prev_from, &prev_to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-            let p = ps.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let s = conn
+                .query(&query, &[&from, &to])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let c = s
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let ps = conn
+                .query(&prev_query, &[&prev_from, &prev_to])
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
+            let p = ps
+                .into_first_result()
+                .await
+                .map_err(|e| RepoError::QueryError(e.to_string()))?;
             (c, p)
         };
 
         Ok((
-            cur_rows.iter().map(|r| RawDailyRow {
-                date: r.get(0).unwrap_or_default(), own_sales: get_i64(r, 1), charter_sales: get_i64(r, 2),
-                own_sales_raw: get_i64(r, 3), charter_sales_raw: get_i64(r, 4), transport_count: get_i32(r, 5),
-            }).collect(),
-            prev_rows.iter().map(|r| RawDailyPrevRow {
-                date: r.get(0).unwrap_or_default(), own_sales: get_i64(r, 1), charter_sales: get_i64(r, 2),
-                own_sales_raw: get_i64(r, 3), charter_sales_raw: get_i64(r, 4),
-            }).collect(),
+            cur_rows
+                .iter()
+                .map(|r| RawDailyRow {
+                    date: r.get(0).unwrap_or_default(),
+                    own_sales: get_i64(r, 1),
+                    charter_sales: get_i64(r, 2),
+                    own_sales_raw: get_i64(r, 3),
+                    charter_sales_raw: get_i64(r, 4),
+                    transport_count: get_i32(r, 5),
+                })
+                .collect(),
+            prev_rows
+                .iter()
+                .map(|r| RawDailyPrevRow {
+                    date: r.get(0).unwrap_or_default(),
+                    own_sales: get_i64(r, 1),
+                    charter_sales: get_i64(r, 2),
+                    own_sales_raw: get_i64(r, 3),
+                    charter_sales_raw: get_i64(r, 4),
+                })
+                .collect(),
         ))
     }
 
-    async fn customer_trend_data(&self, from: &str, to: &str, limit: i32) -> Result<(Vec<(String, String)>, Vec<RawCustomerMonthlyRow>), RepoError> {
+    async fn customer_trend_data(
+        &self,
+        from: &str,
+        to: &str,
+        limit: i32,
+    ) -> Result<(Vec<(String, String)>, Vec<RawCustomerMonthlyRow>), RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
         let top_query = format!(
             "SELECT TOP {} m.[得意先C], ISNULL(c.[得意先N], '') \
@@ -500,40 +648,73 @@ impl AppRepo for TiberiusRepo {
              ORDER BY SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) DESC",
             limit.min(50)
         );
-        let top_stream = conn.query(&top_query, &[&from, &to]).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let top_rows = top_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let top: Vec<(String, String)> = top_rows.iter().map(|r| (decode_cp932(r, 0), decode_cp932(r, 1))).collect();
+        let top_stream = conn
+            .query(&top_query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let top_rows = top_stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let top: Vec<(String, String)> = top_rows
+            .iter()
+            .map(|r| (decode_cp932(r, 0), decode_cp932(r, 1)))
+            .collect();
 
         if top.is_empty() {
             return Ok((vec![], vec![]));
         }
 
-        let monthly_stream = conn.query(
-            "SELECT m.[得意先C], m.[年月度], \
+        let monthly_stream = conn
+            .query(
+                "SELECT m.[得意先C], m.[年月度], \
              SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) as total \
              FROM [得意先別月計] m \
              WHERE m.[年月度] >= @P1 AND m.[年月度] <= @P2 \
              GROUP BY m.[得意先C], m.[年月度] \
              ORDER BY m.[年月度], total DESC",
-            &[&from, &to],
-        ).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let monthly_rows = monthly_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+                &[&from, &to],
+            )
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let monthly_rows = monthly_stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
-        Ok((top, monthly_rows.iter().map(|r| RawCustomerMonthlyRow {
-            customer_code: decode_cp932(r, 0),
-            year_month: r.get(1).unwrap_or_default(),
-            total: get_i64(r, 2),
-        }).collect()))
+        Ok((
+            top,
+            monthly_rows
+                .iter()
+                .map(|r| RawCustomerMonthlyRow {
+                    customer_code: decode_cp932(r, 0),
+                    year_month: r.get(1).unwrap_or_default(),
+                    total: get_i64(r, 2),
+                })
+                .collect(),
+        ))
     }
 
-    async fn customer_detail_data(&self, code: &str) -> Result<(String, Vec<RawCustomerDetailRow>), RepoError> {
+    async fn customer_detail_data(
+        &self,
+        code: &str,
+    ) -> Result<(String, Vec<RawCustomerDetailRow>), RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
-        let name_stream = conn.query(
-            "SELECT TOP 1 ISNULL(c.[得意先N], '') FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = @P1",
-            &[&code],
-        ).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let name_rows = name_stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let name = name_rows.first().map(|r| decode_cp932(r, 0)).unwrap_or_default();
+        let name_stream = conn
+            .query(
+                "SELECT TOP 1 ISNULL(c.[得意先N], '') FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = @P1",
+                &[&code],
+            )
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let name_rows = name_stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let name = name_rows
+            .first()
+            .map(|r| decode_cp932(r, 0))
+            .unwrap_or_default();
 
         let stream = conn.query(
             "SELECT m.[年月度], \
@@ -544,14 +725,22 @@ impl AppRepo for TiberiusRepo {
              ORDER BY m.[年月度]",
             &[&code],
         ).await.map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream.into_first_result().await.map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
-        Ok((name, rows.iter().map(|r| RawCustomerDetailRow {
-            year_month: r.get(0).unwrap_or_default(),
-            own_sales: get_i64(r, 1),
-            charter_sales: get_i64(r, 2),
-            transport_count: get_i64(r, 3),
-        }).collect()))
+        Ok((
+            name,
+            rows.iter()
+                .map(|r| RawCustomerDetailRow {
+                    year_month: r.get(0).unwrap_or_default(),
+                    own_sales: get_i64(r, 1),
+                    charter_sales: get_i64(r, 2),
+                    transport_count: get_i64(r, 3),
+                })
+                .collect(),
+        ))
     }
 
     async fn customer_yoy_by_dept_data(
@@ -578,10 +767,7 @@ impl AppRepo for TiberiusRepo {
         let group_order = " GROUP BY t.[受注部門], d.[部門N], t.[得意先C], c.[得意先N]";
 
         let (cur_rows, prev_rows) = if let Some(dept) = department_code {
-            let sql = format!(
-                "{} AND t.[受注部門] = @P3 {}",
-                base_select, group_order
-            );
+            let sql = format!("{} AND t.[受注部門] = @P3 {}", base_select, group_order);
             let stream = conn
                 .query(&sql, &[&from, &to, &dept])
                 .await
@@ -629,9 +815,23 @@ impl AppRepo for TiberiusRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
         let stream = conn
-            .simple_query(
-                "SELECT [部門C], ISNULL([部門N], '') FROM [部門ﾏｽﾀ] ORDER BY [部門C]",
-            )
+            .simple_query("SELECT [部門C], ISNULL([部門N], '') FROM [部門ﾏｽﾀ] ORDER BY [部門C]")
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|row| (decode_cp932(row, 0), decode_cp932(row, 1)))
+            .collect())
+    }
+
+    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let stream = conn
+            .simple_query("SELECT [車種C], ISNULL([車種N], '') FROM [車種ﾏｽﾀ] ORDER BY [車種C]")
             .await
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
         let rows = stream
@@ -691,23 +891,34 @@ impl AppRepo for TiberiusRepo {
 // ── Row → Raw 変換ヘルパー ──
 impl TiberiusRepo {
     fn rows_to_monthly(rows: &[tiberius::Row]) -> Vec<RawMonthlyRow> {
-        rows.iter().map(|r| RawMonthlyRow {
-            year_month: r.get(0).unwrap_or_default(),
-            own_sales: get_i64(r, 1), charter_sales: get_i64(r, 2), transport_count: get_i32(r, 3),
-        }).collect()
+        rows.iter()
+            .map(|r| RawMonthlyRow {
+                year_month: r.get(0).unwrap_or_default(),
+                own_sales: get_i64(r, 1),
+                charter_sales: get_i64(r, 2),
+                transport_count: get_i32(r, 3),
+            })
+            .collect()
     }
 
     fn rows_to_monthly_prev(rows: &[tiberius::Row]) -> Vec<RawMonthlyRow> {
-        rows.iter().map(|r| RawMonthlyRow {
-            year_month: r.get(0).unwrap_or_default(),
-            own_sales: get_i64(r, 1), charter_sales: get_i64(r, 2), transport_count: 0,
-        }).collect()
+        rows.iter()
+            .map(|r| RawMonthlyRow {
+                year_month: r.get(0).unwrap_or_default(),
+                own_sales: get_i64(r, 1),
+                charter_sales: get_i64(r, 2),
+                transport_count: 0,
+            })
+            .collect()
     }
 
     fn rows_to_code_total_map(rows: &[tiberius::Row]) -> CodeTotalMap {
         let mut map = std::collections::HashMap::new();
         for row in rows {
-            map.insert(decode_cp932(row, 0), (decode_cp932(row, 1), get_i64(row, 2)));
+            map.insert(
+                decode_cp932(row, 0),
+                (decode_cp932(row, 1), get_i64(row, 2)),
+            );
         }
         map
     }

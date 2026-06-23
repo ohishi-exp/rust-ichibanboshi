@@ -1,4 +1,4 @@
 pub mod health;
-pub mod schema;
 pub mod sales;
+pub mod schema;
 pub mod surcharge;
