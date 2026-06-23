@@ -69,17 +69,34 @@ echo "=== Waiting for auto-restart (PathModified) ==="
 sleep 6
 
 echo "=== Health check (localhost:$HEALTH_PORT/health) ==="
-# remote の localhost に対して health を叩く。HTTP 200 以外は loud fail。
-HTTP_CODE="$(ssh "${SSH_OPTS[@]}" "$TARGET" \
-  "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:$HEALTH_PORT/health || true")"
+# remote の localhost に対して health を叩く。body + HTTP code を一括取得し、
+# HTTP 200 以外は loud fail。body は build 情報 ({"status","commit","built_at"})。
+HEALTH_RESP="$(ssh "${SSH_OPTS[@]}" "$TARGET" \
+  "curl -s -w '\n%{http_code}' --max-time 10 http://localhost:$HEALTH_PORT/health || true")"
+HTTP_CODE="$(printf '%s' "$HEALTH_RESP" | tail -n1)"
+HEALTH_BODY="$(printf '%s' "$HEALTH_RESP" | sed '$d')"
 
 echo "health HTTP code: ${HTTP_CODE:-<none>}"
+echo "health body: ${HEALTH_BODY:-<none>}"
 if [[ "$HTTP_CODE" != "200" ]]; then
   echo "::error::health check failed (expected 200, got ${HTTP_CODE:-<none>})" >&2
   echo "--- systemctl status (last 15 lines) ---" >&2
   ssh "${SSH_OPTS[@]}" "$TARGET" \
     "systemctl status ichibanboshi --no-pager 2>&1 | head -15" >&2 || true
   exit 1
+fi
+
+# GitHub Actions の Step Summary に build 情報を出す (CI のみ。手動 deploy では未設定)。
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    echo "### ✅ Deploy 成功 — ${TARGET_HOST}:${HEALTH_PORT}"
+    echo ""
+    echo "\`/health\` レスポンス (build 識別):"
+    echo ""
+    echo '```json'
+    echo "${HEALTH_BODY:-<empty>}"
+    echo '```'
+  } >> "$GITHUB_STEP_SUMMARY"
 fi
 
 echo "=== Done! deployed & healthy on $TARGET_HOST:$HEALTH_PORT ==="
