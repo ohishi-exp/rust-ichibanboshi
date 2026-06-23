@@ -863,7 +863,8 @@ impl AppRepo for TiberiusRepo {
              t.[車種C], ISNULL(v.[車種N], ''), \
              t.[売上年月日], \
              ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
-             t.[入金予定日] \
+             t.[入金予定日], \
+             ISNULL(t.[傭車先C], '') \
              FROM [運転日報明細] t \
              LEFT JOIN [得意先ﾏｽﾀ] c ON t.[得意先C] = c.[得意先C] \
              LEFT JOIN [車種ﾏｽﾀ] v ON t.[車種C] = v.[車種C] \
@@ -948,6 +949,7 @@ impl TiberiusRepo {
                 sale_date: r.get(7).unwrap_or_default(),
                 fare: get_i64(r, 8),
                 billing_date: r.get(9),
+                subcontractor_code: decode_cp932(r, 10),
             })
             .collect()
     }
