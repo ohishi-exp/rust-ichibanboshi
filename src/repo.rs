@@ -855,7 +855,12 @@ impl AppRepo for TiberiusRepo {
 
         // 調査 #12 で実機検証した SELECT。請求対象行を県・車種付きで取り出す。
         // 県正規化 (地域N → 都道府県) はロジック層 (normalize_prefecture) に任せ、
-        // ここでは 地域ﾏｽﾀ.地域N の生値を返す。運賃は #12 の確定式 金額+割増+実費。
+        // ここでは 地域ﾏｽﾀ.地域N の生値を返す。運賃 (fare) は #12 の確定式 金額+割増+実費。
+        //
+        // fuel_surcharge (末尾列) は #24 で正本に決定した「割増方式 (割増C='19' = 燃料ｻｰﾁｬｰｼﾞ)」
+        // の実額。本体 [割増] には燃料SC以外 (中継料/オガ処理料/深夜等) が混在するため、
+        // 内訳テーブル [運転日報割増明細] の 割増C1/2/3='19' 枠だけを SUM して分離する (Refs #25)。
+        // 運転日報明細 ⇔ 運転日報割増明細 は明細行 1:1 対応 (管理年月日+管理C+自車傭車K='0') 前提。
         //
         // マスタ参照は LEFT JOIN ではなくスカラサブクエリ (TOP 1) で引く。得意先ﾏｽﾀ /
         // 車種ﾏｽﾀ / 地域ﾏｽﾀ がコードに対し複数行を持つと LEFT JOIN は行を掛け算し、
@@ -875,7 +880,15 @@ impl AppRepo for TiberiusRepo {
              t.[入金予定日], \
              ISNULL(t.[傭車先C], ''), \
              ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
-             ISNULL(t.[車輌C], '') \
+             ISNULL(t.[車輌C], ''), \
+             ISNULL((SELECT SUM(\
+               CASE WHEN za.[割増C1] = '19' THEN ISNULL(za.[割増金額1], 0) ELSE 0 END \
+             + CASE WHEN za.[割増C2] = '19' THEN ISNULL(za.[割増金額2], 0) ELSE 0 END \
+             + CASE WHEN za.[割増C3] = '19' THEN ISNULL(za.[割増金額3], 0) ELSE 0 END) \
+               FROM [運転日報割増明細] za \
+               WHERE za.[管理年月日] = t.[管理年月日] \
+                 AND za.[管理C] = t.[管理C] \
+                 AND za.[自車傭車K] = '0'), 0) \
              FROM [運転日報明細] t \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 {} \
              ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]",
@@ -960,6 +973,7 @@ impl TiberiusRepo {
                 item_code: decode_cp932(r, 11),
                 item_name: decode_cp932(r, 12),
                 vehicle_number: decode_cp932(r, 13),
+                fuel_surcharge: get_i64(r, 14),
             })
             .collect()
     }
