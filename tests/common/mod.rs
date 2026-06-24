@@ -252,6 +252,7 @@ impl AppRepo for MockRepo {
                 subcontractor_code: "000000".into(),
                 item_code: "".into(),
                 item_name: "".into(),
+                vehicle_number: "8504".into(),
             },
             // エッジ: 未マップ地域 (000000)・車種未設定 (00)・入金予定日 NULL
             RawSurchargeRow {
@@ -268,6 +269,7 @@ impl AppRepo for MockRepo {
                 subcontractor_code: "001234".into(),
                 item_code: "".into(),
                 item_name: "".into(),
+                vehicle_number: "8504".into(),
             },
         ])
     }

@@ -874,7 +874,8 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
              t.[入金予定日], \
              ISNULL(t.[傭車先C], ''), \
-             ISNULL(t.[品名C], ''), ISNULL(t.[品名N], '') \
+             ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
+             ISNULL(t.[車輌C], '') \
              FROM [運転日報明細] t \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 {} \
              ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]",
@@ -958,6 +959,7 @@ impl TiberiusRepo {
                 subcontractor_code: decode_cp932(r, 10),
                 item_code: decode_cp932(r, 11),
                 item_name: decode_cp932(r, 12),
+                vehicle_number: decode_cp932(r, 13),
             })
             .collect()
     }
