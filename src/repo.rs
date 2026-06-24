@@ -888,7 +888,8 @@ impl AppRepo for TiberiusRepo {
                FROM [運転日報割増明細] za \
                WHERE za.[管理年月日] = t.[管理年月日] \
                  AND za.[管理C] = t.[管理C] \
-                 AND za.[自車傭車K] = '0'), 0) \
+                 AND za.[自車傭車K] = '0'), 0), \
+             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
              FROM [運転日報明細] t \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 {} \
              ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]",
@@ -974,6 +975,7 @@ impl TiberiusRepo {
                 item_name: decode_cp932(r, 12),
                 vehicle_number: decode_cp932(r, 13),
                 fuel_surcharge: get_i64(r, 14),
+                row_id: decode_cp932(r, 15),
             })
             .collect()
     }
