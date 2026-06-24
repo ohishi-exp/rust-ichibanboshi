@@ -94,6 +94,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             item_code: "".into(),
             item_name: "".into(),
             vehicle_number: "8504".into(),
+            fuel_surcharge: 4_020,
         },
         RawSurchargeRow {
             request_kind: "1".into(),
@@ -110,6 +111,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             item_code: "9003".into(),
             item_name: "消費税調整".into(),
             vehicle_number: "9481".into(),
+            fuel_surcharge: 0,
         },
     ];
 
@@ -128,6 +130,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
     assert_eq!(first.fare, 65_000);
     assert_eq!(first.billing_date, Some("2026-07-31".to_string()));
     assert_eq!(first.subcontractor_code, "000000"); // 自車
+    assert_eq!(first.fuel_surcharge, 4_020); // 割増C=19 分は fare と分離して保持
 
     // エッジ: 未マップ地域 → "?"、入金予定日 NULL → None
     let second = &rows[1];
@@ -136,6 +139,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
     assert_eq!(second.vehicle_name, "");
     assert_eq!(second.billing_date, None);
     assert_eq!(second.subcontractor_code, "001234"); // 傭車
+    assert_eq!(second.fuel_surcharge, 0); // 燃料SC無し行は 0
 }
 
 #[test]
