@@ -856,20 +856,25 @@ impl AppRepo for TiberiusRepo {
         // 調査 #12 で実機検証した SELECT。請求対象行を県・車種付きで取り出す。
         // 県正規化 (地域N → 都道府県) はロジック層 (normalize_prefecture) に任せ、
         // ここでは 地域ﾏｽﾀ.地域N の生値を返す。運賃は #12 の確定式 金額+割増+実費。
+        //
+        // マスタ参照は LEFT JOIN ではなくスカラサブクエリ (TOP 1) で引く。得意先ﾏｽﾀ /
+        // 車種ﾏｽﾀ / 地域ﾏｽﾀ がコードに対し複数行を持つと LEFT JOIN は行を掛け算し、
+        // 1 明細が N 重複して返る (請求明細のファンアウト)。スカラサブクエリなら
+        // 「運転日報明細 1 行 = 出力 1 行」を保証でき、本物の重複配送 (同条件 2 回運行)
+        // を潰してしまう DISTINCT の副作用も無い。列順は変更しない (rows_to_surcharge 依存)。
         let query = format!(
             "SELECT TOP {} \
-             t.[請求K], t.[得意先C], ISNULL(c.[得意先N], ''), \
-             ISNULL(o.[地域N], ''), ISNULL(d.[地域N], ''), \
-             t.[車種C], ISNULL(v.[車種N], ''), \
+             t.[請求K], t.[得意先C], \
+             ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = t.[得意先C]), ''), \
+             ISNULL((SELECT TOP 1 o.[地域N] FROM [地域ﾏｽﾀ] o WHERE o.[地域C] = t.[発地域C]), ''), \
+             ISNULL((SELECT TOP 1 d.[地域N] FROM [地域ﾏｽﾀ] d WHERE d.[地域C] = t.[着地域C]), ''), \
+             t.[車種C], \
+             ISNULL((SELECT TOP 1 v.[車種N] FROM [車種ﾏｽﾀ] v WHERE v.[車種C] = t.[車種C]), ''), \
              t.[売上年月日], \
              ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
              t.[入金予定日], \
              ISNULL(t.[傭車先C], '') \
              FROM [運転日報明細] t \
-             LEFT JOIN [得意先ﾏｽﾀ] c ON t.[得意先C] = c.[得意先C] \
-             LEFT JOIN [車種ﾏｽﾀ] v ON t.[車種C] = v.[車種C] \
-             LEFT JOIN [地域ﾏｽﾀ] o ON t.[発地域C] = o.[地域C] \
-             LEFT JOIN [地域ﾏｽﾀ] d ON t.[着地域C] = d.[地域C] \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 {} \
              ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]",
             limit.clamp(1, 10000),
