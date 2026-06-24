@@ -49,6 +49,10 @@ pub struct RawSurchargeRow {
     pub billing_date: Option<NaiveDateTime>,
     /// `傭車先C`。'000000' (6 桁ゼロ) なら自車、それ以外は傭車。
     pub subcontractor_code: String,
+    /// `品名C` (例: 9003=消費税調整 / 9998=端数調整)。調整行の判別に使う。
+    pub item_code: String,
+    /// `品名N` (例: ※請求一括調整明細※)。
+    pub item_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -80,6 +84,10 @@ pub struct SurchargeRow {
     pub billing_date: Option<String>,
     /// 傭車先C ('000000' なら自車、それ以外は傭車)。消費側で自車/傭車を判定する。
     pub subcontractor_code: String,
+    /// 品名C (例: 9003=消費税調整 / 9998=端数調整)。消費側で調整行を除外する判別に使う。
+    pub item_code: String,
+    /// 品名N (例: ※請求一括調整明細※)。
+    pub item_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -159,6 +167,8 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             fare: r.fare,
             billing_date: r.billing_date.map(|d| d.format("%Y-%m-%d").to_string()),
             subcontractor_code: r.subcontractor_code.clone(),
+            item_code: r.item_code.clone(),
+            item_name: r.item_name.clone(),
         })
         .collect()
 }
