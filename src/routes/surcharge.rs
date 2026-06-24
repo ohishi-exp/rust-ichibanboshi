@@ -53,6 +53,8 @@ pub struct RawSurchargeRow {
     pub item_code: String,
     /// `品名N` (例: ※請求一括調整明細※)。
     pub item_name: String,
+    /// `車輌C` (車番。例: 8504)。車種C とは別の具体的な車輌番号。
+    pub vehicle_number: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -88,6 +90,8 @@ pub struct SurchargeRow {
     pub item_code: String,
     /// 品名N (例: ※請求一括調整明細※)。
     pub item_name: String,
+    /// 車輌C (車番。例: 8504)。車種C とは別の具体的な車輌番号。
+    pub vehicle_number: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -169,6 +173,7 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             subcontractor_code: r.subcontractor_code.clone(),
             item_code: r.item_code.clone(),
             item_name: r.item_name.clone(),
+            vehicle_number: r.vehicle_number.clone(),
         })
         .collect()
 }
