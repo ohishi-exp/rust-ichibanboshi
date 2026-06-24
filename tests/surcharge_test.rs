@@ -93,6 +93,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             subcontractor_code: "000000".into(),
             item_code: "".into(),
             item_name: "".into(),
+            vehicle_number: "8504".into(),
         },
         RawSurchargeRow {
             request_kind: "1".into(),
@@ -108,6 +109,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             subcontractor_code: "001234".into(),
             item_code: "9003".into(),
             item_name: "消費税調整".into(),
+            vehicle_number: "9481".into(),
         },
     ];
 
