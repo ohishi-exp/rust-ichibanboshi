@@ -91,6 +91,8 @@ fn test_build_surcharge_rows_normal_and_edges() {
             fare: 65_000,
             billing_date: Some(dt(2026, 7, 31)),
             subcontractor_code: "000000".into(),
+            item_code: "".into(),
+            item_name: "".into(),
         },
         RawSurchargeRow {
             request_kind: "1".into(),
@@ -104,6 +106,8 @@ fn test_build_surcharge_rows_normal_and_edges() {
             fare: 840_000,
             billing_date: None,
             subcontractor_code: "001234".into(),
+            item_code: "9003".into(),
+            item_name: "消費税調整".into(),
         },
     ];
 
