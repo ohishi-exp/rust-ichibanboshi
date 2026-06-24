@@ -250,6 +250,8 @@ impl AppRepo for MockRepo {
                 fare: 65_000,
                 billing_date: Some(dt(2026, 7, 31)),
                 subcontractor_code: "000000".into(),
+                item_code: "".into(),
+                item_name: "".into(),
             },
             // エッジ: 未マップ地域 (000000)・車種未設定 (00)・入金予定日 NULL
             RawSurchargeRow {
@@ -264,6 +266,8 @@ impl AppRepo for MockRepo {
                 fare: 840_000,
                 billing_date: None,
                 subcontractor_code: "001234".into(),
+                item_code: "".into(),
+                item_name: "".into(),
             },
         ])
     }
