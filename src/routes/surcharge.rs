@@ -55,6 +55,10 @@ pub struct RawSurchargeRow {
     pub item_name: String,
     /// `車輌C` (車番。例: 8504)。車種C とは別の具体的な車輌番号。
     pub vehicle_number: String,
+    /// 燃料サーチャージ額 (円)。`運転日報割増明細` の `割増C='19'` (燃料ｻｰﾁｬｰｼﾞ) 枠のみを
+    /// 集計した値で、`fare` (金額+割増+実費) には含めず分離して保持する (Refs #25)。
+    /// 割増C=19 が無い行は 0。
+    pub fuel_surcharge: i64,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -92,6 +96,9 @@ pub struct SurchargeRow {
     pub item_name: String,
     /// 車輌C (車番。例: 8504)。車種C とは別の具体的な車輌番号。
     pub vehicle_number: String,
+    /// 燃料サーチャージ額 (円)。`割増C='19'` (燃料ｻｰﾁｬｰｼﾞ) 分のみ。`fare` とは分離。
+    /// 消費側 (nuxt-ichibanboshi-seikyu) はこの値をそのまま計上額として集計する (Refs #25)。
+    pub fuel_surcharge: i64,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -174,6 +181,7 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             item_code: r.item_code.clone(),
             item_name: r.item_name.clone(),
             vehicle_number: r.vehicle_number.clone(),
+            fuel_surcharge: r.fuel_surcharge,
         })
         .collect()
 }
