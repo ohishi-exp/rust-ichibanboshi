@@ -63,6 +63,9 @@ pub struct RawSurchargeRow {
     /// 安定キー (値カラムに依存しないため編集されても不変)。消費側 (seikyu) の
     /// 「計算しない (skip) 行」の永続化キーに使う。
     pub row_id: String,
+    /// `入力担当C` (運転日報明細の入力担当コード)。消費側 (seikyu) の「入力者」絞り込み用。
+    /// 担当者名マスタは参照せずコードのみを返す (Refs #12)。空欄行は空文字。
+    pub input_staff_code: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -106,6 +109,9 @@ pub struct SurchargeRow {
     /// 行 ID = `管理年月日`(yyyymmdd) + '-' + `管理C`。運転日報明細 1 行の安定キー。
     /// 消費側の「計算しない (skip) 行」永続化キーに使う。
     pub row_id: String,
+    /// 入力担当C (運転日報明細の入力担当コード)。消費側 (seikyu) の「入力者」絞り込み用。
+    /// 担当者名マスタは引かずコードのみ。空欄行は空文字。
+    pub input_staff_code: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -190,6 +196,7 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             vehicle_number: r.vehicle_number.clone(),
             fuel_surcharge: r.fuel_surcharge,
             row_id: r.row_id.clone(),
+            input_staff_code: r.input_staff_code.clone(),
         })
         .collect()
 }
