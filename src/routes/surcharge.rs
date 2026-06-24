@@ -66,6 +66,9 @@ pub struct RawSurchargeRow {
     /// `入力担当C` (運転日報明細の入力担当コード)。消費側 (seikyu) の「入力者」絞り込み用。
     /// 担当者名マスタは参照せずコードのみを返す (Refs #12)。空欄行は空文字。
     pub input_staff_code: String,
+    /// 入力者氏名 (`社員ﾏｽﾀ.社員N` を `入力担当C = 社員C` で引いた値)。Refs #29。
+    /// 未マップ (`0000` 入力担当なし等) は空文字。
+    pub input_staff_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -112,6 +115,8 @@ pub struct SurchargeRow {
     /// 入力担当C (運転日報明細の入力担当コード)。消費側 (seikyu) の「入力者」絞り込み用。
     /// 担当者名マスタは引かずコードのみ。空欄行は空文字。
     pub input_staff_code: String,
+    /// 入力者氏名 (`社員ﾏｽﾀ.社員N`、`入力担当C = 社員C` で引く)。未マップは空文字。Refs #29。
+    pub input_staff_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -197,6 +202,7 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             fuel_surcharge: r.fuel_surcharge,
             row_id: r.row_id.clone(),
             input_staff_code: r.input_staff_code.clone(),
+            input_staff_name: r.input_staff_name.clone(),
         })
         .collect()
 }

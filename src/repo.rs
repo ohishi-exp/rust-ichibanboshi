@@ -890,7 +890,8 @@ impl AppRepo for TiberiusRepo {
                  AND za.[管理C] = t.[管理C] \
                  AND za.[自車傭車K] = '0'), 0), \
              CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
-             ISNULL(t.[入力担当C], '') \
+             ISNULL(t.[入力担当C], ''), \
+             ISNULL((SELECT TOP 1 s.[社員N] FROM [社員ﾏｽﾀ] s WHERE s.[社員C] = t.[入力担当C]), '') \
              FROM [運転日報明細] t \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 {} \
              ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]",
@@ -978,6 +979,7 @@ impl TiberiusRepo {
                 fuel_surcharge: get_i64(r, 14),
                 row_id: decode_cp932(r, 15),
                 input_staff_code: decode_cp932(r, 16),
+                input_staff_name: decode_cp932(r, 17),
             })
             .collect()
     }
