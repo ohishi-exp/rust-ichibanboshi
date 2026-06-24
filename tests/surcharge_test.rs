@@ -97,6 +97,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             fuel_surcharge: 4_020,
             row_id: "20260621-1001".into(),
             input_staff_code: "0012".into(),
+            input_staff_name: "西田　和恵".into(),
         },
         RawSurchargeRow {
             request_kind: "1".into(),
@@ -116,6 +117,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
             fuel_surcharge: 0,
             row_id: "20260620-1002".into(),
             input_staff_code: "".into(),
+            input_staff_name: "".into(),
         },
     ];
 
@@ -137,6 +139,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
     assert_eq!(first.fuel_surcharge, 4_020); // 割増C=19 分は fare と分離して保持
     assert_eq!(first.row_id, "20260621-1001"); // 行 ID = 管理年月日+管理C
     assert_eq!(first.input_staff_code, "0012"); // 入力担当C (入力者 絞り込み用)
+    assert_eq!(first.input_staff_name, "西田　和恵"); // 社員ﾏｽﾀ.社員N (Refs #29)
 
     // エッジ: 未マップ地域 → "?"、入金予定日 NULL → None
     let second = &rows[1];
@@ -148,6 +151,7 @@ fn test_build_surcharge_rows_normal_and_edges() {
     assert_eq!(second.fuel_surcharge, 0); // 燃料SC無し行は 0
     assert_eq!(second.row_id, "20260620-1002");
     assert_eq!(second.input_staff_code, ""); // 入力担当C 空欄行は空文字
+    assert_eq!(second.input_staff_name, ""); // 未マップは空文字
 }
 
 #[test]
