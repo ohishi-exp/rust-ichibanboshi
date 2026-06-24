@@ -59,6 +59,10 @@ pub struct RawSurchargeRow {
     /// 集計した値で、`fare` (金額+割増+実費) には含めず分離して保持する (Refs #25)。
     /// 割増C=19 が無い行は 0。
     pub fuel_surcharge: i64,
+    /// 行 ID = `管理年月日`(yyyymmdd) + '-' + `管理C`。運転日報明細 1 行を一意に識別する
+    /// 安定キー (値カラムに依存しないため編集されても不変)。消費側 (seikyu) の
+    /// 「計算しない (skip) 行」の永続化キーに使う。
+    pub row_id: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -99,6 +103,9 @@ pub struct SurchargeRow {
     /// 燃料サーチャージ額 (円)。`割増C='19'` (燃料ｻｰﾁｬｰｼﾞ) 分のみ。`fare` とは分離。
     /// 消費側 (nuxt-ichibanboshi-seikyu) はこの値をそのまま計上額として集計する (Refs #25)。
     pub fuel_surcharge: i64,
+    /// 行 ID = `管理年月日`(yyyymmdd) + '-' + `管理C`。運転日報明細 1 行の安定キー。
+    /// 消費側の「計算しない (skip) 行」永続化キーに使う。
+    pub row_id: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -182,6 +189,7 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
             item_name: r.item_name.clone(),
             vehicle_number: r.vehicle_number.clone(),
             fuel_surcharge: r.fuel_surcharge,
+            row_id: r.row_id.clone(),
         })
         .collect()
 }
