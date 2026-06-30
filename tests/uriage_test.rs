@@ -1564,3 +1564,170 @@ async fn verify_filters_out_zero_entries() {
     assert_eq!(v["ok"], true);
     assert!(v["diff"].is_null());
 }
+
+// ══════════════════════════════════════════════════════════════
+// verify_jobs upsert + /verify-history endpoint
+// ══════════════════════════════════════════════════════════════
+
+async fn get_path(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn verify_upserts_to_verify_jobs_table_and_history_returns_them() {
+    // PHP=Rust 一致ケース 1 件 → verify_jobs に 1 行 upsert される
+    let php_sum = json!({
+        "青井": { "金額": 51500, "傭車金額": 30800, "件数": 1 }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), php_sum).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(common::mock_repo(), store.clone(), server.uri(), raw);
+
+    // verify を 1 回叩く
+    let (s, v) = get_verify(
+        app.clone(),
+        "/api/uriage/verify?id=1&date=2026-06-15&cal=true",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+
+    // verify-history で読み出せる
+    let (s, h) = get_path(
+        app,
+        "/api/uriage/verify-history?from=2026-06-01&to=2026-06-30&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["count"], 1);
+    assert_eq!(h["rows"][0]["unko_date"], "2026-06-15");
+    assert_eq!(h["rows"][0]["eigyosho_id"], 1);
+    assert_eq!(h["rows"][0]["cal"], 1);
+    assert_eq!(h["rows"][0]["ok"], 1);
+    assert_eq!(h["rows"][0]["month"], "2026-06");
+    assert!(h["rows"][0]["skipped_reason"].is_null());
+}
+
+#[tokio::test]
+async fn verify_upserts_skipped_reason_for_no_bumon() {
+    let offices_with_empty_bumon = json!({
+        "13": {
+            "display_name": "受注なし営業所",
+            "persons": {},
+            "other": {},
+            "bumon": []
+        }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], offices_with_empty_bumon, json!({}))
+            .await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(common::mock_repo(), store.clone(), server.uri(), raw);
+
+    let (s, _) = get_verify(
+        app.clone(),
+        "/api/uriage/verify?id=13&date=2026-06-15&cal=true",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, h) = get_path(
+        app,
+        "/api/uriage/verify-history?from=2026-06-01&to=2026-06-30&eigyosho_id=13",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["count"], 1);
+    assert_eq!(h["rows"][0]["ok"], 1);
+    assert_eq!(h["rows"][0]["skipped_reason"], "no_bumon");
+    assert_eq!(h["rows"][0]["row_count"], 0);
+}
+
+#[tokio::test]
+async fn verify_upsert_overwrites_on_rerun_same_key() {
+    // 同じ (date, eigyosho_id, cal) を 2 回 verify したら 1 行のみ (PK 上書き)
+    // 1 回目: PHP=Rust 一致
+    // 2 回目: PHP=Rust 不一致 (PHP の値を変えて NG にする) → ok=0 に更新される
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    // print-json は最初 一致値、その後 NG 値で別 mock を作る
+    Mock::given(wm_method("GET"))
+        .and(wm_path("/uriage-jyuchu-display/print-json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sum": { "青井": { "金額": 51500, "傭車金額": 30800, "件数": 1 } }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(wm_method("GET"))
+        .and(wm_path("/uriage-jyuchu-display/print-json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sum": { "青井": { "金額": 99999, "傭車金額": 30800, "件数": 1 } }
+        })))
+        .mount(&server)
+        .await;
+
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(common::mock_repo(), store.clone(), server.uri(), raw);
+
+    // 1 回目 (一致)
+    let (_, v1) = get_verify(
+        app.clone(),
+        "/api/uriage/verify?id=1&date=2026-06-15&cal=true",
+    )
+    .await;
+    assert_eq!(v1["ok"], true);
+
+    // 2 回目 (不一致)
+    let (_, v2) = get_verify(
+        app.clone(),
+        "/api/uriage/verify?id=1&date=2026-06-15&cal=true",
+    )
+    .await;
+    assert_eq!(v2["ok"], false);
+
+    // history は 1 行 (上書きされている)、ok=0
+    let (_, h) = get_path(
+        app,
+        "/api/uriage/verify-history?from=2026-06-01&to=2026-06-30&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(h["count"], 1);
+    assert_eq!(h["rows"][0]["ok"], 0);
+    assert!(h["rows"][0]["diff_json"].is_string());
+}
+
+#[tokio::test]
+async fn verify_history_400_when_from_empty() {
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), json!({})).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (s, _) = get_path(app, "/api/uriage/verify-history?from=&to=2026-06-30").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
