@@ -644,6 +644,10 @@ pub fn build_app_full(
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))
+        .route(
+            "/uriage/person-monthly-totals",
+            get(routes::uriage::person_monthly_totals),
+        )
         .route("/uriage/r2/pending", get(routes::uriage::r2_pending))
         .route(
             "/uriage/raw/{month}/{eigyosho_id}",

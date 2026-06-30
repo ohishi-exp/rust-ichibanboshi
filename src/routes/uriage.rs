@@ -1108,6 +1108,53 @@ pub async fn daily(
 }
 
 // ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/person-monthly-totals?from=YYYY-MM&to=YYYY-MM&cal=true
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct PersonMonthlyTotalsQuery {
+    /// 期間下限 (`YYYY-MM`、inclusive)
+    pub from: String,
+    /// 期間上限 (`YYYY-MM`、inclusive)
+    pub to: String,
+    /// `cal` フラグ (省略時 true、別営業所合算)
+    #[serde(default = "default_cal")]
+    pub cal: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersonMonthlyTotalsResponse {
+    pub from: String,
+    pub to: String,
+    pub cal: bool,
+    /// `(month, person_name)` で sort 済 (eigyosho_id は 0 固定 = 全営業所合算)
+    pub rows: Vec<crate::sqlite::PersonMonthlyRow>,
+}
+
+/// GET `/api/uriage/person-monthly-totals?from=YYYY-MM&to=YYYY-MM&cal=true`
+///
+/// 期間内の **月 × 担当者 の SUM** を返す (全営業所合算)。
+/// 担当者順位推移チャート (bump chart) 用。
+pub async fn person_monthly_totals(
+    Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<PersonMonthlyTotalsQuery>,
+) -> Result<Json<PersonMonthlyTotalsResponse>, StatusCode> {
+    if q.from.is_empty() || q.to.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let rows = store
+        .person_monthly_totals(&q.from, &q.to, q.cal)
+        .await
+        .map_err(map_local_store_err)?;
+    Ok(Json(PersonMonthlyTotalsResponse {
+        from: q.from,
+        to: q.to,
+        cal: q.cal,
+        rows,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
 // Admin: 削除 / 再作成
 // ══════════════════════════════════════════════════════════════
 
