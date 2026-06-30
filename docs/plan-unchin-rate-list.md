@@ -20,7 +20,7 @@ Refs #57
 
 | 項目 | 決定 |
 |---|---|
-| ストレージ | KV + R2（nuxt-ichibanboshi Worker 側）。D1 は不採用（件数は多くない想定） |
+| ストレージ | R2 のみ（nuxt-ichibanboshi Worker 側、既存 `URIAGE_R2` バケットを `unchin/` prefix で流用）。D1 は不採用（件数は多くない想定）。新規 KV namespace は CCoW 環境から CF 認証して provisioning できないため作成せず、index も R2 オブジェクトとして持つ（性能上必要になれば後から KV 化可能） |
 | データ取得元 | rust-ichibanboshi の既存 SQL Server (`CAPE#01`) 連携経由 |
 | 値上げ管理 | 履歴をバージョンとして保持し、日付/期間を選んで過去・現在の運賃表を切り替え表示する |
 | 値上げタイミングの確定方法 | 自動検知ではなく、ユーザー（管理者）の操作で保存する。保存時に誰が登録したか（ユーザー情報）を記録する |
@@ -37,8 +37,9 @@ SQL Server (CAPE#01)
   ↓ 管理画面で候補を確認 → (得意先C+H or 傭車先C+H, 品名C, 金額) で集約
     (品名C が '0000'/'0002' 等の空品名コードの場合は 発地N+着地N も同一性キーに含める)
   ↓ 「このタイミングで確定 (値上げ登録)」操作
-  ↓ KV: 取引先 (得意先 or 傭車先、C+H キー) ごとの index (バージョン一覧、effective_from、登録者)
-  ↓ R2: バージョンごとの確定運賃データ本体 (品目・金額・発地N/着地N ペア配列の JSON)
+  ↓ R2 (URIAGE_R2, prefix `unchin/`): 取引先ごとの index オブジェクト (バージョン一覧、
+    effective_from、登録者) + バージョンごとの確定運賃データ本体 (品目・金額・
+    発地N/着地N ペア配列の JSON)
 [ブラウザ UI]
   - header の「運賃リスト」ボタン → 一覧ページ (得意先別/傭車先別の売上・支払サマリ)
   - クリック → 明細ページ (運賃順リスト、バージョン切替プルダウン)
@@ -127,6 +128,121 @@ KV/R2 に蓄積していく前提が必須**（DB を遡って過去の運賃変
 旧 PHP `IchibanRowsController::jistuunsoPrint()`（`yhonda-ohishi/nginx`）が品名・得意先・
 傭車先・発地N/着地N・積込/納入年月日を `運転日報明細` から直接 select しており、本機能の
 抽出ロジックの元ネタに近い。
+
+## 実装仕様（このまま実装可能な詳細）
+
+実装はユーザー側で行う前提（Claude Code は本ドキュメントの整備まで）。
+
+### A. バックエンド: rust-ichibanboshi 新規 endpoint
+
+新規ファイル `src/routes/unchin.rs`（`src/routes/surcharge.rs` を参考に作成）:
+
+```rust
+// RawUnchinRow (repo 層): partner_code(=C+'-'+H), partner_name, item_code(品名C),
+// item_name(品名N), fare(i64), origin(発地N), dest(着地N), sale_date(NaiveDateTime)
+//
+// UnchinCandidateRow (response 層): 上記を文字列化したもの (sale_date は "YYYY-MM-DD")
+
+#[derive(Deserialize)]
+pub struct UnchinQuery {
+    pub from: String,          // YYYY-MM-DD (inclusive)
+    pub to: String,            // YYYY-MM-DD (exclusive)
+    pub partner_type: String,  // "customer" | "subcontractor"
+    pub limit: Option<i32>,    // default 5000、1..=20000 にクランプ
+}
+
+// GET /api/unchin/candidates
+pub async fn unchin_candidates(...) -> Result<Json<ApiResponse<Vec<UnchinCandidateRow>>>, StatusCode> {
+    // partner_type が customer/subcontractor 以外なら 400
+    // repo.unchin_candidates(from, to, partner_type, limit) を呼ぶだけの薄いハンドラ
+}
+```
+
+`AppRepo` trait に追加するメソッド:
+
+```rust
+async fn unchin_candidates(
+    &self,
+    from: &str,
+    to: &str,
+    partner_type: &str, // "customer" | "subcontractor"
+    limit: i32,
+) -> Result<Vec<RawUnchinRow>, RepoError>;
+```
+
+`TiberiusRepo` 実装の SQL 案（`surcharge_base` と同じくスカラサブクエリでマスタ名を引く、
+LEFT JOIN によるファンアウトは避ける）:
+
+```sql
+-- partner_type = "customer"
+SELECT TOP {limit}
+  CONCAT(t.[得意先C], '-', t.[得意先H]),
+  ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c
+          WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), ''),
+  ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''),
+  ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0),
+  ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''),
+  t.[売上年月日]
+FROM [運転日報明細] t
+WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2
+  AND t.[品名C] NOT IN ('9003', '9998')
+ORDER BY t.[得意先C], t.[得意先H], t.[品名C], t.[金額]
+
+-- partner_type = "subcontractor" は 傭車先C != '000000' を WHERE に追加し、
+-- 得意先ﾏｽﾀ→傭車先ﾏｽﾀ（C+H 結合）、金額/割増/実費→傭車金額/傭車割増/傭車実費 に置き換える
+```
+
+- `品名C='9999'`（8306乗務）の除外要否は実装前に再確認すること（#57 参照）
+- `server.rs` の `api_routes` に `.route("/unchin/candidates", get(routes::unchin::unchin_candidates))`
+  を追加、`routes/mod.rs` に `pub mod unchin;` を追加
+- テストは `tests/surcharge_test.rs` の `MockRepo` パターンを踏襲（`tests/unchin_test.rs` を新設）
+- グルーピング（積卸ペアを1レコードにまとめる処理）は **rust 側ではやらない**。raw 行をそのまま
+  返し、グルーピングは nuxt-ichibanboshi Worker 側で行う（同一性キー判定は SQL より TypeScript の
+  方が調整しやすいため）
+
+### B. フロントエンド: nuxt-ichibanboshi の R2 スキーマ・API・UI
+
+#### R2 オブジェクトキー（`URIAGE_R2` バケットを `unchin/` prefix で流用、新規バケット作成不要）
+
+```
+unchin/index/{partner_type}/{partner_code}.json
+  → [{ version_id, effective_from, registered_by, registered_at, item_count }, ...]
+    (registered_by はメールアドレス、effective_from 降順で並べておく)
+
+unchin/data/{partner_type}/{partner_code}/{version_id}.json
+  → [{ item_code, item_name, fare, routes: [{ origin, dest }, ...] }, ...]
+    (fare 降順 = 運賃順 で並べて保存しておくと一覧表示がそのまま使える)
+```
+
+`partner_code` は `得意先C-得意先H` または `傭車先C-傭車先H`（rust の `partner_code` をそのまま
+key の一部に使う）。`version_id` は ULID や `effective_from` (YYYYMMDD) + 連番で一意にする。
+
+#### server routes（新規）
+
+- `GET /api/unchin/candidates?from=&to=&partner_type=` — rust `/api/unchin/candidates` を
+  `salesApiFetch` 経由で呼び、`(partner_code, item_code, fare)` でグルーピングして
+  `routes: [{origin, dest}]` 配列を組み立てて返す。`item_code` が `0000`/`0002` の場合は
+  グルーピングキーに `origin`+`dest` も含める（過剰集約防止、#57 確定事項）
+- `GET /api/unchin/versions?partner_type=&partner_code=` — R2 の index オブジェクトを読む
+- `GET /api/unchin/versions/:version_id?partner_type=&partner_code=` — R2 の data オブジェクトを読む
+- `POST /api/unchin/versions` — body `{ partner_type, partner_code, effective_from, items }`。
+  認証ユーザーのメールアドレスを `registered_by` として記録し、R2 に data オブジェクトを書き、
+  index オブジェクトに追記する。**認証ユーザーのメール取得方法は要確認**: `logi_auth_token` cookie
+  の JWT を server 側で decode する必要があるが、本リポジトリの `server/middleware/auth.ts` は
+  現状 tenant チェックのみで claims を取り出していない。`@ippoan/auth-client` (server 側 export)
+  に decode helper が無いか確認し、無ければ `jsonwebtoken` 等で claims (`email`/`name`) を decode
+  する処理を追加すること
+
+#### UI
+
+- header（`app/app.vue` または各ページ）に「運賃リスト」ボタンを追加 → `/unchin` へリンク
+- `app/pages/unchin/index.vue` — 一覧ページ。得意先別・傭車先別の最新バージョン合計金額を表示。
+  行クリックで詳細ページへ遷移
+- `app/pages/unchin/[partnerType]/[partnerCode].vue` — 詳細ページ。バージョン切替プルダウン
+  （`GET /api/unchin/versions` の一覧から選択）+ 運賃順テーブル + 「値上げとして登録」ボタン
+  （`POST /api/unchin/versions` を叩く、effective_from は管理者が日付入力）
+- PDF 印刷: サーバ側 PDF 生成ライブラリは導入せず、`@media print` CSS + `window.print()` の
+  ブラウザ印刷機能で済ませる（Workers 環境にも依存せずシンプル）
 
 ## 参考
 
