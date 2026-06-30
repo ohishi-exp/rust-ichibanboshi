@@ -560,6 +560,51 @@ impl LocalStore {
     // recalc_jobs / r2_pending (Phase 2 PR-D)
     // ──────────────────────────────────────────────────────────────────
 
+    /// `recalc_jobs` を月範囲で取得 (UI 状態サマリ用)。
+    /// `from`/`to` は YYYY-MM 形式、両端 inclusive。
+    pub async fn list_recalc_jobs(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RecalcJob>, LocalStoreError> {
+        let from = from.to_string();
+        let to = to.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT month, eigyosho_id, status, fingerprint_before, fingerprint_after, \
+                            raw_path, created_at, computed_at, r2_synced_at, last_error \
+                     FROM recalc_jobs \
+                     WHERE month BETWEEN ?1 AND ?2 \
+                     ORDER BY month ASC, eigyosho_id ASC",
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![from, to], |r| {
+                    Ok(RecalcJob {
+                        month: r.get(0)?,
+                        eigyosho_id: r.get(1)?,
+                        status: r.get(2)?,
+                        fingerprint_before: r.get(3)?,
+                        fingerprint_after: r.get(4)?,
+                        raw_path: r.get(5)?,
+                        created_at: r.get(6)?,
+                        computed_at: r.get(7)?,
+                        r2_synced_at: r.get(8)?,
+                        last_error: r.get(9)?,
+                    })
+                })
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<Vec<RecalcJob>, LocalStoreError>(rows)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
     /// `(month, eigyosho_id)` の現在の job 行を取得 (なければ None)。
     pub async fn get_recalc_job(
         &self,
