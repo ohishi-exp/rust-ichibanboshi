@@ -370,6 +370,14 @@ impl LocalStore {
             -- r2_pending: 「R2 同期候補」 view。verify_coverage を LEFT JOIN し、
             -- caller (nuxt) が「(month の日数) × 2 cal」と verified_count を比較して
             -- ready を判定できるようにする。verified_ng>0 は ng_present で gate される。
+            --
+            -- 条件は 3 つだけ: status='computed' AND r2_synced_at IS NULL AND raw_path IS NOT NULL。
+            -- 以前は「fingerprint_before != fingerprint_after」condition も含めていたが、
+            -- PR #51 以前の bug code path で「fp_before == fp_after かつ r2_synced_at IS NULL」
+            -- の行が永久に view から除外され R2 sync 不能になる事故が出た (user 2026-06-30:
+            -- 「ｒ２同期押してもこれ」)。r2_synced_at IS NULL ですでに「未同期 = 要 sync」を
+            -- 表現できるので fingerprint 比較は不要 (= 同期済 case は r2_synced_at IS NOT NULL
+            -- で既に除外されている)。
             CREATE VIEW r2_pending AS
             SELECT rj.month,
                    rj.eigyosho_id,
@@ -385,10 +393,6 @@ impl LocalStore {
             WHERE rj.status = 'computed'
               AND rj.r2_synced_at IS NULL
               AND rj.raw_path IS NOT NULL
-              AND (
-                  rj.fingerprint_before IS NULL
-                  OR rj.fingerprint_before != rj.fingerprint_after
-              )
             ORDER BY rj.computed_at ASC;
             "#,
         )
@@ -1591,6 +1595,40 @@ mod tests {
         assert_eq!(j4.status, "failed", "failed は触らない");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn r2_pending_includes_unsynced_even_when_fingerprint_unchanged() {
+        // user 2026-06-30 「R2 同期押してもこれ」 — r2_synced_at IS NULL なのに
+        // pending list に出ない不具合。原因: 旧 r2_pending view が
+        // `fingerprint_before != fingerprint_after` を必須条件にしていた。
+        //
+        // 2 回連続 record_recalc_computed (同 fp、間に sync なし) → status='computed'、
+        // fp_before == fp_after、r2_synced_at IS NULL という状態が作れる (PR #51 前の
+        // bug code path の遺物)。本テストでは sync 未実施なので pending に**残る**べき。
+        let store = LocalStore::open(":memory:").unwrap();
+        // 1 回目: status='computed', fp_before=NULL, fp_after=fp1, r2_synced_at=NULL
+        store
+            .record_recalc_computed("2026-06", 1, "fp1", Some("/tmp/r.gz"), "t1")
+            .await
+            .unwrap();
+        // 2 回目 (同 fp): status='computed' のまま (PR #51 後の logic: 元 status='computed' なので
+        // CASE で維持), fp_before=fp1, fp_after=fp1, r2_synced_at=NULL のまま (sync 未実施)
+        store
+            .record_recalc_computed("2026-06", 1, "fp1", Some("/tmp/r.gz"), "t2")
+            .await
+            .unwrap();
+        let job = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+        assert_eq!(job.status, "computed");
+        assert_eq!(job.fingerprint_before.as_deref(), Some("fp1"));
+        assert_eq!(job.fingerprint_after.as_deref(), Some("fp1"));
+        assert_eq!(job.r2_synced_at, None);
+
+        // pending list に **出る** べき (旧 view では fp_before == fp_after で除外されていた)
+        let pending = store.list_r2_pending(None, None).await.unwrap();
+        assert_eq!(pending.len(), 1, "fp 不変でも未同期なら pending に出るべき");
+        assert_eq!(pending[0].month, "2026-06");
+        assert_eq!(pending[0].eigyosho_id, 1);
     }
 
     #[tokio::test]
