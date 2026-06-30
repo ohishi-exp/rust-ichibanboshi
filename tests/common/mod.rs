@@ -663,7 +663,8 @@ pub fn build_app_full(
         .route(
             "/uriage/verify-history",
             get(routes::uriage::verify_history),
-        );
+        )
+        .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))
