@@ -12,7 +12,6 @@ mod common;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use rust_ichibanboshi::routes::uriage::{compute_person_sum, PersonAccum, UriageRow};
-use rust_ichibanboshi::sqlite::LocalStore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -593,17 +592,22 @@ async fn by_person_rejects_malformed_json() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// HTTP endpoint test: POST /api/uriage/recalc (Phase 2 PR-C1)
+// HTTP endpoint test: POST /api/uriage/recalc (Phase 2 PR-C2 / D)
+//   CakePHP pull + editable_months チェック + raw NDJSON.gz 出力 + fingerprint 記録
 // ══════════════════════════════════════════════════════════════
 
-async fn post_recalc(app: axum::Router, body: Value) -> (StatusCode, Value) {
+use rust_ichibanboshi::cakephp::CakephpClient;
+use rust_ichibanboshi::config::RawConfig;
+use wiremock::matchers::{method as wm_method, path as wm_path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn post_recalc_path(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let res = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/uriage/recalc")
-                .header("content-type", "application/json")
-                .body(json_body(body))
+                .uri(uri)
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -618,191 +622,461 @@ async fn post_recalc(app: axum::Router, body: Value) -> (StatusCode, Value) {
     (status, v)
 }
 
-fn recalc_body(month: &str, eigyosho_id: i64, cal: bool) -> Value {
+/// 標準的な editable_months + masters を返す wiremock server を立てる。
+/// `editable_months` と `master_offices` を caller から指定可能。
+async fn start_cakephp_mock(
+    editable_months: Vec<&str>,
+    master_offices: Value, // {"1": {display_name, persons, other, bumon}, ...}
+) -> MockServer {
+    let server = MockServer::start().await;
+
+    let em_resp = json!({
+        "operation_month": "2026-07",
+        "editable_months_count": editable_months.len(),
+        "editable_months": editable_months,
+    });
+    Mock::given(wm_method("GET"))
+        .and(wm_path("/uriage-jyuchu-display/editable-months"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(em_resp))
+        .mount(&server)
+        .await;
+
+    let masters_resp = json!({
+        "date": "2026-06-30",
+        "offices": master_offices,
+    });
+    Mock::given(wm_method("GET"))
+        .and(wm_path("/uriage-jyuchu-display/masters-json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(masters_resp))
+        .mount(&server)
+        .await;
+
+    server
+}
+
+fn standard_offices() -> Value {
     json!({
-        "month": month,
-        "from": format!("{month}-01"),
-        "to":   format!("{month}-30"),
-        "eigyosho_id": eigyosho_id,
-        "bumon": ["010"],
-        "persons": { "1499": "青井" },
-        "other":   {},
-        "cal": cal
+        "1": {
+            "display_name": "本社",
+            "persons": { "1499": "青井" },
+            "other": {},
+            "bumon": ["010"]
+        },
+        "9": {
+            "display_name": "宮崎",
+            "persons": { "2000": "田中" },
+            "other": {},
+            "bumon": ["015"]
+        }
     })
 }
 
-#[tokio::test]
-async fn recalc_persists_summary_into_sqlite() {
-    let store = common::local_store();
-    let app = common::build_app_with_store(common::mock_repo(), store.clone());
-
-    let body = recalc_body("2026-06", 1, true);
-    let (status, v) = post_recalc(app, body).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(v["month"], "2026-06");
-    assert_eq!(v["eigyosho_id"], 1);
-    assert_eq!(v["cal"], true);
-    assert_eq!(v["persisted_count"], 1); // 青井のみ非ゼロ
-    assert_eq!(v["row_count"], 2); // MockRepo の uriage_rows 2 行
-    assert_eq!(v["sum"]["青井"]["金額"], 51500);
-
-    // SQLite に persist された行を直接確認
-    let rows = store
-        .get_person_monthly("2026-06", 1, true)
-        .await
-        .expect("get_person_monthly");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].person_name, "青井");
-    assert_eq!(rows[0].kingaku, 51500);
-    assert_eq!(rows[0].yosha_kingaku, 30800);
-    assert_eq!(rows[0].kensuu, 1);
-    assert!(v["calculated_at"].as_str().unwrap().contains('T'));
+fn build_app_with_cakephp(
+    repo: rust_ichibanboshi::repo::DynRepo,
+    store: rust_ichibanboshi::sqlite::DynLocalStore,
+    cakephp_base: String,
+    raw_cfg: Arc<RawConfig>,
+) -> axum::Router {
+    let cakephp = Arc::new(CakephpClient::new(cakephp_base, 30).unwrap());
+    common::build_app_full(repo, store, cakephp, raw_cfg)
 }
 
 #[tokio::test]
-async fn recalc_second_run_overwrites_bucket() {
-    let store = common::local_store();
-    let app = common::build_app_with_store(common::mock_repo(), store.clone());
-    let body = recalc_body("2026-06", 1, true);
-
-    // 1 回目
-    let (status, _) = post_recalc(app.clone(), body.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    let first_count = store
-        .get_person_monthly("2026-06", 1, true)
-        .await
-        .unwrap()
-        .len();
-    assert_eq!(first_count, 1);
-
-    // 2 回目: 同じ bucket、同じ内容 → 上書きされても行数 / 値は同一
-    let (status, _) = post_recalc(app, body).await;
-    assert_eq!(status, StatusCode::OK);
-    let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].kingaku, 51500);
-}
-
-#[tokio::test]
-async fn recalc_isolates_buckets() {
-    let store = common::local_store();
-    let app = common::build_app_with_store(common::mock_repo(), store.clone());
-
-    // (2026-06, 1, true) を入れる
-    let (s, _) = post_recalc(app.clone(), recalc_body("2026-06", 1, true)).await;
-    assert_eq!(s, StatusCode::OK);
-    // 別営業所
-    let (s, _) = post_recalc(app.clone(), recalc_body("2026-06", 2, true)).await;
-    assert_eq!(s, StatusCode::OK);
-    // 別 cal
-    let (s, _) = post_recalc(app.clone(), recalc_body("2026-06", 1, false)).await;
-    assert_eq!(s, StatusCode::OK);
-    // 別月
-    let (s, _) = post_recalc(app, recalc_body("2026-07", 1, true)).await;
-    assert_eq!(s, StatusCode::OK);
-
-    // 4 つの独立 bucket に persist される
-    for (m, e, c) in [
-        ("2026-06", 1, true),
-        ("2026-06", 2, true),
-        ("2026-06", 1, false),
-        ("2026-07", 1, true),
-    ] {
-        let rows = store.get_person_monthly(m, e, c).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "bucket (m={}, e={}, c={}) should have 1 row",
-            m,
-            e,
-            c
-        );
-    }
-}
-
-#[tokio::test]
-async fn recalc_rejects_missing_required_fields() {
+async fn recalc_503_when_cakephp_not_configured() {
+    // base_url 空 → /recalc は 503
     let app = common::build_app(common::mock_repo());
+    let (status, _) = post_recalc_path(app, "/api/uriage/recalc?month=2026-06").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
 
-    // month 欠落
-    let body = json!({
-        "from": "2026-06-01", "to": "2026-06-30",
-        "eigyosho_id": 1, "bumon": ["010"],
-        "persons": {}, "other": {}
-    });
+#[tokio::test]
+async fn recalc_422_when_month_not_editable() {
+    let server = start_cakephp_mock(vec!["2026-06", "2026-07"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    // 2026-05 は editable_months に無い → 422
+    let (status, v) = post_recalc_path(app, "/api/uriage/recalc?month=2026-05").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // body は plain text (axum (StatusCode, String) tuple)
+    assert!(v == Value::Null || v.is_string() || v.is_object());
+}
+
+#[tokio::test]
+async fn recalc_single_month_single_office_persists_and_records_fingerprint() {
+    let server = start_cakephp_mock(vec!["2026-06", "2026-07"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    let (status, v) = post_recalc_path(app, "/api/uriage/recalc?month=2026-06&eigyosho_id=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["months"][0], "2026-06");
+    assert_eq!(v["editable_months_count"], 2);
+    assert_eq!(v["jobs"].as_array().unwrap().len(), 1);
+    let job = &v["jobs"][0];
+    assert_eq!(job["month"], "2026-06");
+    assert_eq!(job["eigyosho_id"], 1);
+    assert_eq!(job["status"], "computed");
+    assert_eq!(job["row_count"], 2); // MockRepo の uriage_rows 2 行
+    assert_eq!(job["persisted_count_cal"], 1); // 青井のみ非ゼロ
+    assert_eq!(job["persisted_count_nocal"], 1);
+    assert!(job["fingerprint"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .all(|c| c.is_ascii_hexdigit()));
+    let raw_path = job["raw_path"].as_str().unwrap().to_string();
+    assert!(raw_path.ends_with("eigyosho-1.ndjson.gz"));
+    assert!(std::path::Path::new(&raw_path).exists());
+
+    // SQLite に cal=true / cal=false 両方 persist
+    let rows_cal = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+    let rows_nocal = store.get_person_monthly("2026-06", 1, false).await.unwrap();
+    assert_eq!(rows_cal.len(), 1);
+    assert_eq!(rows_nocal.len(), 1);
+
+    // recalc_jobs に記録
+    let rec = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+    assert_eq!(rec.status, "computed");
+    assert_eq!(
+        rec.fingerprint_after.as_deref(),
+        job["fingerprint"].as_str()
+    );
+    assert_eq!(rec.raw_path.as_deref(), Some(raw_path.as_str()));
+
+    // 後始末
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn recalc_no_month_processes_all_editable_all_offices() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    let (status, v) = post_recalc_path(app, "/api/uriage/recalc").await;
+    assert_eq!(status, StatusCode::OK);
+    let jobs = v["jobs"].as_array().unwrap();
+    // 1 ヶ月 × 2 営業所 = 2 jobs
+    assert_eq!(jobs.len(), 2);
+    let ids: Vec<i64> = jobs
+        .iter()
+        .map(|j| j["eigyosho_id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&9));
+    // 全 job が "computed"
+    for j in jobs {
+        assert_eq!(j["status"], "computed");
+    }
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn recalc_eigyosho_id_not_in_masters_returns_skipped() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // eigyosho_id=99 は masters に居ない → skipped
+    let (status, v) =
+        post_recalc_path(app, "/api/uriage/recalc?month=2026-06&eigyosho_id=99").await;
+    assert_eq!(status, StatusCode::OK);
+    let job = &v["jobs"][0];
+    assert_eq!(job["status"], "skipped");
+    assert_eq!(job["eigyosho_id"], 99);
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn recalc_sqlserver_error_records_failed() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::error_repo(), // pool error
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    let (status, v) = post_recalc_path(app, "/api/uriage/recalc?month=2026-06&eigyosho_id=1").await;
+    // 全体 HTTP は 200 (個別 job が failed)
+    assert_eq!(status, StatusCode::OK);
+    let job = &v["jobs"][0];
+    assert_eq!(job["status"], "failed");
+    assert!(job["error"].as_str().unwrap().contains("sqlserver"));
+    // recalc_jobs にも failed が記録される
+    let rec = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+    assert_eq!(rec.status, "failed");
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn recalc_same_fingerprint_keeps_r2_synced_at() {
+    // 1) recalc → r2_synced 記録 → 同 fingerprint で recalc 再実行 → r2_synced_at 維持
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    let (s1, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // r2_synced を明示記録
+    store
+        .record_r2_synced("2026-06", 1, "manual-sync-ts")
+        .await
+        .unwrap();
+    let rec1 = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+    assert_eq!(rec1.status, "r2_synced");
+    assert_eq!(rec1.r2_synced_at.as_deref(), Some("manual-sync-ts"));
+
+    // 2 回目 recalc (raw rows 不変 → fingerprint も同じ)
+    let (s2, _) = post_recalc_path(app, "/api/uriage/recalc?month=2026-06&eigyosho_id=1").await;
+    assert_eq!(s2, StatusCode::OK);
+    let rec2 = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+    // fingerprint が同じなので r2_synced_at は維持される (= 再送不要)
+    assert_eq!(rec2.r2_synced_at.as_deref(), Some("manual-sync-ts"));
+    assert_eq!(rec2.fingerprint_after, rec1.fingerprint_after);
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP endpoint test: R2 sync endpoints (Phase 2 PR-D)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn r2_pending_empty_when_nothing_computed() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/r2/pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["count"], 0);
+    assert_eq!(v["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn r2_pending_lists_after_recalc() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc 実行 → /r2/pending に 1 件出る
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/r2/pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["items"][0]["month"], "2026-06");
+    assert_eq!(v["items"][0]["eigyosho_id"], 1);
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn raw_get_returns_gz_bytes_after_recalc() {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc 実行
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // raw_get で bytes を取得
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/raw/2026-06/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res.headers().get("content-type").unwrap();
+    assert_eq!(ct, "application/gzip");
+    let cd = res.headers().get("content-disposition").unwrap();
+    assert!(cd
+        .to_str()
+        .unwrap()
+        .contains("2026-06-eigyosho-1.ndjson.gz"));
+
+    let bytes = to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
+    assert!(!bytes.is_empty());
+    // gunzip して NDJSON 行が含まれるか
+    let mut dec = GzDecoder::new(&bytes[..]);
+    let mut s = String::new();
+    dec.read_to_string(&mut s).unwrap();
+    assert!(s.contains("\"yokoyoko\""));
+    assert!(s.lines().count() >= 1);
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn raw_get_404_when_no_recalc() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/raw/2026-06/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn raw_ack_marks_synced_and_removes_from_pending() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc → /r2/pending に 1 件 → ack → /r2/pending 空
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
     let res = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/uriage/recalc")
-                .header("content-type", "application/json")
-                .body(json_body(body))
+                .uri("/api/uriage/raw/2026-06/1/ack")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY); // axum json deserialize fail
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["month"], "2026-06");
+    assert_eq!(v["eigyosho_id"], 1);
+    assert!(v["synced_at"].as_str().unwrap().contains('T'));
 
-    // 空 from
-    let body = json!({
-        "month": "2026-06", "from": "", "to": "2026-06-30",
-        "eigyosho_id": 1, "bumon": ["010"],
-        "persons": {}, "other": {}
-    });
-    let (status, _) = post_recalc(app.clone(), body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    // 空 bumon
-    let body = json!({
-        "month": "2026-06", "from": "2026-06-01", "to": "2026-06-30",
-        "eigyosho_id": 1, "bumon": [],
-        "persons": {}, "other": {}
-    });
-    let (status, _) = post_recalc(app, body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn recalc_pool_error_returns_503() {
-    let app = common::build_app(common::error_repo());
-    let (status, _) = post_recalc(app, recalc_body("2026-06", 1, true)).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-}
-
-#[tokio::test]
-async fn recalc_query_error_returns_500() {
-    let app = common::build_app(common::query_error_repo());
-    let (status, _) = post_recalc(app, recalc_body("2026-06", 1, true)).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn recalc_local_store_independent_instance() {
-    // build_app は新規 in-memory store を毎回作る → store は独立。
-    // 2 つの app は別の store を持つので互いの persist が見えない。
-    let store_a = Arc::new(LocalStore::open(":memory:").unwrap());
-    let store_b = Arc::new(LocalStore::open(":memory:").unwrap());
-    let app_a = common::build_app_with_store(common::mock_repo(), store_a.clone());
-    let app_b = common::build_app_with_store(common::mock_repo(), store_b.clone());
-
-    let (s, _) = post_recalc(app_a, recalc_body("2026-06", 1, true)).await;
-    assert_eq!(s, StatusCode::OK);
-
-    // store_a には入っているが store_b は空
-    assert_eq!(
-        store_a
-            .get_person_monthly("2026-06", 1, true)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(store_b
-        .get_person_monthly("2026-06", 1, true)
+    // /r2/pending は空に
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/r2/pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
-        .unwrap()
-        .is_empty());
+        .unwrap();
+    let bytes2 = to_bytes(res2.into_body(), 1024 * 1024).await.unwrap();
+    let v2: Value = serde_json::from_slice(&bytes2).unwrap();
+    assert_eq!(v2["count"], 0);
 
-    let _ = app_b; // suppress unused
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn raw_ack_404_when_no_computed_job() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/raw/2026-06/1/ack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
