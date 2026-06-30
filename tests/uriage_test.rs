@@ -270,6 +270,8 @@ fn golden_17_cases_cal_true() {
     let result = compute_person_sum(&rows, &persons, &other, true);
     let nz = non_zero(&result.sum);
 
+    // fixture17 の全行は横横=1 なので y0 系は 0 のままが期待値
+    // (..Default::default() で kingaku_y0/yosha_kingaku_y0/kensuu_y0 = 0)
     let expected: HashMap<String, PersonAccum> = [
         (
             "大石",
@@ -277,6 +279,7 @@ fn golden_17_cases_cal_true() {
                 yosha_kingaku: 20031,
                 kingaku: 20031,
                 kensuu: 2,
+                ..Default::default()
             },
         ),
         (
@@ -285,6 +288,7 @@ fn golden_17_cases_cal_true() {
                 yosha_kingaku: 90059,
                 kingaku: 90059,
                 kensuu: 9,
+                ..Default::default()
             },
         ),
         (
@@ -293,6 +297,7 @@ fn golden_17_cases_cal_true() {
                 yosha_kingaku: 20020,
                 kingaku: 20020,
                 kensuu: 2,
+                ..Default::default()
             },
         ),
     ]
@@ -317,6 +322,7 @@ fn golden_17_cases_cal_false() {
                 yosha_kingaku: 60041,
                 kingaku: 60041,
                 kensuu: 6,
+                ..Default::default()
             },
         ),
         (
@@ -325,6 +331,7 @@ fn golden_17_cases_cal_false() {
                 yosha_kingaku: 10006,
                 kingaku: 10006,
                 kensuu: 1,
+                ..Default::default()
             },
         ),
     ]
