@@ -955,17 +955,33 @@ impl AppRepo for TiberiusRepo {
             .collect::<Vec<_>>()
             .join(",");
 
-        // PHP UriageJyuchuDisplayController setup_dir 由来の SELECT を 1:1 で写経。
-        // - WHERE は (請求K,備考2) の 3 経路 OR
-        // - 品名N の調整行 / 得意先C='000002' を除外
-        // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)
-        // - 社員ﾏｽﾀ.社員R を 入力担当C で JOIN
-        // 横横 / 請求K / 入力担当C は DB schema が varchar の可能性があるため
-        // 明示 CAST で int に揃える (失敗時は NULL → ISNULL で 0)。これらの数値化は
-        // tiberius の get_i32 でも吸収できるが、SQL 側で揃える方がエラー時の挙動が予測可能。
+        // PHP `UriageJyuchuDisplayController` setup_dir 由来の SELECT を再現。
+        //
+        // PHP は make_yosha_sql / sql_from_other / sql_from_other_with_bumon + make_array
+        // の 3〜5 本クエリを実行して結果を UNION し、コード側で `横横` フラグを
+        // 付与する構造。Rust では同等の row set を **単一クエリ + CASE WHEN** で
+        // 表現するため、以下の点を踏襲する:
+        //
+        // - **`横横` は DB 列ではなく PHP 派生フラグ** (確認済、user 報告 2026-06-30)。
+        //   `(受注部門 IN bumon) AND (稼動部門 NOT IN bumon)` を満たす行は 横横=1、
+        //   それ以外 (`稼動 IN bumon` 系) は 0。SELECT で CASE WHEN で算出する。
+        // - **WHERE は PHP 全クエリの行集合の superset** とし、`compute_person_sum`
+        //   側の skip ルール (`請求K=1 AND 備考2='請求のみ'`) で誤検出を除く:
+        //     (受注 IN bumon OR 稼動 IN bumon)
+        // - **品名N の調整行除外は全角スペース** (U+3000)。半角だと NOT IN が一致せず
+        //   調整行が混入し金額がズレる (user 報告 2026-06-30)。
+        // - **`日報K != 3` を追加** (PHP make_yosha_sql 1710 行)。
+        // - **`請求K=2 → 備考2='表示' or LIKE '売上%'`** (PHP 1712 / 1738 行)。
+        // - `得意先C != '000002'` は PHP に無いため除去。
+        // - 社員ﾏｽﾀ.社員R を 入力担当C で JOIN。
+        // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)。
+        // - 請求K / 入力担当C は DB schema が varchar の可能性があるため `TRY_CAST(... AS INT)`
+        //   で int に揃える (失敗時は NULL → ISNULL で 0)。
         let query = format!(
             "SELECT \
-                 ISNULL(TRY_CAST(t.[横横] AS INT), 0), \
+                 CASE WHEN t.[受注部門] IN ({in_clause}) \
+                            AND t.[稼動部門] NOT IN ({in_clause}) \
+                      THEN 1 ELSE 0 END AS [横横], \
                  ISNULL(TRY_CAST(t.[請求K] AS INT), 0), \
                  ISNULL(t.[備考2], ''), \
                  ISNULL(TRY_CAST(t.[入力担当C] AS INT), 0), \
@@ -982,15 +998,14 @@ impl AppRepo for TiberiusRepo {
                  ISNULL(t.[傭車先C], '000000') \
              FROM [運転日報明細] t \
              LEFT JOIN [社員ﾏｽﾀ] e ON e.[社員C] = t.[入力担当C] \
-             WHERE t.[受注部門] IN ({}) \
-               AND t.[品名N] NOT IN ('※ 請求一括調整明細 ※', '※ 傭車一括調整明細 ※') \
-               AND t.[得意先C] != '000002' \
-               AND ((t.[請求K] = '2' AND t.[備考2] = '売上') \
-                    OR (t.[請求K] = '1' AND t.[備考2] = '') \
-                    OR (t.[請求K] = '0')) \
+             WHERE (t.[受注部門] IN ({in_clause}) OR t.[稼動部門] IN ({in_clause})) \
+               AND t.[品名N] NOT IN ('※\u{3000}請求一括調整明細\u{3000}※', '※\u{3000}傭車一括調整明細\u{3000}※') \
+               AND ISNULL(t.[日報K], 0) != 3 \
+               AND NOT (t.[請求K] = '1' AND t.[備考2] = '請求のみ') \
+               AND (t.[請求K] != '2' OR t.[備考2] = '表示' OR t.[備考2] LIKE '売上%') \
                AND t.[運行年月日] >= @P1 AND t.[運行年月日] <= @P2 \
              ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC",
-            in_clause
+            in_clause = in_clause
         );
 
         let stream = conn
