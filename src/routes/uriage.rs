@@ -106,7 +106,11 @@ pub struct CalTotal {
 }
 
 /// 担当者ごとの集計値。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` を持つのは `/verify` endpoint で PHP `print-json.sum` を
+/// `HashMap<String, PersonAccum>` に parse するため。serde の field 名は
+/// 日本語 (PHP 側 JSON キーと一致) なので Deserialize でもこの rename が効く。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersonAccum {
     /// 傭車金額累計 (`傭車金額 + 傭車値引 + 傭車割増 + 傭車実費`)。
     #[serde(rename = "傭車金額")]
@@ -1215,6 +1219,205 @@ pub async fn admin_rebuild(
     Ok(Json(AdminRebuildResponse {
         rebuilt_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/verify
+//   PHP print-json vs Rust by-person を単日 × 営業所 × cal で 1:1 diff
+//   (Phase 1 検証、shell の verify_uriage_diff_php_vs_rust.sh を rust 内製化)
+// ══════════════════════════════════════════════════════════════
+
+/// `/api/uriage/verify` のクエリパラメータ。
+///
+/// shell script (`scripts/verify_uriage_diff_php_vs_rust.sh`) が呼ぶ単日 × 営業所
+/// × cal の 1 単位を rust 内製の HTTP endpoint に化けたもの。nuxt UI が大量の
+/// 組み合わせを iterate する想定。
+#[derive(Debug, Deserialize)]
+pub struct VerifyQuery {
+    /// 営業所 id (`masters-json.offices` のキー)
+    pub id: i64,
+    /// 運行年月日 (`YYYY-MM-DD`、単日)
+    pub date: String,
+    /// `true` で別営業所合算 (PHP 既定)、`false` で除外モード
+    #[serde(default = "default_cal")]
+    pub cal: bool,
+}
+
+/// PHP `$sum` と Rust 集計の差分。
+///
+/// `php_only`: PHP にあって rust と値が違う、または rust に無い entry
+/// `rust_only`: 逆
+#[derive(Debug, Serialize)]
+pub struct VerifyDiff {
+    pub php_only: HashMap<String, PersonAccum>,
+    pub rust_only: HashMap<String, PersonAccum>,
+}
+
+/// `/api/uriage/verify` のレスポンス。
+#[derive(Debug, Serialize)]
+pub struct VerifyResponse {
+    pub office_id: i64,
+    pub date: String,
+    pub cal: bool,
+    pub php_sum: HashMap<String, PersonAccum>,
+    pub rust_sum: HashMap<String, PersonAccum>,
+    /// 差分なし (= 一致) なら `null`
+    pub diff: Option<VerifyDiff>,
+    /// `diff is None` と同等
+    pub ok: bool,
+    /// Rust 側 SELECT 行数 (debug 用)
+    pub row_count: usize,
+    pub elapsed_ms: u64,
+}
+
+/// GET `/api/uriage/verify?id=N&date=YYYY-MM-DD&cal=true|false`
+///
+/// 内部で:
+/// 1. CakePHP `/masters-json?date=...` を pull (`persons`/`other`/`bumon`)
+/// 2. CakePHP `/print-json?id=N&date=...[&cal=cal]` を pull (PHP `$sum`)
+/// 3. SQL Server `uriage_rows(date, date, bumon)` で行取得 → `compute_person_sum`
+/// 4. PHP `$sum` と Rust `$sum` を 0 entry を除外して 1:1 diff
+///
+/// shell の `verify_uriage_diff_php_vs_rust.sh` を「1 (date, office, cal) 単位」で
+/// HTTP endpoint 化したもの。nuxt UI が並列 iterate する想定。
+pub async fn verify(
+    Extension(repo): Extension<DynRepo>,
+    Extension(cakephp): Extension<Arc<CakephpClient>>,
+    Query(q): Query<VerifyQuery>,
+) -> Result<Json<VerifyResponse>, (StatusCode, String)> {
+    let started = std::time::Instant::now();
+
+    if !cakephp.is_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CakePHP base_url 未設定: /verify は無効".to_string(),
+        ));
+    }
+    if q.date.len() != 10 || !q.date.as_bytes().iter().all(|b| b.is_ascii()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("date 形式不正 (YYYY-MM-DD): {}", q.date),
+        ));
+    }
+
+    // 1. CakePHP masters (date= 検証対象日)
+    let masters = cakephp
+        .fetch_masters(&q.date)
+        .await
+        .map_err(map_cakephp_err)?;
+    let office = office_lookup(&masters, q.id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("office_id={} は masters に無い", q.id),
+        )
+    })?;
+    let persons = office.persons_as_int_map();
+    let other = office.other.clone();
+    let bumon = office.bumon.clone();
+    if bumon.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("office_id={} の受注部門 (bumon) が空", q.id),
+        ));
+    }
+
+    // 2. CakePHP print-json (PHP $sum)
+    let php_resp = cakephp
+        .fetch_print_json(q.id, &q.date, q.cal)
+        .await
+        .map_err(map_cakephp_err)?;
+    let php_sum = parse_php_sum(&php_resp.sum)?;
+
+    // 3. Rust SELECT + compute_person_sum (from=to=同一日 の単日)
+    let rows = repo
+        .uriage_rows(&q.date, &q.date, &bumon)
+        .await
+        .map_err(|e| {
+            let st = map_repo_err(e);
+            (
+                st,
+                format!("SQL Server fetch failed (status={})", st.as_u16()),
+            )
+        })?;
+    let row_count = rows.len();
+    let rust_sum = compute_person_sum(&rows, &persons, &other, q.cal).sum;
+
+    // 4. shell の jq logic 相当: 0 のみ entry を除外して 1:1 diff
+    let diff = compute_verify_diff(&php_sum, &rust_sum);
+    let ok = diff.is_none();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    Ok(Json(VerifyResponse {
+        office_id: q.id,
+        date: q.date,
+        cal: q.cal,
+        php_sum,
+        rust_sum,
+        diff,
+        ok,
+        row_count,
+        elapsed_ms,
+    }))
+}
+
+/// `PrintJsonResponse.sum` (= `serde_json::Value`) → `HashMap<String, PersonAccum>` 変換。
+/// 空 object / null は空 map を返す (PHP 側で対象データが無い日)。
+fn parse_php_sum(
+    v: &serde_json::Value,
+) -> Result<HashMap<String, PersonAccum>, (StatusCode, String)> {
+    if v.is_null() {
+        return Ok(HashMap::new());
+    }
+    serde_json::from_value::<HashMap<String, PersonAccum>>(v.clone()).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("PHP print-json sum parse failed: {e}"),
+        )
+    })
+}
+
+/// shell の jq logic を写経した diff 計算:
+/// 1. 両側で「金額/傭車金額/件数 が全て 0」の entry を除外
+/// 2. キー集合と各値が一致するか比較し、不一致なら php_only / rust_only に振り分け
+/// 3. 完全一致なら `None`
+fn compute_verify_diff(
+    php: &HashMap<String, PersonAccum>,
+    rust: &HashMap<String, PersonAccum>,
+) -> Option<VerifyDiff> {
+    fn is_nonzero(a: &PersonAccum) -> bool {
+        a.kingaku != 0 || a.yosha_kingaku != 0 || a.kensuu != 0
+    }
+
+    let php_nz: HashMap<String, PersonAccum> = php
+        .iter()
+        .filter(|(_, v)| is_nonzero(v))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let rust_nz: HashMap<String, PersonAccum> = rust
+        .iter()
+        .filter(|(_, v)| is_nonzero(v))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
+    let php_only: HashMap<String, PersonAccum> = php_nz
+        .iter()
+        .filter(|(k, v)| rust_nz.get(*k).copied() != Some(**v))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let rust_only: HashMap<String, PersonAccum> = rust_nz
+        .iter()
+        .filter(|(k, v)| php_nz.get(*k).copied() != Some(**v))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
+    if php_only.is_empty() && rust_only.is_empty() {
+        None
+    } else {
+        Some(VerifyDiff {
+            php_only,
+            rust_only,
+        })
+    }
 }
 
 /// `preg_replace("/売上　|売上\s/", "", $str)` の写経。

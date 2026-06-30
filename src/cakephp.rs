@@ -100,6 +100,17 @@ pub struct EditableMonthsResponse {
     pub editable_months: Vec<String>,
 }
 
+/// `/uriage-jyuchu-display/print-json` のレスポンス (検証用に使う `.sum` のみ抽出)。
+///
+/// PHP テンプレ由来の単日 (date) × 営業所 (id) × cal の `$sum` を JSON 化したもの。
+/// 担当者名 → `{ 金額, 傭車金額, 件数 }` の map。verify endpoint で Rust 側 sum と
+/// 1:1 比較する。他のフィールド (例: meta) は無視 (serde default)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrintJsonResponse {
+    #[serde(default)]
+    pub sum: serde_json::Value,
+}
+
 /// CakePHP fetch client。
 ///
 /// `base_url` 空文字なら NotConfigured を返す。
@@ -146,6 +157,39 @@ impl CakephpClient {
             "{}/uriage-jyuchu-display/editable-months",
             self.base_url.trim_end_matches('/')
         );
+        self.get_json(&url).await
+    }
+
+    /// `/uriage-jyuchu-display/print-json?id=N&date=YYYY-MM-DD[&cal=cal]`
+    ///
+    /// 単日 × 営業所 × cal の PHP `$sum` を pull (検証 endpoint 用)。`cal=true` (=
+    /// 別営業所合算、PHP の既定) なら `cal` パラメータを送らず、`cal=false` のとき
+    /// だけ `cal=cal` を付ける (shell の verify script と同じ慣習)。
+    pub async fn fetch_print_json(
+        &self,
+        id: i64,
+        date: &str,
+        cal: bool,
+    ) -> Result<PrintJsonResponse, CakephpError> {
+        if !self.is_enabled() {
+            return Err(CakephpError::NotConfigured);
+        }
+        let base = self.base_url.trim_end_matches('/');
+        let url = if cal {
+            format!(
+                "{}/uriage-jyuchu-display/print-json?id={}&date={}",
+                base,
+                id,
+                urlencode(date)
+            )
+        } else {
+            format!(
+                "{}/uriage-jyuchu-display/print-json?id={}&date={}&cal=cal",
+                base,
+                id,
+                urlencode(date)
+            )
+        };
         self.get_json(&url).await
     }
 
