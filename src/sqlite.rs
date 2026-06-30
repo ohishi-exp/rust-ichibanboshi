@@ -67,6 +67,11 @@ pub struct PersonDailyRow {
 
 /// `recalc_jobs` 1 行。`status` 遷移: `queued → computing → computed → r2_synced`。
 /// 失敗時は `status='failed' + last_error`。
+///
+/// `verified_*` は `verify_coverage` view 経由で LEFT JOIN した verify 集計
+/// (= 当該 (month, eigyosho_id) の verify_jobs 行数)。verify 未走行は 0 / 0 / 0。
+/// UI 側で `expected_count = days_in_month × 2 cal` と突合して
+/// 「全件 verify 済み / 一部のみ / 未走行」を判定する。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecalcJob {
     pub month: String,
@@ -79,6 +84,9 @@ pub struct RecalcJob {
     pub computed_at: Option<String>,
     pub r2_synced_at: Option<String>,
     pub last_error: Option<String>,
+    pub verified_count: i64,
+    pub verified_ok: i64,
+    pub verified_ng: i64,
 }
 
 /// `r2_pending` view の 1 行 (R2 へ送信すべき 月×営業所)。
@@ -574,11 +582,18 @@ impl LocalStore {
             let guard = futures_lock(&conn);
             let mut stmt = guard
                 .prepare(
-                    "SELECT month, eigyosho_id, status, fingerprint_before, fingerprint_after, \
-                            raw_path, created_at, computed_at, r2_synced_at, last_error \
-                     FROM recalc_jobs \
-                     WHERE month BETWEEN ?1 AND ?2 \
-                     ORDER BY month ASC, eigyosho_id ASC",
+                    "SELECT rj.month, rj.eigyosho_id, rj.status, \
+                            rj.fingerprint_before, rj.fingerprint_after, \
+                            rj.raw_path, rj.created_at, rj.computed_at, \
+                            rj.r2_synced_at, rj.last_error, \
+                            COALESCE(vc.verified_count, 0), \
+                            COALESCE(vc.verified_ok,    0), \
+                            COALESCE(vc.verified_ng,    0) \
+                     FROM recalc_jobs rj \
+                     LEFT JOIN verify_coverage vc \
+                       ON vc.month = rj.month AND vc.eigyosho_id = rj.eigyosho_id \
+                     WHERE rj.month BETWEEN ?1 AND ?2 \
+                     ORDER BY rj.month ASC, rj.eigyosho_id ASC",
                 )
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             let rows = stmt
@@ -594,6 +609,9 @@ impl LocalStore {
                         computed_at: r.get(7)?,
                         r2_synced_at: r.get(8)?,
                         last_error: r.get(9)?,
+                        verified_count: r.get(10)?,
+                        verified_ok: r.get(11)?,
+                        verified_ng: r.get(12)?,
                     })
                 })
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
@@ -617,10 +635,17 @@ impl LocalStore {
             let guard = futures_lock(&conn);
             let mut stmt = guard
                 .prepare(
-                    "SELECT month, eigyosho_id, status, fingerprint_before, fingerprint_after, \
-                            raw_path, created_at, computed_at, r2_synced_at, last_error \
-                     FROM recalc_jobs \
-                     WHERE month = ?1 AND eigyosho_id = ?2",
+                    "SELECT rj.month, rj.eigyosho_id, rj.status, \
+                            rj.fingerprint_before, rj.fingerprint_after, \
+                            rj.raw_path, rj.created_at, rj.computed_at, \
+                            rj.r2_synced_at, rj.last_error, \
+                            COALESCE(vc.verified_count, 0), \
+                            COALESCE(vc.verified_ok,    0), \
+                            COALESCE(vc.verified_ng,    0) \
+                     FROM recalc_jobs rj \
+                     LEFT JOIN verify_coverage vc \
+                       ON vc.month = rj.month AND vc.eigyosho_id = rj.eigyosho_id \
+                     WHERE rj.month = ?1 AND rj.eigyosho_id = ?2",
                 )
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             let row = stmt
@@ -636,6 +661,9 @@ impl LocalStore {
                         computed_at: r.get(7)?,
                         r2_synced_at: r.get(8)?,
                         last_error: r.get(9)?,
+                        verified_count: r.get(10)?,
+                        verified_ok: r.get(11)?,
+                        verified_ng: r.get(12)?,
                     })
                 })
                 .optional()
@@ -1392,6 +1420,94 @@ mod tests {
         let job = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
         assert_eq!(job.status, "failed");
         assert_eq!(job.last_error.as_deref(), Some("sqlserver timeout"));
+    }
+
+    #[tokio::test]
+    async fn list_recalc_jobs_joins_verify_coverage() {
+        // recalc 1 件 + verify 3 件 (うち 1 件 NG) で aggregate 結果を確認
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .record_recalc_computed(
+                "2026-06",
+                5,
+                "fp1",
+                Some("/tmp/r.gz"),
+                "2026-06-30T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        // 3 件: (06-01, cal=false, ok), (06-01, cal=true, ok), (06-02, cal=false, ng)
+        store
+            .upsert_verify_job(
+                "2026-06-01",
+                5,
+                false,
+                true,
+                None,
+                None,
+                10,
+                42,
+                "2026-06-30T00:00:01Z",
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_verify_job(
+                "2026-06-01",
+                5,
+                true,
+                true,
+                None,
+                None,
+                7,
+                33,
+                "2026-06-30T00:00:02Z",
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_verify_job(
+                "2026-06-02",
+                5,
+                false,
+                false,
+                None,
+                Some("{\"diff\":1}"),
+                10,
+                40,
+                "2026-06-30T00:00:03Z",
+            )
+            .await
+            .unwrap();
+
+        let jobs = store.list_recalc_jobs("2026-06", "2026-06").await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        let j = &jobs[0];
+        assert_eq!(j.eigyosho_id, 5);
+        assert_eq!(j.verified_count, 3);
+        assert_eq!(j.verified_ok, 2);
+        assert_eq!(j.verified_ng, 1);
+    }
+
+    #[tokio::test]
+    async fn list_recalc_jobs_returns_zero_for_unverified() {
+        // verify_jobs に 1 件も無い時は 0 / 0 / 0 (LEFT JOIN + COALESCE)
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .record_recalc_computed(
+                "2026-06",
+                1,
+                "fp1",
+                Some("/tmp/r.gz"),
+                "2026-06-30T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let jobs = store.list_recalc_jobs("2026-06", "2026-06").await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].verified_count, 0);
+        assert_eq!(jobs[0].verified_ok, 0);
+        assert_eq!(jobs[0].verified_ng, 0);
     }
 
     #[tokio::test]
