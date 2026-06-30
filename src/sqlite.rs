@@ -82,6 +82,9 @@ pub struct RecalcJob {
 }
 
 /// `r2_pending` view の 1 行 (R2 へ送信すべき 月×営業所)。
+///
+/// 2026-06-30 (`verify_jobs` 導入) で verify coverage の summary を同居。
+/// `ready=true` のみ R2 sync 対象、`blocker` は scenairo (unverified/ng_present) を示す。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct R2PendingRow {
     pub month: String,
@@ -89,6 +92,27 @@ pub struct R2PendingRow {
     pub raw_path: String,
     pub fingerprint_after: String,
     pub computed_at: String,
+    /// verify_jobs に存在する (date, cal) 行数 (全 cal flag 合計)
+    pub verified_count: i64,
+    /// verify_jobs.ok = 1 の行数
+    pub verified_ok: i64,
+    /// verify_jobs.ok = 0 の行数
+    pub verified_ng: i64,
+}
+
+/// `verify_jobs` table の 1 行 (検証履歴)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifyJobRow {
+    pub unko_date: String,
+    pub eigyosho_id: i64,
+    pub cal: i64, // 0 / 1
+    pub month: String,
+    pub ok: i64,
+    pub skipped_reason: Option<String>,
+    pub diff_json: Option<String>,
+    pub row_count: i64,
+    pub elapsed_ms: i64,
+    pub ran_at: String,
 }
 
 /// SQLite local store (Phase 2、担当者別売上 summary)。
@@ -193,17 +217,61 @@ impl LocalStore {
             CREATE INDEX IF NOT EXISTS idx_rj_status
                 ON recalc_jobs (status);
 
+            -- 検証履歴 (verify endpoint が upsert する。Refs #762 R2 sync gate)。
+            -- (unko_date, eigyosho_id, cal) で UPSERT。再 verify すると上書き、
+            -- 履歴の累積は持たない (= 「最新の検証結果」が SoT)。
+            -- diff_json は ng 時の {"php_only":..., "rust_only":...} を文字列保存。
+            CREATE TABLE IF NOT EXISTS verify_jobs (
+                unko_date         TEXT    NOT NULL,
+                eigyosho_id       INTEGER NOT NULL,
+                cal               INTEGER NOT NULL,
+                month             TEXT    NOT NULL,
+                ok                INTEGER NOT NULL,
+                skipped_reason    TEXT,
+                diff_json         TEXT,
+                row_count         INTEGER NOT NULL,
+                elapsed_ms        INTEGER NOT NULL,
+                ran_at            TEXT    NOT NULL,
+                PRIMARY KEY (unko_date, eigyosho_id, cal)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vj_month_eigyosho
+                ON verify_jobs (month, eigyosho_id);
+            CREATE INDEX IF NOT EXISTS idx_vj_ran_at
+                ON verify_jobs (ran_at DESC);
+
+            -- (month, eigyosho_id) ごとの verify 集計 view。R2 sync gate の判定用。
+            CREATE VIEW IF NOT EXISTS verify_coverage AS
+            SELECT month,
+                   eigyosho_id,
+                   COUNT(*)                                AS verified_count,
+                   SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS verified_ok,
+                   SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS verified_ng
+            FROM verify_jobs
+            GROUP BY month, eigyosho_id;
+
+            -- r2_pending: 「R2 同期候補」 view。verify_coverage を LEFT JOIN し、
+            -- caller (nuxt) が「(month の日数) × 2 cal」と verified_count を比較して
+            -- ready を判定できるようにする。verified_ng>0 は ng_present で gate される。
             CREATE VIEW IF NOT EXISTS r2_pending AS
-            SELECT month, eigyosho_id, raw_path, fingerprint_after, computed_at
-            FROM recalc_jobs
-            WHERE status = 'computed'
-              AND r2_synced_at IS NULL
-              AND raw_path IS NOT NULL
+            SELECT rj.month,
+                   rj.eigyosho_id,
+                   rj.raw_path,
+                   rj.fingerprint_after,
+                   rj.computed_at,
+                   COALESCE(vc.verified_count, 0) AS verified_count,
+                   COALESCE(vc.verified_ok,    0) AS verified_ok,
+                   COALESCE(vc.verified_ng,    0) AS verified_ng
+            FROM recalc_jobs rj
+            LEFT JOIN verify_coverage vc
+              ON vc.month = rj.month AND vc.eigyosho_id = rj.eigyosho_id
+            WHERE rj.status = 'computed'
+              AND rj.r2_synced_at IS NULL
+              AND rj.raw_path IS NOT NULL
               AND (
-                  fingerprint_before IS NULL
-                  OR fingerprint_before != fingerprint_after
+                  rj.fingerprint_before IS NULL
+                  OR rj.fingerprint_before != rj.fingerprint_after
               )
-            ORDER BY computed_at ASC;
+            ORDER BY rj.computed_at ASC;
             "#,
         )
         .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
@@ -572,13 +640,15 @@ impl LocalStore {
     }
 
     /// `r2_pending` view を読む (fingerprint 変化あり & 未送信の (month, eigyosho_id))。
+    /// verify_jobs 由来の coverage を同梱して返す (Refs #762 R2 sync gate)。
     pub async fn list_r2_pending(&self) -> Result<Vec<R2PendingRow>, LocalStoreError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let mut stmt = guard
                 .prepare(
-                    "SELECT month, eigyosho_id, raw_path, fingerprint_after, computed_at \
+                    "SELECT month, eigyosho_id, raw_path, fingerprint_after, computed_at, \
+                            verified_count, verified_ok, verified_ng \
                      FROM r2_pending",
                 )
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
@@ -590,12 +660,139 @@ impl LocalStore {
                         raw_path: r.get(2)?,
                         fingerprint_after: r.get(3)?,
                         computed_at: r.get(4)?,
+                        verified_count: r.get(5)?,
+                        verified_ok: r.get(6)?,
+                        verified_ng: r.get(7)?,
                     })
                 })
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             Ok::<Vec<R2PendingRow>, LocalStoreError>(rows)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `verify_jobs` に 1 行 UPSERT。primary key = (unko_date, eigyosho_id, cal)。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_verify_job(
+        &self,
+        unko_date: &str,
+        eigyosho_id: i64,
+        cal: bool,
+        ok: bool,
+        skipped_reason: Option<&str>,
+        diff_json: Option<&str>,
+        row_count: i64,
+        elapsed_ms: i64,
+        ran_at: &str,
+    ) -> Result<(), LocalStoreError> {
+        let unko_date = unko_date.to_string();
+        let month = if unko_date.len() >= 7 {
+            unko_date[0..7].to_string()
+        } else {
+            return Err(LocalStoreError::QueryError(format!(
+                "unko_date が短すぎる (YYYY-MM-DD 形式必要): {unko_date}"
+            )));
+        };
+        let cal_int: i64 = if cal { 1 } else { 0 };
+        let ok_int: i64 = if ok { 1 } else { 0 };
+        let skipped_reason = skipped_reason.map(|s| s.to_string());
+        let diff_json = diff_json.map(|s| s.to_string());
+        let ran_at = ran_at.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            guard
+                .execute(
+                    "INSERT INTO verify_jobs \
+                         (unko_date, eigyosho_id, cal, month, ok, skipped_reason, \
+                          diff_json, row_count, elapsed_ms, ran_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                     ON CONFLICT(unko_date, eigyosho_id, cal) DO UPDATE SET \
+                         month          = excluded.month, \
+                         ok             = excluded.ok, \
+                         skipped_reason = excluded.skipped_reason, \
+                         diff_json      = excluded.diff_json, \
+                         row_count      = excluded.row_count, \
+                         elapsed_ms     = excluded.elapsed_ms, \
+                         ran_at         = excluded.ran_at",
+                    params![
+                        unko_date,
+                        eigyosho_id,
+                        cal_int,
+                        month,
+                        ok_int,
+                        skipped_reason,
+                        diff_json,
+                        row_count,
+                        elapsed_ms,
+                        ran_at,
+                    ],
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<(), LocalStoreError>(())
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `verify_jobs` を範囲指定で取得 (履歴一覧用)。
+    /// `eigyosho_id` を指定すれば絞り込み、空なら全営業所。
+    pub async fn list_verify_jobs(
+        &self,
+        from: &str,
+        to: &str,
+        eigyosho_id: Option<i64>,
+    ) -> Result<Vec<VerifyJobRow>, LocalStoreError> {
+        let from = from.to_string();
+        let to = to.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) =
+                if let Some(eid) = eigyosho_id {
+                    (
+                        "SELECT unko_date, eigyosho_id, cal, month, ok, skipped_reason, \
+                            diff_json, row_count, elapsed_ms, ran_at \
+                     FROM verify_jobs \
+                     WHERE unko_date BETWEEN ?1 AND ?2 AND eigyosho_id = ?3 \
+                     ORDER BY unko_date ASC, eigyosho_id ASC, cal ASC",
+                        vec![from.into(), to.into(), eid.into()],
+                    )
+                } else {
+                    (
+                        "SELECT unko_date, eigyosho_id, cal, month, ok, skipped_reason, \
+                            diff_json, row_count, elapsed_ms, ran_at \
+                     FROM verify_jobs \
+                     WHERE unko_date BETWEEN ?1 AND ?2 \
+                     ORDER BY unko_date ASC, eigyosho_id ASC, cal ASC",
+                        vec![from.into(), to.into()],
+                    )
+                };
+            let mut stmt = guard
+                .prepare(sql)
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params_vec), |r| {
+                    Ok(VerifyJobRow {
+                        unko_date: r.get(0)?,
+                        eigyosho_id: r.get(1)?,
+                        cal: r.get(2)?,
+                        month: r.get(3)?,
+                        ok: r.get(4)?,
+                        skipped_reason: r.get(5)?,
+                        diff_json: r.get(6)?,
+                        row_count: r.get(7)?,
+                        elapsed_ms: r.get(8)?,
+                        ran_at: r.get(9)?,
+                    })
+                })
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<Vec<VerifyJobRow>, LocalStoreError>(rows)
         })
         .await
         .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
@@ -690,7 +887,9 @@ impl LocalStore {
                 .execute_batch(
                     r#"
                     DROP VIEW  IF EXISTS r2_pending;
+                    DROP VIEW  IF EXISTS verify_coverage;
                     DROP VIEW  IF EXISTS uriage_person_monthly;
+                    DROP TABLE IF EXISTS verify_jobs;
                     DROP TABLE IF EXISTS recalc_jobs;
                     DROP TABLE IF EXISTS uriage_person_daily;
                     "#,

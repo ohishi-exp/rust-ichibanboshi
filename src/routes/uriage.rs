@@ -982,22 +982,98 @@ fn office_lookup(masters: &MastersResponse, eigyosho_id: i64) -> Option<&OfficeM
 /// GET `/api/uriage/r2/pending`
 ///
 /// `r2_pending` view を返す (fingerprint 変化があったが R2 未送信の (month, eigyosho_id))。
-/// nuxt cron が叩いて、結果の各 entry の `/raw/:month/:eigyosho_id` を fetch → R2 put →
-/// `/raw/:month/:eigyosho_id/ack` を順に叩く。
+/// 2026-06-30 以降は **verify_jobs 由来の gate** を同梱:
+/// - `expected_count` = month の日数 × 2 cal
+/// - `ready` = `verified_count >= expected_count` AND `verified_ng == 0`
+/// - `blocker` = `"ng_present"` (NG あり) | `"unverified"` (cells 不足) | `None`
+///
+/// nuxt cron は `ready=true` の bucket のみ /raw + /ack を叩き、`unverified` なら
+/// 先に /verify を iterate してから retry する (Refs #762)。
 pub async fn r2_pending(
     Extension(store): Extension<DynLocalStore>,
 ) -> Result<Json<R2PendingResponse>, StatusCode> {
     let rows = store.list_r2_pending().await.map_err(map_local_store_err)?;
+    let items: Vec<R2PendingItem> = rows.into_iter().map(annotate_r2_pending).collect();
     Ok(Json(R2PendingResponse {
-        count: rows.len(),
-        items: rows,
+        count: items.len(),
+        items,
     }))
+}
+
+/// `r2_pending` row に verify gate (`expected_count` / `ready` / `blocker`) を付与する。
+fn annotate_r2_pending(row: crate::sqlite::R2PendingRow) -> R2PendingItem {
+    let expected_count = days_in_month(&row.month)
+        .map(|d| (d as i64) * 2)
+        .unwrap_or(0);
+    let (ready, blocker) = if row.verified_ng > 0 {
+        (false, Some("ng_present".to_string()))
+    } else if expected_count > 0 && row.verified_count < expected_count {
+        (false, Some("unverified".to_string()))
+    } else if expected_count == 0 {
+        // month 形式不正 (理論上ありえないが防御): unverified 扱い
+        (false, Some("unverified".to_string()))
+    } else {
+        (true, None)
+    };
+    R2PendingItem {
+        month: row.month,
+        eigyosho_id: row.eigyosho_id,
+        raw_path: row.raw_path,
+        fingerprint_after: row.fingerprint_after,
+        computed_at: row.computed_at,
+        verified_count: row.verified_count,
+        verified_ok: row.verified_ok,
+        verified_ng: row.verified_ng,
+        expected_count,
+        ready,
+        blocker,
+    }
+}
+
+/// YYYY-MM → その月の日数 (28-31)。形式不正なら `None`。
+fn days_in_month(month: &str) -> Option<u32> {
+    use chrono::Datelike;
+    if month.len() != 7 || month.as_bytes()[4] != b'-' {
+        return None;
+    }
+    let year: i32 = month[..4].parse().ok()?;
+    let m: u32 = month[5..].parse().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    let next = if m == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, m + 1, 1)?
+    };
+    let last = next.pred_opt()?;
+    Some(last.day())
 }
 
 #[derive(Debug, Serialize)]
 pub struct R2PendingResponse {
     pub count: usize,
-    pub items: Vec<crate::sqlite::R2PendingRow>,
+    pub items: Vec<R2PendingItem>,
+}
+
+/// `/r2/pending` の 1 entry。SQLite の `R2PendingRow` に verify gate (expected_count /
+/// ready / blocker) を付与した形。
+#[derive(Debug, Serialize)]
+pub struct R2PendingItem {
+    pub month: String,
+    pub eigyosho_id: i64,
+    pub raw_path: String,
+    pub fingerprint_after: String,
+    pub computed_at: String,
+    pub verified_count: i64,
+    pub verified_ok: i64,
+    pub verified_ng: i64,
+    /// 月の日数 × 2 cal (= 完全 verify を満たす期待 cell 数)
+    pub expected_count: i64,
+    /// `true` なら caller は /raw + /ack を進めて良い
+    pub ready: bool,
+    /// `Some("ng_present" | "unverified")` なら blocker。`None` = `ready`
+    pub blocker: Option<String>,
 }
 
 /// GET `/api/uriage/raw/:month/:eigyosho_id`
@@ -1281,11 +1357,13 @@ pub struct VerifyResponse {
 /// 2. CakePHP `/print-json?id=N&date=...[&cal=cal]` を pull (PHP `$sum`)
 /// 3. SQL Server `uriage_rows(date, date, bumon)` で行取得 → `compute_person_sum`
 /// 4. PHP `$sum` と Rust `$sum` を 0 entry を除外して 1:1 diff
+/// 5. 結果を `verify_jobs` table に UPSERT (PK: unko_date, eigyosho_id, cal、Refs #762)
 ///
 /// shell の `verify_uriage_diff_php_vs_rust.sh` を「1 (date, office, cal) 単位」で
 /// HTTP endpoint 化したもの。nuxt UI が並列 iterate する想定。
 pub async fn verify(
     Extension(repo): Extension<DynRepo>,
+    Extension(store): Extension<DynLocalStore>,
     Extension(cakephp): Extension<Arc<CakephpClient>>,
     Query(q): Query<VerifyQuery>,
 ) -> Result<Json<VerifyResponse>, (StatusCode, String)> {
@@ -1322,7 +1400,23 @@ pub async fn verify(
         // shell の `[[ "$bumon" == "[]" ]] && continue` と同じ扱い。受注部門が
         // 未登録の営業所は構造上 検証対象が無いだけで「失敗」ではないので、
         // 200 + skipped_reason フラグで返す (caller は status=skipped に振る)。
+        // verify_jobs にも skipped_reason='no_bumon', ok=1 で 1 行記録する
+        // (これがないと r2_pending coverage が永遠に埋まらない bucket になる)。
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        let ran_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let _ = store
+            .upsert_verify_job(
+                &q.date,
+                q.id,
+                q.cal,
+                true,
+                Some("no_bumon"),
+                None,
+                0,
+                elapsed_ms as i64,
+                &ran_at,
+            )
+            .await; // upsert 失敗は致命的でないので log のみで握りつぶす
         return Ok(Json(VerifyResponse {
             office_id: q.id,
             date: q.date,
@@ -1363,6 +1457,23 @@ pub async fn verify(
     let ok = diff.is_none();
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
+    // 5. verify_jobs に upsert (Refs #762 R2 sync gate)
+    let ran_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let diff_json = diff.as_ref().and_then(|d| serde_json::to_string(d).ok());
+    let _ = store
+        .upsert_verify_job(
+            &q.date,
+            q.id,
+            q.cal,
+            ok,
+            None,
+            diff_json.as_deref(),
+            row_count as i64,
+            elapsed_ms as i64,
+            &ran_at,
+        )
+        .await; // upsert 失敗は致命的でない (verify 結果自体は caller に返す)
+
     Ok(Json(VerifyResponse {
         office_id: q.id,
         date: q.date,
@@ -1374,6 +1485,63 @@ pub async fn verify(
         row_count,
         elapsed_ms,
         skipped_reason: None,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/verify-history
+//   verify_jobs を範囲指定で読む (履歴一覧、Refs #762)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyHistoryQuery {
+    /// 期間下限 (`YYYY-MM-DD`、inclusive)
+    pub from: String,
+    /// 期間上限 (`YYYY-MM-DD`、inclusive)
+    pub to: String,
+    /// 営業所 id (省略で全営業所)
+    pub eigyosho_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyHistoryResponse {
+    pub from: String,
+    pub to: String,
+    pub eigyosho_id: Option<i64>,
+    pub count: usize,
+    pub rows: Vec<crate::sqlite::VerifyJobRow>,
+}
+
+/// GET `/api/uriage/verify-history?from=YYYY-MM-DD&to=YYYY-MM-DD&eigyosho_id=N`
+///
+/// `verify_jobs` を範囲指定で読む (履歴一覧)。caller は status コード (緑/赤/灰) や
+/// 「過去 N 週間 連続 green」判定に使う。
+pub async fn verify_history(
+    Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<VerifyHistoryQuery>,
+) -> Result<Json<VerifyHistoryResponse>, (StatusCode, String)> {
+    if q.from.is_empty() || q.to.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "from と to は必須 (YYYY-MM-DD)".to_string(),
+        ));
+    }
+    let rows = store
+        .list_verify_jobs(&q.from, &q.to, q.eigyosho_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("list_verify_jobs failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("verify-history query failed: {e}"),
+            )
+        })?;
+    Ok(Json(VerifyHistoryResponse {
+        from: q.from,
+        to: q.to,
+        eigyosho_id: q.eigyosho_id,
+        count: rows.len(),
+        rows,
     }))
 }
 
