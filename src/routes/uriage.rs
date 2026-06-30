@@ -836,12 +836,15 @@ async fn recalc_one(
 /// **body は受け取らない** (persons/other/bumon は CakePHP から pull)。
 ///
 /// - `month` 未指定: editable_months 全部 (CakePHP の `editable_months` 配列) を処理
-/// - `month` 指定 + editable_months に含まれない → 422 (編集不可月の recalc は拒否)
+/// - `month` 指定: 任意の過去月を受け付ける (SELECT は無制限。経理の `入力可能月数`
+///   とは無関係、log だけ残す)
 /// - `eigyosho_id` 指定なし: その月の全営業所 (masters.offices) を処理
 ///
-/// 編集不可月の recalc を 422 で拒否する設計判断 (user, 2026-06-30):
-/// > 「編集不可月は recalc skip」が design contract — fingerprint は残し、編集可能月を
-/// > 変更したら復活する
+/// 設計判断 (user, 2026-06-30): **入力可能月 ≠ 取得可能月**。CakePHP `基本事項.入力可能月数`
+/// は経理 UI の編集制限で、rust 側の再集計 (= 純粋な SELECT) には関係ない。チャート伸長
+/// などで過去月の集計を取り直す要件が当然ありうるため、editable_months 422 gate は撤廃
+/// (Refs yhonda-ohishi/nginx#762)。`editable_months` はログ用に残す (= CakePHP 側の編集
+/// 状態は引き続き参考情報になる)。
 pub async fn recalc(
     Extension(repo): Extension<DynRepo>,
     Extension(store): Extension<DynLocalStore>,
@@ -857,7 +860,7 @@ pub async fn recalc(
         ));
     }
 
-    // editable_months を取得
+    // editable_months を取得 (参考情報として log 出力。recalc 自体は gate しない)
     let editable = cakephp
         .fetch_editable_months()
         .await
@@ -867,13 +870,11 @@ pub async fn recalc(
     let target_months: Vec<String> = match &q.month {
         Some(m) => {
             if !editable.editable_months.iter().any(|em| em == m) {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!(
-                        "month={m} は編集可能月ではない (editable_months={:?})",
-                        editable.editable_months
-                    ),
-                ));
+                tracing::info!(
+                    month = %m,
+                    editable_months = ?editable.editable_months,
+                    "month は CakePHP 編集可能月の外だが、recalc は実行 (入力可能月 ≠ 取得可能月)"
+                );
             }
             vec![m.clone()]
         }
