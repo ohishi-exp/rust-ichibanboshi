@@ -33,22 +33,30 @@ fn test_normalize_partner_type_customer_and_fallback() {
 
 #[test]
 fn test_unchin_kind_filter() {
-    assert_eq!(unchin_kind_filter("billing_only"), "AND t.[請求K] = '1'");
-    assert_eq!(unchin_kind_filter("non_billing"), "AND t.[請求K] = '2'");
-    assert_eq!(unchin_kind_filter("all"), "");
-    // 未知の値・default は transport (請求K=0) にフォールバック
-    assert_eq!(unchin_kind_filter("transport"), "AND t.[請求K] = '0'");
-    assert_eq!(unchin_kind_filter(""), "AND t.[請求K] = '0'");
-    assert_eq!(unchin_kind_filter("xxx"), "AND t.[請求K] = '0'");
+    assert_eq!(
+        unchin_kind_filter("with_billing_only"),
+        "AND t.[請求K] IN ('0', '1')"
+    );
+    // 未知の値・default は with_non_billing (請求K IN (0,2)) にフォールバック
+    assert_eq!(
+        unchin_kind_filter("with_non_billing"),
+        "AND t.[請求K] IN ('0', '2')"
+    );
+    assert_eq!(unchin_kind_filter(""), "AND t.[請求K] IN ('0', '2')");
+    assert_eq!(unchin_kind_filter("xxx"), "AND t.[請求K] IN ('0', '2')");
 }
 
 #[test]
 fn test_unchin_kind_label() {
-    assert_eq!(unchin_kind_label("billing_only"), "請求のみ (請求K=1)");
-    assert_eq!(unchin_kind_label("non_billing"), "非請求 (請求K=2)");
-    assert_eq!(unchin_kind_label("all"), "全請求区分");
-    assert_eq!(unchin_kind_label("transport"), "請求 (請求K=0)");
-    assert_eq!(unchin_kind_label("xxx"), "請求 (請求K=0)");
+    assert_eq!(
+        unchin_kind_label("with_billing_only"),
+        "請求＋請求のみ (請求K IN (0,1))"
+    );
+    assert_eq!(
+        unchin_kind_label("with_non_billing"),
+        "請求＋非請求 (請求K IN (0,2))"
+    );
+    assert_eq!(unchin_kind_label("xxx"), "請求＋非請求 (請求K IN (0,2))");
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -153,7 +161,7 @@ async fn test_unchin_candidates_ok_customer_with_params() {
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/unchin/candidates?from=2026-04-01&to=2026-07-01&partner_type=customer&kind=billing_only")
+                .uri("/api/unchin/candidates?from=2026-04-01&to=2026-07-01&partner_type=customer&kind=with_billing_only")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -168,7 +176,7 @@ async fn test_unchin_candidates_ok_subcontractor() {
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/unchin/candidates?partner_type=subcontractor&kind=non_billing")
+                .uri("/api/unchin/candidates?partner_type=subcontractor&kind=with_non_billing")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -185,21 +193,6 @@ async fn test_unchin_candidates_ok_unknown_partner_type_and_kind_fall_back() {
         .oneshot(
             Request::builder()
                 .uri("/api/unchin/candidates?partner_type=xxx&kind=xxx")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_unchin_candidates_ok_kind_all() {
-    let app = common::build_app(common::mock_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/unchin/candidates?kind=all")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -263,7 +256,7 @@ async fn test_unchin_summary_ok_subcontractor_with_kind() {
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/unchin/summary?partner_type=subcontractor&kind=billing_only&from=2026-01-01&to=2027-01-01")
+                .uri("/api/unchin/summary?partner_type=subcontractor&kind=with_billing_only&from=2026-01-01&to=2027-01-01")
                 .body(Body::empty())
                 .unwrap(),
         )
