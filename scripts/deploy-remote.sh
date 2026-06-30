@@ -83,6 +83,28 @@ if [[ "$HTTP_CODE" != "200" ]]; then
   echo "--- systemctl status (last 15 lines) ---" >&2
   ssh "${SSH_OPTS[@]}" "$TARGET" \
     "systemctl status ichibanboshi --no-pager 2>&1 | head -15" >&2 || true
+  # journalctl: binary が boot 時に panic した場合、stderr メッセージはここに出る。
+  echo "--- journalctl -u ichibanboshi (last 80 lines、binary stderr 含む) ---" >&2
+  ssh "${SSH_OPTS[@]}" "$TARGET" \
+    "journalctl -u ichibanboshi --no-pager --since='5 minutes ago' 2>&1 | tail -80" >&2 || true
+  # GitHub Actions Step Summary にも構造化して残す (failure debugging を見やすく)
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "### ❌ Deploy 失敗 — health check ${HTTP_CODE:-<none>}"
+      echo ""
+      echo "#### systemctl status"
+      echo '```'
+      ssh "${SSH_OPTS[@]}" "$TARGET" \
+        "systemctl status ichibanboshi --no-pager 2>&1 | head -30" 2>&1 || true
+      echo '```'
+      echo ""
+      echo "#### journalctl -u ichibanboshi (last 100 lines、binary panic 含む)"
+      echo '```'
+      ssh "${SSH_OPTS[@]}" "$TARGET" \
+        "journalctl -u ichibanboshi --no-pager --since='5 minutes ago' 2>&1 | tail -100" 2>&1 || true
+      echo '```'
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
   exit 1
 fi
 
