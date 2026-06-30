@@ -65,6 +65,15 @@ pub struct CorsConfig {
     pub allowed_origins: Vec<String>,
 }
 
+/// SQLite local store configuration (Phase 2: 担当者別売上 summary 永続化、issue #762)
+#[derive(Debug, Clone, Deserialize)]
+pub struct SqliteConfig {
+    /// SQLite データベースファイルのパス。`:memory:` で in-memory (テスト用)。
+    /// 本番デフォルトは `/var/lib/ichibanboshi/state.db`。
+    #[serde(default = "default_sqlite_path")]
+    pub path: String,
+}
+
 /// Runtime configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -86,6 +95,9 @@ pub struct Config {
 
     #[serde(default)]
     pub cors: CorsConfig,
+
+    #[serde(default)]
+    pub sqlite: SqliteConfig,
 }
 
 fn default_port() -> u16 {
@@ -108,6 +120,9 @@ fn default_true() -> bool {
 }
 fn default_allowed_origins() -> Vec<String> {
     vec!["https://ichibanboshi.mtamaramu.com".to_string()]
+}
+fn default_sqlite_path() -> String {
+    "/var/lib/ichibanboshi/state.db".to_string()
 }
 
 impl Default for DatabaseConfig {
@@ -136,6 +151,14 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: default_allowed_origins(),
+        }
+    }
+}
+
+impl Default for SqliteConfig {
+    fn default() -> Self {
+        Self {
+            path: default_sqlite_path(),
         }
     }
 }
@@ -186,6 +209,7 @@ impl Config {
             database: DatabaseConfig::default(),
             auth: AuthConfig::default(),
             cors: CorsConfig::default(),
+            sqlite: SqliteConfig::default(),
         })
     }
 }

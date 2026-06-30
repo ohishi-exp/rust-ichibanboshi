@@ -12,8 +12,10 @@ mod common;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use rust_ichibanboshi::routes::uriage::{compute_person_sum, PersonAccum, UriageRow};
+use rust_ichibanboshi::sqlite::LocalStore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 /// PHP `testRowData` の Rust 表現 (横横=1, 入力担当C=1499, 稼動部門="010", ...)。
@@ -588,4 +590,219 @@ async fn by_person_rejects_malformed_json() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP endpoint test: POST /api/uriage/recalc (Phase 2 PR-C1)
+// ══════════════════════════════════════════════════════════════
+
+async fn post_recalc(app: axum::Router, body: Value) -> (StatusCode, Value) {
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/recalc")
+                .header("content-type", "application/json")
+                .body(json_body(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+fn recalc_body(month: &str, eigyosho_id: i64, cal: bool) -> Value {
+    json!({
+        "month": month,
+        "from": format!("{month}-01"),
+        "to":   format!("{month}-30"),
+        "eigyosho_id": eigyosho_id,
+        "bumon": ["010"],
+        "persons": { "1499": "青井" },
+        "other":   {},
+        "cal": cal
+    })
+}
+
+#[tokio::test]
+async fn recalc_persists_summary_into_sqlite() {
+    let store = common::local_store();
+    let app = common::build_app_with_store(common::mock_repo(), store.clone());
+
+    let body = recalc_body("2026-06", 1, true);
+    let (status, v) = post_recalc(app, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["month"], "2026-06");
+    assert_eq!(v["eigyosho_id"], 1);
+    assert_eq!(v["cal"], true);
+    assert_eq!(v["persisted_count"], 1); // 青井のみ非ゼロ
+    assert_eq!(v["row_count"], 2); // MockRepo の uriage_rows 2 行
+    assert_eq!(v["sum"]["青井"]["金額"], 51500);
+
+    // SQLite に persist された行を直接確認
+    let rows = store
+        .get_person_monthly("2026-06", 1, true)
+        .await
+        .expect("get_person_monthly");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].person_name, "青井");
+    assert_eq!(rows[0].kingaku, 51500);
+    assert_eq!(rows[0].yosha_kingaku, 30800);
+    assert_eq!(rows[0].kensuu, 1);
+    assert!(v["calculated_at"].as_str().unwrap().contains('T'));
+}
+
+#[tokio::test]
+async fn recalc_second_run_overwrites_bucket() {
+    let store = common::local_store();
+    let app = common::build_app_with_store(common::mock_repo(), store.clone());
+    let body = recalc_body("2026-06", 1, true);
+
+    // 1 回目
+    let (status, _) = post_recalc(app.clone(), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_count = store
+        .get_person_monthly("2026-06", 1, true)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(first_count, 1);
+
+    // 2 回目: 同じ bucket、同じ内容 → 上書きされても行数 / 値は同一
+    let (status, _) = post_recalc(app, body).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kingaku, 51500);
+}
+
+#[tokio::test]
+async fn recalc_isolates_buckets() {
+    let store = common::local_store();
+    let app = common::build_app_with_store(common::mock_repo(), store.clone());
+
+    // (2026-06, 1, true) を入れる
+    let (s, _) = post_recalc(app.clone(), recalc_body("2026-06", 1, true)).await;
+    assert_eq!(s, StatusCode::OK);
+    // 別営業所
+    let (s, _) = post_recalc(app.clone(), recalc_body("2026-06", 2, true)).await;
+    assert_eq!(s, StatusCode::OK);
+    // 別 cal
+    let (s, _) = post_recalc(app.clone(), recalc_body("2026-06", 1, false)).await;
+    assert_eq!(s, StatusCode::OK);
+    // 別月
+    let (s, _) = post_recalc(app, recalc_body("2026-07", 1, true)).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // 4 つの独立 bucket に persist される
+    for (m, e, c) in [
+        ("2026-06", 1, true),
+        ("2026-06", 2, true),
+        ("2026-06", 1, false),
+        ("2026-07", 1, true),
+    ] {
+        let rows = store.get_person_monthly(m, e, c).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "bucket (m={}, e={}, c={}) should have 1 row",
+            m,
+            e,
+            c
+        );
+    }
+}
+
+#[tokio::test]
+async fn recalc_rejects_missing_required_fields() {
+    let app = common::build_app(common::mock_repo());
+
+    // month 欠落
+    let body = json!({
+        "from": "2026-06-01", "to": "2026-06-30",
+        "eigyosho_id": 1, "bumon": ["010"],
+        "persons": {}, "other": {}
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/recalc")
+                .header("content-type", "application/json")
+                .body(json_body(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY); // axum json deserialize fail
+
+    // 空 from
+    let body = json!({
+        "month": "2026-06", "from": "", "to": "2026-06-30",
+        "eigyosho_id": 1, "bumon": ["010"],
+        "persons": {}, "other": {}
+    });
+    let (status, _) = post_recalc(app.clone(), body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 空 bumon
+    let body = json!({
+        "month": "2026-06", "from": "2026-06-01", "to": "2026-06-30",
+        "eigyosho_id": 1, "bumon": [],
+        "persons": {}, "other": {}
+    });
+    let (status, _) = post_recalc(app, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn recalc_pool_error_returns_503() {
+    let app = common::build_app(common::error_repo());
+    let (status, _) = post_recalc(app, recalc_body("2026-06", 1, true)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn recalc_query_error_returns_500() {
+    let app = common::build_app(common::query_error_repo());
+    let (status, _) = post_recalc(app, recalc_body("2026-06", 1, true)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn recalc_local_store_independent_instance() {
+    // build_app は新規 in-memory store を毎回作る → store は独立。
+    // 2 つの app は別の store を持つので互いの persist が見えない。
+    let store_a = Arc::new(LocalStore::open(":memory:").unwrap());
+    let store_b = Arc::new(LocalStore::open(":memory:").unwrap());
+    let app_a = common::build_app_with_store(common::mock_repo(), store_a.clone());
+    let app_b = common::build_app_with_store(common::mock_repo(), store_b.clone());
+
+    let (s, _) = post_recalc(app_a, recalc_body("2026-06", 1, true)).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // store_a には入っているが store_b は空
+    assert_eq!(
+        store_a
+            .get_person_monthly("2026-06", 1, true)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store_b
+        .get_person_monthly("2026-06", 1, true)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let _ = app_b; // suppress unused
 }
