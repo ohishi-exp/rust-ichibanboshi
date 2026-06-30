@@ -955,28 +955,42 @@ impl AppRepo for TiberiusRepo {
             .collect::<Vec<_>>()
             .join(",");
 
-        // PHP `UriageJyuchuDisplayController` setup_dir 由来の SELECT を再現。
+        // PHP `UriageJyuchuDisplayController` setup_dir の **3 経路 UNION** を再現。
         //
-        // PHP は make_yosha_sql / sql_from_other / sql_from_other_with_bumon + make_array
-        // の 3〜5 本クエリを実行して結果を UNION し、コード側で `横横` フラグを
-        // 付与する構造。Rust では同等の row set を **単一クエリ + CASE WHEN** で
-        // 表現するため、以下の点を踏襲する:
+        // 設計判断 (2026-06-30 v2、user 診断による):
+        // PR #34 の `受注 IN bumon OR 稼動 IN bumon` だけでは過剰集計 (~100x、本社で実害)。
+        // PHP が除外する「自車運行+受注他営業所+自社稼動」と「自社内 配車K=0」rows を
+        // Rust が拾っていた。WHERE を PHP の row-set にタイトに合わせる:
         //
-        // - **`横横` は DB 列ではなく PHP 派生フラグ** (確認済、user 報告 2026-06-30)。
-        //   `(受注部門 IN bumon) AND (稼動部門 NOT IN bumon)` を満たす行は 横横=1、
-        //   それ以外 (`稼動 IN bumon` 系) は 0。SELECT で CASE WHEN で算出する。
-        // - **WHERE は PHP 全クエリの行集合の superset** とし、`compute_person_sum`
-        //   側の skip ルール (`請求K=1 AND 備考2='請求のみ'`) で誤検出を除く:
-        //     (受注 IN bumon OR 稼動 IN bumon)
-        // - **品名N の調整行除外は全角スペース** (U+3000)。半角だと NOT IN が一致せず
-        //   調整行が混入し金額がズレる (user 報告 2026-06-30)。
-        // - **`日報K != 3` を追加** (PHP make_yosha_sql 1710 行)。
-        // - **`請求K=2 → 備考2='表示' or LIKE '売上%'`** (PHP 1712 / 1738 行)。
-        // - `得意先C != '000002'` は PHP に無いため除去。
-        // - 社員ﾏｽﾀ.社員R を 入力担当C で JOIN。
-        // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)。
-        // - 請求K / 入力担当C は DB schema が varchar の可能性があるため `TRY_CAST(... AS INT)`
-        //   で int に揃える (失敗時は NULL → ISNULL で 0)。
+        // - **Set A** (make_array 3 ケース + sql_from_other_with_bumon の union):
+        //     `受注 IN bumon AND ((稼動 NOT IN bumon) OR (配車K = '1'))`
+        //
+        //     make_array は 3 ケースの OR:
+        //     - 傭車:       稼動 IN bumon AND 配車K=1
+        //     - 営業所傭車: 稼動 NOT IN bumon AND 配車K=0
+        //     - 傭車傭車:   稼動 NOT IN bumon AND 配車K=1
+        //     OR 簡約: `(稼動 NOT IN bumon) OR (配車K=1)`
+        //     sql_from_other_with_bumon (受注 IN bumon AND 稼動 NOT IN bumon) も
+        //     `稼動 NOT IN bumon` 側に包含。
+        //
+        // - **Set B** (sql_from_other):
+        //     `受注 NOT IN bumon AND 稼動 IN bumon AND 傭車先C != '000000'`
+        //
+        //     **`傭車先C != '000000'` が要件** (自車運行は除外)。PR #34 ではこれが
+        //     抜けて 自車運行+他営業所受注+本社稼動 の rows を拾い 100x になっていた。
+        //
+        // - `横横` 派生フラグ (CASE WHEN): `受注 IN bumon AND 稼動 NOT IN bumon`
+        //   (sql_from_other_with_bumon + 営業所傭車/傭車傭車 の集合に対応)
+        //
+        // 細部:
+        // - 品名N の調整行除外は全角空白 U+3000 (PHP L1708-1709 と同形)
+        // - `日報K != 3` (PHP L1710)
+        // - `請求K=2 → 備考2='表示' or LIKE '売上%'` (PHP L1712/1738 OR superset)
+        // - `NOT (請求K='1' AND 備考2='請求のみ')` (PHP L1713)
+        // - 社員R は **TOP 1 スカラサブクエリ** で引く (社員ﾏｽﾀ 複数行/社員C による
+        //   JOIN ファンアウト防止、surcharge.rs と同型)
+        // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)
+        // - 請求K / 入力担当C は varchar の可能性あり `TRY_CAST(... AS INT)` で int 化
         let query = format!(
             "SELECT \
                  CASE WHEN t.[受注部門] IN ({in_clause}) \
@@ -994,11 +1008,16 @@ impl AppRepo for TiberiusRepo {
                  ISNULL(t.[傭車値引], 0), \
                  ISNULL(t.[傭車割増], 0), \
                  ISNULL(t.[傭車実費], 0), \
-                 ISNULL(e.[社員R], ''), \
+                 ISNULL((SELECT TOP 1 e.[社員R] FROM [社員ﾏｽﾀ] e WHERE e.[社員C] = t.[入力担当C]), ''), \
                  ISNULL(t.[傭車先C], '000000') \
              FROM [運転日報明細] t \
-             LEFT JOIN [社員ﾏｽﾀ] e ON e.[社員C] = t.[入力担当C] \
-             WHERE (t.[受注部門] IN ({in_clause}) OR t.[稼動部門] IN ({in_clause})) \
+             WHERE ( \
+                 (t.[受注部門] IN ({in_clause}) \
+                  AND (t.[稼動部門] NOT IN ({in_clause}) OR t.[配車K] = '1')) \
+                 OR (t.[受注部門] NOT IN ({in_clause}) \
+                     AND t.[稼動部門] IN ({in_clause}) \
+                     AND ISNULL(t.[傭車先C], '000000') != '000000') \
+               ) \
                AND t.[品名N] NOT IN ('※\u{3000}請求一括調整明細\u{3000}※', '※\u{3000}傭車一括調整明細\u{3000}※') \
                AND ISNULL(t.[日報K], 0) != 3 \
                AND NOT (t.[請求K] = '1' AND t.[備考2] = '請求のみ') \
