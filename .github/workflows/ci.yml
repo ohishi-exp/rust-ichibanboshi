@@ -21,9 +21,16 @@ jobs:
         with:
           components: llvm-tools-preview
 
+      # native target (= test job) と musl target (= deploy job) は target/ が
+      # 別物なので shared-key を分離する必要がある。同 key で奪い合うと restore→
+      # save→restore の thrashing で実質 cache 無効化される (= prod 報告: deploy
+      # の release build cache 効いてない、2026-06-30)。
+      # save-if を main 限定にすることで PR の中途半端な target/ が main の cache
+      # を上書きするのを防ぐ (= 非対称 save-if、rust-alc-api #426 確立 pattern)。
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci"
+          shared-key: ichibanboshi-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -31,7 +38,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
@@ -68,9 +75,13 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      # musl release build 用の専用 cache (test job の native target とは別 key)。
+      # deploy は main push 限定なので save-if 条件は実質的に常に true だが、
+      # 一貫性のため明示。
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci"
+          shared-key: ichibanboshi-musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -78,10 +89,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build musl release binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        # --locked で Cargo.lock 整合性を強制 (reproducible)。
+        # CC_x86_64_unknown_linux_musl は ring 等の C 依存を musl-gcc で cross-compile
+        # するため (rust-flickr ci.yml と同 pattern)。
+        run: cargo build --release --target x86_64-unknown-linux-musl --locked
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          CC_x86_64_unknown_linux_musl: musl-gcc
 
       - name: Install cloudflared
         run: |
