@@ -75,6 +75,7 @@ pub async fn run(
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
+        .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))
