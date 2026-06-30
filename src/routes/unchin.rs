@@ -7,11 +7,12 @@
 //! 行わず、raw 行をそのまま返す (`/candidates`)。集約・バージョン管理は消費側
 //! (nuxt-ichibanboshi) が行う設計 (`docs/plan-unchin-rate-list.md` 参照)。
 //!
-//! `請求K` フィルタ (`kind`) は `surcharge.rs` の `surcharge_kind_filter` と同じ方針:
-//! `billing_only` (請求のみ, K=1) / `transport` (請求, K=0、default) / `non_billing`
-//! (非請求, K=2) / `all` (フィルタなし)。「運行記録簿用」「事故請求コード」等の社内向け
-//! ダミー得意先は `請求K=2` (非請求) で記録されているため、default の `transport` で
-//! 自然に除外される (実機確認、#57)。
+//! `請求K` フィルタ (`kind`) は 2 択: `with_billing_only` (請求＋請求のみ,
+//! K IN ('0','1')) / `with_non_billing` (請求＋非請求, K IN ('0','2')、default)。
+//! 後者は本リポジトリの月計一致条件 (`請求K IN ('0','2')`) と同じ組み合わせ。
+//! 「運行記録簿用」「事故請求コード」等の社内向けダミー得意先は単独の `請求K=2`
+//! 行として記録されているが、`(0,2)` には含まれてしまうため値が大きい場合は
+//! ユーザー側で目視除外が必要 (実機確認、#57)。
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -101,8 +102,8 @@ pub struct UnchinQuery {
     pub to: Option<String>,
     /// `"customer"`（得意先、default）| `"subcontractor"`（傭車先）
     pub partner_type: Option<String>,
-    /// `"billing_only"`(請求のみ,K=1) | `"transport"`(請求,K=0、default) |
-    /// `"non_billing"`(非請求,K=2) | `"all"`(フィルタなし)
+    /// `"with_billing_only"`(請求＋請求のみ, K IN (0,1)) |
+    /// `"with_non_billing"`(請求＋非請求, K IN (0,2)、default)
     pub kind: Option<String>,
 }
 
@@ -120,23 +121,21 @@ pub fn normalize_partner_type(partner_type: &str) -> &'static str {
 }
 
 /// `kind` パラメータ → `請求K` の SQL WHERE フラグメント。
-/// 未知の値は `transport`（請求、K=0）と同義にフォールバックする。
+/// `"with_billing_only"` (請求＋請求のみ, K IN ('0','1')) 以外は
+/// `"with_non_billing"` (請求＋非請求, K IN ('0','2')、default) にフォールバックする。
+/// 後者は本リポジトリの月計一致条件 (`請求K IN ('0','2')`) と同じ組み合わせ。
 pub fn unchin_kind_filter(kind: &str) -> &'static str {
     match kind {
-        "billing_only" => "AND t.[請求K] = '1'",
-        "non_billing" => "AND t.[請求K] = '2'",
-        "all" => "",
-        _ => "AND t.[請求K] = '0'",
+        "with_billing_only" => "AND t.[請求K] IN ('0', '1')",
+        _ => "AND t.[請求K] IN ('0', '2')",
     }
 }
 
 /// `kind` パラメータ → source_table 表示用ラベル。
 pub fn unchin_kind_label(kind: &str) -> &'static str {
     match kind {
-        "billing_only" => "請求のみ (請求K=1)",
-        "non_billing" => "非請求 (請求K=2)",
-        "all" => "全請求区分",
-        _ => "請求 (請求K=0)",
+        "with_billing_only" => "請求＋請求のみ (請求K IN (0,1))",
+        _ => "請求＋非請求 (請求K IN (0,2))",
     }
 }
 
