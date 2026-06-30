@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::{routing::get, Extension, Router};
+use axum::{
+    routing::{get, post},
+    Extension, Router,
+};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -54,7 +57,8 @@ pub async fn run(
             get(routes::sales::customer_detail),
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
-        .route("/vehicles", get(routes::surcharge::vehicles));
+        .route("/vehicles", get(routes::surcharge::vehicles))
+        .route("/uriage/by-person", post(routes::uriage::by_person));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))

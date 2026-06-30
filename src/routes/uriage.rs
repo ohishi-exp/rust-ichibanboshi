@@ -9,11 +9,16 @@
 //! のため、条件式・符号・正規表現の意味は一字一句変えない (リファクタ禁止)。
 //! テストは `tests/uriage_test.rs` で同じ 17 ケース + 全分岐網羅。
 
-use serde::Serialize;
+use axum::http::StatusCode;
+use axum::Extension;
+use axum::Json;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+use crate::repo::{DynRepo, RepoError};
 
 /// `preg_match("/(.+)→(.+)/u", $cleaned, $pregtest)` の写経。
 ///
@@ -349,6 +354,96 @@ pub fn is_yosha(yoshasaki_c: &str) -> bool {
 /// 元 PHP: UriageJyuchuDisplayController::is_oth_yosha() (798-801)。
 pub fn is_oth_yosha(jyuchu_eigyosho_id: &str, kado_eigyosho_id: &str) -> bool {
     jyuchu_eigyosho_id != kado_eigyosho_id
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: POST /api/uriage/by-person
+// ══════════════════════════════════════════════════════════════
+
+/// `/api/uriage/by-person` のリクエストボディ。
+///
+/// マスタ (`persons` / `other`) は CakePHP 側 SoT のため呼び出し側で fetch して
+/// body に積む。Rust はマスタを persist しない (検証段階の挙動の完全再現が目的)。
+#[derive(Debug, Deserialize)]
+pub struct ByPersonRequest {
+    /// 運行年月日 下限 (YYYY-MM-DD、含む)
+    pub from: String,
+    /// 運行年月日 上限 (YYYY-MM-DD、含む)
+    pub to: String,
+    /// 受注部門コード (営業所配下の部門群)。PHP の
+    /// `jyuchu_bumon_in_jyuchu_display[$display_id]` 相当
+    pub bumon: Vec<String>,
+    /// 入力担当C → 担当者名 (`UriageJyuchuDisplayPersons_name`)
+    pub persons: HashMap<i32, String>,
+    /// 稼動部門コード → 営業所名 (`UriageJyuchuDisplay_other`)
+    pub other: HashMap<String, String>,
+    /// PHP の `$cal`。truthy で別営業所も合算。省略時 true。
+    #[serde(default = "default_cal")]
+    pub cal: bool,
+}
+
+fn default_cal() -> bool {
+    true
+}
+
+/// `/api/uriage/by-person` のレスポンス。
+#[derive(Debug, Serialize)]
+pub struct ByPersonResponse {
+    pub source_table: String,
+    pub from: String,
+    pub to: String,
+    pub bumon: Vec<String>,
+    pub cal: bool,
+    /// 担当者振替判定後の集計 (PHP `$sum` と 1:1)。
+    pub sum: HashMap<String, PersonAccum>,
+    /// 取得行数 (デバッグ用、`request.K` フィルタ後)。
+    pub row_count: usize,
+}
+
+fn map_repo_err(e: RepoError) -> StatusCode {
+    match &e {
+        RepoError::PoolError => StatusCode::SERVICE_UNAVAILABLE,
+        RepoError::QueryError(msg) => {
+            tracing::error!("Query error: {msg}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST `/api/uriage/by-person`
+///
+/// PHP `/uriage-jyuchu-display/print-json` の Rust 等価 endpoint。検証段階で
+/// 1 円単位 diff を取るために、PHP 側で fetch した persons/other をそのまま
+/// body に積んで呼び出す。
+pub async fn by_person(
+    Extension(repo): Extension<DynRepo>,
+    Json(req): Json<ByPersonRequest>,
+) -> Result<Json<ByPersonResponse>, StatusCode> {
+    // 入力検証
+    if req.from.is_empty() || req.to.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if req.bumon.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let rows = repo
+        .uriage_rows(&req.from, &req.to, &req.bumon)
+        .await
+        .map_err(map_repo_err)?;
+    let row_count = rows.len();
+
+    let result = compute_person_sum(&rows, &req.persons, &req.other, req.cal);
+
+    Ok(Json(ByPersonResponse {
+        source_table: "運転日報明細 + 社員ﾏｽﾀ".to_string(),
+        from: req.from,
+        to: req.to,
+        bumon: req.bumon,
+        cal: req.cal,
+        sum: result.sum,
+        row_count,
+    }))
 }
 
 /// `preg_replace("/売上　|売上\s/", "", $str)` の写経。
