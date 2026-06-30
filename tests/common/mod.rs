@@ -15,7 +15,7 @@ use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
-use rust_ichibanboshi::routes::unchin::RawUnchinRow;
+use rust_ichibanboshi::routes::unchin::{RawUnchinRow, RawUnchinSummaryRow};
 use rust_ichibanboshi::routes::uriage::UriageRow;
 use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
 use uuid::Uuid;
@@ -345,7 +345,7 @@ impl AppRepo for MockRepo {
         _from: &str,
         _to: &str,
         partner_type: &str,
-        _limit: i32,
+        _kind_filter: &str,
     ) -> Result<Vec<RawUnchinRow>, RepoError> {
         if partner_type == "subcontractor" {
             return Ok(vec![RawUnchinRow {
@@ -382,6 +382,27 @@ impl AppRepo for MockRepo {
                 sale_date: dt(2026, 6, 19),
             },
         ])
+    }
+
+    async fn unchin_summary(
+        &self,
+        _from: &str,
+        _to: &str,
+        partner_type: &str,
+        _kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
+        if partner_type == "subcontractor" {
+            return Ok(vec![RawUnchinSummaryRow {
+                partner_code: "021970-000".into(),
+                partner_name: "㈱九州運輸".into(),
+                total: 28_000,
+            }]);
+        }
+        Ok(vec![RawUnchinSummaryRow {
+            partner_code: "034760-015".into(),
+            partner_name: "全農物流㈱　九州支店".into(),
+            total: 170_000,
+        }])
     }
 }
 
@@ -505,8 +526,17 @@ impl AppRepo for ErrorRepo {
         _: &str,
         _: &str,
         _: &str,
-        _: i32,
+        _: &str,
     ) -> Result<Vec<RawUnchinRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn unchin_summary(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
         Err(RepoError::PoolError)
     }
 }
@@ -631,8 +661,17 @@ impl AppRepo for QueryErrorRepo {
         _: &str,
         _: &str,
         _: &str,
-        _: i32,
+        _: &str,
     ) -> Result<Vec<RawUnchinRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
+    async fn unchin_summary(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
 }
@@ -710,6 +749,7 @@ pub fn build_app_full(
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
         .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
+        .route("/unchin/summary", get(routes::unchin::unchin_summary))
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))

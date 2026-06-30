@@ -2,7 +2,10 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use rust_ichibanboshi::routes::unchin::{build_unchin_rows, normalize_partner_type, RawUnchinRow};
+use rust_ichibanboshi::routes::unchin::{
+    build_unchin_rows, build_unchin_summary_rows, normalize_partner_type, unchin_kind_filter,
+    unchin_kind_label, RawUnchinRow, RawUnchinSummaryRow,
+};
 use tower::ServiceExt;
 
 use common::dt;
@@ -22,6 +25,30 @@ fn test_normalize_partner_type_customer_and_fallback() {
     // 未知の値・空文字は customer にフォールバック
     assert_eq!(normalize_partner_type(""), "customer");
     assert_eq!(normalize_partner_type("xxx"), "customer");
+}
+
+// ══════════════════════════════════════════════════════════════
+// 純粋関数: unchin_kind_filter / unchin_kind_label
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_unchin_kind_filter() {
+    assert_eq!(unchin_kind_filter("billing_only"), "AND t.[請求K] = '1'");
+    assert_eq!(unchin_kind_filter("non_billing"), "AND t.[請求K] = '2'");
+    assert_eq!(unchin_kind_filter("all"), "");
+    // 未知の値・default は transport (請求K=0) にフォールバック
+    assert_eq!(unchin_kind_filter("transport"), "AND t.[請求K] = '0'");
+    assert_eq!(unchin_kind_filter(""), "AND t.[請求K] = '0'");
+    assert_eq!(unchin_kind_filter("xxx"), "AND t.[請求K] = '0'");
+}
+
+#[test]
+fn test_unchin_kind_label() {
+    assert_eq!(unchin_kind_label("billing_only"), "請求のみ (請求K=1)");
+    assert_eq!(unchin_kind_label("non_billing"), "非請求 (請求K=2)");
+    assert_eq!(unchin_kind_label("all"), "全請求区分");
+    assert_eq!(unchin_kind_label("transport"), "請求 (請求K=0)");
+    assert_eq!(unchin_kind_label("xxx"), "請求 (請求K=0)");
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -80,6 +107,28 @@ fn test_build_unchin_rows_empty() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// 純粋関数: build_unchin_summary_rows
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_build_unchin_summary_rows() {
+    let raw = vec![RawUnchinSummaryRow {
+        partner_code: "034760-015".into(),
+        partner_name: "全農物流㈱　九州支店".into(),
+        total: 170_000,
+    }];
+    let rows = build_unchin_summary_rows(&raw);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].partner_code, "034760-015");
+    assert_eq!(rows[0].total, 170_000);
+}
+
+#[test]
+fn test_build_unchin_summary_rows_empty() {
+    assert!(build_unchin_summary_rows(&[]).is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════
 // ハンドラ: GET /api/unchin/candidates
 // ══════════════════════════════════════════════════════════════
 
@@ -104,7 +153,7 @@ async fn test_unchin_candidates_ok_customer_with_params() {
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/unchin/candidates?from=2026-04-01&to=2026-07-01&partner_type=customer&limit=100")
+                .uri("/api/unchin/candidates?from=2026-04-01&to=2026-07-01&partner_type=customer&kind=billing_only")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -119,7 +168,7 @@ async fn test_unchin_candidates_ok_subcontractor() {
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/unchin/candidates?partner_type=subcontractor")
+                .uri("/api/unchin/candidates?partner_type=subcontractor&kind=non_billing")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -129,13 +178,28 @@ async fn test_unchin_candidates_ok_subcontractor() {
 }
 
 #[tokio::test]
-async fn test_unchin_candidates_ok_unknown_partner_type_falls_back() {
-    // partner_type が不正な値 → customer にフォールバックし 200 を返す
+async fn test_unchin_candidates_ok_unknown_partner_type_and_kind_fall_back() {
+    // partner_type / kind が不正な値 → fallback して 200 を返す
     let app = common::build_app(common::mock_repo());
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/unchin/candidates?partner_type=xxx&limit=0")
+                .uri("/api/unchin/candidates?partner_type=xxx&kind=xxx")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unchin_candidates_ok_kind_all() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/candidates?kind=all")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -166,6 +230,70 @@ async fn test_unchin_candidates_query_error() {
         .oneshot(
             Request::builder()
                 .uri("/api/unchin/candidates")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+// ══════════════════════════════════════════════════════════════
+// ハンドラ: GET /api/unchin/summary
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_unchin_summary_ok_defaults() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unchin_summary_ok_subcontractor_with_kind() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/summary?partner_type=subcontractor&kind=billing_only&from=2026-01-01&to=2027-01-01")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unchin_summary_pool_error() {
+    let app = common::build_app(common::error_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_unchin_summary_query_error() {
+    let app = common::build_app(common::query_error_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
