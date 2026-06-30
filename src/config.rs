@@ -122,7 +122,10 @@ fn default_allowed_origins() -> Vec<String> {
     vec!["https://ichibanboshi.mtamaramu.com".to_string()]
 }
 fn default_sqlite_path() -> String {
-    "/var/lib/ichibanboshi/state.db".to_string()
+    // VPS では `/opt/ichibanboshi/` が binary 配置先 (ubuntu 所有、CLAUDE.md 参照)。
+    // ここに state.db を置けば追加の mkdir / chown 無しで動く。`/var/lib/ichibanboshi/`
+    // は root 所有ディレクトリ配下で ubuntu が mkdir できず crash-loop した実害あり (#33 後)。
+    "/opt/ichibanboshi/state.db".to_string()
 }
 
 impl Default for DatabaseConfig {
