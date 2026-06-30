@@ -8,6 +8,8 @@ use axum::{Extension, Router};
 use chrono::{NaiveDate, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rust_ichibanboshi::auth::{AppClaims, JwtSecret};
+use rust_ichibanboshi::cakephp::CakephpClient;
+use rust_ichibanboshi::config::RawConfig;
 use rust_ichibanboshi::repo::{AppRepo, DynRepo, RepoError};
 use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::sales::*;
@@ -578,11 +580,42 @@ pub fn local_store() -> DynLocalStore {
     Arc::new(LocalStore::open(":memory:").expect("in-memory sqlite"))
 }
 
+/// テスト用 raw dir。**test 毎にユニーク**な path を作って衝突を避ける (各 test が
+/// 同 PID + 同時刻 nanos でぶつかる可能性を考慮し、UUID もまぶす)。
+pub fn temp_raw_dir() -> Arc<RawConfig> {
+    let dir = std::env::temp_dir().join(format!(
+        "ichibanboshi-test-raw-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        Uuid::new_v4()
+    ));
+    Arc::new(RawConfig {
+        dir: dir.to_string_lossy().into_owned(),
+    })
+}
+
+/// CakePHP 未配線 (base_url 空) の client。/recalc が 503 を返す経路用。
+pub fn disabled_cakephp() -> Arc<CakephpClient> {
+    Arc::new(CakephpClient::new(String::new(), 30).expect("cakephp client build"))
+}
+
 pub fn build_app(repo: DynRepo) -> Router {
-    build_app_with_store(repo, local_store())
+    build_app_full(repo, local_store(), disabled_cakephp(), temp_raw_dir())
 }
 
 pub fn build_app_with_store(repo: DynRepo, store: DynLocalStore) -> Router {
+    build_app_full(repo, store, disabled_cakephp(), temp_raw_dir())
+}
+
+pub fn build_app_full(
+    repo: DynRepo,
+    store: DynLocalStore,
+    cakephp: Arc<CakephpClient>,
+    raw_cfg: Arc<RawConfig>,
+) -> Router {
     let jwt_secret = JwtSecret(TEST_JWT_SECRET.to_string());
     let api_routes = Router::new()
         .route("/sales/monthly", get(routes::sales::monthly))
@@ -607,7 +640,16 @@ pub fn build_app_with_store(repo: DynRepo, store: DynLocalStore) -> Router {
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
         .route("/uriage/by-person", post(routes::uriage::by_person))
-        .route("/uriage/recalc", post(routes::uriage::recalc));
+        .route("/uriage/recalc", post(routes::uriage::recalc))
+        .route("/uriage/r2/pending", get(routes::uriage::r2_pending))
+        .route(
+            "/uriage/raw/{month}/{eigyosho_id}",
+            get(routes::uriage::raw_get),
+        )
+        .route(
+            "/uriage/raw/{month}/{eigyosho_id}/ack",
+            post(routes::uriage::raw_ack),
+        );
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))
@@ -618,6 +660,8 @@ pub fn build_app_with_store(repo: DynRepo, store: DynLocalStore) -> Router {
         .nest("/api", schema_routes)
         .layer(Extension(repo))
         .layer(Extension(store))
+        .layer(Extension(cakephp))
+        .layer(Extension(raw_cfg))
         .layer(Extension(jwt_secret))
 }
 

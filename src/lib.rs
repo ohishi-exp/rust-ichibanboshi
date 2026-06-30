@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cakephp;
 pub mod config;
 pub mod db;
 pub mod repo;

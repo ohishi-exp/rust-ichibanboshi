@@ -74,6 +74,28 @@ pub struct SqliteConfig {
     pub path: String,
 }
 
+/// CakePHP fetch configuration (Phase 2: masters / editable-months pull、issue #762)
+#[derive(Debug, Clone, Deserialize)]
+pub struct CakephpConfig {
+    /// CakePHP base URL (例: `https://ohishi-dev.ohishi.local/uriage-jyuchu-display`)。
+    /// 社内 LAN 内で到達可、token 不要。空文字なら `/recalc` などの依存 endpoint が 503 を返す。
+    #[serde(default)]
+    pub base_url: String,
+    /// HTTP request timeout (秒)。default 30 秒
+    #[serde(default = "default_cakephp_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// Raw NDJSON.gz 出力 configuration (Phase 2: R2 warm backup の input、issue #762)
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawConfig {
+    /// 生 NDJSON.gz の出力ディレクトリ (例: `/opt/ichibanboshi/raw/`)。
+    /// `recalc_jobs.raw_path = ${dir}/YYYY-MM/eigyosho-{id}.ndjson.gz`。
+    /// 親 dir が無い場合は auto-create。
+    #[serde(default = "default_raw_dir")]
+    pub dir: String,
+}
+
 /// Runtime configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -98,6 +120,12 @@ pub struct Config {
 
     #[serde(default)]
     pub sqlite: SqliteConfig,
+
+    #[serde(default)]
+    pub cakephp: CakephpConfig,
+
+    #[serde(default)]
+    pub raw: RawConfig,
 }
 
 fn default_port() -> u16 {
@@ -126,6 +154,12 @@ fn default_sqlite_path() -> String {
     // ここに state.db を置けば追加の mkdir / chown 無しで動く。`/var/lib/ichibanboshi/`
     // は root 所有ディレクトリ配下で ubuntu が mkdir できず crash-loop した実害あり (#33 後)。
     "/opt/ichibanboshi/state.db".to_string()
+}
+fn default_cakephp_timeout_secs() -> u64 {
+    30
+}
+fn default_raw_dir() -> String {
+    "/opt/ichibanboshi/raw".to_string()
 }
 
 impl Default for DatabaseConfig {
@@ -162,6 +196,23 @@ impl Default for SqliteConfig {
     fn default() -> Self {
         Self {
             path: default_sqlite_path(),
+        }
+    }
+}
+
+impl Default for CakephpConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            timeout_secs: default_cakephp_timeout_secs(),
+        }
+    }
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_raw_dir(),
         }
     }
 }
@@ -213,6 +264,8 @@ impl Config {
             auth: AuthConfig::default(),
             cors: CorsConfig::default(),
             sqlite: SqliteConfig::default(),
+            cakephp: CakephpConfig::default(),
+            raw: RawConfig::default(),
         })
     }
 }

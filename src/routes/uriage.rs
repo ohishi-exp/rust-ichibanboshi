@@ -9,15 +9,21 @@
 //! のため、条件式・符号・正規表現の意味は一字一句変えない (リファクタ禁止)。
 //! テストは `tests/uriage_test.rs` で同じ 17 ケース + 全分岐網羅。
 
-use axum::http::StatusCode;
+use axum::extract::{Path, Query};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use sha2::{Digest, Sha256};
 
+use crate::cakephp::{CakephpClient, CakephpError, MastersResponse, OfficeMasters};
+use crate::config::RawConfig;
 use crate::repo::{DynRepo, RepoError};
 use crate::sqlite::{DynLocalStore, LocalStoreError};
 
@@ -449,49 +455,55 @@ pub async fn by_person(
 
 // ══════════════════════════════════════════════════════════════
 // HTTP handler: POST /api/uriage/recalc
+//   CakePHP pull → editable_months チェック → raw NDJSON.gz 出力 → fingerprint 記録
 // ══════════════════════════════════════════════════════════════
 
-/// `/api/uriage/recalc` のリクエストボディ。
+/// `/api/uriage/recalc` のクエリパラメータ。
 ///
-/// `/by-person` と同じ入力 + 永続化に必要な `month` (bucket key) と `eigyosho_id`。
-/// `from`/`to` は SQL Server のフィルタ範囲、`month` は SQLite で集計をまとめる
-/// 単位 (典型的には `from` の月)。
-#[derive(Debug, Deserialize)]
-pub struct RecalcRequest {
-    /// 集計対象月 (`YYYY-MM`)。SQLite `uriage_person_monthly.month` の値になる
+/// 全パラメータ optional。**body 不要** (CakePHP から persons/other/bumon を pull するため)。
+///
+/// - `month` 未指定: editable_months 全部を処理
+/// - `month` 指定 + `eigyosho_id` 未指定: その月の全営業所を処理
+/// - 両方指定: 単一 (month, eigyosho_id) のみ処理
+#[derive(Debug, Deserialize, Default)]
+pub struct RecalcQuery {
+    /// 集計対象月 (`YYYY-MM`)。editable_months 内である必要がある (外なら 422)
+    pub month: Option<String>,
+    /// 営業所 id (`MastersResponse.offices` のキー)。指定時はその営業所のみ処理
+    pub eigyosho_id: Option<i64>,
+}
+
+/// 1 (month, eigyosho_id) 単位の recalc 結果。
+#[derive(Debug, Serialize)]
+pub struct RecalcJobResult {
     pub month: String,
-    /// 運行年月日 下限 (`YYYY-MM-DD`、含む)
-    pub from: String,
-    /// 運行年月日 上限 (`YYYY-MM-DD`、含む)。month-to-date なら月の途中で OK
-    pub to: String,
-    /// 営業所 id (`UriageJyuchuDisplay_list` のキー、SQLite の bucket 列)
     pub eigyosho_id: i64,
-    /// 受注部門コード (PHP の `jyuchu_bumon_in_jyuchu_display[$display_id]`)
-    pub bumon: Vec<String>,
-    /// 入力担当C → 担当者名
-    pub persons: HashMap<i32, String>,
-    /// 稼動部門コード → 営業所名
-    pub other: HashMap<String, String>,
-    /// PHP の `$cal`。truthy で別営業所も合算。省略時 true
-    #[serde(default = "default_cal")]
-    pub cal: bool,
+    /// `"computed"` | `"failed"` | `"skipped"` (営業所が masters に居ない等)
+    pub status: String,
+    /// 取得 raw row 数
+    pub row_count: usize,
+    /// SQLite に投入された非ゼロ担当者数 (cal=true) — fail/skip 時は 0
+    pub persisted_count_cal: usize,
+    /// 〃 cal=false
+    pub persisted_count_nocal: usize,
+    /// 32 hex 桁の sha256 prefix (fingerprint_after)
+    pub fingerprint: Option<String>,
+    /// raw NDJSON.gz の絶対 path
+    pub raw_path: Option<String>,
+    /// 失敗時の error 文言
+    pub error: Option<String>,
 }
 
 /// `/api/uriage/recalc` のレスポンス。
 #[derive(Debug, Serialize)]
 pub struct RecalcResponse {
     pub source_table: String,
-    pub month: String,
-    pub from: String,
-    pub to: String,
-    pub eigyosho_id: i64,
-    pub cal: bool,
-    pub sum: HashMap<String, PersonAccum>,
-    pub row_count: usize,
-    /// SQLite に insert された行数 (= 非ゼロ担当者数)
-    pub persisted_count: usize,
-    /// ISO 8601 UTC タイムスタンプ
+    /// 処理対象になった editable_months (1 つに絞った場合も配列)
+    pub months: Vec<String>,
+    /// CakePHP `editable_months_count` のエコー
+    pub editable_months_count: i32,
     pub calculated_at: String,
+    pub jobs: Vec<RecalcJobResult>,
 }
 
 fn map_local_store_err(e: LocalStoreError) -> StatusCode {
@@ -499,58 +511,524 @@ fn map_local_store_err(e: LocalStoreError) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-/// POST `/api/uriage/recalc`
+fn map_cakephp_err(e: CakephpError) -> (StatusCode, String) {
+    match e {
+        CakephpError::NotConfigured => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CakePHP base_url が未設定".to_string(),
+        ),
+        CakephpError::RequestFailed(m) => (
+            StatusCode::BAD_GATEWAY,
+            format!("CakePHP fetch failed: {m}"),
+        ),
+        CakephpError::StatusError {
+            status,
+            body_excerpt,
+        } => (
+            StatusCode::BAD_GATEWAY,
+            format!("CakePHP status {status}: {body_excerpt}"),
+        ),
+        CakephpError::JsonError(m) => (
+            StatusCode::BAD_GATEWAY,
+            format!("CakePHP response parse failed: {m}"),
+        ),
+    }
+}
+
+/// `month` (YYYY-MM) → 月初/月末 日付 (YYYY-MM-DD) を返す。
+/// SQL Server の `運行年月日 >=` と `<=` の inclusive 区間に使う。
+pub(crate) fn month_to_range(month: &str) -> Option<(String, String, String)> {
+    // YYYY-MM 形式チェック
+    if month.len() != 7 || month.as_bytes()[4] != b'-' {
+        return None;
+    }
+    let year: i32 = month[..4].parse().ok()?;
+    let m: u32 = month[5..].parse().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    // chrono で月末日を計算
+    let first = chrono::NaiveDate::from_ymd_opt(year, m, 1)?;
+    // 月末 = 翌月初の前日
+    let next = if m == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, m + 1, 1)?
+    };
+    let last = next.pred_opt()?;
+    // masters fetch 用に「月末日」を date として返す (CakePHP `/masters-json?date=` 用)
+    Some((
+        first.format("%Y-%m-%d").to_string(),
+        last.format("%Y-%m-%d").to_string(),
+        last.format("%Y-%m-%d").to_string(),
+    ))
+}
+
+/// raw rows を JSON-serializable 構造体に変換 (sort 済み列順は repo 側で保証済み、再 sort しない)。
+#[derive(Serialize)]
+struct RawRowOut<'a> {
+    yokoyoko: i32,
+    seikyu_k: i32,
+    biko2: &'a str,
+    nyuryoku_tanto_c: i32,
+    kado_bumon: &'a str,
+    kingaku: i64,
+    nebiki: i64,
+    warimashi: i64,
+    jippi: i64,
+    yosha_kingaku: i64,
+    yosha_nebiki: i64,
+    yosha_warimashi: i64,
+    yosha_jippi: i64,
+    shain_r: &'a str,
+    yoshasaki_c: &'a str,
+}
+
+impl<'a> From<&'a UriageRow> for RawRowOut<'a> {
+    fn from(r: &'a UriageRow) -> Self {
+        Self {
+            yokoyoko: r.yokoyoko,
+            seikyu_k: r.seikyu_k,
+            biko2: &r.biko2,
+            nyuryoku_tanto_c: r.nyuryoku_tanto_c,
+            kado_bumon: &r.kado_bumon,
+            kingaku: r.kingaku,
+            nebiki: r.nebiki,
+            warimashi: r.warimashi,
+            jippi: r.jippi,
+            yosha_kingaku: r.yosha_kingaku,
+            yosha_nebiki: r.yosha_nebiki,
+            yosha_warimashi: r.yosha_warimashi,
+            yosha_jippi: r.yosha_jippi,
+            shain_r: &r.shain_r,
+            yoshasaki_c: &r.yoshasaki_c,
+        }
+    }
+}
+
+/// raw rows を NDJSON (改行区切り JSON) bytes にシリアライズし、その bytes の sha256 hex を
+/// fingerprint として返す。bytes は gzip 圧縮前の確定形 (row order = repo sort 順)。
+pub(crate) fn serialize_ndjson_and_fingerprint(rows: &[UriageRow]) -> (Vec<u8>, String) {
+    let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 200);
+    for r in rows {
+        let out = RawRowOut::from(r);
+        // serde_json::to_writer は trailing \n を付けないので明示的に push する
+        let _ = serde_json::to_writer(&mut buf, &out);
+        buf.push(b'\n');
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    let fingerprint = format!("{:x}", hasher.finalize());
+    (buf, fingerprint)
+}
+
+/// NDJSON bytes を gzip 圧縮して指定パスに書き出す (親 dir auto-create)。
+pub(crate) fn write_raw_ndjson_gz(
+    raw_dir: &str,
+    month: &str,
+    eigyosho_id: i64,
+    ndjson: &[u8],
+) -> std::io::Result<String> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let dir = std::path::Path::new(raw_dir).join(month);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("eigyosho-{}.ndjson.gz", eigyosho_id));
+
+    // tmp 経由 atomic rename (PathModified watcher 等への中途半端な書き込み防止)
+    let tmp_path = path.with_extension("ndjson.gz.tmp");
+    {
+        let f = std::fs::File::create(&tmp_path)?;
+        let mut enc = GzEncoder::new(f, Compression::default());
+        enc.write_all(ndjson)?;
+        enc.finish()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 1 (month, eigyosho_id) 単位の recalc を実行する。
 ///
-/// SQL Server から運転日報明細を取り出し、`compute_person_sum` で担当者別 sum を算出して
-/// **SQLite に永続化** する。`/by-person` と同じ入力 + 永続化メタ (`month`, `eigyosho_id`)。
+/// 戻り値の `RecalcJobResult.status` は `"computed"` / `"failed"` のいずれか。
+/// failed の場合は SQLite recalc_jobs にも `status='failed' + last_error` で記録する。
+#[allow(clippy::too_many_arguments)]
+async fn recalc_one(
+    repo: &DynRepo,
+    store: &DynLocalStore,
+    raw_dir: &str,
+    month: &str,
+    eigyosho_id: i64,
+    masters: &OfficeMasters,
+    from: &str,
+    to: &str,
+    calculated_at: &str,
+) -> RecalcJobResult {
+    let mut job = RecalcJobResult {
+        month: month.to_string(),
+        eigyosho_id,
+        status: "computed".to_string(),
+        row_count: 0,
+        persisted_count_cal: 0,
+        persisted_count_nocal: 0,
+        fingerprint: None,
+        raw_path: None,
+        error: None,
+    };
+
+    // bumon が空 (= マスタ未設定) は skip しても compute は走らせない方が安全。
+    // CakePHP /masters-json の bumon は PR #766 以降の仕様で空配列にはならないはずだが、
+    // 未対応の旧 CakePHP が混ざった場合の防御。
+    if masters.bumon.is_empty() {
+        job.status = "failed".to_string();
+        job.error = Some("masters.bumon is empty (CakePHP 旧仕様?)".to_string());
+        let _ = store
+            .record_recalc_failed(
+                month,
+                eigyosho_id,
+                job.error.as_deref().unwrap_or(""),
+                calculated_at,
+            )
+            .await;
+        return job;
+    }
+
+    // SQL Server から運転日報明細を取得
+    let rows = match repo.uriage_rows(from, to, &masters.bumon).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("sqlserver: {e:?}");
+            job.status = "failed".to_string();
+            job.error = Some(msg.clone());
+            let _ = store
+                .record_recalc_failed(month, eigyosho_id, &msg, calculated_at)
+                .await;
+            return job;
+        }
+    };
+    job.row_count = rows.len();
+
+    let persons = masters.persons_as_int_map();
+    let other = masters.other.clone();
+
+    // raw fingerprint (cal は raw rows には影響しないので 1 回でよい)
+    let (ndjson, fingerprint) = serialize_ndjson_and_fingerprint(&rows);
+
+    // raw NDJSON.gz を disk に出す (失敗しても recalc 本体は続行、raw_path = None)
+    let raw_path = match write_raw_ndjson_gz(raw_dir, month, eigyosho_id, &ndjson) {
+        Ok(p) => {
+            job.raw_path = Some(p.clone());
+            Some(p)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "raw NDJSON.gz 書き出しに失敗 (recalc は続行): month={month} eigyosho={eigyosho_id} err={e}"
+            );
+            None
+        }
+    };
+
+    // cal=true / cal=false それぞれで compute_person_sum + upsert
+    let result_cal = compute_person_sum(&rows, &persons, &other, true);
+    let result_nocal = compute_person_sum(&rows, &persons, &other, false);
+
+    match store
+        .upsert_person_monthly(month, eigyosho_id, true, &result_cal.sum, calculated_at)
+        .await
+    {
+        Ok(n) => job.persisted_count_cal = n,
+        Err(e) => {
+            let msg = format!("sqlite upsert(cal=true): {e}");
+            job.status = "failed".to_string();
+            job.error = Some(msg.clone());
+            let _ = store
+                .record_recalc_failed(month, eigyosho_id, &msg, calculated_at)
+                .await;
+            return job;
+        }
+    }
+    match store
+        .upsert_person_monthly(month, eigyosho_id, false, &result_nocal.sum, calculated_at)
+        .await
+    {
+        Ok(n) => job.persisted_count_nocal = n,
+        Err(e) => {
+            let msg = format!("sqlite upsert(cal=false): {e}");
+            job.status = "failed".to_string();
+            job.error = Some(msg.clone());
+            let _ = store
+                .record_recalc_failed(month, eigyosho_id, &msg, calculated_at)
+                .await;
+            return job;
+        }
+    }
+
+    // recalc_jobs に記録 (fingerprint + raw_path + status='computed')
+    if let Err(e) = store
+        .record_recalc_computed(
+            month,
+            eigyosho_id,
+            &fingerprint,
+            raw_path.as_deref(),
+            calculated_at,
+        )
+        .await
+    {
+        // 記録だけ落ちた場合は status は computed のまま (集計は成功している) だが
+        // error フィールドで知らせる
+        job.error = Some(format!("record_recalc_computed: {e}"));
+    }
+    job.fingerprint = Some(fingerprint);
+    job
+}
+
+/// POST `/api/uriage/recalc?month=YYYY-MM&eigyosho_id=N`
 ///
-/// (Phase 2、issue #762 PR-C1) 現状は同期。後続 PR で tokio worker による fire-and-forget
-/// 化と fingerprint 比較 / raw NDJSON.gz 出力 / `r2_pending` view を追加。
+/// CakePHP から masters + editable_months を pull し、対象 (month, eigyosho_id) について
+/// SQL Server から運転日報明細を取得 → compute_person_sum (cal={true,false}) → SQLite
+/// upsert + raw NDJSON.gz 出力 + recalc_jobs に fingerprint 記録、を行う。
+///
+/// **body は受け取らない** (persons/other/bumon は CakePHP から pull)。
+///
+/// - `month` 未指定: editable_months 全部 (CakePHP の `editable_months` 配列) を処理
+/// - `month` 指定 + editable_months に含まれない → 422 (編集不可月の recalc は拒否)
+/// - `eigyosho_id` 指定なし: その月の全営業所 (masters.offices) を処理
+///
+/// 編集不可月の recalc を 422 で拒否する設計判断 (user, 2026-06-30):
+/// > 「編集不可月は recalc skip」が design contract — fingerprint は残し、編集可能月を
+/// > 変更したら復活する
 pub async fn recalc(
     Extension(repo): Extension<DynRepo>,
     Extension(store): Extension<DynLocalStore>,
-    Json(req): Json<RecalcRequest>,
-) -> Result<Json<RecalcResponse>, StatusCode> {
-    // 入力検証
-    if req.from.is_empty() || req.to.is_empty() || req.month.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if req.bumon.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+    Extension(cakephp): Extension<Arc<CakephpClient>>,
+    Extension(raw_config): Extension<Arc<RawConfig>>,
+    Query(q): Query<RecalcQuery>,
+) -> Result<Json<RecalcResponse>, (StatusCode, String)> {
+    // CakePHP 未配線なら 503 (= base_url 空)
+    if !cakephp.is_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CakePHP base_url 未設定: /recalc は無効".to_string(),
+        ));
     }
 
-    let rows = repo
-        .uriage_rows(&req.from, &req.to, &req.bumon)
+    // editable_months を取得
+    let editable = cakephp
+        .fetch_editable_months()
         .await
-        .map_err(map_repo_err)?;
-    let row_count = rows.len();
+        .map_err(map_cakephp_err)?;
 
-    let result = compute_person_sum(&rows, &req.persons, &req.other, req.cal);
+    // 処理対象月を決める
+    let target_months: Vec<String> = match &q.month {
+        Some(m) => {
+            if !editable.editable_months.iter().any(|em| em == m) {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "month={m} は編集可能月ではない (editable_months={:?})",
+                        editable.editable_months
+                    ),
+                ));
+            }
+            vec![m.clone()]
+        }
+        None => editable.editable_months.clone(),
+    };
 
     let calculated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let persisted = store
-        .upsert_person_monthly(
-            &req.month,
-            req.eigyosho_id,
-            req.cal,
-            &result.sum,
-            &calculated_at,
-        )
-        .await
-        .map_err(map_local_store_err)?;
+    let mut jobs: Vec<RecalcJobResult> = Vec::new();
+
+    for month in &target_months {
+        let (from, to, masters_date) = match month_to_range(month) {
+            Some(t) => t,
+            None => {
+                jobs.push(RecalcJobResult {
+                    month: month.clone(),
+                    eigyosho_id: 0,
+                    status: "failed".to_string(),
+                    row_count: 0,
+                    persisted_count_cal: 0,
+                    persisted_count_nocal: 0,
+                    fingerprint: None,
+                    raw_path: None,
+                    error: Some(format!("month の形式が不正: {month}")),
+                });
+                continue;
+            }
+        };
+
+        // masters を「月末日」基準で取得 (人事異動等は月跨ぎでは想定外)
+        let masters = match cakephp.fetch_masters(&masters_date).await {
+            Ok(m) => m,
+            Err(e) => {
+                jobs.push(RecalcJobResult {
+                    month: month.clone(),
+                    eigyosho_id: 0,
+                    status: "failed".to_string(),
+                    row_count: 0,
+                    persisted_count_cal: 0,
+                    persisted_count_nocal: 0,
+                    fingerprint: None,
+                    raw_path: None,
+                    error: Some(format!("CakePHP masters fetch: {e}")),
+                });
+                continue;
+            }
+        };
+
+        let targets: Vec<(i64, &OfficeMasters)> = if let Some(eid) = q.eigyosho_id {
+            // 単一営業所指定: masters に居なければ skip
+            match office_lookup(&masters, eid) {
+                Some(o) => vec![(eid, o)],
+                None => {
+                    jobs.push(RecalcJobResult {
+                        month: month.clone(),
+                        eigyosho_id: eid,
+                        status: "skipped".to_string(),
+                        row_count: 0,
+                        persisted_count_cal: 0,
+                        persisted_count_nocal: 0,
+                        fingerprint: None,
+                        raw_path: None,
+                        error: Some(format!("eigyosho_id={eid} が masters に存在しない")),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            // 全営業所: masters.offices の全エントリ
+            let mut v: Vec<(i64, &OfficeMasters)> = masters
+                .offices
+                .iter()
+                .filter_map(|(k, v)| k.parse::<i64>().ok().map(|i| (i, v)))
+                .collect();
+            // 安定順 (id 昇順) で処理
+            v.sort_by_key(|(id, _)| *id);
+            v
+        };
+
+        for (eid, om) in targets {
+            let job = recalc_one(
+                &repo,
+                &store,
+                &raw_config.dir,
+                month,
+                eid,
+                om,
+                &from,
+                &to,
+                &calculated_at,
+            )
+            .await;
+            jobs.push(job);
+        }
+    }
 
     Ok(Json(RecalcResponse {
-        source_table: "運転日報明細 + 社員ﾏｽﾀ → uriage_person_monthly (SQLite)".to_string(),
-        month: req.month,
-        from: req.from,
-        to: req.to,
-        eigyosho_id: req.eigyosho_id,
-        cal: req.cal,
-        sum: result.sum,
-        row_count,
-        persisted_count: persisted,
+        source_table: "運転日報明細 + CakePHP masters → uriage_person_monthly + recalc_jobs"
+            .to_string(),
+        months: target_months,
+        editable_months_count: editable.editable_months_count,
         calculated_at,
+        jobs,
     }))
+}
+
+/// `MastersResponse.offices` (HashMap<String, _>) から i64 key で OfficeMasters を引く。
+fn office_lookup(masters: &MastersResponse, eigyosho_id: i64) -> Option<&OfficeMasters> {
+    masters.offices.get(&eigyosho_id.to_string())
+}
+
+// ══════════════════════════════════════════════════════════════
+// R2 sync endpoints
+// ══════════════════════════════════════════════════════════════
+
+/// GET `/api/uriage/r2/pending`
+///
+/// `r2_pending` view を返す (fingerprint 変化があったが R2 未送信の (month, eigyosho_id))。
+/// nuxt cron が叩いて、結果の各 entry の `/raw/:month/:eigyosho_id` を fetch → R2 put →
+/// `/raw/:month/:eigyosho_id/ack` を順に叩く。
+pub async fn r2_pending(
+    Extension(store): Extension<DynLocalStore>,
+) -> Result<Json<R2PendingResponse>, StatusCode> {
+    let rows = store.list_r2_pending().await.map_err(map_local_store_err)?;
+    Ok(Json(R2PendingResponse {
+        count: rows.len(),
+        items: rows,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct R2PendingResponse {
+    pub count: usize,
+    pub items: Vec<crate::sqlite::R2PendingRow>,
+}
+
+/// GET `/api/uriage/raw/:month/:eigyosho_id`
+///
+/// recalc が disk に書き出した raw NDJSON.gz の bytes を返す (`Content-Type: application/gzip`)。
+/// path は SQLite `recalc_jobs.raw_path` から引く (URL 直接 path traversal 不可)。
+pub async fn raw_get(
+    Extension(store): Extension<DynLocalStore>,
+    Path((month, eigyosho_id)): Path<(String, i64)>,
+) -> Result<Response, StatusCode> {
+    let job = store
+        .get_recalc_job(&month, eigyosho_id)
+        .await
+        .map_err(map_local_store_err)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let path = job.raw_path.ok_or(StatusCode::NOT_FOUND)?;
+
+    let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        tracing::error!("raw read failed: path={path} err={e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut resp = bytes.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/gzip"),
+    );
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}-eigyosho-{}.ndjson.gz\"",
+            month, eigyosho_id
+        ))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("attachment")),
+    );
+    Ok(resp)
+}
+
+/// POST `/api/uriage/raw/:month/:eigyosho_id/ack`
+///
+/// R2 への送信完了を記録する (`recalc_jobs.status='r2_synced' + r2_synced_at=now`)。
+/// 該当 job が computed 状態に無い場合は 404 (ack 対象が無い)。
+pub async fn raw_ack(
+    Extension(store): Extension<DynLocalStore>,
+    Path((month, eigyosho_id)): Path<(String, i64)>,
+) -> Result<Json<RawAckResponse>, StatusCode> {
+    let synced_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let n = store
+        .record_r2_synced(&month, eigyosho_id, &synced_at)
+        .await
+        .map_err(map_local_store_err)?;
+    if n == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(RawAckResponse {
+        month,
+        eigyosho_id,
+        synced_at,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct RawAckResponse {
+    pub month: String,
+    pub eigyosho_id: i64,
+    pub synced_at: String,
 }
 
 /// `preg_replace("/売上　|売上\s/", "", $str)` の写経。
@@ -703,5 +1181,179 @@ mod tests {
         // 別営業所 → true
         assert!(is_oth_yosha("本社", "佐賀営業所"));
         assert!(is_oth_yosha("1", "8"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // PR-C2 / D helpers
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn month_to_range_jan() {
+        let (from, to, date) = month_to_range("2026-01").unwrap();
+        assert_eq!(from, "2026-01-01");
+        assert_eq!(to, "2026-01-31");
+        assert_eq!(date, "2026-01-31");
+    }
+
+    #[test]
+    fn month_to_range_feb_handles_leap() {
+        // 2024 はうるう年
+        let (from, to, date) = month_to_range("2024-02").unwrap();
+        assert_eq!(from, "2024-02-01");
+        assert_eq!(to, "2024-02-29");
+        assert_eq!(date, "2024-02-29");
+        // 2026 は平年
+        let (from, to, _) = month_to_range("2026-02").unwrap();
+        assert_eq!(from, "2026-02-01");
+        assert_eq!(to, "2026-02-28");
+    }
+
+    #[test]
+    fn month_to_range_dec_year_rollover() {
+        let (from, to, _) = month_to_range("2026-12").unwrap();
+        assert_eq!(from, "2026-12-01");
+        assert_eq!(to, "2026-12-31");
+    }
+
+    #[test]
+    fn month_to_range_invalid_format_returns_none() {
+        assert!(month_to_range("2026-1").is_none()); // 1 桁月
+        assert!(month_to_range("26-01").is_none()); // 短い年
+        assert!(month_to_range("2026/01").is_none()); // 区切り違い
+        assert!(month_to_range("2026-13").is_none()); // 月範囲外
+        assert!(month_to_range("2026-00").is_none()); // 0 月
+        assert!(month_to_range("").is_none());
+        assert!(month_to_range("abcd-ef").is_none());
+    }
+
+    #[test]
+    fn serialize_ndjson_empty_rows() {
+        let (bytes, fp) = serialize_ndjson_and_fingerprint(&[]);
+        assert!(bytes.is_empty());
+        // 空 bytes でも sha256 は固定値
+        // sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            fp,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn serialize_ndjson_deterministic_for_same_rows() {
+        let rows = vec![
+            UriageRow {
+                kingaku: 1000,
+                biko2: "売上 山﨑".to_string(),
+                ..UriageRow::default()
+            },
+            UriageRow {
+                kingaku: 2000,
+                biko2: "売上 青井".to_string(),
+                ..UriageRow::default()
+            },
+        ];
+        let (b1, fp1) = serialize_ndjson_and_fingerprint(&rows);
+        let (b2, fp2) = serialize_ndjson_and_fingerprint(&rows);
+        assert_eq!(b1, b2);
+        assert_eq!(fp1, fp2);
+        // 2 行 → 改行で分かれている
+        assert_eq!(b1.iter().filter(|&&c| c == b'\n').count(), 2);
+    }
+
+    #[test]
+    fn serialize_ndjson_changes_when_row_changes() {
+        let r1 = vec![UriageRow {
+            kingaku: 1000,
+            ..UriageRow::default()
+        }];
+        let r2 = vec![UriageRow {
+            kingaku: 1001,
+            ..UriageRow::default()
+        }];
+        let (_, fp1) = serialize_ndjson_and_fingerprint(&r1);
+        let (_, fp2) = serialize_ndjson_and_fingerprint(&r2);
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn write_raw_ndjson_gz_creates_file_and_can_be_decoded() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ichibanboshi-raw-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let raw_dir = tmp.to_string_lossy().into_owned();
+
+        let payload = b"line1\nline2\n";
+        let path = write_raw_ndjson_gz(&raw_dir, "2026-06", 9, payload).unwrap();
+        assert!(path.contains("2026-06"));
+        assert!(path.ends_with("eigyosho-9.ndjson.gz"));
+        assert!(std::path::Path::new(&path).exists());
+
+        // gunzip して中身が一致するか
+        let bytes = std::fs::read(&path).unwrap();
+        let mut dec = GzDecoder::new(&bytes[..]);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_raw_ndjson_gz_atomic_rename_leaves_no_tmp() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ichibanboshi-raw-tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let raw_dir = tmp.to_string_lossy().into_owned();
+        let path = write_raw_ndjson_gz(&raw_dir, "2026-06", 1, b"x").unwrap();
+        // 同じ dir に .tmp は残らない
+        let tmp_path = std::path::Path::new(&path).with_extension("ndjson.gz.tmp");
+        assert!(!tmp_path.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn office_lookup_parses_string_keys() {
+        use crate::cakephp::OfficeMasters;
+        let mut offices = std::collections::HashMap::new();
+        offices.insert(
+            "1".to_string(),
+            OfficeMasters {
+                display_name: "本社".to_string(),
+                persons: HashMap::new(),
+                other: HashMap::new(),
+                bumon: vec!["010".to_string()],
+            },
+        );
+        offices.insert(
+            "9".to_string(),
+            OfficeMasters {
+                display_name: "宮崎".to_string(),
+                persons: HashMap::new(),
+                other: HashMap::new(),
+                bumon: vec!["015".to_string()],
+            },
+        );
+        let masters = MastersResponse {
+            date: "2026-06-29".to_string(),
+            offices,
+        };
+        assert_eq!(office_lookup(&masters, 1).unwrap().display_name, "本社");
+        assert_eq!(office_lookup(&masters, 9).unwrap().display_name, "宮崎");
+        assert!(office_lookup(&masters, 7).is_none());
     }
 }

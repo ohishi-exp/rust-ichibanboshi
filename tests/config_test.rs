@@ -177,6 +177,55 @@ fn test_cors_config_default() {
 }
 
 #[test]
+fn test_sqlite_config_default() {
+    let s = rust_ichibanboshi::config::SqliteConfig::default();
+    assert_eq!(s.path, "/opt/ichibanboshi/state.db");
+}
+
+#[test]
+fn test_cakephp_config_default() {
+    let c = rust_ichibanboshi::config::CakephpConfig::default();
+    assert!(c.base_url.is_empty()); // 空文字 = 機能無効
+    assert_eq!(c.timeout_secs, 30);
+}
+
+#[test]
+fn test_raw_config_default() {
+    let r = rust_ichibanboshi::config::RawConfig::default();
+    assert_eq!(r.dir, "/opt/ichibanboshi/raw");
+}
+
+#[test]
+fn test_config_phase2_sections_from_toml() {
+    let toml_str = r#"
+[sqlite]
+path = "/var/tmp/test.db"
+
+[cakephp]
+base_url = "https://ohishi-dev.local"
+timeout_secs = 10
+
+[raw]
+dir = "/data/raw"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.sqlite.path, "/var/tmp/test.db");
+    assert_eq!(config.cakephp.base_url, "https://ohishi-dev.local");
+    assert_eq!(config.cakephp.timeout_secs, 10);
+    assert_eq!(config.raw.dir, "/data/raw");
+}
+
+#[test]
+fn test_config_phase2_defaults_when_omitted() {
+    // empty TOML → SqliteConfig/CakephpConfig/RawConfig すべて default 値で埋まる
+    let config: Config = toml::from_str("").unwrap();
+    assert_eq!(config.sqlite.path, "/opt/ichibanboshi/state.db");
+    assert!(config.cakephp.base_url.is_empty());
+    assert_eq!(config.cakephp.timeout_secs, 30);
+    assert_eq!(config.raw.dir, "/opt/ichibanboshi/raw");
+}
+
+#[test]
 fn test_config_from_args_with_config_file() {
     // temp ファイルに TOML を書き出して --config で読み込み
     let dir = std::env::temp_dir().join("ichibanboshi_test");

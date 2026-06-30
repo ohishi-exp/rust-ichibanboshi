@@ -38,12 +38,21 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 # Phase 2 担当者別売上 summary local store (sqlite.rs)。bundled で OS の libsqlite 不要
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Phase 2 CakePHP masters / editable-months HTTP pull (社内 LAN、token 不要)
+# rustls-tls で openssl 依存を回避 (musl static build を維持)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+# Phase 2 raw NDJSON.gz 出力
+flate2 = "1"
+# Phase 2 fingerprint (raw rows sha256 — recalc skip 判定 + R2 sync 必要性判定)
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# CakePHP fetch を stub する HTTP mock (Phase 2 /recalc 統合テスト)
+wiremock = "0.6"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
