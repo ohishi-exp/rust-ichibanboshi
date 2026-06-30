@@ -155,23 +155,52 @@ impl LocalStore {
         })
     }
 
+    /// `sqlite_master.type` を見て TABLE or VIEW を判別し、適切な DROP を発行する。
+    ///
+    /// SQLite は `DROP TABLE` を VIEW に対して使うとエラー、`DROP VIEW` を TABLE に
+    /// 対して使うともエラーになる。schema 移行時 (TABLE → VIEW 等) で旧型が残っている
+    /// 可能性に対応するための helper。対象が存在しなければ no-op。
+    fn drop_object_if_exists(conn: &Connection, name: &str) -> Result<(), LocalStoreError> {
+        use rusqlite::OptionalExtension;
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+        let drop_sql = match kind.as_deref() {
+            Some("view") => format!("DROP VIEW IF EXISTS {name}"),
+            Some("table") => format!("DROP TABLE IF EXISTS {name}"),
+            // index / trigger / その他 or 存在せず → no-op
+            _ => return Ok(()),
+        };
+        conn.execute_batch(&drop_sql)
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
     fn migrate(conn: &Connection) -> Result<(), LocalStoreError> {
         // 担当者×月×営業所×cal 集計。
         //
-        // 設計判断 (Refs #43、2026-06-30):
+        // 設計判断 (Refs #43/#44、2026-06-30):
         // - **table / index**: `CREATE IF NOT EXISTS` で idempotent。既存データ保持。
-        // - **view**: SQLite は `CREATE OR REPLACE VIEW` を持たないため、
-        //   schema 変更時に `IF NOT EXISTS` だと旧定義が残り続け新カラム読みで
-        //   `no such column` エラーになる (= prod 500 の原因、user 報告)。
-        //   **view は毎 boot で `DROP THEN CREATE`** にする (= derived なので
-        //   再生成 cost は無視できる、データ損失なし)。
+        // - **view**: SQLite は `CREATE OR REPLACE VIEW` を持たないため schema 変更を
+        //   反映するには毎 boot で DROP+CREATE が必要 (= derived なので再生成 cost 0)。
+        //   ただし旧 PR で `uriage_person_monthly` を **TABLE → VIEW に変更**した時に
+        //   `CREATE VIEW IF NOT EXISTS` が既存 TABLE をスキップしてしまい、prod DB に
+        //   TABLE のまま残っている事例があった (#44 deploy で `use DROP TABLE to delete
+        //   table` エラーで boot 不能になった実害)。よって **sqlite_master.type を見て
+        //   TABLE/VIEW を判別してから適切な DROP を出す** helper を使う (`drop_object_if_exists`)。
         //
         // recalc_jobs: per (month, eigyosho_id) の recalc 状態 + fingerprint + R2 sync 状態。
         // r2_pending view: fingerprint 変化があったが R2 未送信の (month, eigyosho_id)。
         // nuxt cron が `GET /api/uriage/r2/pending` で取得し、生 bytes を R2 に putAll → ack。
+
+        // ── 1. tables / indexes (idempotent、データ保持) ──
         conn.execute_batch(
             r#"
-            -- ── 1. tables / indexes (idempotent、データ保持) ──
             CREATE TABLE IF NOT EXISTS uriage_person_daily (
                 unko_date     TEXT    NOT NULL,
                 month         TEXT    NOT NULL,
@@ -205,10 +234,6 @@ impl LocalStore {
             CREATE INDEX IF NOT EXISTS idx_rj_status
                 ON recalc_jobs (status);
 
-            -- 検証履歴 (verify endpoint が upsert する。Refs #762 R2 sync gate)。
-            -- (unko_date, eigyosho_id, cal) で UPSERT。再 verify すると上書き、
-            -- 履歴の累積は持たない (= 「最新の検証結果」が SoT)。
-            -- diff_json は ng 時の {"php_only":..., "rust_only":...} を文字列保存。
             CREATE TABLE IF NOT EXISTS verify_jobs (
                 unko_date         TEXT    NOT NULL,
                 eigyosho_id       INTEGER NOT NULL,
@@ -226,12 +251,21 @@ impl LocalStore {
                 ON verify_jobs (month, eigyosho_id);
             CREATE INDEX IF NOT EXISTS idx_vj_ran_at
                 ON verify_jobs (ran_at DESC);
+            "#,
+        )
+        .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
 
-            -- ── 2. views (毎 boot で drop+create、schema 変更を漏れなく反映) ──
-            DROP VIEW IF EXISTS r2_pending;
-            DROP VIEW IF EXISTS verify_coverage;
-            DROP VIEW IF EXISTS uriage_person_monthly;
+        // ── 2. views を一旦 DROP (TABLE/VIEW を sqlite_master で判別) ──
+        // 3 名はいずれも現行 schema では VIEW だが、旧 deploy 残骸で TABLE として
+        // 存在する可能性があるため (PR #44 deploy 失敗の root cause)、type を見てから
+        // 適切な DROP を出す。
+        Self::drop_object_if_exists(conn, "r2_pending")?;
+        Self::drop_object_if_exists(conn, "verify_coverage")?;
+        Self::drop_object_if_exists(conn, "uriage_person_monthly")?;
 
+        // ── 3. views を CREATE (schema 変更は毎 boot 反映) ──
+        conn.execute_batch(
+            r#"
             -- 月次集計は日次の SUM 由来の VIEW (= 二重持ちしない、user 指摘 2026-06-30)。
             CREATE VIEW uriage_person_monthly AS
             SELECT month,
@@ -1397,6 +1431,56 @@ mod migration_upgrade_tests {
         assert_eq!(pending.len(), 0);
 
         // 後始末
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// prod の post-#44-failed state: `uriage_person_monthly` が **TABLE として残骸**
+    /// (旧 deploy で TABLE → VIEW 移行時に `CREATE VIEW IF NOT EXISTS` がスキップして
+    /// TABLE が居座ったまま)。新 migrate は `drop_object_if_exists` で sqlite_master
+    /// の type を見て DROP TABLE を発行できるか。これが効かないと `use DROP TABLE to
+    /// delete table uriage_person_monthly` エラーで binary が boot 不能 (#45 で実測)。
+    #[test]
+    fn migrate_drops_uriage_person_monthly_when_it_exists_as_table() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ichibanboshi-test-monthly-as-table-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        // 1. uriage_person_monthly を TABLE として作る (prod 残骸を再現)
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE uriage_person_monthly (
+                    month TEXT NOT NULL,
+                    person_name TEXT NOT NULL,
+                    eigyosho_id INTEGER NOT NULL,
+                    cal INTEGER NOT NULL,
+                    kingaku INTEGER NOT NULL,
+                    yosha_kingaku INTEGER NOT NULL,
+                    kensuu INTEGER NOT NULL,
+                    calculated_at TEXT NOT NULL,
+                    PRIMARY KEY (month, person_name, eigyosho_id, cal)
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        // 2. LocalStore::open → migrate で drop_object_if_exists が TABLE を消す
+        //    → CREATE VIEW で再生成、boot が通る
+        let store = LocalStore::open(tmp.to_str().unwrap())
+            .expect("migrate should handle uriage_person_monthly residual TABLE");
+        // 3. view として引けることを確認
+        let rows = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(store.get_person_monthly("2026-06", 1, true))
+            .expect("get_person_monthly should not fail (view recreated)");
+        assert_eq!(rows.len(), 0);
         let _ = std::fs::remove_file(&tmp);
     }
 }
