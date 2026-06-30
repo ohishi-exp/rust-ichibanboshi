@@ -77,6 +77,7 @@ pub async fn run(
         .route("/vehicles", get(routes::surcharge::vehicles))
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
+        .route("/uriage/daily", get(routes::uriage::daily))
         .route("/uriage/r2/pending", get(routes::uriage::r2_pending))
         .route(
             "/uriage/raw/{month}/{eigyosho_id}",
@@ -85,7 +86,9 @@ pub async fn run(
         .route(
             "/uriage/raw/{month}/{eigyosho_id}/ack",
             post(routes::uriage::raw_ack),
-        );
+        )
+        .route("/uriage/admin/delete", post(routes::uriage::admin_delete))
+        .route("/uriage/admin/rebuild", post(routes::uriage::admin_rebuild));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
