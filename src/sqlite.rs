@@ -63,7 +63,24 @@ impl std::fmt::Debug for LocalStore {
 
 impl LocalStore {
     /// 指定パス (or `:memory:`) の SQLite を open し、schema migration を流す。
+    ///
+    /// 親ディレクトリが存在しない場合は `fs::create_dir_all` で作成する (caller が
+    /// mkdir し忘れて crash-loop に陥った実害あり、PR #33 後の deploy で発生)。
+    /// 親ディレクトリの作成権限が無い場合は `OpenFailed` を返す (例: `/var/lib/`
+    /// など root 所有領域)。
     pub fn open(path: &str) -> Result<Self, LocalStoreError> {
+        if path != ":memory:" {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        LocalStoreError::OpenFailed(format!(
+                            "create_dir_all({}) failed: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+            }
+        }
         let conn =
             Connection::open(path).map_err(|e| LocalStoreError::OpenFailed(e.to_string()))?;
         Self::migrate(&conn)?;
@@ -395,9 +412,30 @@ mod tests {
 
     #[test]
     fn open_invalid_path_returns_error() {
-        // 存在しない directory 配下に open → OpenFailed
-        let err = LocalStore::open("/nonexistent-dir-xyzzy/state.db").unwrap_err();
+        // `/dev/null` は char device で、その配下に dir を作れない → create_dir_all 失敗 →
+        // OpenFailed が返る (path 自己回復が無理なケースの代表)
+        let err = LocalStore::open("/dev/null/sub/state.db").unwrap_err();
         assert!(matches!(err, LocalStoreError::OpenFailed(_)));
-        assert!(err.to_string().contains("sqlite open failed"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create_dir_all") || msg.contains("sqlite open failed"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_creates_parent_dir_if_missing() {
+        // テスト用一時 dir 配下に存在しない subdir を含むパスを指定 → 自動作成される
+        let tmp = std::env::temp_dir().join(format!("ichibanboshi-test-{}", std::process::id()));
+        // 前テストの残骸を片付け
+        let _ = std::fs::remove_dir_all(&tmp);
+        let nested = tmp.join("nested/dir/state.db");
+        let store = LocalStore::open(nested.to_str().unwrap())
+            .expect("open should auto-create parent dirs");
+        let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+        assert!(rows.is_empty());
+        assert!(nested.exists(), "state.db file should be created");
+        // 後始末
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
