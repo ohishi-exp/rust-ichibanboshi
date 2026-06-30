@@ -313,6 +313,7 @@ impl AppRepo for MockRepo {
                 shain_r: "青井".into(),
                 yoshasaki_c: "000000".into(),
                 unko_date: "2026-06-15".into(),
+                uriage_date: "2026-06-15".into(),
             },
             // 入力担当 9999 (マスタ外) → B6 で表示のみ、$sum に積まない
             UriageRow {
@@ -332,6 +333,7 @@ impl AppRepo for MockRepo {
                 shain_r: "無関係".into(),
                 yoshasaki_c: "021970".into(),
                 unko_date: "2026-06-16".into(),
+                uriage_date: "2026-06-16".into(),
             },
         ])
     }

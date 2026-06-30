@@ -36,6 +36,7 @@ fn base_row() -> UriageRow {
         shain_r: "青井健".to_string(),
         yoshasaki_c: "021970".to_string(),
         unko_date: "2026-06-15".to_string(),
+        uriage_date: "2026-06-15".to_string(),
     }
 }
 
