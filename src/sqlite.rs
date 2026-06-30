@@ -49,6 +49,22 @@ pub struct PersonMonthlyRow {
     pub calculated_at: String,
 }
 
+/// 担当者×日×営業所×cal の集計 1 行 (drill-down 用)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonDailyRow {
+    /// 運行年月日 (`YYYY-MM-DD`)
+    pub unko_date: String,
+    /// 集計バケット月 (`YYYY-MM`、unko_date の上位 7 文字と一致する想定)
+    pub month: String,
+    pub person_name: String,
+    pub eigyosho_id: i64,
+    pub cal: bool,
+    pub kingaku: i64,
+    pub yosha_kingaku: i64,
+    pub kensuu: i64,
+    pub calculated_at: String,
+}
+
 /// `recalc_jobs` 1 行。`status` 遷移: `queued → computing → computed → r2_synced`。
 /// 失敗時は `status='failed' + last_error`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -127,7 +143,10 @@ impl LocalStore {
         // nuxt cron が `GET /api/uriage/r2/pending` で取得し、生 bytes を R2 に putAll → ack。
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS uriage_person_monthly (
+            -- 日次集計 (SoT、唯一の persistence)。`(month, eigyosho_id, cal)` 単位で
+            -- delete-then-insert する (recalc 毎に全置換)。
+            CREATE TABLE IF NOT EXISTS uriage_person_daily (
+                unko_date     TEXT    NOT NULL,
                 month         TEXT    NOT NULL,
                 person_name   TEXT    NOT NULL,
                 eigyosho_id   INTEGER NOT NULL,
@@ -136,12 +155,27 @@ impl LocalStore {
                 yosha_kingaku INTEGER NOT NULL,
                 kensuu        INTEGER NOT NULL,
                 calculated_at TEXT    NOT NULL,
-                PRIMARY KEY (month, person_name, eigyosho_id, cal)
+                PRIMARY KEY (unko_date, person_name, eigyosho_id, cal)
             );
-            CREATE INDEX IF NOT EXISTS idx_upm_person_month
-                ON uriage_person_monthly (person_name, month);
-            CREATE INDEX IF NOT EXISTS idx_upm_eigyosho_month
-                ON uriage_person_monthly (eigyosho_id, month);
+            CREATE INDEX IF NOT EXISTS idx_upd_month_eigyosho
+                ON uriage_person_daily (month, eigyosho_id, cal);
+            CREATE INDEX IF NOT EXISTS idx_upd_person_date
+                ON uriage_person_daily (person_name, unko_date);
+
+            -- 月次集計は日次の SUM 由来の VIEW (= 二重持ちしない、user 指摘 2026-06-30)。
+            -- API レスポンスとしては既存の月次 query (`get_person_monthly`) と互換。
+            -- `calculated_at` は同 (month, eigyosho_id, cal) 内で日次 row の最新値を採用。
+            CREATE VIEW IF NOT EXISTS uriage_person_monthly AS
+            SELECT month,
+                   person_name,
+                   eigyosho_id,
+                   cal,
+                   SUM(kingaku)        AS kingaku,
+                   SUM(yosha_kingaku)  AS yosha_kingaku,
+                   SUM(kensuu)         AS kensuu,
+                   MAX(calculated_at)  AS calculated_at
+            FROM uriage_person_daily
+            GROUP BY month, person_name, eigyosho_id, cal;
 
             CREATE TABLE IF NOT EXISTS recalc_jobs (
                 month                TEXT    NOT NULL,
@@ -174,74 +208,6 @@ impl LocalStore {
         )
         .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
         Ok(())
-    }
-
-    /// `(month, eigyosho_id, cal)` の既存行を全削除して、引数の `sums` を入れ直す。
-    ///
-    /// `compute_person_sum` の出力をそのまま投入する想定。`kensuu == 0` の行は
-    /// drill-down ノイズになるので投入しない (マスタ初期化由来の空エントリを弾く)。
-    ///
-    /// 返り値 = 実際に insert した行数 (= 非ゼロ担当者数)。
-    pub async fn upsert_person_monthly(
-        &self,
-        month: &str,
-        eigyosho_id: i64,
-        cal: bool,
-        sums: &HashMap<String, PersonAccum>,
-        calculated_at: &str,
-    ) -> Result<usize, LocalStoreError> {
-        let month = month.to_string();
-        let calculated_at = calculated_at.to_string();
-        let cal_int = if cal { 1 } else { 0 };
-        let entries: Vec<(String, PersonAccum)> = sums
-            .iter()
-            .filter(|(_, v)| v.kensuu != 0 || v.kingaku != 0 || v.yosha_kingaku != 0)
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = futures_lock(&conn);
-            let tx = guard
-                .transaction()
-                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
-            tx.execute(
-                "DELETE FROM uriage_person_monthly \
-                 WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3",
-                params![month, eigyosho_id, cal_int],
-            )
-            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
-            let mut inserted = 0usize;
-            {
-                let mut stmt = tx
-                    .prepare(
-                        "INSERT INTO uriage_person_monthly \
-                         (month, person_name, eigyosho_id, cal, kingaku, yosha_kingaku, \
-                          kensuu, calculated_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    )
-                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
-                for (name, accum) in &entries {
-                    stmt.execute(params![
-                        month,
-                        name,
-                        eigyosho_id,
-                        cal_int,
-                        accum.kingaku,
-                        accum.yosha_kingaku,
-                        accum.kensuu,
-                        calculated_at,
-                    ])
-                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
-                    inserted += 1;
-                }
-            }
-            tx.commit()
-                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
-            Ok::<usize, LocalStoreError>(inserted)
-        })
-        .await
-        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
     }
 
     /// `(month, eigyosho_id, cal)` の集計行を取得 (非ゼロ担当者のみ)。
@@ -282,6 +248,124 @@ impl LocalStore {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             Ok::<Vec<PersonMonthlyRow>, LocalStoreError>(rows)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `(month, eigyosho_id, cal)` の日次集計を一括 upsert (delete-then-insert)。
+    ///
+    /// `daily_sums` は `unko_date` → 担当者名 → `PersonAccum` の二重 map。
+    /// `kensuu == 0 AND kingaku == 0 AND yosha_kingaku == 0` の行は投入しない。
+    ///
+    /// 返り値 = 実際に insert した行数。
+    pub async fn upsert_person_daily(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+        cal: bool,
+        daily_sums: &HashMap<String, HashMap<String, PersonAccum>>,
+        calculated_at: &str,
+    ) -> Result<usize, LocalStoreError> {
+        let month = month.to_string();
+        let calculated_at = calculated_at.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        // (unko_date, name, PersonAccum) flatten
+        let entries: Vec<(String, String, PersonAccum)> = daily_sums
+            .iter()
+            .flat_map(|(date, per_person)| {
+                per_person
+                    .iter()
+                    .filter(|(_, v)| v.kensuu != 0 || v.kingaku != 0 || v.yosha_kingaku != 0)
+                    .map(|(name, v)| (date.clone(), name.clone(), *v))
+            })
+            .collect();
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = futures_lock(&conn);
+            let tx = guard
+                .transaction()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM uriage_person_daily \
+                 WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3",
+                params![month, eigyosho_id, cal_int],
+            )
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let mut inserted = 0usize;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO uriage_person_daily \
+                         (unko_date, month, person_name, eigyosho_id, cal, kingaku, \
+                          yosha_kingaku, kensuu, calculated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )
+                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+                for (date, name, accum) in &entries {
+                    stmt.execute(params![
+                        date,
+                        month,
+                        name,
+                        eigyosho_id,
+                        cal_int,
+                        accum.kingaku,
+                        accum.yosha_kingaku,
+                        accum.kensuu,
+                        calculated_at,
+                    ])
+                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+                    inserted += 1;
+                }
+            }
+            tx.commit()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<usize, LocalStoreError>(inserted)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `(month, eigyosho_id, cal)` の日次集計を取得 (非ゼロ担当者のみ、日付昇順)。
+    pub async fn get_person_daily(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+        cal: bool,
+    ) -> Result<Vec<PersonDailyRow>, LocalStoreError> {
+        let month = month.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT unko_date, month, person_name, eigyosho_id, cal, \
+                            kingaku, yosha_kingaku, kensuu, calculated_at \
+                     FROM uriage_person_daily \
+                     WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3 \
+                     ORDER BY unko_date ASC, kingaku DESC, person_name ASC",
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![month, eigyosho_id, cal_int], |r| {
+                    Ok(PersonDailyRow {
+                        unko_date: r.get(0)?,
+                        month: r.get(1)?,
+                        person_name: r.get(2)?,
+                        eigyosho_id: r.get(3)?,
+                        cal: r.get::<_, i64>(4)? != 0,
+                        kingaku: r.get(5)?,
+                        yosha_kingaku: r.get(6)?,
+                        kensuu: r.get(7)?,
+                        calculated_at: r.get(8)?,
+                    })
+                })
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<Vec<PersonDailyRow>, LocalStoreError>(rows)
         })
         .await
         .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
@@ -494,6 +578,90 @@ impl LocalStore {
         .await
         .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Admin: 削除 + 再作成
+    // ──────────────────────────────────────────────────────────────────
+
+    /// `(month, eigyosho_id)` を全 cal で削除 (一部リセット用)。
+    ///
+    /// 対象 table:
+    /// - `uriage_person_daily`   (cal=true / cal=false 両方)
+    /// - `recalc_jobs`           (1 行)
+    ///
+    /// 月次 (`uriage_person_monthly`) は日次から導出する VIEW のため自動消滅する。
+    ///
+    /// 戻り値 = 各 table の affected row 数の合計。
+    /// 削除後に再度 `/recalc` を叩けば fresh fingerprint (fp_before=NULL) で
+    /// raw NDJSON.gz が再生成され、R2 sync 対象になる。
+    pub async fn delete_bucket(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+    ) -> Result<DeleteBucketResult, LocalStoreError> {
+        let month = month.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = futures_lock(&conn);
+            let tx = guard
+                .transaction()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let daily = tx
+                .execute(
+                    "DELETE FROM uriage_person_daily WHERE month = ?1 AND eigyosho_id = ?2",
+                    params![month, eigyosho_id],
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let job = tx
+                .execute(
+                    "DELETE FROM recalc_jobs WHERE month = ?1 AND eigyosho_id = ?2",
+                    params![month, eigyosho_id],
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<DeleteBucketResult, LocalStoreError>(DeleteBucketResult {
+                daily_deleted: daily,
+                jobs_deleted: job,
+            })
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// 全 table/view を DROP → 再 migrate (フルリセット、全データ消失)。
+    ///
+    /// SQLite のスキーマがおかしくなった時の最終手段。`r2_pending` view と
+    /// `uriage_person_monthly` view も一緒に再作成される。
+    /// 呼び出し後は recalc を叩き直して再生成する必要あり。
+    pub async fn rebuild_schema(&self) -> Result<(), LocalStoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            guard
+                .execute_batch(
+                    r#"
+                    DROP VIEW  IF EXISTS r2_pending;
+                    DROP VIEW  IF EXISTS uriage_person_monthly;
+                    DROP TABLE IF EXISTS recalc_jobs;
+                    DROP TABLE IF EXISTS uriage_person_daily;
+                    "#,
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            // re-create
+            Self::migrate(&guard)?;
+            Ok::<(), LocalStoreError>(())
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+}
+
+/// `delete_bucket` の affected rows サマリ。月次は VIEW のため対象外。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeleteBucketResult {
+    pub daily_deleted: usize,
+    pub jobs_deleted: usize,
 }
 
 /// `tokio::sync::Mutex` は async lock。`spawn_blocking` 内 (sync 文脈) では
@@ -530,48 +698,81 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    #[tokio::test]
-    async fn upsert_then_get_returns_persisted_rows() {
-        let store = LocalStore::open(":memory:").unwrap();
-        let mut sums = HashMap::new();
-        sums.insert("青井".to_string(), pa(90059, 90059, 9));
-        sums.insert("山﨑智".to_string(), pa(20020, 20020, 2));
-        sums.insert("zero_person".to_string(), pa(0, 0, 0)); // ゼロは投入されない
-
-        let n = store
-            .upsert_person_monthly("2026-06", 1, true, &sums, "2026-06-30T12:00:00Z")
-            .await
-            .unwrap();
-        assert_eq!(n, 2);
-
-        let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        // ORDER BY kingaku DESC で 青井 が先頭
-        assert_eq!(rows[0].person_name, "青井");
-        assert_eq!(rows[0].kingaku, 90059);
-        assert_eq!(rows[1].person_name, "山﨑智");
-        assert_eq!(rows[1].kingaku, 20020);
+    /// `upsert_person_daily` 用ヘルパ: 1 日分の (person → accum) を指定。
+    fn daily_one_day(
+        date: &str,
+        per_person: HashMap<String, PersonAccum>,
+    ) -> HashMap<String, HashMap<String, PersonAccum>> {
+        let mut m = HashMap::new();
+        m.insert(date.to_string(), per_person);
+        m
     }
 
     #[tokio::test]
-    async fn upsert_overwrites_existing_bucket() {
+    async fn upsert_daily_then_monthly_view_aggregates() {
         let store = LocalStore::open(":memory:").unwrap();
+        // 2 日分の daily を入れて、monthly VIEW が SUM で返すか確認
+        let mut day1 = HashMap::new();
+        day1.insert("青井".to_string(), pa(50000, 50000, 5));
+        day1.insert("山﨑智".to_string(), pa(10000, 10000, 1));
+        let mut day2 = HashMap::new();
+        day2.insert("青井".to_string(), pa(40059, 40059, 4));
+        day2.insert("山﨑智".to_string(), pa(10020, 10020, 1));
+
+        let mut daily = HashMap::new();
+        daily.insert("2026-06-01".to_string(), day1);
+        daily.insert("2026-06-02".to_string(), day2);
+
+        let n = store
+            .upsert_person_daily("2026-06", 1, true, &daily, "2026-06-30T12:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(n, 4); // 2 days × 2 persons
+
+        // monthly VIEW が 2 日分を SUM
+        let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let aoi = rows.iter().find(|r| r.person_name == "青井").unwrap();
+        assert_eq!(aoi.kingaku, 90059); // 50000 + 40059
+        assert_eq!(aoi.kensuu, 9); // 5 + 4
+        let yam = rows.iter().find(|r| r.person_name == "山﨑智").unwrap();
+        assert_eq!(yam.kingaku, 20020); // 10000 + 10020
+    }
+
+    #[tokio::test]
+    async fn upsert_daily_overwrites_bucket_in_full() {
+        let store = LocalStore::open(":memory:").unwrap();
+        // 1 回目
         let mut a = HashMap::new();
         a.insert("青井".to_string(), pa(100, 50, 1));
         store
-            .upsert_person_monthly("2026-06", 1, true, &a, "2026-06-29T00:00:00Z")
+            .upsert_person_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day("2026-06-15", a.clone()),
+                "2026-06-29T00:00:00Z",
+            )
             .await
             .unwrap();
 
+        // 2 回目: 同じ bucket、別の日付に別の中身 → 1 回目の行は消える
         let mut b = HashMap::new();
         b.insert("青井".to_string(), pa(200, 100, 2));
         b.insert("大石".to_string(), pa(30, 20, 1));
         let n = store
-            .upsert_person_monthly("2026-06", 1, true, &b, "2026-06-30T00:00:00Z")
+            .upsert_person_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day("2026-06-16", b),
+                "2026-06-30T00:00:00Z",
+            )
             .await
             .unwrap();
         assert_eq!(n, 2);
 
+        // monthly VIEW では 2026-06-16 だけが残っている (2026-06-15 は消えた)
         let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
         let aoi = rows.iter().find(|r| r.person_name == "青井").unwrap();
         assert_eq!(aoi.kingaku, 200); // 上書きされている
@@ -580,28 +781,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_isolates_buckets_by_eigyosho_and_cal() {
+    async fn upsert_daily_isolates_buckets_by_eigyosho_and_cal() {
         let store = LocalStore::open(":memory:").unwrap();
         let mut a = HashMap::new();
         a.insert("青井".to_string(), pa(100, 50, 1));
-        // (2026-06, eigyosho=1, cal=true) と (2026-06, eigyosho=2, cal=true) は別 bucket
+        let day = daily_one_day("2026-06-15", a);
+
         store
-            .upsert_person_monthly("2026-06", 1, true, &a, "t1")
+            .upsert_person_daily("2026-06", 1, true, &day, "t1")
             .await
             .unwrap();
         store
-            .upsert_person_monthly("2026-06", 2, true, &a, "t1")
+            .upsert_person_daily("2026-06", 2, true, &day, "t1")
             .await
             .unwrap();
-        // cal=false は別 bucket
         store
-            .upsert_person_monthly("2026-06", 1, false, &a, "t1")
+            .upsert_person_daily("2026-06", 1, false, &day, "t1")
             .await
             .unwrap();
 
-        // eigyosho=1 / cal=true の bucket を空集計で上書き → eigyosho=2, cal=false は残る
+        // eigyosho=1 / cal=true を空 map で上書き → 他の bucket は残る
         store
-            .upsert_person_monthly("2026-06", 1, true, &HashMap::new(), "t2")
+            .upsert_person_daily("2026-06", 1, true, &HashMap::new(), "t2")
             .await
             .unwrap();
 
@@ -640,9 +841,16 @@ mod tests {
         let mut s = HashMap::new();
         s.insert("青井".to_string(), pa(100, 50, 1));
         store
-            .upsert_person_monthly("2026-06", 1, true, &s, "2026-06-30T10:00:00Z")
+            .upsert_person_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day("2026-06-15", s),
+                "2026-06-30T10:00:00Z",
+            )
             .await
             .unwrap();
+        // monthly VIEW の calculated_at は MAX で取得される
         assert_eq!(
             store.last_calculated_at("2026-06", 1, true).await.unwrap(),
             Some("2026-06-30T10:00:00Z".to_string())

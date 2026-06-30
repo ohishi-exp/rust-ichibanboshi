@@ -312,6 +312,7 @@ impl AppRepo for MockRepo {
                 yosha_jippi: 200,
                 shain_r: "青井".into(),
                 yoshasaki_c: "000000".into(),
+                unko_date: "2026-06-15".into(),
             },
             // 入力担当 9999 (マスタ外) → B6 で表示のみ、$sum に積まない
             UriageRow {
@@ -330,6 +331,7 @@ impl AppRepo for MockRepo {
                 yosha_jippi: 0,
                 shain_r: "無関係".into(),
                 yoshasaki_c: "021970".into(),
+                unko_date: "2026-06-16".into(),
             },
         ])
     }
@@ -641,6 +643,7 @@ pub fn build_app_full(
         .route("/vehicles", get(routes::surcharge::vehicles))
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
+        .route("/uriage/daily", get(routes::uriage::daily))
         .route("/uriage/r2/pending", get(routes::uriage::r2_pending))
         .route(
             "/uriage/raw/{month}/{eigyosho_id}",
@@ -649,7 +652,9 @@ pub fn build_app_full(
         .route(
             "/uriage/raw/{month}/{eigyosho_id}/ack",
             post(routes::uriage::raw_ack),
-        );
+        )
+        .route("/uriage/admin/delete", post(routes::uriage::admin_delete))
+        .route("/uriage/admin/rebuild", post(routes::uriage::admin_rebuild));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))
