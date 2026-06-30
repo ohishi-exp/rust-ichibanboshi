@@ -568,20 +568,26 @@ impl LocalStore {
     // recalc_jobs / r2_pending (Phase 2 PR-D)
     // ──────────────────────────────────────────────────────────────────
 
-    /// `recalc_jobs` を月範囲で取得 (UI 状態サマリ用)。
-    /// `from`/`to` は YYYY-MM 形式、両端 inclusive。
+    /// `recalc_jobs` を取得 (UI 状態サマリ用)。verify_coverage と LEFT JOIN して
+    /// `verified_count / ok / ng` を同梱。
+    ///
+    /// `from` / `to` (YYYY-MM、inclusive) が **両方** Some なら期間 filter、それ以外は
+    /// 全件 (user 2026-06-30: 状態サマリは全期間表示)。
+    ///
+    /// ORDER BY `month DESC, eigyosho_id ASC` — 直近月を上位に出すための降順
+    /// (user 2026-06-30: 「状態サマリは降順」)。同月内は office id 昇順。
     pub async fn list_recalc_jobs(
         &self,
-        from: &str,
-        to: &str,
+        from: Option<&str>,
+        to: Option<&str>,
     ) -> Result<Vec<RecalcJob>, LocalStoreError> {
-        let from = from.to_string();
-        let to = to.to_string();
+        let from = from.map(|s| s.to_string());
+        let to = to.map(|s| s.to_string());
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
-            let mut stmt = guard
-                .prepare(
+            let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match (&from, &to) {
+                (Some(f), Some(t)) => (
                     "SELECT rj.month, rj.eigyosho_id, rj.status, \
                             rj.fingerprint_before, rj.fingerprint_after, \
                             rj.raw_path, rj.created_at, rj.computed_at, \
@@ -593,11 +599,29 @@ impl LocalStore {
                      LEFT JOIN verify_coverage vc \
                        ON vc.month = rj.month AND vc.eigyosho_id = rj.eigyosho_id \
                      WHERE rj.month BETWEEN ?1 AND ?2 \
-                     ORDER BY rj.month ASC, rj.eigyosho_id ASC",
-                )
+                     ORDER BY rj.month DESC, rj.eigyosho_id ASC",
+                    vec![f, t],
+                ),
+                _ => (
+                    "SELECT rj.month, rj.eigyosho_id, rj.status, \
+                            rj.fingerprint_before, rj.fingerprint_after, \
+                            rj.raw_path, rj.created_at, rj.computed_at, \
+                            rj.r2_synced_at, rj.last_error, \
+                            COALESCE(vc.verified_count, 0), \
+                            COALESCE(vc.verified_ok,    0), \
+                            COALESCE(vc.verified_ng,    0) \
+                     FROM recalc_jobs rj \
+                     LEFT JOIN verify_coverage vc \
+                       ON vc.month = rj.month AND vc.eigyosho_id = rj.eigyosho_id \
+                     ORDER BY rj.month DESC, rj.eigyosho_id ASC",
+                    vec![],
+                ),
+            };
+            let mut stmt = guard
+                .prepare(sql)
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             let rows = stmt
-                .query_map(params![from, to], |r| {
+                .query_map(rusqlite::params_from_iter(params.iter()), |r| {
                     Ok(RecalcJob {
                         month: r.get(0)?,
                         eigyosho_id: r.get(1)?,
@@ -754,19 +778,39 @@ impl LocalStore {
 
     /// `r2_pending` view を読む (fingerprint 変化あり & 未送信の (month, eigyosho_id))。
     /// verify_jobs 由来の coverage を同梱して返す (Refs #762 R2 sync gate)。
-    pub async fn list_r2_pending(&self) -> Result<Vec<R2PendingRow>, LocalStoreError> {
+    ///
+    /// `from` / `to` (YYYY-MM、inclusive) が両方 `Some` なら期間内のみ。`None` は全件
+    /// (= cron / 後方互換)。UI 操作で期間に従わせる用途は両方 `Some` で叩く。
+    pub async fn list_r2_pending(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<R2PendingRow>, LocalStoreError> {
+        let from = from.map(|s| s.to_string());
+        let to = to.map(|s| s.to_string());
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
-            let mut stmt = guard
-                .prepare(
+            let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match (&from, &to) {
+                (Some(f), Some(t)) => (
+                    "SELECT month, eigyosho_id, raw_path, fingerprint_after, computed_at, \
+                            verified_count, verified_ok, verified_ng \
+                     FROM r2_pending \
+                     WHERE month BETWEEN ?1 AND ?2",
+                    vec![f, t],
+                ),
+                _ => (
                     "SELECT month, eigyosho_id, raw_path, fingerprint_after, computed_at, \
                             verified_count, verified_ok, verified_ng \
                      FROM r2_pending",
-                )
+                    vec![],
+                ),
+            };
+            let mut stmt = guard
+                .prepare(sql)
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             let rows = stmt
-                .query_map([], |r| {
+                .query_map(rusqlite::params_from_iter(params.iter()), |r| {
                     Ok(R2PendingRow {
                         month: r.get(0)?,
                         eigyosho_id: r.get(1)?,
@@ -1385,7 +1429,7 @@ mod tests {
             .unwrap();
         store.record_r2_synced("2026-07", 1, "t2").await.unwrap();
 
-        let pending = store.list_r2_pending().await.unwrap();
+        let pending = store.list_r2_pending(None, None).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].month, "2026-06");
         assert_eq!(pending[0].eigyosho_id, 1);
@@ -1406,7 +1450,7 @@ mod tests {
             .await
             .unwrap();
         // fingerprint 同じなので r2_synced_at は維持されている
-        let pending = store.list_r2_pending().await.unwrap();
+        let pending = store.list_r2_pending(None, None).await.unwrap();
         assert!(pending.is_empty());
     }
 
@@ -1480,13 +1524,77 @@ mod tests {
             .await
             .unwrap();
 
-        let jobs = store.list_recalc_jobs("2026-06", "2026-06").await.unwrap();
+        let jobs = store
+            .list_recalc_jobs(Some("2026-06"), Some("2026-06"))
+            .await
+            .unwrap();
         assert_eq!(jobs.len(), 1);
         let j = &jobs[0];
         assert_eq!(j.eigyosho_id, 5);
         assert_eq!(j.verified_count, 3);
         assert_eq!(j.verified_ok, 2);
         assert_eq!(j.verified_ng, 1);
+    }
+
+    #[tokio::test]
+    async fn list_recalc_jobs_returns_all_when_from_to_none() {
+        // from/to が None なら全 month の row を返す (= 状態サマリ全期間表示用)
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .record_recalc_computed("2026-04", 1, "fp", Some("/tmp/a.gz"), "t1")
+            .await
+            .unwrap();
+        store
+            .record_recalc_computed("2026-06", 1, "fp", Some("/tmp/b.gz"), "t2")
+            .await
+            .unwrap();
+        store
+            .record_recalc_computed("2026-05", 1, "fp", Some("/tmp/c.gz"), "t3")
+            .await
+            .unwrap();
+        let jobs = store.list_recalc_jobs(None, None).await.unwrap();
+        assert_eq!(jobs.len(), 3);
+        // 降順: 2026-06 → 2026-05 → 2026-04
+        assert_eq!(jobs[0].month, "2026-06");
+        assert_eq!(jobs[1].month, "2026-05");
+        assert_eq!(jobs[2].month, "2026-04");
+    }
+
+    #[tokio::test]
+    async fn list_r2_pending_filters_by_month_range() {
+        // from/to を渡すと当該月の bucket だけ返る (UI 期間 R2 同期用)
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .record_recalc_computed("2026-04", 1, "fp", Some("/tmp/a.gz"), "t1")
+            .await
+            .unwrap();
+        store
+            .record_recalc_computed("2026-05", 1, "fp", Some("/tmp/b.gz"), "t2")
+            .await
+            .unwrap();
+        store
+            .record_recalc_computed("2026-06", 1, "fp", Some("/tmp/c.gz"), "t3")
+            .await
+            .unwrap();
+
+        // 2026-05 だけ
+        let pending = store
+            .list_r2_pending(Some("2026-05"), Some("2026-05"))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].month, "2026-05");
+
+        // 全件 (filter なし)
+        let all = store.list_r2_pending(None, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // 2026-04 ~ 2026-05 (両端 inclusive)
+        let two = store
+            .list_r2_pending(Some("2026-04"), Some("2026-05"))
+            .await
+            .unwrap();
+        assert_eq!(two.len(), 2);
     }
 
     #[tokio::test]
@@ -1503,7 +1611,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let jobs = store.list_recalc_jobs("2026-06", "2026-06").await.unwrap();
+        let jobs = store
+            .list_recalc_jobs(Some("2026-06"), Some("2026-06"))
+            .await
+            .unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].verified_count, 0);
         assert_eq!(jobs[0].verified_ok, 0);
@@ -1586,7 +1697,7 @@ mod migration_upgrade_tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(store.list_r2_pending())
+            .block_on(store.list_r2_pending(None, None))
             .expect("list_r2_pending should not fail after migrate replaces old view");
         // 行は空 (recalc_jobs に row 無し) でも query 自体は通る = view が更新済
         assert_eq!(pending.len(), 0);

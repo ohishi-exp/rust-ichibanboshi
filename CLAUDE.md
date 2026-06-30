@@ -12,6 +12,44 @@
          → 172.18.21.102\softec (SQL Server, CAPE#01)
 ```
 
+## 担当者別売上 (Phase 2、Refs #762) のデータ流れと status
+
+```
+SQL Server (CAPE#01、172.18.21.102)
+    ↓ recalc 実行 (rust の POST /api/uriage/recalc)
+[ohishi-data:3100 (rust host)]
+  ├─ SQLite (/opt/ichibanboshi/data.db): uriage_person_daily / recalc_jobs / verify_jobs
+  └─ disk (/opt/ichibanboshi/raw/{month}/eigyosho-{id}.ndjson.gz): R2 投入用 raw NDJSON.gz
+    ↓ R2 sync (nuxt の /api/uriage/r2-sync = rust から raw を fetch して R2 へ put)
+[Cloudflare R2 bucket]
+  └─ uriage/{month}/eigyosho-{id}.ndjson.gz
+    ↓ Worker から read
+[ブラウザ UI (nuxt /admin/*)]
+```
+
+`recalc_jobs.status` の意味:
+
+| status | SQLite | disk raw | R2 | UI から見える? |
+|---|---|---|---|---|
+| `r2_synced` (✅ R2 同期済) | ある | ある | ある | 見える |
+| `computed` (🟡 計算済、R2 同期待ち、`r2_synced_at IS NULL`) | ある | ある | **無い** | 見えない |
+| `computed` (`r2_synced_at` が非 null、= 古い data の R2 残骸) | ある | ある | **古い data** | 古い値が見えている (要 R2 同期) |
+| `failed` (❌ 失敗) | failed 記録のみ | 無し | 無し | 見えない |
+
+要点:
+
+- **`computed` は「rust host にはデータがあるが、R2 にはまだ転送していない」状態**。
+  ブラウザから直接 SQLite は見えないので、R2 同期しないと UI 側には反映されない。
+- `record_recalc_computed` は fingerprint 変化があれば `r2_synced_at = NULL` にリセット
+  する。fingerprint が同じ recalc 再走では `r2_synced_at` を維持 (= 既存 R2 オブジェクト
+  はそのまま有効)。
+- verify (PHP vs Rust) は `verify_jobs` (PK: unko_date, eigyosho_id, cal) に upsert。
+  `verify_coverage` view が `(month, eigyosho_id)` で集計し、`r2_pending` view と
+  `list_recalc_jobs` が LEFT JOIN して `verified_count / ok / ng` を露出する。
+- `r2_pending` view の条件: `status='computed' AND r2_synced_at IS NULL AND raw_path IS NOT NULL
+  AND (fingerprint_before IS NULL OR fingerprint_before != fingerprint_after)`。
+  fingerprint 変化なし (= データ同じ) なら R2 への再送信は不要。
+
 ## 燃料サーチャージ基礎データ (`/api/surcharge/base`、Refs #12)
 
 調査 #12 で確定した「`運転日報明細` の単一行に完了条件の全項目が揃う」結論に基づく

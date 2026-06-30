@@ -979,7 +979,7 @@ fn office_lookup(masters: &MastersResponse, eigyosho_id: i64) -> Option<&OfficeM
 // R2 sync endpoints
 // ══════════════════════════════════════════════════════════════
 
-/// GET `/api/uriage/r2/pending`
+/// GET `/api/uriage/r2/pending?from=YYYY-MM&to=YYYY-MM`
 ///
 /// `r2_pending` view を返す (fingerprint 変化があったが R2 未送信の (month, eigyosho_id))。
 /// 2026-06-30 以降は **verify_jobs 由来の gate** を同梱:
@@ -987,17 +987,32 @@ fn office_lookup(masters: &MastersResponse, eigyosho_id: i64) -> Option<&OfficeM
 /// - `ready` = `verified_count >= expected_count` AND `verified_ng == 0`
 /// - `blocker` = `"ng_present"` (NG あり) | `"unverified"` (cells 不足) | `None`
 ///
-/// nuxt cron は `ready=true` の bucket のみ /raw + /ack を叩き、`unverified` なら
-/// 先に /verify を iterate してから retry する (Refs #762)。
+/// `from` / `to` (YYYY-MM、両端 inclusive) が **両方** 指定された時のみ期間で filter する。
+/// 片方のみ / どちらも未指定は全件 (= cron / backward compat)。UI 操作で
+/// 「期間に従う」場合は両方付ける (Refs #762、user 2026-06-30: 「R2 同期も recalc も
+/// 期間に従う」)。
 pub async fn r2_pending(
     Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<R2PendingQuery>,
 ) -> Result<Json<R2PendingResponse>, StatusCode> {
-    let rows = store.list_r2_pending().await.map_err(map_local_store_err)?;
+    let rows = store
+        .list_r2_pending(q.from.as_deref(), q.to.as_deref())
+        .await
+        .map_err(map_local_store_err)?;
     let items: Vec<R2PendingItem> = rows.into_iter().map(annotate_r2_pending).collect();
     Ok(Json(R2PendingResponse {
         count: items.len(),
         items,
     }))
+}
+
+/// `/r2/pending` の optional 期間 filter。
+#[derive(Debug, Deserialize)]
+pub struct R2PendingQuery {
+    /// 下限月 (YYYY-MM、inclusive)。`to` と両方指定で filter 有効。
+    pub from: Option<String>,
+    /// 上限月 (YYYY-MM、inclusive)。
+    pub to: Option<String>,
 }
 
 /// `r2_pending` row に verify gate (`expected_count` / `ready` / `blocker`) を付与する。
@@ -1495,35 +1510,32 @@ pub async fn verify(
 
 #[derive(Debug, Deserialize)]
 pub struct RecalcJobsQuery {
-    /// 期間下限 (YYYY-MM、inclusive)
-    pub from: String,
-    /// 期間上限 (YYYY-MM、inclusive)
-    pub to: String,
+    /// 期間下限 (YYYY-MM、inclusive)。`to` と両方指定で filter 有効。
+    pub from: Option<String>,
+    /// 期間上限 (YYYY-MM、inclusive)。
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RecalcJobsResponse {
-    pub from: String,
-    pub to: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub count: usize,
     pub jobs: Vec<crate::sqlite::RecalcJob>,
 }
 
 /// GET `/api/uriage/recalc-jobs?from=YYYY-MM&to=YYYY-MM`
 ///
-/// `recalc_jobs` を月範囲で読む。UI の状態サマリ (= 各月 × 営業所が computed /
-/// r2_synced / failed のどれか) を出すために使う。
+/// `recalc_jobs` を読む (UI 状態サマリ用)。`from` / `to` が両方指定された時のみ
+/// 期間 filter する。**両方未指定 = 全件取得** (user 2026-06-30: 状態サマリは
+/// 全期間表示)。並び順は `month DESC, eigyosho_id ASC` (直近月が上)。
 pub async fn list_recalc_jobs(
     Extension(store): Extension<DynLocalStore>,
     Query(q): Query<RecalcJobsQuery>,
 ) -> Result<Json<RecalcJobsResponse>, (StatusCode, String)> {
-    if q.from.is_empty() || q.to.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "from と to は必須 (YYYY-MM)".to_string(),
-        ));
-    }
-    let jobs = store.list_recalc_jobs(&q.from, &q.to).await.map_err(|e| {
+    let from = q.from.as_deref().filter(|s| !s.is_empty());
+    let to = q.to.as_deref().filter(|s| !s.is_empty());
+    let jobs = store.list_recalc_jobs(from, to).await.map_err(|e| {
         tracing::error!("list_recalc_jobs failed: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
