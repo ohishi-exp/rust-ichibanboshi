@@ -74,6 +74,10 @@ pub struct UriageRow {
     /// 傭車先C (`"000000"` なら自車、それ以外は傭車)。
     /// `compute_person_sum` は読まないが、`cal_total` / `is_yosha` で使う。
     pub yoshasaki_c: String,
+    /// 運行年月日 (`YYYY-MM-DD`)。日次集計 (`uriage_person_daily`) と raw NDJSON.gz
+    /// の drill-down に使う。`compute_person_sum` の振替判定では使わないが、
+    /// `compute_person_sum_by_day` で行を日付ごとにグルーピングするのに必須。
+    pub unko_date: String,
 }
 
 /// `cal_total()` (PHP 803-819) 等価。営業所別月次集計で使う 1 行ぶんのサブ
@@ -316,6 +320,43 @@ pub fn compute_person_sum(
     }
 }
 
+/// 日次集計版。rows を `unko_date` でグルーピングし、各日について
+/// `compute_person_sum` を呼ぶ。返り値は `unko_date` → 担当者名 → `PersonAccum`。
+///
+/// 月集計 (`compute_person_sum` を月 rows 全体に 1 度呼ぶ) と日集計 (本関数) の
+/// 合計値は `cal` 値が同じなら一致する (compute_person_sum が行ごとに独立して
+/// 担当者を決めるため、和は順序非依存)。
+pub fn compute_person_sum_by_day(
+    rows: &[UriageRow],
+    persons: &HashMap<i32, String>,
+    other: &HashMap<String, String>,
+    cal: bool,
+) -> HashMap<String, HashMap<String, PersonAccum>> {
+    // unko_date → Vec<&UriageRow> でグルーピング
+    let mut by_day: HashMap<String, Vec<UriageRow>> = HashMap::new();
+    for r in rows {
+        by_day
+            .entry(r.unko_date.clone())
+            .or_default()
+            .push(r.clone());
+    }
+    // 各日で compute_person_sum を呼ぶ。`persons` 由来の 0 初期化エントリは捨てて
+    // 非ゼロ担当者だけ返す (SQLite に投入する upsert 側で zero filter する前提)。
+    let mut out: HashMap<String, HashMap<String, PersonAccum>> = HashMap::new();
+    for (date, day_rows) in by_day {
+        let res = compute_person_sum(&day_rows, persons, other, cal);
+        let non_zero: HashMap<String, PersonAccum> = res
+            .sum
+            .into_iter()
+            .filter(|(_, v)| v.kensuu != 0 || v.kingaku != 0 || v.yosha_kingaku != 0)
+            .collect();
+        if !non_zero.is_empty() {
+            out.insert(date, non_zero);
+        }
+    }
+    out
+}
+
 /// 集計加算 (`$sum[$name]['金額'] += k_sum` 相当)。
 fn accumulate(sum: &mut HashMap<String, PersonAccum>, name: &str, k_sum: i64, y_sum: i64) {
     let acc = sum.entry(name.to_string()).or_default();
@@ -474,7 +515,10 @@ pub struct RecalcQuery {
 }
 
 /// 1 (month, eigyosho_id) 単位の recalc 結果。
-#[derive(Debug, Serialize)]
+///
+/// 月次テーブルは廃止 (日次 SUM の VIEW に降格、user 指摘 2026-06-30) のため
+/// monthly counts は持たない。日次に投入された (日 × 担当者) 行数のみ持つ。
+#[derive(Debug, Default, Serialize)]
 pub struct RecalcJobResult {
     pub month: String,
     pub eigyosho_id: i64,
@@ -482,10 +526,10 @@ pub struct RecalcJobResult {
     pub status: String,
     /// 取得 raw row 数
     pub row_count: usize,
-    /// SQLite に投入された非ゼロ担当者数 (cal=true) — fail/skip 時は 0
-    pub persisted_count_cal: usize,
+    /// 日次集計に投入された (日 × 担当者) 行数 (cal=true)
+    pub daily_count_cal: usize,
     /// 〃 cal=false
-    pub persisted_count_nocal: usize,
+    pub daily_count_nocal: usize,
     /// 32 hex 桁の sha256 prefix (fingerprint_after)
     pub fingerprint: Option<String>,
     /// raw NDJSON.gz の絶対 path
@@ -565,8 +609,11 @@ pub(crate) fn month_to_range(month: &str) -> Option<(String, String, String)> {
 }
 
 /// raw rows を JSON-serializable 構造体に変換 (sort 済み列順は repo 側で保証済み、再 sort しない)。
+///
+/// `unko_date` を含めることで、R2 にある raw NDJSON.gz から後で日次再集計できる。
 #[derive(Serialize)]
 struct RawRowOut<'a> {
+    unko_date: &'a str,
     yokoyoko: i32,
     seikyu_k: i32,
     biko2: &'a str,
@@ -587,6 +634,7 @@ struct RawRowOut<'a> {
 impl<'a> From<&'a UriageRow> for RawRowOut<'a> {
     fn from(r: &'a UriageRow) -> Self {
         Self {
+            unko_date: &r.unko_date,
             yokoyoko: r.yokoyoko,
             seikyu_k: r.seikyu_k,
             biko2: &r.biko2,
@@ -669,12 +717,7 @@ async fn recalc_one(
         month: month.to_string(),
         eigyosho_id,
         status: "computed".to_string(),
-        row_count: 0,
-        persisted_count_cal: 0,
-        persisted_count_nocal: 0,
-        fingerprint: None,
-        raw_path: None,
-        error: None,
+        ..Default::default()
     };
 
     // bumon が空 (= マスタ未設定) は skip しても compute は走らせない方が安全。
@@ -729,17 +772,18 @@ async fn recalc_one(
         }
     };
 
-    // cal=true / cal=false それぞれで compute_person_sum + upsert
-    let result_cal = compute_person_sum(&rows, &persons, &other, true);
-    let result_nocal = compute_person_sum(&rows, &persons, &other, false);
+    // cal=true / cal=false それぞれで日次集計を計算 (月次は VIEW なので不要)
+    let daily_cal = compute_person_sum_by_day(&rows, &persons, &other, true);
+    let daily_nocal = compute_person_sum_by_day(&rows, &persons, &other, false);
 
+    // 日次集計 upsert (失敗は recalc 全体を failed にする)
     match store
-        .upsert_person_monthly(month, eigyosho_id, true, &result_cal.sum, calculated_at)
+        .upsert_person_daily(month, eigyosho_id, true, &daily_cal, calculated_at)
         .await
     {
-        Ok(n) => job.persisted_count_cal = n,
+        Ok(n) => job.daily_count_cal = n,
         Err(e) => {
-            let msg = format!("sqlite upsert(cal=true): {e}");
+            let msg = format!("sqlite upsert_daily(cal=true): {e}");
             job.status = "failed".to_string();
             job.error = Some(msg.clone());
             let _ = store
@@ -749,12 +793,12 @@ async fn recalc_one(
         }
     }
     match store
-        .upsert_person_monthly(month, eigyosho_id, false, &result_nocal.sum, calculated_at)
+        .upsert_person_daily(month, eigyosho_id, false, &daily_nocal, calculated_at)
         .await
     {
-        Ok(n) => job.persisted_count_nocal = n,
+        Ok(n) => job.daily_count_nocal = n,
         Err(e) => {
-            let msg = format!("sqlite upsert(cal=false): {e}");
+            let msg = format!("sqlite upsert_daily(cal=false): {e}");
             job.status = "failed".to_string();
             job.error = Some(msg.clone());
             let _ = store
@@ -845,14 +889,9 @@ pub async fn recalc(
             None => {
                 jobs.push(RecalcJobResult {
                     month: month.clone(),
-                    eigyosho_id: 0,
                     status: "failed".to_string(),
-                    row_count: 0,
-                    persisted_count_cal: 0,
-                    persisted_count_nocal: 0,
-                    fingerprint: None,
-                    raw_path: None,
                     error: Some(format!("month の形式が不正: {month}")),
+                    ..Default::default()
                 });
                 continue;
             }
@@ -864,14 +903,9 @@ pub async fn recalc(
             Err(e) => {
                 jobs.push(RecalcJobResult {
                     month: month.clone(),
-                    eigyosho_id: 0,
                     status: "failed".to_string(),
-                    row_count: 0,
-                    persisted_count_cal: 0,
-                    persisted_count_nocal: 0,
-                    fingerprint: None,
-                    raw_path: None,
                     error: Some(format!("CakePHP masters fetch: {e}")),
+                    ..Default::default()
                 });
                 continue;
             }
@@ -886,12 +920,8 @@ pub async fn recalc(
                         month: month.clone(),
                         eigyosho_id: eid,
                         status: "skipped".to_string(),
-                        row_count: 0,
-                        persisted_count_cal: 0,
-                        persisted_count_nocal: 0,
-                        fingerprint: None,
-                        raw_path: None,
                         error: Some(format!("eigyosho_id={eid} が masters に存在しない")),
+                        ..Default::default()
                     });
                     continue;
                 }
@@ -1029,6 +1059,114 @@ pub struct RawAckResponse {
     pub month: String,
     pub eigyosho_id: i64,
     pub synced_at: String,
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/daily?month=YYYY-MM&eigyosho_id=N&cal=true|false
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct DailyQuery {
+    /// 集計対象月 (`YYYY-MM`、必須)
+    pub month: String,
+    /// 営業所 id (必須)
+    pub eigyosho_id: i64,
+    /// PHP の `$cal`。truthy で別営業所も合算。省略時 true
+    #[serde(default = "default_cal")]
+    pub cal: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DailyResponse {
+    pub month: String,
+    pub eigyosho_id: i64,
+    pub cal: bool,
+    pub rows: Vec<crate::sqlite::PersonDailyRow>,
+}
+
+/// GET `/api/uriage/daily?month=YYYY-MM&eigyosho_id=N&cal=true`
+///
+/// `(month, eigyosho_id, cal)` の **日次集計** を SQLite から読んで返す。
+/// recalc 後でなければ空配列が返る。drill-down 表示用。
+pub async fn daily(
+    Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<DailyQuery>,
+) -> Result<Json<DailyResponse>, StatusCode> {
+    if q.month.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let rows = store
+        .get_person_daily(&q.month, q.eigyosho_id, q.cal)
+        .await
+        .map_err(map_local_store_err)?;
+    Ok(Json(DailyResponse {
+        month: q.month,
+        eigyosho_id: q.eigyosho_id,
+        cal: q.cal,
+        rows,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// Admin: 削除 / 再作成
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct AdminDeleteQuery {
+    pub month: String,
+    pub eigyosho_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDeleteResponse {
+    pub month: String,
+    pub eigyosho_id: i64,
+    pub daily_deleted: usize,
+    pub jobs_deleted: usize,
+}
+
+/// POST `/api/uriage/admin/delete?month=YYYY-MM&eigyosho_id=N`
+///
+/// 指定 `(month, eigyosho_id)` の集計を SQLite 上の全 cal で削除し、`recalc_jobs`
+/// の該当行も消す (一部リセット用)。月次集計は日次の VIEW なので自動で連動消滅。
+/// 再度 `/recalc` を叩けば fingerprint なしで fresh に再計算 → R2 にも再 sync
+/// 対象として並ぶ。
+pub async fn admin_delete(
+    Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<AdminDeleteQuery>,
+) -> Result<Json<AdminDeleteResponse>, StatusCode> {
+    if q.month.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let r = store
+        .delete_bucket(&q.month, q.eigyosho_id)
+        .await
+        .map_err(map_local_store_err)?;
+    Ok(Json(AdminDeleteResponse {
+        month: q.month,
+        eigyosho_id: q.eigyosho_id,
+        daily_deleted: r.daily_deleted,
+        jobs_deleted: r.jobs_deleted,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRebuildResponse {
+    pub rebuilt_at: String,
+}
+
+/// POST `/api/uriage/admin/rebuild`
+///
+/// SQLite の全 uriage table (monthly / daily / recalc_jobs / r2_pending view) を
+/// DROP → 再 migrate で作り直す **フルリセット**。集計データは全て消える。
+/// schema 不整合や fingerprint の全更新が必要な時の最終手段。
+pub async fn admin_rebuild(
+    Extension(store): Extension<DynLocalStore>,
+) -> Result<Json<AdminRebuildResponse>, StatusCode> {
+    store.rebuild_schema().await.map_err(map_local_store_err)?;
+    Ok(Json(AdminRebuildResponse {
+        rebuilt_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    }))
 }
 
 /// `preg_replace("/売上　|売上\s/", "", $str)` の写経。

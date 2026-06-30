@@ -35,6 +35,7 @@ fn base_row() -> UriageRow {
         yosha_jippi: 0,
         shain_r: "青井健".to_string(),
         yoshasaki_c: "021970".to_string(),
+        unko_date: "2026-06-15".to_string(),
     }
 }
 
@@ -728,8 +729,11 @@ async fn recalc_single_month_single_office_persists_and_records_fingerprint() {
     assert_eq!(job["eigyosho_id"], 1);
     assert_eq!(job["status"], "computed");
     assert_eq!(job["row_count"], 2); // MockRepo の uriage_rows 2 行
-    assert_eq!(job["persisted_count_cal"], 1); // 青井のみ非ゼロ
-    assert_eq!(job["persisted_count_nocal"], 1);
+                                     // MockRepo の 2 行は別日 (2026-06-15, 2026-06-16)、Row1 は B5 で青井に積算、
+                                     // Row2 は B6 (マスタ外、表示のみ) なので積算しない → 2026-06-15 だけが非ゼロ
+                                     // → daily に 1 (日) × 1 (人) = 1 行ずつ入る
+    assert_eq!(job["daily_count_cal"], 1);
+    assert_eq!(job["daily_count_nocal"], 1);
     assert!(job["fingerprint"]
         .as_str()
         .unwrap()
@@ -1079,4 +1083,189 @@ async fn raw_ack_404_when_no_computed_job() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP endpoint test: daily / admin endpoints (Phase 2 C-series)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn daily_returns_persisted_rows_after_recalc() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc → daily に 1 行入る (Row 1 only、2026-06-15、青井)
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/daily?month=2026-06&eigyosho_id=1&cal=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["month"], "2026-06");
+    assert_eq!(v["eigyosho_id"], 1);
+    assert_eq!(v["cal"], true);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(v["rows"][0]["unko_date"], "2026-06-15");
+    assert_eq!(v["rows"][0]["person_name"], "青井");
+    assert!(v["rows"][0]["kingaku"].as_i64().unwrap() > 0);
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn daily_empty_when_no_recalc() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/daily?month=2026-06&eigyosho_id=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["rows"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn admin_delete_removes_bucket_and_recalc_jobs() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc → daily に 1 行、recalc_jobs に 1 行
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(store.get_recalc_job("2026-06", 1).await.unwrap().is_some());
+
+    // delete
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/admin/delete?month=2026-06&eigyosho_id=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    // daily 1 行 × cal {true,false} = 2 行 (cal=false でも同じ 1 日 1 人)
+    assert!(v["daily_deleted"].as_i64().unwrap() >= 1);
+    assert_eq!(v["jobs_deleted"], 1);
+
+    // recalc_jobs から消えた / daily も空
+    assert!(store.get_recalc_job("2026-06", 1).await.unwrap().is_none());
+    let daily_rows = store.get_person_daily("2026-06", 1, true).await.unwrap();
+    assert!(daily_rows.is_empty());
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn admin_delete_400_when_month_empty() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/admin/delete?month=&eigyosho_id=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_rebuild_drops_and_recreates_schema() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc して daily / recalc_jobs に行が入った状態にする
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(store.get_recalc_job("2026-06", 1).await.unwrap().is_some());
+
+    // rebuild
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/admin/rebuild")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v["rebuilt_at"].as_str().unwrap().contains('T'));
+
+    // 全 data が消えている (schema は再生成済 = 各 query は空 Vec を返す)
+    assert!(store.get_recalc_job("2026-06", 1).await.unwrap().is_none());
+    assert!(store
+        .get_person_daily("2026-06", 1, true)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .get_person_monthly("2026-06", 1, true)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
 }
