@@ -1433,6 +1433,43 @@ async fn verify_404_when_office_not_in_masters() {
 }
 
 #[tokio::test]
+async fn verify_skips_office_with_empty_bumon() {
+    // 受注部門が空の office (例 office_id=13 在実プロダクション) は構造上検証対象が
+    // 無いため、422 ではなく 200 + skipped_reason="no_bumon" を返す
+    // (shell `[[ "$bumon" == "[]" ]] && continue` と同じ挙動、Refs nuxt#57 後追い)
+    let offices_with_empty_bumon = json!({
+        "1": {
+            "display_name": "本社",
+            "persons": { "1499": "青井" },
+            "other": {},
+            "bumon": ["010"]
+        },
+        "13": {
+            "display_name": "受注なし営業所",
+            "persons": {},
+            "other": {},
+            "bumon": []
+        }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], offices_with_empty_bumon, json!({}))
+            .await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, v) = get_verify(app, "/api/uriage/verify?id=13&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+    assert!(v["diff"].is_null());
+    assert_eq!(v["skipped_reason"], "no_bumon");
+    assert_eq!(v["row_count"], 0);
+}
+
+#[tokio::test]
 async fn verify_ok_when_php_and_rust_match() {
     // mock_repo は青井 1499 で kingaku_sum=51500 / yosha_sum=30800 / 件数=1 を返す。
     // PHP も同じ値を返せば diff=null, ok=true。
