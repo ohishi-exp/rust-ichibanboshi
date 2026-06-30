@@ -1352,3 +1352,178 @@ async fn admin_rebuild_drops_and_recreates_schema() {
 
     let _ = std::fs::remove_dir_all(&raw.dir);
 }
+
+// ══════════════════════════════════════════════════════════════
+// HTTP endpoint test: GET /api/uriage/verify (PHP vs Rust diff)
+// ══════════════════════════════════════════════════════════════
+
+/// `start_cakephp_mock` の verify 用拡張: print-json 用 mock を別途設定可能。
+/// `php_sum` を `null` にすると print-json は `{"sum": null}` を返し、PHP は空扱い。
+async fn start_cakephp_mock_with_print_json(
+    editable_months: Vec<&str>,
+    master_offices: Value,
+    php_sum: Value,
+) -> MockServer {
+    let server = start_cakephp_mock(editable_months, master_offices).await;
+    let print_resp = json!({ "sum": php_sum });
+    Mock::given(wm_method("GET"))
+        .and(wm_path("/uriage-jyuchu-display/print-json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(print_resp))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn get_verify(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn verify_503_when_cakephp_not_configured() {
+    let app = common::build_app(common::mock_repo());
+    let (status, _) = get_verify(app, "/api/uriage/verify?id=1&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn verify_400_when_date_format_invalid() {
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), json!({})).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, _) = get_verify(app, "/api/uriage/verify?id=1&date=2026-06&cal=true").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn verify_404_when_office_not_in_masters() {
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), json!({})).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, _) = get_verify(app, "/api/uriage/verify?id=99&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn verify_ok_when_php_and_rust_match() {
+    // mock_repo は青井 1499 で kingaku_sum=51500 / yosha_sum=30800 / 件数=1 を返す。
+    // PHP も同じ値を返せば diff=null, ok=true。
+    let php_sum = json!({
+        "青井": { "金額": 51500, "傭車金額": 30800, "件数": 1 }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), php_sum.clone())
+            .await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, v) = get_verify(app, "/api/uriage/verify?id=1&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+    assert!(v["diff"].is_null());
+    assert_eq!(v["php_sum"], php_sum);
+    assert_eq!(v["rust_sum"]["青井"]["金額"], 51500);
+    assert_eq!(v["rust_sum"]["青井"]["傭車金額"], 30800);
+    assert_eq!(v["rust_sum"]["青井"]["件数"], 1);
+}
+
+#[tokio::test]
+async fn verify_diff_when_php_value_differs() {
+    // PHP が青井 50000 を返し、Rust は 51500 → diff に両方乗る。
+    let php_sum = json!({
+        "青井": { "金額": 50000, "傭車金額": 30800, "件数": 1 }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), php_sum).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, v) = get_verify(app, "/api/uriage/verify?id=1&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["diff"]["php_only"]["青井"]["金額"], 50000);
+    assert_eq!(v["diff"]["rust_only"]["青井"]["金額"], 51500);
+}
+
+#[tokio::test]
+async fn verify_diff_when_php_has_extra_person() {
+    // PHP に田中 が追加で居る (Rust には居ない) → php_only に田中
+    let php_sum = json!({
+        "青井": { "金額": 51500, "傭車金額": 30800, "件数": 1 },
+        "田中": { "金額": 1000, "傭車金額": 0, "件数": 1 }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), php_sum).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, v) = get_verify(app, "/api/uriage/verify?id=1&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["diff"]["php_only"]["田中"]["金額"], 1000);
+    // 青井は両側で一致しているので diff に出ない
+    assert!(v["diff"]["php_only"]["青井"].is_null());
+    assert!(v["diff"]["rust_only"]["青井"].is_null());
+}
+
+#[tokio::test]
+async fn verify_filters_out_zero_entries() {
+    // PHP が全 0 entry を返しても diff に出ない (jq logic 相当)
+    let php_sum = json!({
+        "青井": { "金額": 51500, "傭車金額": 30800, "件数": 1 },
+        "ゼロ": { "金額": 0, "傭車金額": 0, "件数": 0 }
+    });
+    let server =
+        start_cakephp_mock_with_print_json(vec!["2026-06"], standard_offices(), php_sum).await;
+    let raw = common::temp_raw_dir();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        common::local_store(),
+        server.uri(),
+        raw,
+    );
+    let (status, v) = get_verify(app, "/api/uriage/verify?id=1&date=2026-06-15&cal=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+    assert!(v["diff"].is_null());
+}
