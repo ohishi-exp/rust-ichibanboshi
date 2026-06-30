@@ -32,17 +32,29 @@ SQL Server (CAPE#01、172.18.21.102)
 | status | SQLite | disk raw | R2 | UI から見える? |
 |---|---|---|---|---|
 | `r2_synced` (✅ R2 同期済) | ある | ある | ある | 見える |
-| `computed` (🟡 計算済、R2 同期待ち、`r2_synced_at IS NULL`) | ある | ある | **無い** | 見えない |
-| `computed` (`r2_synced_at` が非 null、= 古い data の R2 残骸) | ある | ある | **古い data** | 古い値が見えている (要 R2 同期) |
+| `computed` (🟡 計算済、R2 同期待ち) | ある | ある | **無い** | 見えない |
 | `failed` (❌ 失敗) | failed 記録のみ | 無し | 無し | 見えない |
+
+タイムスタンプ列の意味:
+
+| 列 | 意味 |
+|---|---|
+| `created_at` | 行が初めて作られた時刻 (= 初回 recalc 時) |
+| `computed_at` | **最後に recalc が走った時刻** (fingerprint が変わったかどうかに関わらず更新) |
+| `fingerprint_changed_at` | **fingerprint が実際に変化した時刻** (= data が変わった時刻、fingerprint 不変な再 recalc では更新されない) |
+| `r2_synced_at` | 最後に R2 同期に成功した時刻 (= R2 オブジェクトが最新化された時刻) |
 
 要点:
 
 - **`computed` は「rust host にはデータがあるが、R2 にはまだ転送していない」状態**。
   ブラウザから直接 SQLite は見えないので、R2 同期しないと UI 側には反映されない。
-- `record_recalc_computed` は fingerprint 変化があれば `r2_synced_at = NULL` にリセット
-  する。fingerprint が同じ recalc 再走では `r2_synced_at` を維持 (= 既存 R2 オブジェクト
-  はそのまま有効)。
+- `record_recalc_computed` は **fingerprint が同じ再 recalc** では status / `r2_synced_at` /
+  `fingerprint_changed_at` をすべて維持する。**fingerprint 変化時のみ** `status='computed'`
+  + `r2_synced_at=NULL` + `fingerprint_changed_at=now` を立てて R2 再送信を促す
+  (user 2026-06-30: 「ｒ２同期待ちおかしくね?」「finger verified のほうがよくね?」)。
+- `computed_at` は不変/変化に関わらず毎回更新される (= 最終 recalc 試行時刻)。なので
+  「`computed_at` が新しいのに `fingerprint_changed_at` が古い」 = 「最近 recalc は走ったが
+  data は変わっていない」と読める。
 - verify (PHP vs Rust) は `verify_jobs` (PK: unko_date, eigyosho_id, cal) に upsert。
   `verify_coverage` view が `(month, eigyosho_id)` で集計し、`r2_pending` view と
   `list_recalc_jobs` が LEFT JOIN して `verified_count / ok / ng` を露出する。
