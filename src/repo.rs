@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
+use crate::routes::uriage::UriageRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
 #[async_trait]
@@ -95,6 +96,19 @@ pub trait AppRepo: Send + Sync {
         kind_filter: &str,
         limit: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError>;
+
+    // ── uriage (担当者別売上、#762) ──
+    /// `[運転日報明細]` から `compute_person_sum` の入力 1 行を取得する。
+    /// PHP `UriageJyuchuDisplayController` setup_dir::make_yosha_sql 系の SELECT を
+    /// 1:1 で再現したもの。`受注部門 IN (bumon_codes)` で営業所配下の部門を絞り、
+    /// 集計対象外の調整行 (`品名N` `※ ... 一括調整明細 ※`) と除外得意先
+    /// (`得意先C='000002'`) を弾く。
+    async fn uriage_rows(
+        &self,
+        from: &str,
+        to: &str,
+        bumon_codes: &[String],
+    ) -> Result<Vec<UriageRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -910,6 +924,86 @@ impl AppRepo for TiberiusRepo {
 
         Ok(Self::rows_to_surcharge(&rows))
     }
+
+    async fn uriage_rows(
+        &self,
+        from: &str,
+        to: &str,
+        bumon_codes: &[String],
+    ) -> Result<Vec<UriageRow>, RepoError> {
+        if bumon_codes.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 受注部門 IN (...) を動的に組む。bumon_codes は呼び出し側で whitelist 済み
+        // (営業所マスタから引いた `'010'`,`'011'` 等の固定形式) のため SQL injection
+        // 上は安全だが、念のため英数字のみに絞ってから組み立てる。
+        let safe_bumon: Vec<String> = bumon_codes
+            .iter()
+            .filter(|c| {
+                !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            })
+            .cloned()
+            .collect();
+        if safe_bumon.is_empty() {
+            return Ok(vec![]);
+        }
+        let in_clause = safe_bumon
+            .iter()
+            .map(|c| format!("'{}'", c))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // PHP UriageJyuchuDisplayController setup_dir 由来の SELECT を 1:1 で写経。
+        // - WHERE は (請求K,備考2) の 3 経路 OR
+        // - 品名N の調整行 / 得意先C='000002' を除外
+        // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)
+        // - 社員ﾏｽﾀ.社員R を 入力担当C で JOIN
+        // 横横 / 請求K / 入力担当C は DB schema が varchar の可能性があるため
+        // 明示 CAST で int に揃える (失敗時は NULL → ISNULL で 0)。これらの数値化は
+        // tiberius の get_i32 でも吸収できるが、SQL 側で揃える方がエラー時の挙動が予測可能。
+        let query = format!(
+            "SELECT \
+                 ISNULL(TRY_CAST(t.[横横] AS INT), 0), \
+                 ISNULL(TRY_CAST(t.[請求K] AS INT), 0), \
+                 ISNULL(t.[備考2], ''), \
+                 ISNULL(TRY_CAST(t.[入力担当C] AS INT), 0), \
+                 ISNULL(t.[稼動部門], ''), \
+                 ISNULL(t.[金額], 0), \
+                 ISNULL(t.[値引], 0), \
+                 ISNULL(t.[割増], 0), \
+                 ISNULL(t.[実費], 0), \
+                 ISNULL(t.[傭車金額], 0), \
+                 ISNULL(t.[傭車値引], 0), \
+                 ISNULL(t.[傭車割増], 0), \
+                 ISNULL(t.[傭車実費], 0), \
+                 ISNULL(e.[社員R], ''), \
+                 ISNULL(t.[傭車先C], '000000') \
+             FROM [運転日報明細] t \
+             LEFT JOIN [社員ﾏｽﾀ] e ON e.[社員C] = t.[入力担当C] \
+             WHERE t.[受注部門] IN ({}) \
+               AND t.[品名N] NOT IN ('※ 請求一括調整明細 ※', '※ 傭車一括調整明細 ※') \
+               AND t.[得意先C] != '000002' \
+               AND ((t.[請求K] = '2' AND t.[備考2] = '売上') \
+                    OR (t.[請求K] = '1' AND t.[備考2] = '') \
+                    OR (t.[請求K] = '0')) \
+               AND t.[運行年月日] >= @P1 AND t.[運行年月日] <= @P2 \
+             ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC",
+            in_clause
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_uriage(&rows))
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -955,6 +1049,28 @@ impl TiberiusRepo {
                 customer_code: decode_cp932(r, 2),
                 customer_name: decode_cp932(r, 3),
                 total: get_i64(r, 4),
+            })
+            .collect()
+    }
+
+    fn rows_to_uriage(rows: &[tiberius::Row]) -> Vec<UriageRow> {
+        rows.iter()
+            .map(|r| UriageRow {
+                yokoyoko: get_i32(r, 0),
+                seikyu_k: get_i32(r, 1),
+                biko2: decode_cp932(r, 2),
+                nyuryoku_tanto_c: get_i32(r, 3),
+                kado_bumon: decode_cp932(r, 4),
+                kingaku: get_i64(r, 5),
+                nebiki: get_i64(r, 6),
+                warimashi: get_i64(r, 7),
+                jippi: get_i64(r, 8),
+                yosha_kingaku: get_i64(r, 9),
+                yosha_nebiki: get_i64(r, 10),
+                yosha_warimashi: get_i64(r, 11),
+                yosha_jippi: get_i64(r, 12),
+                shain_r: decode_cp932(r, 13),
+                yoshasaki_c: decode_cp932(r, 14),
             })
             .collect()
     }
