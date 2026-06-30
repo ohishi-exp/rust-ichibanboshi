@@ -15,6 +15,7 @@ use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
+use rust_ichibanboshi::routes::unchin::RawUnchinRow;
 use rust_ichibanboshi::routes::uriage::UriageRow;
 use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
 use uuid::Uuid;
@@ -338,6 +339,50 @@ impl AppRepo for MockRepo {
             },
         ])
     }
+
+    async fn unchin_candidates(
+        &self,
+        _from: &str,
+        _to: &str,
+        partner_type: &str,
+        _limit: i32,
+    ) -> Result<Vec<RawUnchinRow>, RepoError> {
+        if partner_type == "subcontractor" {
+            return Ok(vec![RawUnchinRow {
+                partner_code: "021970-000".into(),
+                partner_name: "㈱九州運輸".into(),
+                item_code: "6301".into(),
+                item_name: "フレコン".into(),
+                fare: 28_000,
+                origin: "鳥栖".into(),
+                dest: "大石運輸  本社".into(),
+                sale_date: dt(2026, 6, 18),
+            }]);
+        }
+        Ok(vec![
+            RawUnchinRow {
+                partner_code: "034760-015".into(),
+                partner_name: "全農物流㈱　九州支店".into(),
+                item_code: "6301".into(),
+                item_name: "フレコン".into(),
+                fare: 30_000,
+                origin: "釧路".into(),
+                dest: "八代".into(),
+                sale_date: dt(2026, 6, 20),
+            },
+            // 空品名コード (汎用コード、過剰集約の補正対象。#57 確定事項)
+            RawUnchinRow {
+                partner_code: "034760-015".into(),
+                partner_name: "全農物流㈱　九州支店".into(),
+                item_code: "0000".into(),
+                item_name: "".into(),
+                fare: 140_000,
+                origin: "".into(),
+                dest: "福岡県北九州市".into(),
+                sale_date: dt(2026, 6, 19),
+            },
+        ])
+    }
 }
 
 // ── ErrorRepo: 全メソッドがエラーを返す ──
@@ -453,6 +498,15 @@ impl AppRepo for ErrorRepo {
         _: &[String],
         _: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn unchin_candidates(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<Vec<RawUnchinRow>, RepoError> {
         Err(RepoError::PoolError)
     }
 }
@@ -572,6 +626,15 @@ impl AppRepo for QueryErrorRepo {
     ) -> Result<Vec<UriageRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn unchin_candidates(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<Vec<RawUnchinRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
 }
 
 // ── ヘルパー ──
@@ -646,6 +709,7 @@ pub fn build_app_full(
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
+        .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))

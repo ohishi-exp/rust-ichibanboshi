@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
+use crate::routes::unchin::RawUnchinRow;
 use crate::routes::uriage::UriageRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
@@ -112,6 +113,17 @@ pub trait AppRepo: Send + Sync {
         bumon_codes: &[String],
         persons_id_list: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError>;
+
+    // ── unchin (得意先・傭車先別運賃リスト、#57) ──
+    /// `運転日報明細` から得意先 or 傭車先別の運賃候補行を取得する。
+    /// `partner_type`: `"customer"` (得意先) | `"subcontractor"` (傭車先)。
+    async fn unchin_candidates(
+        &self,
+        from: &str,
+        to: &str,
+        partner_type: &str,
+        limit: i32,
+    ) -> Result<Vec<RawUnchinRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -1106,6 +1118,71 @@ impl AppRepo for TiberiusRepo {
 
         Ok(Self::rows_to_uriage(&rows))
     }
+
+    async fn unchin_candidates(
+        &self,
+        from: &str,
+        to: &str,
+        partner_type: &str,
+        limit: i32,
+    ) -> Result<Vec<RawUnchinRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // #57 実機調査で確定した抽出ロジック:
+        // - 取引先は C+H の複合キー必須 (H は固定値ではなく変動する)
+        // - 運賃額は customer: 金額+割増+実費 / subcontractor: 傭車金額+傭車割増+傭車実費
+        //   (金額 は既に税抜のため値引は無視可、#57 確定式)
+        // - 発地N/着地N は自由入力の生文字列をそのまま使う (県正規化はしない)
+        // - 品名C IN ('9003','9998') (消費税調整/端数調整) は除外。9999 は要追加確認のため
+        //   現時点では除外しない
+        // マスタ参照は surcharge_base と同様にスカラサブクエリで引き、LEFT JOIN による
+        // ファンアウト (1 明細行が N 重複して返る) を避ける。
+        let query = if partner_type == "subcontractor" {
+            format!(
+                "SELECT TOP {} \
+                 CONCAT(t.[傭車先C], '-', t.[傭車先H]), \
+                 ISNULL((SELECT TOP 1 c.[傭車先N] FROM [傭車先ﾏｽﾀ] c \
+                   WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]), ''), \
+                 ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
+                 ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0), \
+                 ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
+                 t.[売上年月日] \
+                 FROM [運転日報明細] t \
+                 WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+                   AND t.[品名C] NOT IN ('9003', '9998') \
+                   AND ISNULL(t.[傭車先C], '000000') != '000000' \
+                 ORDER BY t.[傭車先C], t.[傭車先H], t.[品名C], t.[金額]",
+                limit.clamp(1, 20000)
+            )
+        } else {
+            format!(
+                "SELECT TOP {} \
+                 CONCAT(t.[得意先C], '-', t.[得意先H]), \
+                 ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
+                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), ''), \
+                 ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
+                 ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
+                 ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
+                 t.[売上年月日] \
+                 FROM [運転日報明細] t \
+                 WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+                   AND t.[品名C] NOT IN ('9003', '9998') \
+                 ORDER BY t.[得意先C], t.[得意先H], t.[品名C], t.[金額]",
+                limit.clamp(1, 20000)
+            )
+        };
+
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_unchin(&rows))
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -1176,6 +1253,21 @@ impl TiberiusRepo {
                 // CONVERT(varchar(10), …, 23) で 'YYYY-MM-DD' 文字列が返る (locale 非依存)
                 unko_date: decode_cp932(r, 15),
                 uriage_date: decode_cp932(r, 16),
+            })
+            .collect()
+    }
+
+    fn rows_to_unchin(rows: &[tiberius::Row]) -> Vec<RawUnchinRow> {
+        rows.iter()
+            .map(|r| RawUnchinRow {
+                partner_code: decode_cp932(r, 0),
+                partner_name: decode_cp932(r, 1),
+                item_code: decode_cp932(r, 2),
+                item_name: decode_cp932(r, 3),
+                fare: get_i64(r, 4),
+                origin: decode_cp932(r, 5),
+                dest: decode_cp932(r, 6),
+                sale_date: r.get(7).unwrap_or_default(),
             })
             .collect()
     }
