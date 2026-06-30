@@ -1489,6 +1489,56 @@ pub async fn verify(
 }
 
 // ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/recalc-jobs
+//   recalc_jobs を月範囲で読む (UI 状態サマリ用、Refs #762)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct RecalcJobsQuery {
+    /// 期間下限 (YYYY-MM、inclusive)
+    pub from: String,
+    /// 期間上限 (YYYY-MM、inclusive)
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecalcJobsResponse {
+    pub from: String,
+    pub to: String,
+    pub count: usize,
+    pub jobs: Vec<crate::sqlite::RecalcJob>,
+}
+
+/// GET `/api/uriage/recalc-jobs?from=YYYY-MM&to=YYYY-MM`
+///
+/// `recalc_jobs` を月範囲で読む。UI の状態サマリ (= 各月 × 営業所が computed /
+/// r2_synced / failed のどれか) を出すために使う。
+pub async fn list_recalc_jobs(
+    Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<RecalcJobsQuery>,
+) -> Result<Json<RecalcJobsResponse>, (StatusCode, String)> {
+    if q.from.is_empty() || q.to.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "from と to は必須 (YYYY-MM)".to_string(),
+        ));
+    }
+    let jobs = store.list_recalc_jobs(&q.from, &q.to).await.map_err(|e| {
+        tracing::error!("list_recalc_jobs failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list_recalc_jobs query failed: {e}"),
+        )
+    })?;
+    Ok(Json(RecalcJobsResponse {
+        from: q.from,
+        to: q.to,
+        count: jobs.len(),
+        jobs,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
 // HTTP handler: GET /api/uriage/verify-history
 //   verify_jobs を範囲指定で読む (履歴一覧、Refs #762)
 // ══════════════════════════════════════════════════════════════
