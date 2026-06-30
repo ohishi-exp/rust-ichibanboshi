@@ -156,19 +156,22 @@ impl LocalStore {
     }
 
     fn migrate(conn: &Connection) -> Result<(), LocalStoreError> {
-        // 担当者×月×営業所×cal 集計。idempotent (CREATE IF NOT EXISTS)。
-        // 行は `recalc` 実行毎に (month, eigyosho_id, cal) 単位で delete-then-insert する。
+        // 担当者×月×営業所×cal 集計。
+        //
+        // 設計判断 (Refs #43、2026-06-30):
+        // - **table / index**: `CREATE IF NOT EXISTS` で idempotent。既存データ保持。
+        // - **view**: SQLite は `CREATE OR REPLACE VIEW` を持たないため、
+        //   schema 変更時に `IF NOT EXISTS` だと旧定義が残り続け新カラム読みで
+        //   `no such column` エラーになる (= prod 500 の原因、user 報告)。
+        //   **view は毎 boot で `DROP THEN CREATE`** にする (= derived なので
+        //   再生成 cost は無視できる、データ損失なし)。
         //
         // recalc_jobs: per (month, eigyosho_id) の recalc 状態 + fingerprint + R2 sync 状態。
-        // cal は raw row には影響しない (compute_person_sum の挙動だけ変える) ため
-        // recalc_jobs は (month, eigyosho_id) PK で持ち、cal 別の sum は uriage_person_monthly に。
-        //
         // r2_pending view: fingerprint 変化があったが R2 未送信の (month, eigyosho_id)。
         // nuxt cron が `GET /api/uriage/r2/pending` で取得し、生 bytes を R2 に putAll → ack。
         conn.execute_batch(
             r#"
-            -- 日次集計 (SoT、唯一の persistence)。`(month, eigyosho_id, cal)` 単位で
-            -- delete-then-insert する (recalc 毎に全置換)。
+            -- ── 1. tables / indexes (idempotent、データ保持) ──
             CREATE TABLE IF NOT EXISTS uriage_person_daily (
                 unko_date     TEXT    NOT NULL,
                 month         TEXT    NOT NULL,
@@ -185,21 +188,6 @@ impl LocalStore {
                 ON uriage_person_daily (month, eigyosho_id, cal);
             CREATE INDEX IF NOT EXISTS idx_upd_person_date
                 ON uriage_person_daily (person_name, unko_date);
-
-            -- 月次集計は日次の SUM 由来の VIEW (= 二重持ちしない、user 指摘 2026-06-30)。
-            -- API レスポンスとしては既存の月次 query (`get_person_monthly`) と互換。
-            -- `calculated_at` は同 (month, eigyosho_id, cal) 内で日次 row の最新値を採用。
-            CREATE VIEW IF NOT EXISTS uriage_person_monthly AS
-            SELECT month,
-                   person_name,
-                   eigyosho_id,
-                   cal,
-                   SUM(kingaku)        AS kingaku,
-                   SUM(yosha_kingaku)  AS yosha_kingaku,
-                   SUM(kensuu)         AS kensuu,
-                   MAX(calculated_at)  AS calculated_at
-            FROM uriage_person_daily
-            GROUP BY month, person_name, eigyosho_id, cal;
 
             CREATE TABLE IF NOT EXISTS recalc_jobs (
                 month                TEXT    NOT NULL,
@@ -239,8 +227,26 @@ impl LocalStore {
             CREATE INDEX IF NOT EXISTS idx_vj_ran_at
                 ON verify_jobs (ran_at DESC);
 
+            -- ── 2. views (毎 boot で drop+create、schema 変更を漏れなく反映) ──
+            DROP VIEW IF EXISTS r2_pending;
+            DROP VIEW IF EXISTS verify_coverage;
+            DROP VIEW IF EXISTS uriage_person_monthly;
+
+            -- 月次集計は日次の SUM 由来の VIEW (= 二重持ちしない、user 指摘 2026-06-30)。
+            CREATE VIEW uriage_person_monthly AS
+            SELECT month,
+                   person_name,
+                   eigyosho_id,
+                   cal,
+                   SUM(kingaku)        AS kingaku,
+                   SUM(yosha_kingaku)  AS yosha_kingaku,
+                   SUM(kensuu)         AS kensuu,
+                   MAX(calculated_at)  AS calculated_at
+            FROM uriage_person_daily
+            GROUP BY month, person_name, eigyosho_id, cal;
+
             -- (month, eigyosho_id) ごとの verify 集計 view。R2 sync gate の判定用。
-            CREATE VIEW IF NOT EXISTS verify_coverage AS
+            CREATE VIEW verify_coverage AS
             SELECT month,
                    eigyosho_id,
                    COUNT(*)                                AS verified_count,
@@ -252,7 +258,7 @@ impl LocalStore {
             -- r2_pending: 「R2 同期候補」 view。verify_coverage を LEFT JOIN し、
             -- caller (nuxt) が「(month の日数) × 2 cal」と verified_count を比較して
             -- ready を判定できるようにする。verified_ng>0 は ng_present で gate される。
-            CREATE VIEW IF NOT EXISTS r2_pending AS
+            CREATE VIEW r2_pending AS
             SELECT rj.month,
                    rj.eigyosho_id,
                    rj.raw_path,
@@ -1328,5 +1334,69 @@ mod tests {
         assert_eq!(n, 0);
         let job = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
         assert_eq!(job.status, "failed");
+    }
+}
+
+#[cfg(test)]
+mod migration_upgrade_tests {
+    use super::LocalStore;
+    use rusqlite::Connection;
+
+    /// 旧 (Phase 2 PR-C2) の r2_pending view 定義 (5 カラム、verify_* 無し)。
+    /// 既存 DB に対して新 migrate() が走った時、`DROP VIEW IF EXISTS r2_pending` で
+    /// この古い定義を破棄して新定義 (8 カラム) を作り直すかをテストする。
+    const OLD_R2_PENDING_VIEW: &str = r#"
+        CREATE TABLE IF NOT EXISTS recalc_jobs (
+            month TEXT NOT NULL,
+            eigyosho_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            fingerprint_before TEXT,
+            fingerprint_after TEXT,
+            raw_path TEXT,
+            created_at TEXT NOT NULL,
+            computed_at TEXT,
+            r2_synced_at TEXT,
+            last_error TEXT,
+            PRIMARY KEY (month, eigyosho_id)
+        );
+        CREATE VIEW IF NOT EXISTS r2_pending AS
+        SELECT month, eigyosho_id, raw_path, fingerprint_after, computed_at
+        FROM recalc_jobs
+        WHERE status = 'computed' AND r2_synced_at IS NULL AND raw_path IS NOT NULL;
+    "#;
+
+    #[test]
+    fn migrate_replaces_old_r2_pending_view_with_new_columns() {
+        // 1. 旧 DB を 1 つ open し、旧 view を手書きで作る (= prod の現状)
+        let tmp = std::env::temp_dir().join(format!(
+            "ichibanboshi-test-upgrade-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(OLD_R2_PENDING_VIEW).unwrap();
+            // ここでは LocalStore::open() を呼ばず、生の view だけある状態にする
+        }
+
+        // 2. LocalStore::open() で migrate を走らせる (= 新 binary の boot 相当)
+        let store = LocalStore::open(tmp.to_str().unwrap())
+            .expect("LocalStore should open and migrate existing DB");
+
+        // 3. 新 view が引けるか確認 (verified_count 等のカラムが取れる = 新定義)
+        let pending = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(store.list_r2_pending())
+            .expect("list_r2_pending should not fail after migrate replaces old view");
+        // 行は空 (recalc_jobs に row 無し) でも query 自体は通る = view が更新済
+        assert_eq!(pending.len(), 0);
+
+        // 後始末
+        let _ = std::fs::remove_file(&tmp);
     }
 }
