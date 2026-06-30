@@ -14,6 +14,7 @@ use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
 use rust_ichibanboshi::routes::uriage::UriageRow;
+use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
 use uuid::Uuid;
 
 pub const TEST_JWT_SECRET: &str = "test-jwt-secret-ichibanboshi";
@@ -573,7 +574,15 @@ pub fn dt(y: i32, m: u32, d: u32) -> chrono::NaiveDateTime {
         .unwrap()
 }
 
+pub fn local_store() -> DynLocalStore {
+    Arc::new(LocalStore::open(":memory:").expect("in-memory sqlite"))
+}
+
 pub fn build_app(repo: DynRepo) -> Router {
+    build_app_with_store(repo, local_store())
+}
+
+pub fn build_app_with_store(repo: DynRepo, store: DynLocalStore) -> Router {
     let jwt_secret = JwtSecret(TEST_JWT_SECRET.to_string());
     let api_routes = Router::new()
         .route("/sales/monthly", get(routes::sales::monthly))
@@ -597,7 +606,8 @@ pub fn build_app(repo: DynRepo) -> Router {
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
-        .route("/uriage/by-person", post(routes::uriage::by_person));
+        .route("/uriage/by-person", post(routes::uriage::by_person))
+        .route("/uriage/recalc", post(routes::uriage::recalc));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))
@@ -607,6 +617,7 @@ pub fn build_app(repo: DynRepo) -> Router {
         .nest("/api", api_routes)
         .nest("/api", schema_routes)
         .layer(Extension(repo))
+        .layer(Extension(store))
         .layer(Extension(jwt_secret))
 }
 

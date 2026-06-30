@@ -19,6 +19,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::repo::{DynRepo, RepoError};
+use crate::sqlite::{DynLocalStore, LocalStoreError};
 
 /// `preg_match("/(.+)→(.+)/u", $cleaned, $pregtest)` の写経。
 ///
@@ -443,6 +444,112 @@ pub async fn by_person(
         cal: req.cal,
         sum: result.sum,
         row_count,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: POST /api/uriage/recalc
+// ══════════════════════════════════════════════════════════════
+
+/// `/api/uriage/recalc` のリクエストボディ。
+///
+/// `/by-person` と同じ入力 + 永続化に必要な `month` (bucket key) と `eigyosho_id`。
+/// `from`/`to` は SQL Server のフィルタ範囲、`month` は SQLite で集計をまとめる
+/// 単位 (典型的には `from` の月)。
+#[derive(Debug, Deserialize)]
+pub struct RecalcRequest {
+    /// 集計対象月 (`YYYY-MM`)。SQLite `uriage_person_monthly.month` の値になる
+    pub month: String,
+    /// 運行年月日 下限 (`YYYY-MM-DD`、含む)
+    pub from: String,
+    /// 運行年月日 上限 (`YYYY-MM-DD`、含む)。month-to-date なら月の途中で OK
+    pub to: String,
+    /// 営業所 id (`UriageJyuchuDisplay_list` のキー、SQLite の bucket 列)
+    pub eigyosho_id: i64,
+    /// 受注部門コード (PHP の `jyuchu_bumon_in_jyuchu_display[$display_id]`)
+    pub bumon: Vec<String>,
+    /// 入力担当C → 担当者名
+    pub persons: HashMap<i32, String>,
+    /// 稼動部門コード → 営業所名
+    pub other: HashMap<String, String>,
+    /// PHP の `$cal`。truthy で別営業所も合算。省略時 true
+    #[serde(default = "default_cal")]
+    pub cal: bool,
+}
+
+/// `/api/uriage/recalc` のレスポンス。
+#[derive(Debug, Serialize)]
+pub struct RecalcResponse {
+    pub source_table: String,
+    pub month: String,
+    pub from: String,
+    pub to: String,
+    pub eigyosho_id: i64,
+    pub cal: bool,
+    pub sum: HashMap<String, PersonAccum>,
+    pub row_count: usize,
+    /// SQLite に insert された行数 (= 非ゼロ担当者数)
+    pub persisted_count: usize,
+    /// ISO 8601 UTC タイムスタンプ
+    pub calculated_at: String,
+}
+
+fn map_local_store_err(e: LocalStoreError) -> StatusCode {
+    tracing::error!("local store error: {e}");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+/// POST `/api/uriage/recalc`
+///
+/// SQL Server から運転日報明細を取り出し、`compute_person_sum` で担当者別 sum を算出して
+/// **SQLite に永続化** する。`/by-person` と同じ入力 + 永続化メタ (`month`, `eigyosho_id`)。
+///
+/// (Phase 2、issue #762 PR-C1) 現状は同期。後続 PR で tokio worker による fire-and-forget
+/// 化と fingerprint 比較 / raw NDJSON.gz 出力 / `r2_pending` view を追加。
+pub async fn recalc(
+    Extension(repo): Extension<DynRepo>,
+    Extension(store): Extension<DynLocalStore>,
+    Json(req): Json<RecalcRequest>,
+) -> Result<Json<RecalcResponse>, StatusCode> {
+    // 入力検証
+    if req.from.is_empty() || req.to.is_empty() || req.month.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if req.bumon.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let rows = repo
+        .uriage_rows(&req.from, &req.to, &req.bumon)
+        .await
+        .map_err(map_repo_err)?;
+    let row_count = rows.len();
+
+    let result = compute_person_sum(&rows, &req.persons, &req.other, req.cal);
+
+    let calculated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let persisted = store
+        .upsert_person_monthly(
+            &req.month,
+            req.eigyosho_id,
+            req.cal,
+            &result.sum,
+            &calculated_at,
+        )
+        .await
+        .map_err(map_local_store_err)?;
+
+    Ok(Json(RecalcResponse {
+        source_table: "運転日報明細 + 社員ﾏｽﾀ → uriage_person_monthly (SQLite)".to_string(),
+        month: req.month,
+        from: req.from,
+        to: req.to,
+        eigyosho_id: req.eigyosho_id,
+        cal: req.cal,
+        sum: result.sum,
+        row_count,
+        persisted_count: persisted,
+        calculated_at,
     }))
 }
 
