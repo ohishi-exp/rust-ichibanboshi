@@ -691,7 +691,10 @@ async fn recalc_503_when_cakephp_not_configured() {
 }
 
 #[tokio::test]
-async fn recalc_422_when_month_not_editable() {
+async fn recalc_accepts_month_outside_editable_window() {
+    // 入力可能月 ≠ 取得可能月 (Refs yhonda-ohishi/nginx#762)。
+    // CakePHP の editable_months に含まれない月でも、rust は SELECT して集計し直す。
+    // 422 ではなく 200 で通り、その月が target に入る。
     let server = start_cakephp_mock(vec!["2026-06", "2026-07"], standard_offices()).await;
     let raw = common::temp_raw_dir();
     let app = build_app_with_cakephp(
@@ -700,11 +703,11 @@ async fn recalc_422_when_month_not_editable() {
         server.uri(),
         raw,
     );
-    // 2026-05 は editable_months に無い → 422
     let (status, v) = post_recalc_path(app, "/api/uriage/recalc?month=2026-05").await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    // body は plain text (axum (StatusCode, String) tuple)
-    assert!(v == Value::Null || v.is_string() || v.is_object());
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["months"][0], "2026-05");
+    // editable_months_count は 2 (= mock 値)、target 月とは独立
+    assert_eq!(v["editable_months_count"], 2);
 }
 
 #[tokio::test]
