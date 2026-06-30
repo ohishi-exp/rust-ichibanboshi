@@ -1,11 +1,17 @@
 //! 得意先・傭車先別 運賃リストの基礎データエンドポイント (Refs #57)
 //!
 //! `運転日報明細` から得意先 (`partner_type=customer`) または傭車先
-//! (`partner_type=subcontractor`) 別の運賃候補行を抽出する。
+//! (`partner_type=subcontractor`) 別の運賃候補行・合計金額を抽出する。
 //!
 //! 同じ品目・金額・取引先の場合に積地・卸地ペアをまとめる集約処理は本 endpoint では
-//! 行わず、raw 行をそのまま返す。集約・バージョン管理は消費側 (nuxt-ichibanboshi) が
-//! 行う設計 (`docs/plan-unchin-rate-list.md` 参照)。
+//! 行わず、raw 行をそのまま返す (`/candidates`)。集約・バージョン管理は消費側
+//! (nuxt-ichibanboshi) が行う設計 (`docs/plan-unchin-rate-list.md` 参照)。
+//!
+//! `請求K` フィルタ (`kind`) は `surcharge.rs` の `surcharge_kind_filter` と同じ方針:
+//! `billing_only` (請求のみ, K=1) / `transport` (請求, K=0、default) / `non_billing`
+//! (非請求, K=2) / `all` (フィルタなし)。「運行記録簿用」「事故請求コード」等の社内向け
+//! ダミー得意先は `請求K=2` (非請求) で記録されているため、default の `transport` で
+//! 自然に除外される (実機確認、#57)。
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -52,6 +58,14 @@ pub struct RawUnchinRow {
     pub sale_date: NaiveDateTime,
 }
 
+/// 取引先ごとの合計金額 (`/summary` 用)。
+#[derive(Debug, Clone)]
+pub struct RawUnchinSummaryRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    pub total: i64,
+}
+
 // ══════════════════════════════════════════════════════════════
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
@@ -68,6 +82,13 @@ pub struct UnchinCandidateRow {
     pub sale_date: String,
 }
 
+#[derive(Serialize, Debug, PartialEq)]
+pub struct UnchinSummaryRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    pub total: i64,
+}
+
 // ══════════════════════════════════════════════════════════════
 // Query パラメータ
 // ══════════════════════════════════════════════════════════════
@@ -80,8 +101,9 @@ pub struct UnchinQuery {
     pub to: Option<String>,
     /// `"customer"`（得意先、default）| `"subcontractor"`（傭車先）
     pub partner_type: Option<String>,
-    /// 取得上限件数 (1..=20000、default 5000)
-    pub limit: Option<i32>,
+    /// `"billing_only"`(請求のみ,K=1) | `"transport"`(請求,K=0、default) |
+    /// `"non_billing"`(非請求,K=2) | `"all"`(フィルタなし)
+    pub kind: Option<String>,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -94,6 +116,27 @@ pub fn normalize_partner_type(partner_type: &str) -> &'static str {
     match partner_type {
         "subcontractor" => "subcontractor",
         _ => "customer",
+    }
+}
+
+/// `kind` パラメータ → `請求K` の SQL WHERE フラグメント。
+/// 未知の値は `transport`（請求、K=0）と同義にフォールバックする。
+pub fn unchin_kind_filter(kind: &str) -> &'static str {
+    match kind {
+        "billing_only" => "AND t.[請求K] = '1'",
+        "non_billing" => "AND t.[請求K] = '2'",
+        "all" => "",
+        _ => "AND t.[請求K] = '0'",
+    }
+}
+
+/// `kind` パラメータ → source_table 表示用ラベル。
+pub fn unchin_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "billing_only" => "請求のみ (請求K=1)",
+        "non_billing" => "非請求 (請求K=2)",
+        "all" => "全請求区分",
+        _ => "請求 (請求K=0)",
     }
 }
 
@@ -113,11 +156,22 @@ pub fn build_unchin_rows(raw: &[RawUnchinRow]) -> Vec<UnchinCandidateRow> {
         .collect()
 }
 
+/// Raw 合計行リストをレスポンス行に変換する。
+pub fn build_unchin_summary_rows(raw: &[RawUnchinSummaryRow]) -> Vec<UnchinSummaryRow> {
+    raw.iter()
+        .map(|r| UnchinSummaryRow {
+            partner_code: r.partner_code.clone(),
+            partner_name: r.partner_name.clone(),
+            total: r.total,
+        })
+        .collect()
+}
+
 // ══════════════════════════════════════════════════════════════
 // ハンドラ (薄い — param 解析 → repo → build → JSON)
 // ══════════════════════════════════════════════════════════════
 
-/// GET /api/unchin/candidates?from=&to=&partner_type=customer|subcontractor&limit=
+/// GET /api/unchin/candidates?from=&to=&partner_type=customer|subcontractor&kind=
 pub async fn unchin_candidates(
     Extension(repo): Extension<DynRepo>,
     Query(params): Query<UnchinQuery>,
@@ -125,22 +179,58 @@ pub async fn unchin_candidates(
     let from = params.from.unwrap_or_else(|| "2024-01-01".to_string());
     let to = params.to.unwrap_or_else(|| "2999-12-31".to_string());
     let partner_type = normalize_partner_type(params.partner_type.as_deref().unwrap_or(""));
-    let limit = params.limit.unwrap_or(5000).clamp(1, 20000);
+    let kind = params.kind.unwrap_or_default();
+    let kind_filter = unchin_kind_filter(&kind);
 
     let raw = repo
-        .unchin_candidates(&from, &to, partner_type, limit)
+        .unchin_candidates(&from, &to, partner_type, kind_filter)
         .await
         .map_err(map_repo_err)?;
 
     Ok(Json(ApiResponse {
         source_table: format!(
-            "運転日報明細 + {}",
+            "運転日報明細 + {} [{}]",
             if partner_type == "subcontractor" {
                 "傭車先ﾏｽﾀ"
             } else {
                 "得意先ﾏｽﾀ"
-            }
+            },
+            unchin_kind_label(&kind)
         ),
         data: build_unchin_rows(&raw),
+    }))
+}
+
+/// GET /api/unchin/summary?from=&to=&partner_type=customer|subcontractor&kind=
+///
+/// 得意先 (or 傭車先) ごとの合計金額のみを SQL 側で `GROUP BY` + `SUM` して返す。
+/// raw 行 TOP-N 方式と違い、結果は取引先数で決まるため一部の取引先だけが行数を
+/// 食い潰して他が表示されなくなる問題が起きない（#57 実害の根本対策）。
+pub async fn unchin_summary(
+    Extension(repo): Extension<DynRepo>,
+    Query(params): Query<UnchinQuery>,
+) -> Result<Json<ApiResponse<Vec<UnchinSummaryRow>>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2024-01-01".to_string());
+    let to = params.to.unwrap_or_else(|| "2999-12-31".to_string());
+    let partner_type = normalize_partner_type(params.partner_type.as_deref().unwrap_or(""));
+    let kind = params.kind.unwrap_or_default();
+    let kind_filter = unchin_kind_filter(&kind);
+
+    let raw = repo
+        .unchin_summary(&from, &to, partner_type, kind_filter)
+        .await
+        .map_err(map_repo_err)?;
+
+    Ok(Json(ApiResponse {
+        source_table: format!(
+            "運転日報明細 + {} [{}]",
+            if partner_type == "subcontractor" {
+                "傭車先ﾏｽﾀ"
+            } else {
+                "得意先ﾏｽﾀ"
+            },
+            unchin_kind_label(&kind)
+        ),
+        data: build_unchin_summary_rows(&raw),
     }))
 }

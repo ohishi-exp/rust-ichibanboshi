@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
-use crate::routes::unchin::RawUnchinRow;
+use crate::routes::unchin::{RawUnchinRow, RawUnchinSummaryRow};
 use crate::routes::uriage::UriageRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
@@ -115,15 +115,26 @@ pub trait AppRepo: Send + Sync {
     ) -> Result<Vec<UriageRow>, RepoError>;
 
     // ── unchin (得意先・傭車先別運賃リスト、#57) ──
-    /// `運転日報明細` から得意先 or 傭車先別の運賃候補行を取得する。
+    /// `運転日報明細` から得意先 or 傭車先別の運賃候補行を取得する (raw 行、TOP 上限なし)。
     /// `partner_type`: `"customer"` (得意先) | `"subcontractor"` (傭車先)。
+    /// `kind_filter`: `unchin_kind_filter()` が返す SQL WHERE フラグメント (`請求K` 絞り込み)。
     async fn unchin_candidates(
         &self,
         from: &str,
         to: &str,
         partner_type: &str,
-        limit: i32,
+        kind_filter: &str,
     ) -> Result<Vec<RawUnchinRow>, RepoError>;
+
+    /// `運転日報明細` から得意先 or 傭車先ごとの合計金額を `SUM`/`GROUP BY` で集計する。
+    /// 結果は取引先数で決まるため raw 行 TOP-N 方式と違い行数による打ち切りが起きない。
+    async fn unchin_summary(
+        &self,
+        from: &str,
+        to: &str,
+        partner_type: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSummaryRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -1124,7 +1135,7 @@ impl AppRepo for TiberiusRepo {
         from: &str,
         to: &str,
         partner_type: &str,
-        limit: i32,
+        kind_filter: &str,
     ) -> Result<Vec<RawUnchinRow>, RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
 
@@ -1133,13 +1144,16 @@ impl AppRepo for TiberiusRepo {
         // - 運賃額は customer: 金額+割増+実費 / subcontractor: 傭車金額+傭車割増+傭車実費
         //   (金額 は既に税抜のため値引は無視可、#57 確定式)
         // - 発地N/着地N は自由入力の生文字列をそのまま使う (県正規化はしない)
-        // - 品名C IN ('9003','9998') (消費税調整/端数調整) は除外。9999 は要追加確認のため
-        //   現時点では除外しない
+        // - 品名C IN ('9003','9998') (消費税調整/端数調整) は除外
+        // - kind_filter (請求K) で「運行記録簿用」等の非請求ダミー得意先を除外する
+        //   (#57 実害: TOP 上限 + 得意先C 昇順ソートの組み合わせでダミー得意先が
+        //   行数を食い潰し、本物の得意先が一切表示されない問題が起きていたため、
+        //   TOP 上限を撤廃し 請求K フィルタを根本対策として導入)
         // マスタ参照は surcharge_base と同様にスカラサブクエリで引き、LEFT JOIN による
         // ファンアウト (1 明細行が N 重複して返る) を避ける。
         let query = if partner_type == "subcontractor" {
             format!(
-                "SELECT TOP {} \
+                "SELECT \
                  CONCAT(t.[傭車先C], '-', t.[傭車先H]), \
                  ISNULL((SELECT TOP 1 c.[傭車先N] FROM [傭車先ﾏｽﾀ] c \
                    WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]), ''), \
@@ -1151,12 +1165,13 @@ impl AppRepo for TiberiusRepo {
                  WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                    AND t.[品名C] NOT IN ('9003', '9998') \
                    AND ISNULL(t.[傭車先C], '000000') != '000000' \
+                   {} \
                  ORDER BY t.[傭車先C], t.[傭車先H], t.[品名C], t.[金額]",
-                limit.clamp(1, 20000)
+                kind_filter
             )
         } else {
             format!(
-                "SELECT TOP {} \
+                "SELECT \
                  CONCAT(t.[得意先C], '-', t.[得意先H]), \
                  ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
                    WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), ''), \
@@ -1167,8 +1182,9 @@ impl AppRepo for TiberiusRepo {
                  FROM [運転日報明細] t \
                  WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                    AND t.[品名C] NOT IN ('9003', '9998') \
+                   {} \
                  ORDER BY t.[得意先C], t.[得意先H], t.[品名C], t.[金額]",
-                limit.clamp(1, 20000)
+                kind_filter
             )
         };
 
@@ -1182,6 +1198,60 @@ impl AppRepo for TiberiusRepo {
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
         Ok(Self::rows_to_unchin(&rows))
+    }
+
+    async fn unchin_summary(
+        &self,
+        from: &str,
+        to: &str,
+        partner_type: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 得意先 (or 傭車先) ごとに SUM/GROUP BY で集計する。結果行数 = 取引先数なので
+        // raw 行 TOP-N 方式と違い一部の取引先が行数を食い潰して他が消える問題が起きない。
+        let query = if partner_type == "subcontractor" {
+            format!(
+                "SELECT t.[傭車先C], t.[傭車先H], \
+                 ISNULL((SELECT TOP 1 c.[傭車先N] FROM [傭車先ﾏｽﾀ] c \
+                   WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]), ''), \
+                 SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)) \
+                 FROM [運転日報明細] t \
+                 WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+                   AND t.[品名C] NOT IN ('9003', '9998') \
+                   AND ISNULL(t.[傭車先C], '000000') != '000000' \
+                   {} \
+                 GROUP BY t.[傭車先C], t.[傭車先H] \
+                 ORDER BY SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)) DESC",
+                kind_filter
+            )
+        } else {
+            format!(
+                "SELECT t.[得意先C], t.[得意先H], \
+                 ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
+                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), ''), \
+                 SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) \
+                 FROM [運転日報明細] t \
+                 WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+                   AND t.[品名C] NOT IN ('9003', '9998') \
+                   {} \
+                 GROUP BY t.[得意先C], t.[得意先H] \
+                 ORDER BY SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) DESC",
+                kind_filter
+            )
+        };
+
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_unchin_summary(&rows))
     }
 }
 
@@ -1253,6 +1323,16 @@ impl TiberiusRepo {
                 // CONVERT(varchar(10), …, 23) で 'YYYY-MM-DD' 文字列が返る (locale 非依存)
                 unko_date: decode_cp932(r, 15),
                 uriage_date: decode_cp932(r, 16),
+            })
+            .collect()
+    }
+
+    fn rows_to_unchin_summary(rows: &[tiberius::Row]) -> Vec<RawUnchinSummaryRow> {
+        rows.iter()
+            .map(|r| RawUnchinSummaryRow {
+                partner_code: format!("{}-{}", decode_cp932(r, 0), decode_cp932(r, 1)),
+                partner_name: decode_cp932(r, 2),
+                total: get_i64(r, 3),
             })
             .collect()
     }
