@@ -1010,7 +1010,8 @@ impl AppRepo for TiberiusRepo {
                  ISNULL(t.[傭車実費], 0), \
                  ISNULL((SELECT TOP 1 e.[社員R] FROM [社員ﾏｽﾀ] e WHERE e.[社員C] = t.[入力担当C]), ''), \
                  ISNULL(t.[傭車先C], '000000'), \
-                 CONVERT(varchar(10), t.[運行年月日], 23) \
+                 CONVERT(varchar(10), t.[運行年月日], 23), \
+                 CONVERT(varchar(10), t.[売上年月日], 23) \
              FROM [運転日報明細] t \
              WHERE ( \
                  (t.[受注部門] IN ({in_clause}) \
@@ -1108,6 +1109,7 @@ impl TiberiusRepo {
                 yoshasaki_c: decode_cp932(r, 14),
                 // CONVERT(varchar(10), …, 23) で 'YYYY-MM-DD' 文字列が返る (locale 非依存)
                 unko_date: decode_cp932(r, 15),
+                uriage_date: decode_cp932(r, 16),
             })
             .collect()
     }
