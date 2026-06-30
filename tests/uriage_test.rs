@@ -4,9 +4,17 @@
 //! 整備された 17 ケース golden + 全分岐網羅) を 1:1 で写経したもの。golden
 //! 値は PHP 側 PR #764 で確定済み。本 Rust 実装が PHP と 1 円単位で一致する
 //! ことを保証する。
+//!
+//! 末尾には HTTP endpoint (`POST /api/uriage/by-person`) の統合テストも置く。
 
+mod common;
+
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
 use rust_ichibanboshi::routes::uriage::{compute_person_sum, PersonAccum, UriageRow};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use tower::ServiceExt;
 
 /// PHP `testRowData` の Rust 表現 (横横=1, 入力担当C=1499, 稼動部門="010", ...)。
 fn base_row() -> UriageRow {
@@ -378,4 +386,206 @@ fn all_branches_reached() {
     assert_eq!(aoi.kingaku, 95409); // 90059 + 5350
     assert_eq!(aoi.yosha_kingaku, 93094); // 90059 + 3035
     assert_eq!(aoi.kensuu, 10); // 9 + 1
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP endpoint test: POST /api/uriage/by-person
+// ══════════════════════════════════════════════════════════════
+
+/// `Json` body helper
+fn json_body(v: Value) -> Body {
+    Body::from(serde_json::to_vec(&v).unwrap())
+}
+
+/// POST した response から JSON を取り出す
+async fn post_by_person(app: axum::Router, body: Value) -> (StatusCode, Value) {
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/by-person")
+                .header("content-type", "application/json")
+                .body(json_body(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn by_person_ok_with_mock_rows() {
+    // MockRepo.uriage_rows は 2 行返す:
+    //  - 入力担当C=1499 (= 青井) / 横横=0 / 金額=50000 / 値引=0 / 割増=1000 / 実費=500
+    //                                    / 傭車金額=30000 / 傭車値引=0 / 傭車割増=600 / 傭車実費=200
+    //  - 入力担当C=9999 (マスタ外) → B6 で表示のみ、$sum に影響しない
+    let app = common::build_app(common::mock_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "2026-06-30",
+        "bumon": ["010", "011", "030"],
+        "persons": {
+            "1499": "青井",
+            "1364": "山﨑智"
+        },
+        "other": {
+            "021": "諸富営業所",
+            "013": "佐賀営業所"
+        },
+        "cal": true
+    });
+
+    let (status, v) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // メタ情報
+    assert_eq!(v["source_table"], "運転日報明細 + 社員ﾏｽﾀ");
+    assert_eq!(v["row_count"], 2);
+    assert_eq!(v["cal"], true);
+
+    // 青井に B5 経路で加算: 50000 + 0 + 1000 + 500 = 51500
+    //                       傭車: 30000 + 0 + 600 + 200 = 30800
+    assert_eq!(v["sum"]["青井"]["金額"], 51500);
+    assert_eq!(v["sum"]["青井"]["傭車金額"], 30800);
+    assert_eq!(v["sum"]["青井"]["件数"], 1);
+
+    // 山﨑智 はマスタ初期化のみで 0 のまま
+    assert_eq!(v["sum"]["山﨑智"]["金額"], 0);
+    assert_eq!(v["sum"]["山﨑智"]["件数"], 0);
+}
+
+#[tokio::test]
+async fn by_person_cal_false_skips_other_eigyosho() {
+    // MockRepo の行は 稼動部門="010" (other に無い) なので、cal=false でも skip されない。
+    // 確認: cal=false でも 青井 に加算される。
+    let app = common::build_app(common::mock_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "2026-06-30",
+        "bumon": ["010"],
+        "persons": { "1499": "青井" },
+        "other": { "021": "諸富営業所" },
+        "cal": false
+    });
+
+    let (status, v) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["sum"]["青井"]["金額"], 51500);
+    assert_eq!(v["sum"]["青井"]["件数"], 1);
+}
+
+#[tokio::test]
+async fn by_person_default_cal_is_true() {
+    // body から `cal` を省略すると default_cal() で true になる
+    let app = common::build_app(common::mock_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "2026-06-30",
+        "bumon": ["010"],
+        "persons": { "1499": "青井" },
+        "other": {}
+    });
+
+    let (status, v) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["cal"], true);
+}
+
+#[tokio::test]
+async fn by_person_rejects_empty_bumon() {
+    let app = common::build_app(common::mock_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "2026-06-30",
+        "bumon": [],
+        "persons": {},
+        "other": {}
+    });
+
+    let (status, _) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn by_person_rejects_empty_from() {
+    let app = common::build_app(common::mock_repo());
+    let body = json!({
+        "from": "",
+        "to": "2026-06-30",
+        "bumon": ["010"],
+        "persons": {},
+        "other": {}
+    });
+
+    let (status, _) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn by_person_rejects_empty_to() {
+    let app = common::build_app(common::mock_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "",
+        "bumon": ["010"],
+        "persons": {},
+        "other": {}
+    });
+
+    let (status, _) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn by_person_pool_error_returns_503() {
+    let app = common::build_app(common::error_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "2026-06-30",
+        "bumon": ["010"],
+        "persons": { "1499": "青井" },
+        "other": {}
+    });
+
+    let (status, _) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn by_person_query_error_returns_500() {
+    let app = common::build_app(common::query_error_repo());
+    let body = json!({
+        "from": "2026-06-01",
+        "to": "2026-06-30",
+        "bumon": ["010"],
+        "persons": { "1499": "青井" },
+        "other": {}
+    });
+
+    let (status, _) = post_by_person(app, body).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn by_person_rejects_malformed_json() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/uriage/by-person")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }

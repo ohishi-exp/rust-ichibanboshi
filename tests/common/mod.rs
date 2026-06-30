@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use chrono::{NaiveDate, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
@@ -13,6 +13,7 @@ use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
+use rust_ichibanboshi::routes::uriage::UriageRow;
 use uuid::Uuid;
 
 pub const TEST_JWT_SECRET: &str = "test-jwt-secret-ichibanboshi";
@@ -281,6 +282,54 @@ impl AppRepo for MockRepo {
             },
         ])
     }
+
+    async fn uriage_rows(
+        &self,
+        _from: &str,
+        _to: &str,
+        _bumon_codes: &[String],
+    ) -> Result<Vec<UriageRow>, RepoError> {
+        // 担当者振替で B5 経路 (入力担当C=1499 → "青井") に当たる 1 行と
+        // B6 経路 (マスタ外、表示のみ) に当たる 1 行を返す。
+        // 横横=0 で 傭車金額は独立。
+        Ok(vec![
+            UriageRow {
+                yokoyoko: 0,
+                seikyu_k: 0,
+                biko2: String::new(),
+                nyuryoku_tanto_c: 1499,
+                kado_bumon: "010".into(),
+                kingaku: 50_000,
+                nebiki: 0,
+                warimashi: 1_000,
+                jippi: 500,
+                yosha_kingaku: 30_000,
+                yosha_nebiki: 0,
+                yosha_warimashi: 600,
+                yosha_jippi: 200,
+                shain_r: "青井".into(),
+                yoshasaki_c: "000000".into(),
+            },
+            // 入力担当 9999 (マスタ外) → B6 で表示のみ、$sum に積まない
+            UriageRow {
+                yokoyoko: 0,
+                seikyu_k: 0,
+                biko2: String::new(),
+                nyuryoku_tanto_c: 9999,
+                kado_bumon: "010".into(),
+                kingaku: 8_000,
+                nebiki: 0,
+                warimashi: 0,
+                jippi: 0,
+                yosha_kingaku: 6_000,
+                yosha_nebiki: 0,
+                yosha_warimashi: 0,
+                yosha_jippi: 0,
+                shain_r: "無関係".into(),
+                yoshasaki_c: "021970".into(),
+            },
+        ])
+    }
 }
 
 // ── ErrorRepo: 全メソッドがエラーを返す ──
@@ -387,6 +436,14 @@ impl AppRepo for ErrorRepo {
         _: &str,
         _: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn uriage_rows(
+        &self,
+        _: &str,
+        _: &str,
+        _: &[String],
+    ) -> Result<Vec<UriageRow>, RepoError> {
         Err(RepoError::PoolError)
     }
 }
@@ -497,6 +554,14 @@ impl AppRepo for QueryErrorRepo {
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn uriage_rows(
+        &self,
+        _: &str,
+        _: &str,
+        _: &[String],
+    ) -> Result<Vec<UriageRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
 }
 
 // ── ヘルパー ──
@@ -531,7 +596,8 @@ pub fn build_app(repo: DynRepo) -> Router {
             get(routes::sales::customer_detail),
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
-        .route("/vehicles", get(routes::surcharge::vehicles));
+        .route("/vehicles", get(routes::surcharge::vehicles))
+        .route("/uriage/by-person", post(routes::uriage::by_person));
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/columns", get(routes::schema::list_columns))
