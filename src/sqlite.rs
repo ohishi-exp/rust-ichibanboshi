@@ -311,6 +311,28 @@ impl LocalStore {
         )
         .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
 
+        // ── 2a'. PR #51 以前の bug で生まれた不整合行を repair ──
+        // user 2026-06-30: 「R2 同期押しても対象なし」
+        //
+        // 旧 record_recalc_computed が fingerprint 不変な再 recalc でも常に status='computed'
+        // に下げていた。`r2_synced_at` は CASE で維持されるため、`status='computed' AND
+        // r2_synced_at IS NOT NULL` という不整合データが prod に溜まった。
+        // この行は:
+        // - 状態サマリには「🟡 R2 同期待ち」と出る (status='computed' なので)
+        // - r2_pending view からは除外される (`WHERE r2_synced_at IS NULL` のため)
+        // - 結果: R2 同期ボタンを押しても 0 件しか拾えず永久に「同期待ち」のまま
+        //
+        // 判定の妥当性: r2_synced_at IS NOT NULL = 最後の recalc が fingerprint 一致で
+        // r2_synced_at を維持した = data は R2 と同じ → 'r2_synced' が正しい状態。
+        // PR #51 の新ロジックでは発生しないが、既存の broken 行は本 migration で修復。
+        // (idempotent: 2 回目以降はマッチ行が無いので no-op)
+        conn.execute_batch(
+            "UPDATE recalc_jobs \
+             SET status = 'r2_synced' \
+             WHERE status = 'computed' AND r2_synced_at IS NOT NULL;",
+        )
+        .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+
         // ── 2b. views を一旦 DROP (TABLE/VIEW を sqlite_master で判別) ──
         // 3 名はいずれも現行 schema では VIEW だが、旧 deploy 残骸で TABLE として
         // 存在する可能性があるため (PR #44 deploy 失敗の root cause)、type を見てから
@@ -1513,6 +1535,62 @@ mod tests {
         );
         // computed_at は最新の t3 (= 再 recalc 試行時刻)
         assert_eq!(job.computed_at.as_deref(), Some("t3"));
+    }
+
+    #[tokio::test]
+    async fn migrate_repairs_inconsistent_computed_with_r2_synced_at() {
+        // user 2026-06-30 「R2 同期押しても対象なし」 (PR #51 以前の bug の遺物):
+        // status='computed' AND r2_synced_at IS NOT NULL という不整合行を migrate() が
+        // status='r2_synced' に直すことを確認する。
+        //
+        // この test は LocalStore::open() を直接叩いて migrate() を走らせて検証。
+        // raw connection で broken state を作ってから LocalStore::open() を呼ぶ。
+        let tmp = std::env::temp_dir().join(format!(
+            "ichibanboshi-test-repair-broken-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        {
+            let conn = rusqlite::Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE recalc_jobs (
+                    month TEXT NOT NULL,
+                    eigyosho_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    fingerprint_before TEXT,
+                    fingerprint_after TEXT,
+                    raw_path TEXT,
+                    created_at TEXT NOT NULL,
+                    computed_at TEXT,
+                    r2_synced_at TEXT,
+                    last_error TEXT,
+                    PRIMARY KEY (month, eigyosho_id)
+                );
+                INSERT INTO recalc_jobs (month, eigyosho_id, status, fingerprint_after, raw_path, created_at, computed_at, r2_synced_at)
+                VALUES
+                    ('2026-06', 1, 'computed', 'fp1', '/tmp/r.gz', 't0', 't1', 't2'),  -- broken: should be r2_synced
+                    ('2026-06', 2, 'computed', 'fp2', '/tmp/r.gz', 't0', 't1', NULL),  -- legit pending
+                    ('2026-06', 3, 'r2_synced', 'fp3', '/tmp/r.gz', 't0', 't1', 't2'), -- already correct
+                    ('2026-06', 4, 'failed', NULL, NULL, 't0', NULL, NULL);            -- failed
+                ",
+            )
+            .unwrap();
+        }
+        let store = LocalStore::open(tmp.to_str().unwrap()).expect("open");
+
+        let j1 = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+        assert_eq!(j1.status, "r2_synced", "broken 行は r2_synced に修復");
+        let j2 = store.get_recalc_job("2026-06", 2).await.unwrap().unwrap();
+        assert_eq!(j2.status, "computed", "legit pending は触らない");
+        let j3 = store.get_recalc_job("2026-06", 3).await.unwrap().unwrap();
+        assert_eq!(j3.status, "r2_synced", "既に r2_synced なら触らない");
+        let j4 = store.get_recalc_job("2026-06", 4).await.unwrap().unwrap();
+        assert_eq!(j4.status, "failed", "failed は触らない");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
