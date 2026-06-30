@@ -1,0 +1,403 @@
+//! Phase 2 local store (SQLite, issue #762)。
+//!
+//! 担当者別売上 summary を永続化する。SQL Server (CAPE#01) は source of truth、
+//! SQLite は **derived store** で、`compute_person_sum` の結果をキャッシュ + 集計
+//! ビュー / drill-down の高速読み出しに使う。`:memory:` でテスト可。
+//!
+//! rusqlite は同期 API なので、HTTP handler から呼ぶ際は `tokio::task::spawn_blocking`
+//! に逃がす。Connection は `Arc<Mutex<Connection>>` で共有 (低 throughput な service
+//! のため Mutex 競合は無視できる)。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+use tokio::sync::Mutex;
+
+use crate::routes::uriage::PersonAccum;
+
+#[derive(Debug)]
+pub enum LocalStoreError {
+    OpenFailed(String),
+    QueryError(String),
+    JoinError(String),
+}
+
+impl std::fmt::Display for LocalStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenFailed(m) => write!(f, "sqlite open failed: {m}"),
+            Self::QueryError(m) => write!(f, "sqlite query error: {m}"),
+            Self::JoinError(m) => write!(f, "tokio join error: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for LocalStoreError {}
+
+/// 担当者×月×営業所×cal の集計 1 行 (DB から read out した raw 値)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonMonthlyRow {
+    pub month: String,
+    pub person_name: String,
+    pub eigyosho_id: i64,
+    pub cal: bool,
+    pub kingaku: i64,
+    pub yosha_kingaku: i64,
+    pub kensuu: i64,
+    pub calculated_at: String,
+}
+
+/// SQLite local store (Phase 2、担当者別売上 summary)。
+#[derive(Clone)]
+pub struct LocalStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl std::fmt::Debug for LocalStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalStore").finish_non_exhaustive()
+    }
+}
+
+impl LocalStore {
+    /// 指定パス (or `:memory:`) の SQLite を open し、schema migration を流す。
+    pub fn open(path: &str) -> Result<Self, LocalStoreError> {
+        let conn =
+            Connection::open(path).map_err(|e| LocalStoreError::OpenFailed(e.to_string()))?;
+        Self::migrate(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn migrate(conn: &Connection) -> Result<(), LocalStoreError> {
+        // 担当者×月×営業所×cal 集計。idempotent (CREATE IF NOT EXISTS)。
+        // 行は `recalc` 実行毎に (month, eigyosho_id, cal) 単位で delete-then-insert する。
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS uriage_person_monthly (
+                month         TEXT    NOT NULL,
+                person_name   TEXT    NOT NULL,
+                eigyosho_id   INTEGER NOT NULL,
+                cal           INTEGER NOT NULL,
+                kingaku       INTEGER NOT NULL,
+                yosha_kingaku INTEGER NOT NULL,
+                kensuu        INTEGER NOT NULL,
+                calculated_at TEXT    NOT NULL,
+                PRIMARY KEY (month, person_name, eigyosho_id, cal)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_upm_person_month
+                ON uriage_person_monthly (person_name, month);
+            CREATE INDEX IF NOT EXISTS idx_upm_eigyosho_month
+                ON uriage_person_monthly (eigyosho_id, month);
+            "#,
+        )
+        .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `(month, eigyosho_id, cal)` の既存行を全削除して、引数の `sums` を入れ直す。
+    ///
+    /// `compute_person_sum` の出力をそのまま投入する想定。`kensuu == 0` の行は
+    /// drill-down ノイズになるので投入しない (マスタ初期化由来の空エントリを弾く)。
+    ///
+    /// 返り値 = 実際に insert した行数 (= 非ゼロ担当者数)。
+    pub async fn upsert_person_monthly(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+        cal: bool,
+        sums: &HashMap<String, PersonAccum>,
+        calculated_at: &str,
+    ) -> Result<usize, LocalStoreError> {
+        let month = month.to_string();
+        let calculated_at = calculated_at.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let entries: Vec<(String, PersonAccum)> = sums
+            .iter()
+            .filter(|(_, v)| v.kensuu != 0 || v.kingaku != 0 || v.yosha_kingaku != 0)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = futures_lock(&conn);
+            let tx = guard
+                .transaction()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM uriage_person_monthly \
+                 WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3",
+                params![month, eigyosho_id, cal_int],
+            )
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let mut inserted = 0usize;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO uriage_person_monthly \
+                         (month, person_name, eigyosho_id, cal, kingaku, yosha_kingaku, \
+                          kensuu, calculated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )
+                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+                for (name, accum) in &entries {
+                    stmt.execute(params![
+                        month,
+                        name,
+                        eigyosho_id,
+                        cal_int,
+                        accum.kingaku,
+                        accum.yosha_kingaku,
+                        accum.kensuu,
+                        calculated_at,
+                    ])
+                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+                    inserted += 1;
+                }
+            }
+            tx.commit()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<usize, LocalStoreError>(inserted)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `(month, eigyosho_id, cal)` の集計行を取得 (非ゼロ担当者のみ)。
+    pub async fn get_person_monthly(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+        cal: bool,
+    ) -> Result<Vec<PersonMonthlyRow>, LocalStoreError> {
+        let month = month.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT month, person_name, eigyosho_id, cal, kingaku, yosha_kingaku, \
+                            kensuu, calculated_at \
+                     FROM uriage_person_monthly \
+                     WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3 \
+                     ORDER BY kingaku DESC, person_name ASC",
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![month, eigyosho_id, cal_int], |r| {
+                    Ok(PersonMonthlyRow {
+                        month: r.get(0)?,
+                        person_name: r.get(1)?,
+                        eigyosho_id: r.get(2)?,
+                        cal: r.get::<_, i64>(3)? != 0,
+                        kingaku: r.get(4)?,
+                        yosha_kingaku: r.get(5)?,
+                        kensuu: r.get(6)?,
+                        calculated_at: r.get(7)?,
+                    })
+                })
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<Vec<PersonMonthlyRow>, LocalStoreError>(rows)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `(month, eigyosho_id, cal)` の最終 calculated_at を返す (未集計なら None)。
+    /// recalc が走った形跡を確認する用途。
+    pub async fn last_calculated_at(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+        cal: bool,
+    ) -> Result<Option<String>, LocalStoreError> {
+        let month = month.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let ts: Option<String> = guard
+                .query_row(
+                    "SELECT MAX(calculated_at) FROM uriage_person_monthly \
+                     WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3",
+                    params![month, eigyosho_id, cal_int],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .flatten();
+            Ok::<Option<String>, LocalStoreError>(ts)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+}
+
+/// `tokio::sync::Mutex` は async lock。`spawn_blocking` 内 (sync 文脈) では
+/// `blocking_lock()` を使う必要があるが、tokio runtime context 内なので
+/// `blocking_lock` を直接呼ぶと panic する。代わりに `try_lock` の loop は避け、
+/// ヘルパで sync lock を取り出す。
+///
+/// 実装ノート: tokio Mutex の `blocking_lock()` は runtime 内で呼ぶと panic。
+/// `spawn_blocking` の中は別スレッドだが、まだ runtime に属しているため
+/// `Handle::current().block_on(mutex.lock())` で wait させる必要がある。
+fn futures_lock(m: &Mutex<Connection>) -> tokio::sync::MutexGuard<'_, Connection> {
+    tokio::runtime::Handle::current().block_on(m.lock())
+}
+
+pub type DynLocalStore = Arc<LocalStore>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pa(kingaku: i64, yosha: i64, kensuu: i64) -> PersonAccum {
+        PersonAccum {
+            kingaku,
+            yosha_kingaku: yosha,
+            kensuu,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_in_memory_creates_schema() {
+        let store = LocalStore::open(":memory:").unwrap();
+        // 空の get は空 Vec
+        let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_then_get_returns_persisted_rows() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut sums = HashMap::new();
+        sums.insert("青井".to_string(), pa(90059, 90059, 9));
+        sums.insert("山﨑智".to_string(), pa(20020, 20020, 2));
+        sums.insert("zero_person".to_string(), pa(0, 0, 0)); // ゼロは投入されない
+
+        let n = store
+            .upsert_person_monthly("2026-06", 1, true, &sums, "2026-06-30T12:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // ORDER BY kingaku DESC で 青井 が先頭
+        assert_eq!(rows[0].person_name, "青井");
+        assert_eq!(rows[0].kingaku, 90059);
+        assert_eq!(rows[1].person_name, "山﨑智");
+        assert_eq!(rows[1].kingaku, 20020);
+    }
+
+    #[tokio::test]
+    async fn upsert_overwrites_existing_bucket() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut a = HashMap::new();
+        a.insert("青井".to_string(), pa(100, 50, 1));
+        store
+            .upsert_person_monthly("2026-06", 1, true, &a, "2026-06-29T00:00:00Z")
+            .await
+            .unwrap();
+
+        let mut b = HashMap::new();
+        b.insert("青井".to_string(), pa(200, 100, 2));
+        b.insert("大石".to_string(), pa(30, 20, 1));
+        let n = store
+            .upsert_person_monthly("2026-06", 1, true, &b, "2026-06-30T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let rows = store.get_person_monthly("2026-06", 1, true).await.unwrap();
+        let aoi = rows.iter().find(|r| r.person_name == "青井").unwrap();
+        assert_eq!(aoi.kingaku, 200); // 上書きされている
+        assert_eq!(aoi.kensuu, 2);
+        assert!(rows.iter().any(|r| r.person_name == "大石"));
+    }
+
+    #[tokio::test]
+    async fn upsert_isolates_buckets_by_eigyosho_and_cal() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut a = HashMap::new();
+        a.insert("青井".to_string(), pa(100, 50, 1));
+        // (2026-06, eigyosho=1, cal=true) と (2026-06, eigyosho=2, cal=true) は別 bucket
+        store
+            .upsert_person_monthly("2026-06", 1, true, &a, "t1")
+            .await
+            .unwrap();
+        store
+            .upsert_person_monthly("2026-06", 2, true, &a, "t1")
+            .await
+            .unwrap();
+        // cal=false は別 bucket
+        store
+            .upsert_person_monthly("2026-06", 1, false, &a, "t1")
+            .await
+            .unwrap();
+
+        // eigyosho=1 / cal=true の bucket を空集計で上書き → eigyosho=2, cal=false は残る
+        store
+            .upsert_person_monthly("2026-06", 1, true, &HashMap::new(), "t2")
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_person_monthly("2026-06", 1, true)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .get_person_monthly("2026-06", 2, true)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_person_monthly("2026-06", 1, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn last_calculated_at_returns_max_or_none() {
+        let store = LocalStore::open(":memory:").unwrap();
+        // 未集計 → None
+        assert_eq!(
+            store.last_calculated_at("2026-06", 1, true).await.unwrap(),
+            None
+        );
+
+        let mut s = HashMap::new();
+        s.insert("青井".to_string(), pa(100, 50, 1));
+        store
+            .upsert_person_monthly("2026-06", 1, true, &s, "2026-06-30T10:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.last_calculated_at("2026-06", 1, true).await.unwrap(),
+            Some("2026-06-30T10:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn open_invalid_path_returns_error() {
+        // 存在しない directory 配下に open → OpenFailed
+        let err = LocalStore::open("/nonexistent-dir-xyzzy/state.db").unwrap_err();
+        assert!(matches!(err, LocalStoreError::OpenFailed(_)));
+        assert!(err.to_string().contains("sqlite open failed"));
+    }
+}

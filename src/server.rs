@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::db;
 use crate::repo::TiberiusRepo;
 use crate::routes;
+use crate::sqlite::{DynLocalStore, LocalStore};
 
 /// HTTP サーバーを起動し、shutdown token が cancel されるまでブロック
 pub async fn run(
@@ -21,6 +22,9 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = db::create_pool(&config.database).await?;
     let repo: crate::repo::DynRepo = Arc::new(TiberiusRepo::new(pool));
+
+    // SQLite local store (Phase 2、担当者別売上 summary 永続化)
+    let local_store: DynLocalStore = Arc::new(LocalStore::open(&config.sqlite.path)?);
 
     let jwt_secret = JwtSecret(config.auth.jwt_secret.clone());
 
@@ -58,7 +62,8 @@ pub async fn run(
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
-        .route("/uriage/by-person", post(routes::uriage::by_person));
+        .route("/uriage/by-person", post(routes::uriage::by_person))
+        .route("/uriage/recalc", post(routes::uriage::recalc));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
@@ -72,6 +77,7 @@ pub async fn run(
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(repo))
+        .layer(Extension(local_store))
         .layer(Extension(jwt_secret));
 
     let addr = config.addr();

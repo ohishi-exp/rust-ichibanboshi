@@ -36,6 +36,8 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 # 担当者振替の備考2 パース (PHP preg_match /(.+)→(.+)/u 写経用、routes/uriage.rs)
 regex = "1"
+# Phase 2 担当者別売上 summary local store (sqlite.rs)。bundled で OS の libsqlite 不要
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
