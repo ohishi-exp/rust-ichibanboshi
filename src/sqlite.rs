@@ -81,7 +81,15 @@ pub struct RecalcJob {
     pub fingerprint_after: Option<String>,
     pub raw_path: Option<String>,
     pub created_at: String,
+    /// 最後に recalc が走った時刻 (fingerprint が変わったかどうかに関わらず更新)。
+    /// 「recalc を試した最終時刻」を示す。
     pub computed_at: Option<String>,
+    /// **fingerprint が実際に変化した時刻** (= データが変わった時刻)。
+    /// fingerprint 不変な再 recalc では更新されない。`computed_at` だけ進んで
+    /// `fingerprint_changed_at` が古いままなら「最近 recalc は走ったが data は
+    /// 変わっていない」と分かる (user 2026-06-30: 「fingerprint の時間入れないと
+    /// わからない」)。
+    pub fingerprint_changed_at: Option<String>,
     pub r2_synced_at: Option<String>,
     pub last_error: Option<String>,
     pub verified_count: i64,
@@ -165,6 +173,32 @@ impl LocalStore {
 
     /// `sqlite_master.type` を見て TABLE or VIEW を判別し、適切な DROP を発行する。
     ///
+    /// `ALTER TABLE ADD COLUMN` を idempotent に実行する helper。
+    /// SQLite には `ADD COLUMN IF NOT EXISTS` が無いので `PRAGMA table_info` で
+    /// 既存 column を check してから足りないときだけ ALTER する。
+    fn ensure_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), LocalStoreError> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+        let exists = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+            .filter_map(Result::ok)
+            .any(|c| c == column);
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// SQLite は `DROP TABLE` を VIEW に対して使うとエラー、`DROP VIEW` を TABLE に
     /// 対して使うともエラーになる。schema 移行時 (TABLE → VIEW 等) で旧型が残っている
     /// 可能性に対応するための helper。対象が存在しなければ no-op。
@@ -227,16 +261,17 @@ impl LocalStore {
                 ON uriage_person_daily (person_name, unko_date);
 
             CREATE TABLE IF NOT EXISTS recalc_jobs (
-                month                TEXT    NOT NULL,
-                eigyosho_id          INTEGER NOT NULL,
-                status               TEXT    NOT NULL,
-                fingerprint_before   TEXT,
-                fingerprint_after    TEXT,
-                raw_path             TEXT,
-                created_at           TEXT    NOT NULL,
-                computed_at          TEXT,
-                r2_synced_at         TEXT,
-                last_error           TEXT,
+                month                   TEXT    NOT NULL,
+                eigyosho_id             INTEGER NOT NULL,
+                status                  TEXT    NOT NULL,
+                fingerprint_before      TEXT,
+                fingerprint_after       TEXT,
+                raw_path                TEXT,
+                created_at              TEXT    NOT NULL,
+                computed_at             TEXT,
+                fingerprint_changed_at  TEXT,
+                r2_synced_at            TEXT,
+                last_error              TEXT,
                 PRIMARY KEY (month, eigyosho_id)
             );
             CREATE INDEX IF NOT EXISTS idx_rj_status
@@ -263,7 +298,20 @@ impl LocalStore {
         )
         .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
 
-        // ── 2. views を一旦 DROP (TABLE/VIEW を sqlite_master で判別) ──
+        // ── 2a. recalc_jobs に `fingerprint_changed_at` カラムを後付け追加 ──
+        // 既存 prod DB は `CREATE TABLE IF NOT EXISTS` で skip されるため、ALTER で
+        // 追加する。`PRAGMA table_info` で存在チェックして idempotent に。
+        Self::ensure_column(conn, "recalc_jobs", "fingerprint_changed_at", "TEXT")?;
+        // 既存行の backfill: fingerprint_changed_at がまだ NULL のものは
+        // computed_at の値で埋める (= 旧運用での「data 最終更新時刻」推定)
+        conn.execute_batch(
+            "UPDATE recalc_jobs \
+             SET fingerprint_changed_at = computed_at \
+             WHERE fingerprint_changed_at IS NULL AND computed_at IS NOT NULL;",
+        )
+        .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+
+        // ── 2b. views を一旦 DROP (TABLE/VIEW を sqlite_master で判別) ──
         // 3 名はいずれも現行 schema では VIEW だが、旧 deploy 残骸で TABLE として
         // 存在する可能性があるため (PR #44 deploy 失敗の root cause)、type を見てから
         // 適切な DROP を出す。
@@ -591,6 +639,7 @@ impl LocalStore {
                     "SELECT rj.month, rj.eigyosho_id, rj.status, \
                             rj.fingerprint_before, rj.fingerprint_after, \
                             rj.raw_path, rj.created_at, rj.computed_at, \
+                            rj.fingerprint_changed_at, \
                             rj.r2_synced_at, rj.last_error, \
                             COALESCE(vc.verified_count, 0), \
                             COALESCE(vc.verified_ok,    0), \
@@ -606,6 +655,7 @@ impl LocalStore {
                     "SELECT rj.month, rj.eigyosho_id, rj.status, \
                             rj.fingerprint_before, rj.fingerprint_after, \
                             rj.raw_path, rj.created_at, rj.computed_at, \
+                            rj.fingerprint_changed_at, \
                             rj.r2_synced_at, rj.last_error, \
                             COALESCE(vc.verified_count, 0), \
                             COALESCE(vc.verified_ok,    0), \
@@ -631,11 +681,12 @@ impl LocalStore {
                         raw_path: r.get(5)?,
                         created_at: r.get(6)?,
                         computed_at: r.get(7)?,
-                        r2_synced_at: r.get(8)?,
-                        last_error: r.get(9)?,
-                        verified_count: r.get(10)?,
-                        verified_ok: r.get(11)?,
-                        verified_ng: r.get(12)?,
+                        fingerprint_changed_at: r.get(8)?,
+                        r2_synced_at: r.get(9)?,
+                        last_error: r.get(10)?,
+                        verified_count: r.get(11)?,
+                        verified_ok: r.get(12)?,
+                        verified_ng: r.get(13)?,
                     })
                 })
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
@@ -662,6 +713,7 @@ impl LocalStore {
                     "SELECT rj.month, rj.eigyosho_id, rj.status, \
                             rj.fingerprint_before, rj.fingerprint_after, \
                             rj.raw_path, rj.created_at, rj.computed_at, \
+                            rj.fingerprint_changed_at, \
                             rj.r2_synced_at, rj.last_error, \
                             COALESCE(vc.verified_count, 0), \
                             COALESCE(vc.verified_ok,    0), \
@@ -683,11 +735,12 @@ impl LocalStore {
                         raw_path: r.get(5)?,
                         created_at: r.get(6)?,
                         computed_at: r.get(7)?,
-                        r2_synced_at: r.get(8)?,
-                        last_error: r.get(9)?,
-                        verified_count: r.get(10)?,
-                        verified_ok: r.get(11)?,
-                        verified_ng: r.get(12)?,
+                        fingerprint_changed_at: r.get(8)?,
+                        r2_synced_at: r.get(9)?,
+                        last_error: r.get(10)?,
+                        verified_count: r.get(11)?,
+                        verified_ok: r.get(12)?,
+                        verified_ng: r.get(13)?,
                     })
                 })
                 .optional()
@@ -717,19 +770,38 @@ impl LocalStore {
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             // 既存 fingerprint_after を fingerprint_before に持ち上げて upsert。
-            // r2_synced_at は新しい fingerprint なら NULL に戻す (再送信が必要)。
+            //
+            // 設計 (user 2026-06-30 「ｒ２同期待ちおかしくね?」「finger verified
+            // のほうがよくね?」):
+            // - **fingerprint 不変な再 recalc では status / r2_synced_at /
+            //   fingerprint_changed_at をすべて維持**する。data が変わっていない
+            //   ので R2 既送信オブジェクトは valid のまま。旧 SQL は status='computed'
+            //   に下げてしまい「R2 同期済 → 同期待ち」と誤表示するバグがあった。
+            // - **fingerprint 変化時は status='computed' + r2_synced_at=NULL +
+            //   fingerprint_changed_at=now** で R2 再送信を促す。
+            // - `computed_at` は不変/変化どちらでも更新 (= 最終 recalc 試行時刻)。
             guard
                 .execute(
                     "INSERT INTO recalc_jobs \
                      (month, eigyosho_id, status, fingerprint_before, fingerprint_after, \
-                      raw_path, created_at, computed_at, r2_synced_at, last_error) \
-                 VALUES (?1, ?2, 'computed', NULL, ?3, ?4, ?5, ?5, NULL, NULL) \
+                      raw_path, created_at, computed_at, fingerprint_changed_at, \
+                      r2_synced_at, last_error) \
+                 VALUES (?1, ?2, 'computed', NULL, ?3, ?4, ?5, ?5, ?5, NULL, NULL) \
                  ON CONFLICT(month, eigyosho_id) DO UPDATE SET \
-                     status = 'computed', \
+                     status = CASE \
+                         WHEN recalc_jobs.fingerprint_after = excluded.fingerprint_after \
+                              THEN recalc_jobs.status \
+                         ELSE 'computed' \
+                     END, \
                      fingerprint_before = recalc_jobs.fingerprint_after, \
                      fingerprint_after = excluded.fingerprint_after, \
                      raw_path = excluded.raw_path, \
                      computed_at = excluded.computed_at, \
+                     fingerprint_changed_at = CASE \
+                         WHEN recalc_jobs.fingerprint_after = excluded.fingerprint_after \
+                              THEN recalc_jobs.fingerprint_changed_at \
+                         ELSE excluded.fingerprint_changed_at \
+                     END, \
                      r2_synced_at = CASE \
                          WHEN recalc_jobs.fingerprint_after = excluded.fingerprint_after \
                               THEN recalc_jobs.r2_synced_at \
@@ -1405,6 +1477,72 @@ mod tests {
         assert_eq!(
             job.r2_synced_at, None,
             "fingerprint 変化で r2_synced_at リセット"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_recalc_computed_preserves_status_and_fingerprint_at_when_unchanged() {
+        // user 2026-06-30 「ｒ２同期待ちおかしくね?」「finger verified のほうがよくね?」:
+        // fingerprint 不変な再 recalc で status='computed' に下げて r2_synced_at は維持、
+        // という状態が UI で「R2 同期待ち + r2_synced_at が非 null」の混乱表示を生んでいた。
+        //
+        // 修正後: fingerprint 不変なら status / r2_synced_at / fingerprint_changed_at を全て維持する。
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .record_recalc_computed("2026-06", 1, "fp1", Some("/tmp/r.gz"), "t1")
+            .await
+            .unwrap();
+        store.record_r2_synced("2026-06", 1, "t2").await.unwrap();
+        // 同 fingerprint で 2 回目 recalc → status は r2_synced のまま維持されるべき
+        store
+            .record_recalc_computed("2026-06", 1, "fp1", Some("/tmp/r.gz"), "t3")
+            .await
+            .unwrap();
+        let job = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+        assert_eq!(job.status, "r2_synced", "fingerprint 不変なら status 維持");
+        assert_eq!(
+            job.r2_synced_at.as_deref(),
+            Some("t2"),
+            "fingerprint 不変なら r2_synced_at 維持"
+        );
+        // fingerprint_changed_at は 1 回目の時刻 (t1) のまま維持
+        assert_eq!(
+            job.fingerprint_changed_at.as_deref(),
+            Some("t1"),
+            "fingerprint 不変なら fingerprint_changed_at 維持"
+        );
+        // computed_at は最新の t3 (= 再 recalc 試行時刻)
+        assert_eq!(job.computed_at.as_deref(), Some("t3"));
+    }
+
+    #[tokio::test]
+    async fn record_recalc_computed_updates_fingerprint_at_on_change() {
+        // fingerprint 変化時は fingerprint_changed_at が最新 computed_at に更新される
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .record_recalc_computed("2026-06", 1, "fp1", Some("/tmp/r.gz"), "t1")
+            .await
+            .unwrap();
+        store.record_r2_synced("2026-06", 1, "t2").await.unwrap();
+        // fingerprint 変化 → status='computed' に降格、r2_synced_at=NULL、
+        // fingerprint_changed_at=t3 に更新
+        store
+            .record_recalc_computed("2026-06", 1, "fp2", Some("/tmp/r2.gz"), "t3")
+            .await
+            .unwrap();
+        let job = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
+        assert_eq!(
+            job.status, "computed",
+            "fingerprint 変化なら status を computed に戻す"
+        );
+        assert_eq!(
+            job.r2_synced_at, None,
+            "fingerprint 変化で r2_synced_at リセット"
+        );
+        assert_eq!(
+            job.fingerprint_changed_at.as_deref(),
+            Some("t3"),
+            "fingerprint 変化なら fingerprint_changed_at 更新"
         );
     }
 
