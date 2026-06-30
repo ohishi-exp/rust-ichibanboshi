@@ -99,15 +99,18 @@ pub trait AppRepo: Send + Sync {
 
     // ── uriage (担当者別売上、#762) ──
     /// `[運転日報明細]` から `compute_person_sum` の入力 1 行を取得する。
-    /// PHP `UriageJyuchuDisplayController` setup_dir::make_yosha_sql 系の SELECT を
-    /// 1:1 で再現したもの。`受注部門 IN (bumon_codes)` で営業所配下の部門を絞り、
-    /// 集計対象外の調整行 (`品名N` `※ ... 一括調整明細 ※`) と除外得意先
-    /// (`得意先C='000002'`) を弾く。
+    /// PHP `UriageJyuchuDisplayController::make_arrays()` の **5 ケース UNION** を
+    /// 1:1 で再現する (傭車 / 営業所傭車 / 傭車傭車 / sql_from_other_with_bumon /
+    /// sql_from_other)。`bumon_codes` は受注/稼動部門の IN 条件、`persons_id_list`
+    /// は `UriageJyuchuDisplayPersons_id` 相当 (営業所配下の担当者社員C 一覧)。
+    /// `sql_options` 系は `入力担当C IN persons` で絞り、`sql_from_other_with_bumon`
+    /// は逆に `入力担当C NOT IN persons` で絞る (PHP L1759)。
     async fn uriage_rows(
         &self,
         from: &str,
         to: &str,
         bumon_codes: &[String],
+        persons_id_list: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError>;
 }
 
@@ -930,6 +933,7 @@ impl AppRepo for TiberiusRepo {
         from: &str,
         to: &str,
         bumon_codes: &[String],
+        persons_id_list: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError> {
         if bumon_codes.is_empty() {
             return Ok(vec![]);
@@ -949,84 +953,146 @@ impl AppRepo for TiberiusRepo {
         if safe_bumon.is_empty() {
             return Ok(vec![]);
         }
-        let in_clause = safe_bumon
+        let bumon_in = safe_bumon
             .iter()
             .map(|c| format!("'{}'", c))
             .collect::<Vec<_>>()
             .join(",");
 
-        // PHP `UriageJyuchuDisplayController` setup_dir の **3 経路 UNION** を再現。
+        // 入力担当C IN (...) — persons_id_list は数値なのでそのまま組み立てる
+        // (型は i32、untrusted 入力ではないが念のため format で固定)。
+        // 空リストでも SQL は valid であるべき: IN () は SQL Server で構文エラーに
+        // なるので NULL (= 全件 false) で埋める fallback を入れる。
+        let persons_in = if persons_id_list.is_empty() {
+            "NULL".to_string()
+        } else {
+            persons_id_list
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        // PHP `UriageJyuchuDisplayController::make_arrays()` の **5 ケース UNION** を再現。
         //
-        // 設計判断 (2026-06-30 v2、user 診断による):
-        // PR #34 の `受注 IN bumon OR 稼動 IN bumon` だけでは過剰集計 (~100x、本社で実害)。
-        // PHP が除外する「自車運行+受注他営業所+自社稼動」と「自社内 配車K=0」rows を
-        // Rust が拾っていた。WHERE を PHP の row-set にタイトに合わせる:
+        // PHP L1769-1791:
+        //   foreach ($UriageJyuchuDisplayPersons_id as $ddp) {
+        //       $this->make_array(['入力担当C in' => $ddp]);  // sql_options の 3 ケース
+        //   }
+        //   sql_from_other          → 受注∉ AND 稼動∈ AND 傭車先≠000000
+        //   sql_from_other_with_bumon → 受注∈ AND 稼動∉ AND 傭車先=000000 AND 入力担当C ∉ persons
         //
-        // - **Set A** (make_array 3 ケース + sql_from_other_with_bumon の union):
-        //     `受注 IN bumon AND ((稼動 NOT IN bumon) OR (配車K = '1'))`
+        // sql_options (PHP L1827-1850) は `make_yosha_sql` を base に 3 ケース:
+        //   - 傭車:       稼動∈ AND 配車K=1 AND 入力担当C ∈ persons    → 横横=0
+        //   - 営業所傭車: 稼動∉ AND 配車K=0 AND 入力担当C ∈ persons    → 横横=1
+        //   - 傭車傭車:   稼動∉ AND 配車K=1 AND 入力担当C ∈ persons    → 横横=1
         //
-        //     make_array は 3 ケースの OR:
-        //     - 傭車:       稼動 IN bumon AND 配車K=1
-        //     - 営業所傭車: 稼動 NOT IN bumon AND 配車K=0
-        //     - 傭車傭車:   稼動 NOT IN bumon AND 配車K=1
-        //     OR 簡約: `(稼動 NOT IN bumon) OR (配車K=1)`
-        //     sql_from_other_with_bumon (受注 IN bumon AND 稼動 NOT IN bumon) も
-        //     `稼動 NOT IN bumon` 側に包含。
+        // つまり 5 つの subquery を UNION ALL する (PHP は array_push なので重複なし
+        // のはずだが、PHP の row レベルでも 5 case 互いに排他 = 配車K=0/1 + 稼動部門
+        // ∈/∉ で組み分けされている)。
         //
-        // - **Set B** (sql_from_other):
-        //     `受注 NOT IN bumon AND 稼動 IN bumon AND 傭車先C != '000000'`
-        //
-        //     **`傭車先C != '000000'` が要件** (自車運行は除外)。PR #34 ではこれが
-        //     抜けて 自車運行+他営業所受注+本社稼動 の rows を拾い 100x になっていた。
-        //
-        // - `横横` 派生フラグ (CASE WHEN): `受注 IN bumon AND 稼動 NOT IN bumon`
-        //   (sql_from_other_with_bumon + 営業所傭車/傭車傭車 の集合に対応)
+        // 香月 NG 行 (#762、user 2026-06-30) の原因:
+        //   営業所 10、入力担当C=1180 (∈ persons)、傭車先=000000、配車K=9 (未配車)、
+        //   受注∈ AND 稼動∉。PHP 5 ケース全部 hit せず → $sum 0 円。
+        //   旧 Rust SQL は `(受注∈ AND (稼動∉ OR 配車K=1))` で拾ってしまっていた。
+        //   配車K=9 は sql_options の 3 ケース (配車K=0/1) からも漏れ、
+        //   sql_from_other_with_bumon は 入力担当C ∉ persons が必要で hit せず。
         //
         // 細部:
         // - 品名N の調整行除外は全角空白 U+3000 (PHP L1708-1709 と同形)
         // - `日報K != 3` (PHP L1710)
-        // - `請求K=2 → 備考2='表示' or LIKE '売上%'` (PHP L1712/1738 OR superset)
+        // - `請求K=2 → 備考2='表示' or LIKE '売上%'` (PHP L1712/1738/1760 OR superset)
         // - `NOT (請求K='1' AND 備考2='請求のみ')` (PHP L1713)
         // - 社員R は **TOP 1 スカラサブクエリ** で引く (社員ﾏｽﾀ 複数行/社員C による
         //   JOIN ファンアウト防止、surcharge.rs と同型)
         // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)
         // - 請求K / 入力担当C は varchar の可能性あり `TRY_CAST(... AS INT)` で int 化
+        // - 共通 WHERE 句を repeat する代わりに subquery を inline で書き、外側で
+        //   ORDER BY する形 (UNION ALL は ORDER BY を最外殻に置く制約があるため)
+        let select_cols = "\
+                 t.[横横] AS [横横], \
+                 ISNULL(TRY_CAST(t.[請求K] AS INT), 0) AS [請求K], \
+                 ISNULL(t.[備考2], '') AS [備考2], \
+                 ISNULL(TRY_CAST(t.[入力担当C] AS INT), 0) AS [入力担当C], \
+                 ISNULL(t.[稼動部門], '') AS [稼動部門], \
+                 ISNULL(t.[金額], 0) AS [金額], \
+                 ISNULL(t.[値引], 0) AS [値引], \
+                 ISNULL(t.[割増], 0) AS [割増], \
+                 ISNULL(t.[実費], 0) AS [実費], \
+                 ISNULL(t.[傭車金額], 0) AS [傭車金額], \
+                 ISNULL(t.[傭車値引], 0) AS [傭車値引], \
+                 ISNULL(t.[傭車割増], 0) AS [傭車割増], \
+                 ISNULL(t.[傭車実費], 0) AS [傭車実費], \
+                 ISNULL((SELECT TOP 1 e.[社員R] FROM [社員ﾏｽﾀ] e WHERE e.[社員C] = t.[入力担当C]), '') AS [社員R], \
+                 ISNULL(t.[傭車先C], '000000') AS [傭車先C], \
+                 CONVERT(varchar(10), t.[運行年月日], 23) AS [運行年月日], \
+                 CONVERT(varchar(10), t.[売上年月日], 23) AS [売上年月日], \
+                 t.[管理C] AS [管理C], t.[LC] AS [LC]";
+
+        // 各 case 共通の WHERE 述語 (日付・品名・日報K・請求K・備考2 系)
+        let common_where = "\
+                 [品名N] NOT IN ('※\u{3000}請求一括調整明細\u{3000}※', '※\u{3000}傭車一括調整明細\u{3000}※') \
+                 AND ISNULL([日報K], 0) != 3 \
+                 AND NOT ([請求K] = '1' AND [備考2] = '請求のみ') \
+                 AND ([請求K] != '2' OR [備考2] = '表示' OR [備考2] LIKE '売上%') \
+                 AND [運行年月日] >= @P1 AND [運行年月日] <= @P2";
+
+        // Case 1: 傭車 (横横=0)
+        //   make_yosha_sql + sql_options('傭車'):
+        //   受注∈ AND 稼動∈ AND 配車K='1' AND 入力担当C ∈ persons
+        let case_yosha = format!(
+            "SELECT 0 AS [横横], * FROM [運転日報明細] \
+             WHERE [受注部門] IN ({bumon_in}) AND [稼動部門] IN ({bumon_in}) \
+               AND [配車K] = '1' \
+               AND ISNULL(TRY_CAST([入力担当C] AS INT), 0) IN ({persons_in}) \
+               AND {common_where}"
+        );
+        // Case 2: 営業所傭車 (横横=1)
+        //   受注∈ AND 稼動∉ AND 配車K='0' AND 入力担当C ∈ persons
+        let case_eigyosho_yosha = format!(
+            "SELECT 1 AS [横横], * FROM [運転日報明細] \
+             WHERE [受注部門] IN ({bumon_in}) AND [稼動部門] NOT IN ({bumon_in}) \
+               AND [配車K] = '0' \
+               AND ISNULL(TRY_CAST([入力担当C] AS INT), 0) IN ({persons_in}) \
+               AND {common_where}"
+        );
+        // Case 3: 傭車傭車 (横横=1)
+        //   受注∈ AND 稼動∉ AND 配車K='1' AND 入力担当C ∈ persons
+        let case_yosha_yosha = format!(
+            "SELECT 1 AS [横横], * FROM [運転日報明細] \
+             WHERE [受注部門] IN ({bumon_in}) AND [稼動部門] NOT IN ({bumon_in}) \
+               AND [配車K] = '1' \
+               AND ISNULL(TRY_CAST([入力担当C] AS INT), 0) IN ({persons_in}) \
+               AND {common_where}"
+        );
+        // Case 4: sql_from_other_with_bumon (横横=1、PHP L1747-1767)
+        //   受注∈ AND 稼動∉ AND 傭車先=000000 AND 入力担当C ∉ persons
+        //   ※ 配車K 条件は無い (= 配車K=9 等もここで拾われる、ただし 入力担当C ∉ persons の人だけ)
+        let case_with_bumon = format!(
+            "SELECT 1 AS [横横], * FROM [運転日報明細] \
+             WHERE [受注部門] IN ({bumon_in}) AND [稼動部門] NOT IN ({bumon_in}) \
+               AND ISNULL([傭車先C], '000000') = '000000' \
+               AND ISNULL(TRY_CAST([入力担当C] AS INT), 0) NOT IN ({persons_in}) \
+               AND {common_where}"
+        );
+        // Case 5: sql_from_other (横横=0、PHP L1725-1745)
+        //   受注∉ AND 稼動∈ AND 傭車先≠000000
+        let case_from_other = format!(
+            "SELECT 0 AS [横横], * FROM [運転日報明細] \
+             WHERE [受注部門] NOT IN ({bumon_in}) AND [稼動部門] IN ({bumon_in}) \
+               AND ISNULL([傭車先C], '000000') != '000000' \
+               AND {common_where}"
+        );
+
         let query = format!(
-            "SELECT \
-                 CASE WHEN t.[受注部門] IN ({in_clause}) \
-                            AND t.[稼動部門] NOT IN ({in_clause}) \
-                      THEN 1 ELSE 0 END AS [横横], \
-                 ISNULL(TRY_CAST(t.[請求K] AS INT), 0), \
-                 ISNULL(t.[備考2], ''), \
-                 ISNULL(TRY_CAST(t.[入力担当C] AS INT), 0), \
-                 ISNULL(t.[稼動部門], ''), \
-                 ISNULL(t.[金額], 0), \
-                 ISNULL(t.[値引], 0), \
-                 ISNULL(t.[割増], 0), \
-                 ISNULL(t.[実費], 0), \
-                 ISNULL(t.[傭車金額], 0), \
-                 ISNULL(t.[傭車値引], 0), \
-                 ISNULL(t.[傭車割増], 0), \
-                 ISNULL(t.[傭車実費], 0), \
-                 ISNULL((SELECT TOP 1 e.[社員R] FROM [社員ﾏｽﾀ] e WHERE e.[社員C] = t.[入力担当C]), ''), \
-                 ISNULL(t.[傭車先C], '000000'), \
-                 CONVERT(varchar(10), t.[運行年月日], 23), \
-                 CONVERT(varchar(10), t.[売上年月日], 23) \
-             FROM [運転日報明細] t \
-             WHERE ( \
-                 (t.[受注部門] IN ({in_clause}) \
-                  AND (t.[稼動部門] NOT IN ({in_clause}) OR t.[配車K] = '1')) \
-                 OR (t.[受注部門] NOT IN ({in_clause}) \
-                     AND t.[稼動部門] IN ({in_clause}) \
-                     AND ISNULL(t.[傭車先C], '000000') != '000000') \
-               ) \
-               AND t.[品名N] NOT IN ('※\u{3000}請求一括調整明細\u{3000}※', '※\u{3000}傭車一括調整明細\u{3000}※') \
-               AND ISNULL(t.[日報K], 0) != 3 \
-               AND NOT (t.[請求K] = '1' AND t.[備考2] = '請求のみ') \
-               AND (t.[請求K] != '2' OR t.[備考2] = '表示' OR t.[備考2] LIKE '売上%') \
-               AND t.[運行年月日] >= @P1 AND t.[運行年月日] <= @P2 \
-             ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC",
-            in_clause = in_clause
+            "SELECT {select_cols} FROM ( \
+                 {case_yosha} \
+                 UNION ALL {case_eigyosho_yosha} \
+                 UNION ALL {case_yosha_yosha} \
+                 UNION ALL {case_with_bumon} \
+                 UNION ALL {case_from_other} \
+             ) AS t \
+             ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC"
         );
 
         let stream = conn

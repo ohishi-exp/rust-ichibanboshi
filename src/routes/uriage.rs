@@ -483,8 +483,12 @@ pub async fn by_person(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // PHP `UriageJyuchuDisplayPersons_id` = req.persons の keys (社員C 一覧)。
+    // uriage_rows は sql_options ケースで `入力担当C IN persons`、
+    // sql_from_other_with_bumon ケースで `入力担当C NOT IN persons` を使う。
+    let persons_id_list: Vec<i32> = req.persons.keys().copied().collect();
     let rows = repo
-        .uriage_rows(&req.from, &req.to, &req.bumon)
+        .uriage_rows(&req.from, &req.to, &req.bumon, &persons_id_list)
         .await
         .map_err(map_repo_err)?;
     let row_count = rows.len();
@@ -745,8 +749,17 @@ async fn recalc_one(
         return job;
     }
 
+    // persons map は SQL 述語 (sql_options の `入力担当C IN persons` / with_bumon の
+    // `NOT IN persons`) と compute_person_sum の振替判定の両方で使う。
+    let persons = masters.persons_as_int_map();
+    let other = masters.other.clone();
+    let persons_id_list: Vec<i32> = persons.keys().copied().collect();
+
     // SQL Server から運転日報明細を取得
-    let rows = match repo.uriage_rows(from, to, &masters.bumon).await {
+    let rows = match repo
+        .uriage_rows(from, to, &masters.bumon, &persons_id_list)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("sqlserver: {e:?}");
@@ -759,9 +772,6 @@ async fn recalc_one(
         }
     };
     job.row_count = rows.len();
-
-    let persons = masters.persons_as_int_map();
-    let other = masters.other.clone();
 
     // raw fingerprint (cal は raw rows には影響しないので 1 回でよい)
     let (ndjson, fingerprint) = serialize_ndjson_and_fingerprint(&rows);
@@ -1458,8 +1468,10 @@ pub async fn verify(
     let php_sum = parse_php_sum(&php_resp.sum)?;
 
     // 3. Rust SELECT + compute_person_sum (from=to=同一日 の単日)
+    // persons の keys (社員C 一覧) を SQL の `入力担当C IN/NOT IN` 述語に渡す
+    let persons_id_list: Vec<i32> = persons.keys().copied().collect();
     let rows = repo
-        .uriage_rows(&q.date, &q.date, &bumon)
+        .uriage_rows(&q.date, &q.date, &bumon, &persons_id_list)
         .await
         .map_err(|e| {
             let st = map_repo_err(e);
@@ -1613,8 +1625,9 @@ pub async fn verify_debug(
     let php_sum = parse_php_sum(&php_resp.sum)?;
 
     // 3. Rust SELECT + compute_person_sum
+    let persons_id_list: Vec<i32> = persons.keys().copied().collect();
     let rows = repo
-        .uriage_rows(&q.date, &q.date, &bumon)
+        .uriage_rows(&q.date, &q.date, &bumon, &persons_id_list)
         .await
         .map_err(|e| {
             let st = map_repo_err(e);

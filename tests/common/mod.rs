@@ -291,6 +291,7 @@ impl AppRepo for MockRepo {
         _from: &str,
         _to: &str,
         _bumon_codes: &[String],
+        _persons_id_list: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError> {
         // 担当者振替で B5 経路 (入力担当C=1499 → "青井") に当たる 1 行と
         // B6 経路 (マスタ外、表示のみ) に当たる 1 行を返す。
@@ -450,6 +451,7 @@ impl AppRepo for ErrorRepo {
         _: &str,
         _: &str,
         _: &[String],
+        _: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError> {
         Err(RepoError::PoolError)
     }
@@ -566,6 +568,7 @@ impl AppRepo for QueryErrorRepo {
         _: &str,
         _: &str,
         _: &[String],
+        _: &[i32],
     ) -> Result<Vec<UriageRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
