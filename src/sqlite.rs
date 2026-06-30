@@ -371,6 +371,54 @@ impl LocalStore {
         .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
     }
 
+    /// 期間 `from`/`to` (YYYY-MM 月 inclusive) で 月 × 担当者 の SUM を返す。
+    /// 全営業所合算 (cal フィルタのみ)。`/api/uriage/person-monthly-totals` で使う。
+    /// 戻り値は `(month, person_name)` で sort 済み。
+    pub async fn person_monthly_totals(
+        &self,
+        from_month: &str,
+        to_month: &str,
+        cal: bool,
+    ) -> Result<Vec<PersonMonthlyRow>, LocalStoreError> {
+        let from_month = from_month.to_string();
+        let to_month = to_month.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT month, person_name, 0 AS eigyosho_id, cal, \
+                            SUM(kingaku), SUM(yosha_kingaku), SUM(kensuu), \
+                            MAX(calculated_at) \
+                     FROM uriage_person_daily \
+                     WHERE month >= ?1 AND month <= ?2 AND cal = ?3 \
+                     GROUP BY month, person_name, cal \
+                     ORDER BY month ASC, person_name ASC",
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![from_month, to_month, cal_int], |r| {
+                    Ok(PersonMonthlyRow {
+                        month: r.get(0)?,
+                        person_name: r.get(1)?,
+                        eigyosho_id: r.get::<_, i64>(2)?,
+                        cal: r.get::<_, i64>(3)? != 0,
+                        kingaku: r.get(4)?,
+                        yosha_kingaku: r.get(5)?,
+                        kensuu: r.get(6)?,
+                        calculated_at: r.get(7)?,
+                    })
+                })
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<Vec<PersonMonthlyRow>, LocalStoreError>(rows)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
     /// `(month, eigyosho_id, cal)` の最終 calculated_at を返す (未集計なら None)。
     /// recalc が走った形跡を確認する用途。
     pub async fn last_calculated_at(
@@ -706,6 +754,71 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(date.to_string(), per_person);
         m
+    }
+
+    #[tokio::test]
+    async fn person_monthly_totals_sums_across_eigyosho() {
+        let store = LocalStore::open(":memory:").unwrap();
+        // 同月、同 person、異なる eigyosho に入れて SUM されることを確認
+        let mut day = HashMap::new();
+        day.insert("青井".to_string(), pa(10_000, 5_000, 1));
+        let one = {
+            let mut m = HashMap::new();
+            m.insert("2026-06-15".to_string(), day.clone());
+            m
+        };
+        store
+            .upsert_person_daily("2026-06", 1, true, &one, "t1")
+            .await
+            .unwrap();
+        store
+            .upsert_person_daily("2026-06", 9, true, &one, "t1")
+            .await
+            .unwrap();
+        // 翌月にも入れて期間フィルタも検証
+        let mut day7 = HashMap::new();
+        day7.insert("青井".to_string(), pa(3_000, 1_000, 1));
+        let one7 = {
+            let mut m = HashMap::new();
+            m.insert("2026-07-01".to_string(), day7);
+            m
+        };
+        store
+            .upsert_person_daily("2026-07", 1, true, &one7, "t2")
+            .await
+            .unwrap();
+
+        // 2026-06 のみで絞ると SUM = 2 営業所分
+        let rows = store
+            .person_monthly_totals("2026-06", "2026-06", true)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].month, "2026-06");
+        assert_eq!(rows[0].person_name, "青井");
+        assert_eq!(rows[0].kingaku, 20_000); // 10,000 × 2 営業所
+        assert_eq!(rows[0].kensuu, 2);
+        assert_eq!(rows[0].eigyosho_id, 0); // 全営業所合算は 0 固定
+
+        // 2026-06..2026-07 で 2 行
+        let rows2 = store
+            .person_monthly_totals("2026-06", "2026-07", true)
+            .await
+            .unwrap();
+        assert_eq!(rows2.len(), 2);
+        assert!(rows2
+            .iter()
+            .any(|r| r.month == "2026-06" && r.kingaku == 20_000));
+        assert!(rows2
+            .iter()
+            .any(|r| r.month == "2026-07" && r.kingaku == 3_000));
+
+        // cal=false は空 (入れてないので)
+        let nocal = store
+            .person_monthly_totals("2026-06", "2026-07", false)
+            .await
+            .unwrap();
+        assert!(nocal.is_empty());
     }
 
     #[tokio::test]

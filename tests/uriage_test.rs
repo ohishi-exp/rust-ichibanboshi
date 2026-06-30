@@ -1090,6 +1090,86 @@ async fn raw_ack_404_when_no_computed_job() {
 // ══════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn person_monthly_totals_aggregates_all_offices() {
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    // recalc — MockRepo は 2 行を返し、Row 1 (青井) のみ非ゼロ → 1 担当者
+    // 全営業所合算でも 1 row 残る想定 (office 1 + 9 ともに同じ MockRepo が返す)
+    let (s, _) = post_recalc_path(app.clone(), "/api/uriage/recalc?month=2026-06").await;
+    assert_eq!(s, StatusCode::OK);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/person-monthly-totals?from=2026-06&to=2026-06&cal=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["from"], "2026-06");
+    assert_eq!(v["to"], "2026-06");
+    assert_eq!(v["cal"], true);
+    let rows = v["rows"].as_array().unwrap();
+    // 全 office (1, 9) で MockRepo が同じ青井行を返すので、SUM では青井のみ 1 行
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["month"], "2026-06");
+    assert_eq!(rows[0]["person_name"], "青井");
+    // eigyosho_id は集計後は 0 固定
+    assert_eq!(rows[0]["eigyosho_id"], 0);
+    assert!(rows[0]["kingaku"].as_i64().unwrap() > 0);
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn person_monthly_totals_empty_when_no_data() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/person-monthly-totals?from=2026-06&to=2026-06")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["rows"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn person_monthly_totals_400_when_empty_range() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/person-monthly-totals?from=&to=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn daily_returns_persisted_rows_after_recalc() {
     let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
     let raw = common::temp_raw_dir();
