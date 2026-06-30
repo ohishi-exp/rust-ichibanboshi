@@ -37,6 +37,10 @@ impl std::fmt::Display for LocalStoreError {
 impl std::error::Error for LocalStoreError {}
 
 /// 担当者×月×営業所×cal の集計 1 行 (DB から read out した raw 値)。
+///
+/// `*_y0` は 横横=0 (= 自社運行 or sql_from_other) のみの集計値。
+/// 横横除外フィルタ UI で main fields の代わりに使う。
+/// 旧 data (recalc 未実行) は 0 になる (= recalc 全期間で正しい値に上書きされる)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PersonMonthlyRow {
     pub month: String,
@@ -46,6 +50,9 @@ pub struct PersonMonthlyRow {
     pub kingaku: i64,
     pub yosha_kingaku: i64,
     pub kensuu: i64,
+    pub kingaku_y0: i64,
+    pub yosha_kingaku_y0: i64,
+    pub kensuu_y0: i64,
     pub calculated_at: String,
 }
 
@@ -62,6 +69,9 @@ pub struct PersonDailyRow {
     pub kingaku: i64,
     pub yosha_kingaku: i64,
     pub kensuu: i64,
+    pub kingaku_y0: i64,
+    pub yosha_kingaku_y0: i64,
+    pub kensuu_y0: i64,
     pub calculated_at: String,
 }
 
@@ -244,15 +254,20 @@ impl LocalStore {
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS uriage_person_daily (
-                unko_date     TEXT    NOT NULL,
-                month         TEXT    NOT NULL,
-                person_name   TEXT    NOT NULL,
-                eigyosho_id   INTEGER NOT NULL,
-                cal           INTEGER NOT NULL,
-                kingaku       INTEGER NOT NULL,
-                yosha_kingaku INTEGER NOT NULL,
-                kensuu        INTEGER NOT NULL,
-                calculated_at TEXT    NOT NULL,
+                unko_date         TEXT    NOT NULL,
+                month             TEXT    NOT NULL,
+                person_name       TEXT    NOT NULL,
+                eigyosho_id       INTEGER NOT NULL,
+                cal               INTEGER NOT NULL,
+                kingaku           INTEGER NOT NULL,
+                yosha_kingaku     INTEGER NOT NULL,
+                kensuu            INTEGER NOT NULL,
+                -- 横横=0 (= 自社運行 or sql_from_other) のみの集計値
+                -- (横横除外フィルタ UI 用、user 2026-06-30 要望)
+                kingaku_y0        INTEGER NOT NULL DEFAULT 0,
+                yosha_kingaku_y0  INTEGER NOT NULL DEFAULT 0,
+                kensuu_y0         INTEGER NOT NULL DEFAULT 0,
+                calculated_at     TEXT    NOT NULL,
                 PRIMARY KEY (unko_date, person_name, eigyosho_id, cal)
             );
             CREATE INDEX IF NOT EXISTS idx_upd_month_eigyosho
@@ -302,6 +317,29 @@ impl LocalStore {
         // 既存 prod DB は `CREATE TABLE IF NOT EXISTS` で skip されるため、ALTER で
         // 追加する。`PRAGMA table_info` で存在チェックして idempotent に。
         Self::ensure_column(conn, "recalc_jobs", "fingerprint_changed_at", "TEXT")?;
+
+        // ── 2a-bis. uriage_person_daily に y0 (横横=0) 列を後付け追加 ──
+        // 既存 prod DB には kingaku/yosha_kingaku/kensuu しか無いので ALTER で追加。
+        // DEFAULT 0 で過去行は 0 埋め、recalc し直すと正しい y0 値で UPDATE される
+        // (= 全期間 recalc が必要、計算式変更時と同じ手順)。
+        Self::ensure_column(
+            conn,
+            "uriage_person_daily",
+            "kingaku_y0",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            conn,
+            "uriage_person_daily",
+            "yosha_kingaku_y0",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            conn,
+            "uriage_person_daily",
+            "kensuu_y0",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // 既存行の backfill: fingerprint_changed_at がまだ NULL のものは
         // computed_at の値で埋める (= 旧運用での「data 最終更新時刻」推定)
         conn.execute_batch(
@@ -350,10 +388,13 @@ impl LocalStore {
                    person_name,
                    eigyosho_id,
                    cal,
-                   SUM(kingaku)        AS kingaku,
-                   SUM(yosha_kingaku)  AS yosha_kingaku,
-                   SUM(kensuu)         AS kensuu,
-                   MAX(calculated_at)  AS calculated_at
+                   SUM(kingaku)           AS kingaku,
+                   SUM(yosha_kingaku)     AS yosha_kingaku,
+                   SUM(kensuu)            AS kensuu,
+                   SUM(kingaku_y0)        AS kingaku_y0,
+                   SUM(yosha_kingaku_y0)  AS yosha_kingaku_y0,
+                   SUM(kensuu_y0)         AS kensuu_y0,
+                   MAX(calculated_at)     AS calculated_at
             FROM uriage_person_daily
             GROUP BY month, person_name, eigyosho_id, cal;
 
@@ -415,7 +456,7 @@ impl LocalStore {
             let mut stmt = guard
                 .prepare(
                     "SELECT month, person_name, eigyosho_id, cal, kingaku, yosha_kingaku, \
-                            kensuu, calculated_at \
+                            kensuu, kingaku_y0, yosha_kingaku_y0, kensuu_y0, calculated_at \
                      FROM uriage_person_monthly \
                      WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3 \
                      ORDER BY kingaku DESC, person_name ASC",
@@ -431,7 +472,10 @@ impl LocalStore {
                         kingaku: r.get(4)?,
                         yosha_kingaku: r.get(5)?,
                         kensuu: r.get(6)?,
-                        calculated_at: r.get(7)?,
+                        kingaku_y0: r.get(7)?,
+                        yosha_kingaku_y0: r.get(8)?,
+                        kensuu_y0: r.get(9)?,
+                        calculated_at: r.get(10)?,
                     })
                 })
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
@@ -466,7 +510,17 @@ impl LocalStore {
             .flat_map(|(date, per_person)| {
                 per_person
                     .iter()
-                    .filter(|(_, v)| v.kensuu != 0 || v.kingaku != 0 || v.yosha_kingaku != 0)
+                    .filter(|(_, v)| {
+                        // 合計 or y0 のいずれかが非ゼロなら投入
+                        // (y0 だけ非ゼロ = 全て横横=0 行、というケースは現実には合計も非ゼロだが
+                        //  概念上の整合性のため両方チェック)
+                        v.kensuu != 0
+                            || v.kingaku != 0
+                            || v.yosha_kingaku != 0
+                            || v.kensuu_y0 != 0
+                            || v.kingaku_y0 != 0
+                            || v.yosha_kingaku_y0 != 0
+                    })
                     .map(|(name, v)| (date.clone(), name.clone(), *v))
             })
             .collect();
@@ -489,8 +543,9 @@ impl LocalStore {
                     .prepare(
                         "INSERT INTO uriage_person_daily \
                          (unko_date, month, person_name, eigyosho_id, cal, kingaku, \
-                          yosha_kingaku, kensuu, calculated_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                          yosha_kingaku, kensuu, kingaku_y0, yosha_kingaku_y0, kensuu_y0, \
+                          calculated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     )
                     .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
                 for (date, name, accum) in &entries {
@@ -503,6 +558,9 @@ impl LocalStore {
                         accum.kingaku,
                         accum.yosha_kingaku,
                         accum.kensuu,
+                        accum.kingaku_y0,
+                        accum.yosha_kingaku_y0,
+                        accum.kensuu_y0,
                         calculated_at,
                     ])
                     .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
@@ -532,7 +590,8 @@ impl LocalStore {
             let mut stmt = guard
                 .prepare(
                     "SELECT unko_date, month, person_name, eigyosho_id, cal, \
-                            kingaku, yosha_kingaku, kensuu, calculated_at \
+                            kingaku, yosha_kingaku, kensuu, \
+                            kingaku_y0, yosha_kingaku_y0, kensuu_y0, calculated_at \
                      FROM uriage_person_daily \
                      WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3 \
                      ORDER BY unko_date ASC, kingaku DESC, person_name ASC",
@@ -549,7 +608,10 @@ impl LocalStore {
                         kingaku: r.get(5)?,
                         yosha_kingaku: r.get(6)?,
                         kensuu: r.get(7)?,
-                        calculated_at: r.get(8)?,
+                        kingaku_y0: r.get(8)?,
+                        yosha_kingaku_y0: r.get(9)?,
+                        kensuu_y0: r.get(10)?,
+                        calculated_at: r.get(11)?,
                     })
                 })
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
@@ -580,6 +642,7 @@ impl LocalStore {
                 .prepare(
                     "SELECT month, person_name, 0 AS eigyosho_id, cal, \
                             SUM(kingaku), SUM(yosha_kingaku), SUM(kensuu), \
+                            SUM(kingaku_y0), SUM(yosha_kingaku_y0), SUM(kensuu_y0), \
                             MAX(calculated_at) \
                      FROM uriage_person_daily \
                      WHERE month >= ?1 AND month <= ?2 AND cal = ?3 \
@@ -597,7 +660,10 @@ impl LocalStore {
                         kingaku: r.get(4)?,
                         yosha_kingaku: r.get(5)?,
                         kensuu: r.get(6)?,
-                        calculated_at: r.get(7)?,
+                        kingaku_y0: r.get(7)?,
+                        yosha_kingaku_y0: r.get(8)?,
+                        kensuu_y0: r.get(9)?,
+                        calculated_at: r.get(10)?,
                     })
                 })
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
@@ -1189,6 +1255,11 @@ mod tests {
             kingaku,
             yosha_kingaku: yosha,
             kensuu,
+            // 既存テストは合計値のみ assert する。y0 は 0 で初期化
+            // (= 横横=1 として扱われる、テストでは区別しないので問題なし)
+            kingaku_y0: 0,
+            yosha_kingaku_y0: 0,
+            kensuu_y0: 0,
         }
     }
 

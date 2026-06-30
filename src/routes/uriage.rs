@@ -109,6 +109,11 @@ pub struct CalTotal {
     pub shiharai: i64,
 }
 
+/// y0 フィールド用の serde skip predicate。0 のとき wire format から省略する。
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
 /// 担当者ごとの集計値。
 ///
 /// `Deserialize` を持つのは `/verify` endpoint で PHP `print-json.sum` を
@@ -125,6 +130,20 @@ pub struct PersonAccum {
     /// 件数。
     #[serde(rename = "件数")]
     pub kensuu: i64,
+    /// 横横=0 (= 自社運行 or sql_from_other) のみの 傭車金額累計。
+    /// 「横横除外フィルタ」UI で kingaku_y0 / yosha_kingaku_y0 / kensuu_y0 を
+    /// 表示すると、他社運行委託分 (横横=1) を除外した純粋な自社売上が見える。
+    /// 旧 data には存在しないので `#[serde(default)]` で 0 fallback。
+    /// 0 のときは `skip_serializing_if` で wire format から省略 (= PHP 互換 JSON を
+    /// 維持し、verify diff 比較に y0 が混入しない)。
+    #[serde(default, rename = "傭車金額_y0", skip_serializing_if = "is_zero_i64")]
+    pub yosha_kingaku_y0: i64,
+    /// 横横=0 のみの 金額累計。
+    #[serde(default, rename = "金額_y0", skip_serializing_if = "is_zero_i64")]
+    pub kingaku_y0: i64,
+    /// 横横=0 のみの 件数。
+    #[serde(default, rename = "件数_y0", skip_serializing_if = "is_zero_i64")]
+    pub kensuu_y0: i64,
 }
 
 /// 1 行ごとの判定結果 (テンプレ表示用)。
@@ -258,7 +277,7 @@ pub fn compute_person_sum(
             // B1: A→B のうち A (Fr) がマスタに居る
             tanto.push_str(fr);
             if should_aggregate {
-                accumulate(&mut sum, fr, kingaku_sum, yosha_sum);
+                accumulate(&mut sum, fr, kingaku_sum, yosha_sum, ichi.yokoyoko);
             }
         } else if let Some(to) = uriage_to_name
             .as_deref()
@@ -267,7 +286,7 @@ pub fn compute_person_sum(
             // B2: A→B のうち B (To) がマスタに居る
             tanto.push_str(to);
             if should_aggregate {
-                accumulate(&mut sum, to, kingaku_sum, yosha_sum);
+                accumulate(&mut sum, to, kingaku_sum, yosha_sum, ichi.yokoyoko);
             }
         } else if person_names.contains(lookup_key.as_str()) {
             // B3: 備考2 を空白除去・「売上」除去した結果がマスタに居る
@@ -279,7 +298,7 @@ pub fn compute_person_sum(
             let allow_seikyu =
                 ichi.biko2 != "表示" && (ichi.seikyu_k != 2 || ichi.biko2.contains("売上"));
             if allow_seikyu && should_aggregate {
-                accumulate(&mut sum, &lookup_key, kingaku_sum, yosha_sum);
+                accumulate(&mut sum, &lookup_key, kingaku_sum, yosha_sum, ichi.yokoyoko);
             }
             tanto = lookup_key.clone();
         } else if ichi.biko2 == "表示のみ" && ichi.seikyu_k != 2 {
@@ -300,7 +319,7 @@ pub fn compute_person_sum(
             tanto = name.clone();
             if !(ichi.biko2 == "表示" && ichi.seikyu_k == 2) && should_aggregate {
                 let name = name.clone();
-                accumulate(&mut sum, &name, kingaku_sum, yosha_sum);
+                accumulate(&mut sum, &name, kingaku_sum, yosha_sum, ichi.yokoyoko);
             }
         } else {
             // B6: いずれも該当せず
@@ -353,10 +372,20 @@ pub fn compute_person_sum_by_day(
     let mut out: HashMap<String, HashMap<String, PersonAccum>> = HashMap::new();
     for (date, day_rows) in by_day {
         let res = compute_person_sum(&day_rows, persons, other, cal);
+        // 合計のいずれか or y0 のいずれかが非ゼロなら保持
+        // (横横除外 view で初めて非ゼロになる行は無いが、概念上の整合性のため
+        //  両方チェックする)
         let non_zero: HashMap<String, PersonAccum> = res
             .sum
             .into_iter()
-            .filter(|(_, v)| v.kensuu != 0 || v.kingaku != 0 || v.yosha_kingaku != 0)
+            .filter(|(_, v)| {
+                v.kensuu != 0
+                    || v.kingaku != 0
+                    || v.yosha_kingaku != 0
+                    || v.kensuu_y0 != 0
+                    || v.kingaku_y0 != 0
+                    || v.yosha_kingaku_y0 != 0
+            })
             .collect();
         if !non_zero.is_empty() {
             out.insert(date, non_zero);
@@ -366,11 +395,25 @@ pub fn compute_person_sum_by_day(
 }
 
 /// 集計加算 (`$sum[$name]['金額'] += k_sum` 相当)。
-fn accumulate(sum: &mut HashMap<String, PersonAccum>, name: &str, k_sum: i64, y_sum: i64) {
+///
+/// `yokoyoko=0` (= 自社運行 or sql_from_other) の行は `_y0` 系にも同時加算する。
+/// これにより 1 行で 合計値 (PHP 互換) と 横横除外値 の両方を保持できる。
+fn accumulate(
+    sum: &mut HashMap<String, PersonAccum>,
+    name: &str,
+    k_sum: i64,
+    y_sum: i64,
+    yokoyoko: i32,
+) {
     let acc = sum.entry(name.to_string()).or_default();
     acc.kingaku += k_sum;
     acc.yosha_kingaku += y_sum;
     acc.kensuu += 1;
+    if yokoyoko == 0 {
+        acc.kingaku_y0 += k_sum;
+        acc.yosha_kingaku_y0 += y_sum;
+        acc.kensuu_y0 += 1;
+    }
 }
 
 /// `cal_total()` の写経。営業所別月次集計 (`make_month_arrays`、後続 PR で実装) で
@@ -1813,16 +1856,27 @@ fn compute_verify_diff(
     fn is_nonzero(a: &PersonAccum) -> bool {
         a.kingaku != 0 || a.yosha_kingaku != 0 || a.kensuu != 0
     }
+    // PHP は `kingaku` / `yosha_kingaku` / `kensuu` の 3 フィールドしか返さないため、
+    // diff 比較も main 3 フィールドだけで行う。Rust 側の `kingaku_y0` 等は PHP 互換性に
+    // 関係しないため diff から除外する (= y0 値を 0 に潰してから比較する)。
+    fn main_only(a: &PersonAccum) -> PersonAccum {
+        PersonAccum {
+            kingaku: a.kingaku,
+            yosha_kingaku: a.yosha_kingaku,
+            kensuu: a.kensuu,
+            ..Default::default()
+        }
+    }
 
     let php_nz: HashMap<String, PersonAccum> = php
         .iter()
         .filter(|(_, v)| is_nonzero(v))
-        .map(|(k, v)| (k.clone(), *v))
+        .map(|(k, v)| (k.clone(), main_only(v)))
         .collect();
     let rust_nz: HashMap<String, PersonAccum> = rust
         .iter()
         .filter(|(_, v)| is_nonzero(v))
-        .map(|(k, v)| (k.clone(), *v))
+        .map(|(k, v)| (k.clone(), main_only(v)))
         .collect();
 
     let php_only: HashMap<String, PersonAccum> = php_nz
