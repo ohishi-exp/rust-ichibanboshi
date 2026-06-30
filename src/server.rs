@@ -93,7 +93,11 @@ pub async fn run(
         )
         .route("/uriage/admin/delete", post(routes::uriage::admin_delete))
         .route("/uriage/admin/rebuild", post(routes::uriage::admin_rebuild))
-        .route("/uriage/verify", get(routes::uriage::verify));
+        .route("/uriage/verify", get(routes::uriage::verify))
+        .route(
+            "/uriage/verify-history",
+            get(routes::uriage::verify_history),
+        );
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
