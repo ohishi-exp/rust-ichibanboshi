@@ -78,6 +78,10 @@ pub struct UriageRow {
     /// の drill-down に使う。`compute_person_sum` の振替判定では使わないが、
     /// `compute_person_sum_by_day` で行を日付ごとにグルーピングするのに必須。
     pub unko_date: String,
+    /// 売上年月日 (`YYYY-MM-DD`)。月計テーブル一致条件はこちら (`運行年月日` ではない)。
+    /// verify_debug の debug 表示で「PHP `/print-json` が 売上年月日 でフィルタしている
+    /// 場合、Rust の 運行年月日 フィルタとは pick する行が変わる」可能性を確認する用途。
+    pub uriage_date: String,
 }
 
 /// `cal_total()` (PHP 803-819) 等価。営業所別月次集計で使う 1 行ぶんのサブ
@@ -1500,6 +1504,168 @@ pub async fn verify(
         row_count,
         elapsed_ms,
         skipped_reason: None,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/verify-debug
+//   verify と同じ計算をして raw rows + decisions を返す (NG 原因特定用、
+//   user 2026-06-30 「office しぼれてない」)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Serialize)]
+pub struct VerifyDebugRow {
+    /// 横横==1 (= 受注∈bumon AND 稼動∉bumon)
+    pub yokoyoko: i32,
+    /// 請求K (0/1/2)
+    pub seikyu_k: i32,
+    /// 備考2
+    pub biko2: String,
+    /// 入力担当C (int)
+    pub nyuryoku_tanto_c: i32,
+    /// 稼動部門
+    pub kado_bumon: String,
+    pub kingaku: i64,
+    pub nebiki: i64,
+    pub warimashi: i64,
+    pub jippi: i64,
+    pub yosha_kingaku: i64,
+    pub yosha_nebiki: i64,
+    pub yosha_warimashi: i64,
+    pub yosha_jippi: i64,
+    /// 社員R (社員ﾏｽﾀ から TOP 1)
+    pub shain_r: String,
+    pub yosha_saki_c: String,
+    /// 運行年月日 (Rust の WHERE フィルタはこれを使う)
+    pub unko_date: String,
+    /// 売上年月日 (月計テーブル一致条件はこちら。PHP `/print-json` がこの列で
+    /// フィルタしている可能性あり = NG 原因候補、user 2026-06-30)
+    pub uriage_date: String,
+    /// `compute_person_sum` の判定結果 (B1-B6 のどこに行ったか + 振替後担当)
+    pub decision: RowDecision,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyDebugResponse {
+    pub office_id: i64,
+    pub date: String,
+    pub cal: bool,
+    /// office の bumon list (SQL `WHERE 受注部門 IN (...) OR 稼動部門 IN (...)` の右辺)
+    pub bumon: Vec<String>,
+    /// 入力担当C → 担当者名 (Rust の persons map)
+    pub persons: HashMap<i32, String>,
+    /// 稼動部門 → 担当者名 (Rust の other map)
+    pub other: HashMap<String, String>,
+    /// SQL から fetched された raw rows (decisions 同梱)
+    pub rows: Vec<VerifyDebugRow>,
+    /// PHP $sum (`/print-json` の結果、0 entry 含む)
+    pub php_sum: HashMap<String, PersonAccum>,
+    /// Rust $sum (`compute_person_sum` の結果、0 entry 含む)
+    pub rust_sum: HashMap<String, PersonAccum>,
+    /// php_sum vs rust_sum の diff (0 entry 除外後)
+    pub diff: Option<VerifyDiff>,
+}
+
+/// GET `/api/uriage/verify-debug?id=N&date=YYYY-MM-DD&cal=true|false`
+///
+/// verify と同じパイプラインを実行するが、raw rows と row 単位 decision、bumon list、
+/// persons / other map をすべて response に同梱して返す。NG 行の原因特定用。
+///
+/// verify_jobs テーブルへの upsert は行わない (= 履歴汚染しない)。
+pub async fn verify_debug(
+    Extension(repo): Extension<DynRepo>,
+    Extension(cakephp): Extension<Arc<CakephpClient>>,
+    Query(q): Query<VerifyQuery>,
+) -> Result<Json<VerifyDebugResponse>, (StatusCode, String)> {
+    if !cakephp.is_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CakePHP base_url 未設定: /verify-debug は無効".to_string(),
+        ));
+    }
+    if q.date.len() != 10 || !q.date.as_bytes().iter().all(|b| b.is_ascii()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("date 形式不正 (YYYY-MM-DD): {}", q.date),
+        ));
+    }
+
+    // 1. CakePHP masters
+    let masters = cakephp
+        .fetch_masters(&q.date)
+        .await
+        .map_err(map_cakephp_err)?;
+    let office = office_lookup(&masters, q.id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("office_id={} は masters に無い", q.id),
+        )
+    })?;
+    let persons = office.persons_as_int_map();
+    let other = office.other.clone();
+    let bumon = office.bumon.clone();
+
+    // 2. PHP $sum
+    let php_resp = cakephp
+        .fetch_print_json(q.id, &q.date, q.cal)
+        .await
+        .map_err(map_cakephp_err)?;
+    let php_sum = parse_php_sum(&php_resp.sum)?;
+
+    // 3. Rust SELECT + compute_person_sum
+    let rows = repo
+        .uriage_rows(&q.date, &q.date, &bumon)
+        .await
+        .map_err(|e| {
+            let st = map_repo_err(e);
+            (
+                st,
+                format!("SQL Server fetch failed (status={})", st.as_u16()),
+            )
+        })?;
+    let result = compute_person_sum(&rows, &persons, &other, q.cal);
+    let rust_sum = result.sum.clone();
+
+    // 4. diff
+    let diff = compute_verify_diff(&php_sum, &rust_sum);
+
+    // 5. raw rows + decisions を 1:1 で zip
+    let debug_rows: Vec<VerifyDebugRow> = rows
+        .iter()
+        .zip(result.rows.iter())
+        .map(|(r, d)| VerifyDebugRow {
+            yokoyoko: r.yokoyoko,
+            seikyu_k: r.seikyu_k,
+            biko2: r.biko2.clone(),
+            nyuryoku_tanto_c: r.nyuryoku_tanto_c,
+            kado_bumon: r.kado_bumon.clone(),
+            kingaku: r.kingaku,
+            nebiki: r.nebiki,
+            warimashi: r.warimashi,
+            jippi: r.jippi,
+            yosha_kingaku: r.yosha_kingaku,
+            yosha_nebiki: r.yosha_nebiki,
+            yosha_warimashi: r.yosha_warimashi,
+            yosha_jippi: r.yosha_jippi,
+            shain_r: r.shain_r.clone(),
+            yosha_saki_c: r.yoshasaki_c.clone(),
+            unko_date: r.unko_date.clone(),
+            uriage_date: r.uriage_date.clone(),
+            decision: d.clone(),
+        })
+        .collect();
+
+    Ok(Json(VerifyDebugResponse {
+        office_id: q.id,
+        date: q.date,
+        cal: q.cal,
+        bumon,
+        persons,
+        other,
+        rows: debug_rows,
+        php_sum,
+        rust_sum,
+        diff,
     }))
 }
 
