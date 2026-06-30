@@ -1268,6 +1268,10 @@ pub struct VerifyResponse {
     /// Rust 側 SELECT 行数 (debug 用)
     pub row_count: usize,
     pub elapsed_ms: u64,
+    /// 検証スキップ理由 (例: `"no_bumon"`)。検証していないが errors ではないケース。
+    /// shell の `[[ "$bumon" == "[]" ]] && continue` 相当。`None` = 検証実施済。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
 }
 
 /// GET `/api/uriage/verify?id=N&date=YYYY-MM-DD&cal=true|false`
@@ -1315,10 +1319,22 @@ pub async fn verify(
     let other = office.other.clone();
     let bumon = office.bumon.clone();
     if bumon.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("office_id={} の受注部門 (bumon) が空", q.id),
-        ));
+        // shell の `[[ "$bumon" == "[]" ]] && continue` と同じ扱い。受注部門が
+        // 未登録の営業所は構造上 検証対象が無いだけで「失敗」ではないので、
+        // 200 + skipped_reason フラグで返す (caller は status=skipped に振る)。
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        return Ok(Json(VerifyResponse {
+            office_id: q.id,
+            date: q.date,
+            cal: q.cal,
+            php_sum: HashMap::new(),
+            rust_sum: HashMap::new(),
+            diff: None,
+            ok: true,
+            row_count: 0,
+            elapsed_ms,
+            skipped_reason: Some("no_bumon".to_string()),
+        }));
     }
 
     // 2. CakePHP print-json (PHP $sum)
@@ -1357,6 +1373,7 @@ pub async fn verify(
         ok,
         row_count,
         elapsed_ms,
+        skipped_reason: None,
     }))
 }
 
