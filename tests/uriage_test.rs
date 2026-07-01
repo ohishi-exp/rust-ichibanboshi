@@ -11,7 +11,9 @@ mod common;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use rust_ichibanboshi::routes::uriage::{compute_person_sum, PersonAccum, UriageRow};
+use rust_ichibanboshi::routes::uriage::{
+    compute_person_partner_sum_by_day, compute_person_sum, PartnerKind, PersonAccum, UriageRow,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +39,10 @@ fn base_row() -> UriageRow {
         yoshasaki_c: "021970".to_string(),
         unko_date: "2026-06-15".to_string(),
         uriage_date: "2026-06-15".to_string(),
+        tokuisaki_key: "TESTCUST-0".to_string(),
+        tokuisaki_n: "テスト得意先".to_string(),
+        yoshasaki_key: "021970-0".to_string(),
+        yoshasaki_n: "テスト傭車先".to_string(),
     }
 }
 
@@ -396,6 +402,135 @@ fn all_branches_reached() {
     assert_eq!(aoi.kingaku, 95409); // 90059 + 5350
     assert_eq!(aoi.yosha_kingaku, 93094); // 90059 + 3035
     assert_eq!(aoi.kensuu, 10); // 9 + 1
+}
+
+// ══════════════════════════════════════════════════════════════
+// 担当者×得意先/傭車先 内訳 (compute_person_partner_sum_by_day)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn person_partner_sum_matches_person_sum_totals() {
+    // fixture17 (17件 golden + 全分岐網羅) で、得意先/傭車先内訳の SUM が対応する
+    // PersonAccum.kingaku / yosha_kingaku と 1 円単位で一致することを保証する。
+    // compute_person_sum の 6 段階 if-elseif には一切触れず aggregated フラグ経由で
+    // 再利用しているだけなので、この一致が崩れたら実装ミス (drift 検知用)。
+    let (rows, persons, other) = fixture17();
+    for cal in [true, false] {
+        let person_result = compute_person_sum(&rows, &persons, &other, cal);
+        let partner_by_day = compute_person_partner_sum_by_day(&rows, &persons, &other, cal);
+
+        let mut customer_totals: HashMap<String, i64> = HashMap::new();
+        let mut subcontractor_totals: HashMap<String, i64> = HashMap::new();
+        for entries in partner_by_day.values() {
+            for (key, accum) in entries {
+                let bucket = match key.partner_kind {
+                    PartnerKind::Customer => &mut customer_totals,
+                    PartnerKind::Subcontractor => &mut subcontractor_totals,
+                };
+                *bucket.entry(key.person_name.clone()).or_default() += accum.kingaku;
+            }
+        }
+
+        for (name, accum) in &person_result.sum {
+            let cust = customer_totals.get(name).copied().unwrap_or(0);
+            let sub = subcontractor_totals.get(name).copied().unwrap_or(0);
+            assert_eq!(
+                cust, accum.kingaku,
+                "customer breakdown mismatch for {name} (cal={cal})"
+            );
+            assert_eq!(
+                sub, accum.yosha_kingaku,
+                "subcontractor breakdown mismatch for {name} (cal={cal})"
+            );
+        }
+    }
+}
+
+#[test]
+fn person_partner_sum_excludes_non_aggregated_rows() {
+    let mut persons = HashMap::new();
+    persons.insert(1499, "青井".to_string());
+    let other = HashMap::new();
+
+    let aggregated_row = UriageRow {
+        yokoyoko: 0,
+        nyuryoku_tanto_c: 1499,
+        kingaku: 10000,
+        yosha_kingaku: 4000,
+        tokuisaki_key: "CUST1-0".to_string(),
+        tokuisaki_n: "得意先イチ".to_string(),
+        yoshasaki_c: "000000".to_string(),
+        yoshasaki_key: "000000-0".to_string(),
+        yoshasaki_n: String::new(),
+        ..base_row()
+    };
+    // マスタ外 (B6、表示のみで積算せず) — aggregated=false になるはずの行。
+    // 内訳に一切現れないことを確認する。
+    let unmatched_row = UriageRow {
+        nyuryoku_tanto_c: 9999,
+        kingaku: 99999,
+        yosha_kingaku: 88888,
+        shain_r: "無関係".to_string(),
+        tokuisaki_key: "CUST2-0".to_string(),
+        tokuisaki_n: "得意先ニ".to_string(),
+        ..base_row()
+    };
+
+    let rows = vec![aggregated_row, unmatched_row];
+    let partner_by_day = compute_person_partner_sum_by_day(&rows, &persons, &other, true);
+
+    let day = partner_by_day
+        .get("2026-06-15")
+        .expect("day bucket present");
+    assert!(day
+        .keys()
+        .all(|k| k.partner_code != "CUST2-0" && k.person_name != "無関係"));
+
+    let cust_key = day
+        .keys()
+        .find(|k| k.partner_kind == PartnerKind::Customer)
+        .expect("customer entry present");
+    assert_eq!(cust_key.person_name, "青井");
+    assert_eq!(cust_key.partner_code, "CUST1-0");
+    let cust_accum = &day[cust_key];
+    assert_eq!(cust_accum.partner_name, "得意先イチ");
+    assert_eq!(cust_accum.kingaku, 10000);
+    assert_eq!(cust_accum.kensuu, 1);
+
+    let sub_key = day
+        .keys()
+        .find(|k| k.partner_kind == PartnerKind::Subcontractor)
+        .expect("subcontractor entry present");
+    assert_eq!(sub_key.partner_code, "000000-0");
+    assert_eq!(day[sub_key].kingaku, 4000);
+}
+
+#[test]
+fn person_partner_sum_y0_excludes_yokoyoko_1() {
+    let mut persons = HashMap::new();
+    persons.insert(1499, "青井".to_string());
+    let other = HashMap::new();
+
+    // 横横=1 (他社運行委託) の行は y0 系に加算されない (横横除外フィルタ用)。
+    let row = UriageRow {
+        yokoyoko: 1,
+        nyuryoku_tanto_c: 1499,
+        kingaku: 10000,
+        tokuisaki_key: "CUST1-0".to_string(),
+        tokuisaki_n: "得意先イチ".to_string(),
+        ..base_row()
+    };
+
+    let partner_by_day = compute_person_partner_sum_by_day(&[row], &persons, &other, true);
+    let day = &partner_by_day["2026-06-15"];
+    let cust_key = day
+        .keys()
+        .find(|k| k.partner_kind == PartnerKind::Customer)
+        .unwrap();
+    let accum = &day[cust_key];
+    assert!(accum.kingaku > 0);
+    assert_eq!(accum.kingaku_y0, 0);
+    assert_eq!(accum.kensuu_y0, 0);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1241,6 +1376,90 @@ async fn daily_empty_when_no_recalc() {
     let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["rows"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn person_partner_totals_returns_breakdown_after_recalc() {
+    // MockRepo (tests/common/mod.rs) は 2 行返す: 入力担当C=1499 (office 1 の
+    // persons と一致 → "青井" に aggregate) と 9999 (マスタ外 → B6 表示のみ)。
+    // eigyosho_id=1 に絞って recalc すれば "青井" 分だけが内訳に乗る。
+    let server = start_cakephp_mock(vec!["2026-06"], standard_offices()).await;
+    let raw = common::temp_raw_dir();
+    let store = common::local_store();
+    let app = build_app_with_cakephp(
+        common::mock_repo(),
+        store.clone(),
+        server.uri(),
+        raw.clone(),
+    );
+
+    let (s, _) = post_recalc_path(
+        app.clone(),
+        "/api/uriage/recalc?month=2026-06&eigyosho_id=1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // "青井" を URL エンコード (E9 9D 92 E4 BA 95)
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/person-partner-totals?person=%E9%9D%92%E4%BA%95&from=2026-06&to=2026-06&cal=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["person"], "青井");
+    assert_eq!(v["customers"].as_array().unwrap().len(), 1);
+    assert_eq!(v["customers"][0]["partner_code"], "TESTCUST-0");
+    assert_eq!(v["customers"][0]["partner_name"], "テスト得意先");
+    assert!(v["customers"][0]["kingaku"].as_i64().unwrap() > 0);
+    assert_eq!(v["subcontractors"].as_array().unwrap().len(), 1);
+    assert_eq!(v["subcontractors"][0]["partner_code"], "000000-0");
+    assert!(v["subcontractors"][0]["kingaku"].as_i64().unwrap() > 0);
+
+    let _ = std::fs::remove_dir_all(&raw.dir);
+}
+
+#[tokio::test]
+async fn person_partner_totals_empty_when_no_recalc() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/person-partner-totals?person=%E9%9D%92%E4%BA%95&from=2026-06&to=2026-06")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["customers"].as_array().unwrap().len(), 0);
+    assert_eq!(v["subcontractors"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn person_partner_totals_bad_request_when_missing_params() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/uriage/person-partner-totals?from=2026-06&to=2026-06")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

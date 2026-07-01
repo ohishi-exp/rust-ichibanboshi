@@ -15,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::routes::uriage::PersonAccum;
+use crate::routes::uriage::{PartnerAccum, PartnerKind, PersonAccum, PersonPartnerKey};
 
 #[derive(Debug)]
 pub enum LocalStoreError {
@@ -73,6 +73,18 @@ pub struct PersonDailyRow {
     pub yosha_kingaku_y0: i64,
     pub kensuu_y0: i64,
     pub calculated_at: String,
+}
+
+/// 担当者×得意先/傭車先 内訳 1 行 (期間集計、全営業所合算)。
+/// `GET /api/uriage/person-partner-totals` のデータソース。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonPartnerTotalRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    pub kingaku: i64,
+    pub kensuu: i64,
+    pub kingaku_y0: i64,
+    pub kensuu_y0: i64,
 }
 
 /// `recalc_jobs` 1 行。`status` 遷移: `queued → computing → computed → r2_synced`。
@@ -274,6 +286,30 @@ impl LocalStore {
                 ON uriage_person_daily (month, eigyosho_id, cal);
             CREATE INDEX IF NOT EXISTS idx_upd_person_date
                 ON uriage_person_daily (person_name, unko_date);
+
+            -- 担当者×得意先/傭車先 内訳 (`compute_person_partner_sum_by_day` 由来)。
+            -- `uriage_person_daily` と同じ (unko_date, person_name, eigyosho_id, cal)
+            -- 粒度に `partner_kind`(customer/subcontractor)+`partner_code` 軸を追加。
+            CREATE TABLE IF NOT EXISTS uriage_person_partner_daily (
+                unko_date         TEXT    NOT NULL,
+                month             TEXT    NOT NULL,
+                person_name       TEXT    NOT NULL,
+                eigyosho_id       INTEGER NOT NULL,
+                cal               INTEGER NOT NULL,
+                partner_kind      TEXT    NOT NULL,
+                partner_code      TEXT    NOT NULL,
+                partner_name      TEXT    NOT NULL,
+                kingaku           INTEGER NOT NULL,
+                kensuu            INTEGER NOT NULL,
+                kingaku_y0        INTEGER NOT NULL DEFAULT 0,
+                kensuu_y0         INTEGER NOT NULL DEFAULT 0,
+                calculated_at     TEXT    NOT NULL,
+                PRIMARY KEY (unko_date, person_name, eigyosho_id, cal, partner_kind, partner_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_uppd_month_eigyosho
+                ON uriage_person_partner_daily (month, eigyosho_id, cal);
+            CREATE INDEX IF NOT EXISTS idx_uppd_person_kind
+                ON uriage_person_partner_daily (person_name, month, partner_kind);
 
             CREATE TABLE IF NOT EXISTS recalc_jobs (
                 month                   TEXT    NOT NULL,
@@ -570,6 +606,141 @@ impl LocalStore {
             tx.commit()
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             Ok::<usize, LocalStoreError>(inserted)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// `(month, eigyosho_id, cal)` の担当者×得意先/傭車先 内訳を一括 upsert
+    /// (delete-then-insert、`upsert_person_daily` の (担当者,取引先) 版)。
+    ///
+    /// `daily_sums` は `unko_date` → `(担当者, 種別, 取引先複合キー)` → `PartnerAccum`
+    /// の二重 map (`compute_person_partner_sum_by_day` の戻り値そのまま)。
+    /// 0 行 (`kensuu==0 AND kingaku==0 AND kensuu_y0==0 AND kingaku_y0==0`) は投入しない。
+    ///
+    /// 返り値 = 実際に insert した行数。
+    pub async fn upsert_person_partner_daily(
+        &self,
+        month: &str,
+        eigyosho_id: i64,
+        cal: bool,
+        daily_sums: &HashMap<String, HashMap<PersonPartnerKey, PartnerAccum>>,
+        calculated_at: &str,
+    ) -> Result<usize, LocalStoreError> {
+        let month = month.to_string();
+        let calculated_at = calculated_at.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let entries: Vec<(String, PersonPartnerKey, PartnerAccum)> = daily_sums
+            .iter()
+            .flat_map(|(date, per_key)| {
+                per_key
+                    .iter()
+                    .filter(|(_, v)| {
+                        v.kensuu != 0 || v.kingaku != 0 || v.kensuu_y0 != 0 || v.kingaku_y0 != 0
+                    })
+                    .map(|(k, v)| (date.clone(), k.clone(), v.clone()))
+            })
+            .collect();
+
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = futures_lock(&conn);
+            let tx = guard
+                .transaction()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM uriage_person_partner_daily \
+                 WHERE month = ?1 AND eigyosho_id = ?2 AND cal = ?3",
+                params![month, eigyosho_id, cal_int],
+            )
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let mut inserted = 0usize;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO uriage_person_partner_daily \
+                         (unko_date, month, person_name, eigyosho_id, cal, partner_kind, \
+                          partner_code, partner_name, kingaku, kensuu, kingaku_y0, kensuu_y0, \
+                          calculated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    )
+                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+                for (date, key, accum) in &entries {
+                    stmt.execute(params![
+                        date,
+                        month,
+                        key.person_name,
+                        eigyosho_id,
+                        cal_int,
+                        key.partner_kind.as_str(),
+                        key.partner_code,
+                        accum.partner_name,
+                        accum.kingaku,
+                        accum.kensuu,
+                        accum.kingaku_y0,
+                        accum.kensuu_y0,
+                        calculated_at,
+                    ])
+                    .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+                    inserted += 1;
+                }
+            }
+            tx.commit()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<usize, LocalStoreError>(inserted)
+        })
+        .await
+        .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
+    }
+
+    /// person_name + 期間 (`from_month..=to_month`、月 inclusive) + cal + partner_kind
+    /// で得意先 or 傭車先ごとの SUM を返す (全営業所合算)。
+    /// `GET /api/uriage/person-partner-totals` のデータソース。
+    pub async fn person_partner_totals(
+        &self,
+        person_name: &str,
+        from_month: &str,
+        to_month: &str,
+        cal: bool,
+        partner_kind: PartnerKind,
+    ) -> Result<Vec<PersonPartnerTotalRow>, LocalStoreError> {
+        let person_name = person_name.to_string();
+        let from_month = from_month.to_string();
+        let to_month = to_month.to_string();
+        let cal_int = if cal { 1 } else { 0 };
+        let kind_str = partner_kind.as_str().to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT partner_code, partner_name, \
+                            SUM(kingaku), SUM(kensuu), SUM(kingaku_y0), SUM(kensuu_y0) \
+                     FROM uriage_person_partner_daily \
+                     WHERE person_name = ?1 AND month >= ?2 AND month <= ?3 \
+                       AND cal = ?4 AND partner_kind = ?5 \
+                     GROUP BY partner_code, partner_name \
+                     ORDER BY SUM(kingaku) DESC, partner_code ASC",
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            let rows = stmt
+                .query_map(
+                    params![person_name, from_month, to_month, cal_int, kind_str],
+                    |r| {
+                        Ok(PersonPartnerTotalRow {
+                            partner_code: r.get(0)?,
+                            partner_name: r.get(1)?,
+                            kingaku: r.get(2)?,
+                            kensuu: r.get(3)?,
+                            kingaku_y0: r.get(4)?,
+                            kensuu_y0: r.get(5)?,
+                        })
+                    },
+                )
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            Ok::<Vec<PersonPartnerTotalRow>, LocalStoreError>(rows)
         })
         .await
         .map_err(|e| LocalStoreError::JoinError(e.to_string()))?
@@ -1178,6 +1349,11 @@ impl LocalStore {
                     params![month, eigyosho_id],
                 )
                 .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM uriage_person_partner_daily WHERE month = ?1 AND eigyosho_id = ?2",
+                params![month, eigyosho_id],
+            )
+            .map_err(|e| LocalStoreError::QueryError(e.to_string()))?;
             let job = tx
                 .execute(
                     "DELETE FROM recalc_jobs WHERE month = ?1 AND eigyosho_id = ?2",
@@ -1212,6 +1388,7 @@ impl LocalStore {
                     DROP VIEW  IF EXISTS uriage_person_monthly;
                     DROP TABLE IF EXISTS verify_jobs;
                     DROP TABLE IF EXISTS recalc_jobs;
+                    DROP TABLE IF EXISTS uriage_person_partner_daily;
                     DROP TABLE IF EXISTS uriage_person_daily;
                     "#,
                 )
@@ -1965,6 +2142,244 @@ mod tests {
         assert_eq!(n, 0);
         let job = store.get_recalc_job("2026-06", 1).await.unwrap().unwrap();
         assert_eq!(job.status, "failed");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // uriage_person_partner_daily (担当者×得意先/傭車先 内訳)
+    // ══════════════════════════════════════════════════════════════
+
+    fn partner_key(person_name: &str, kind: PartnerKind, code: &str) -> PersonPartnerKey {
+        PersonPartnerKey {
+            person_name: person_name.to_string(),
+            partner_kind: kind,
+            partner_code: code.to_string(),
+        }
+    }
+
+    fn partner_accum(name: &str, kingaku: i64, kensuu: i64) -> PartnerAccum {
+        PartnerAccum {
+            partner_name: name.to_string(),
+            kingaku,
+            kensuu,
+            kingaku_y0: 0,
+            kensuu_y0: 0,
+        }
+    }
+
+    fn daily_one_day_partner(
+        date: &str,
+        entries: HashMap<PersonPartnerKey, PartnerAccum>,
+    ) -> HashMap<String, HashMap<PersonPartnerKey, PartnerAccum>> {
+        let mut m = HashMap::new();
+        m.insert(date.to_string(), entries);
+        m
+    }
+
+    #[tokio::test]
+    async fn upsert_partner_daily_then_totals_sums_across_eigyosho_and_month() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut day = HashMap::new();
+        day.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST1-0"),
+            partner_accum("得意先イチ", 10_000, 1),
+        );
+        day.insert(
+            partner_key("青井", PartnerKind::Subcontractor, "000000-0"),
+            partner_accum("", 4_000, 1),
+        );
+        let one = daily_one_day_partner("2026-06-15", day.clone());
+        store
+            .upsert_person_partner_daily("2026-06", 1, true, &one, "t1")
+            .await
+            .unwrap();
+        // 別営業所にも同じ得意先向けの売上 → SUM されるはず
+        store
+            .upsert_person_partner_daily("2026-06", 9, true, &one, "t1")
+            .await
+            .unwrap();
+        // 翌月分 (期間フィルタの検証用)
+        let mut day7 = HashMap::new();
+        day7.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST1-0"),
+            partner_accum("得意先イチ", 3_000, 1),
+        );
+        store
+            .upsert_person_partner_daily(
+                "2026-07",
+                1,
+                true,
+                &daily_one_day_partner("2026-07-01", day7),
+                "t2",
+            )
+            .await
+            .unwrap();
+
+        let customers = store
+            .person_partner_totals("青井", "2026-06", "2026-06", true, PartnerKind::Customer)
+            .await
+            .unwrap();
+        assert_eq!(customers.len(), 1);
+        assert_eq!(customers[0].partner_code, "CUST1-0");
+        assert_eq!(customers[0].partner_name, "得意先イチ");
+        assert_eq!(customers[0].kingaku, 20_000); // 10,000 × 2 営業所
+        assert_eq!(customers[0].kensuu, 2);
+
+        let subcontractors = store
+            .person_partner_totals(
+                "青井",
+                "2026-06",
+                "2026-06",
+                true,
+                PartnerKind::Subcontractor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(subcontractors.len(), 1);
+        assert_eq!(subcontractors[0].partner_code, "000000-0");
+        assert_eq!(subcontractors[0].kingaku, 8_000); // 4,000 × 2 営業所
+
+        // 期間を広げると 2026-07 分も乗る
+        let wide = store
+            .person_partner_totals("青井", "2026-06", "2026-07", true, PartnerKind::Customer)
+            .await
+            .unwrap();
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].kingaku, 23_000); // 20,000 + 3,000
+
+        // 別担当者 / cal=false / 別 partner_kind では 0 件
+        assert!(store
+            .person_partner_totals("大石", "2026-06", "2026-06", true, PartnerKind::Customer)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .person_partner_totals("青井", "2026-06", "2026-06", false, PartnerKind::Customer)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_partner_daily_overwrites_bucket_in_full() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut a = HashMap::new();
+        a.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST1-0"),
+            partner_accum("得意先イチ", 100, 1),
+        );
+        store
+            .upsert_person_partner_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day_partner("2026-06-15", a),
+                "t1",
+            )
+            .await
+            .unwrap();
+
+        // 2 回目: 同じ bucket に別の内容 → 1 回目の行は消える (delete-then-insert)
+        let mut b = HashMap::new();
+        b.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST2-0"),
+            partner_accum("得意先ニ", 200, 1),
+        );
+        store
+            .upsert_person_partner_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day_partner("2026-06-16", b),
+                "t2",
+            )
+            .await
+            .unwrap();
+
+        let rows = store
+            .person_partner_totals("青井", "2026-06", "2026-06", true, PartnerKind::Customer)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].partner_code, "CUST2-0");
+        assert_eq!(rows[0].kingaku, 200);
+    }
+
+    #[tokio::test]
+    async fn upsert_partner_daily_skips_zero_rows() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut day = HashMap::new();
+        day.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST1-0"),
+            partner_accum("得意先イチ", 0, 0),
+        );
+        let n = store
+            .upsert_person_partner_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day_partner("2026-06-15", day),
+                "t1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_also_clears_partner_daily() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut day = HashMap::new();
+        day.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST1-0"),
+            partner_accum("得意先イチ", 100, 1),
+        );
+        store
+            .upsert_person_partner_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day_partner("2026-06-15", day),
+                "t1",
+            )
+            .await
+            .unwrap();
+
+        store.delete_bucket("2026-06", 1).await.unwrap();
+
+        let rows = store
+            .person_partner_totals("青井", "2026-06", "2026-06", true, PartnerKind::Customer)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebuild_schema_recreates_partner_table() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let mut day = HashMap::new();
+        day.insert(
+            partner_key("青井", PartnerKind::Customer, "CUST1-0"),
+            partner_accum("得意先イチ", 100, 1),
+        );
+        store
+            .upsert_person_partner_daily(
+                "2026-06",
+                1,
+                true,
+                &daily_one_day_partner("2026-06-15", day),
+                "t1",
+            )
+            .await
+            .unwrap();
+
+        store.rebuild_schema().await.unwrap();
+
+        // rebuild 後は全データ消失するが、schema はそのまま使える
+        let rows = store
+            .person_partner_totals("青井", "2026-06", "2026-06", true, PartnerKind::Customer)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }
 
