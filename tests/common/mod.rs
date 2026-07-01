@@ -15,7 +15,9 @@ use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
-use rust_ichibanboshi::routes::unchin::{RawUnchinRow, RawUnchinSummaryRow};
+use rust_ichibanboshi::routes::unchin::{
+    RawUnchinRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
+};
 use rust_ichibanboshi::routes::uriage::UriageRow;
 use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
 use uuid::Uuid;
@@ -422,6 +424,22 @@ impl AppRepo for MockRepo {
             bumon_name: "本社".into(),
         }])
     }
+
+    async fn unchin_subcontractor_net(
+        &self,
+        _from: &str,
+        _to: &str,
+        _kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError> {
+        Ok(vec![RawUnchinSubcontractorNetRow {
+            partner_code: "021970-000".into(),
+            partner_name: "㈱九州運輸".into(),
+            total_sales: 40_000,
+            total_payment: 28_000,
+            bumon_code: "012".into(),
+            bumon_name: "佐賀".into(),
+        }])
+    }
 }
 
 // ── ErrorRepo: 全メソッドがエラーを返す ──
@@ -555,6 +573,14 @@ impl AppRepo for ErrorRepo {
         _: &str,
         _: &str,
     ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn unchin_subcontractor_net(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError> {
         Err(RepoError::PoolError)
     }
 }
@@ -692,6 +718,14 @@ impl AppRepo for QueryErrorRepo {
     ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn unchin_subcontractor_net(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
 }
 
 // ── ヘルパー ──
@@ -768,6 +802,10 @@ pub fn build_app_full(
         .route("/vehicles", get(routes::surcharge::vehicles))
         .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/unchin/summary", get(routes::unchin::unchin_summary))
+        .route(
+            "/unchin/subcontractor-net",
+            get(routes::unchin::unchin_subcontractor_net),
+        )
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))
