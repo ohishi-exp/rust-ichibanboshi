@@ -84,6 +84,10 @@ pub async fn run(
             "/uriage/person-monthly-totals",
             get(routes::uriage::person_monthly_totals),
         )
+        .route(
+            "/uriage/person-partner-totals",
+            get(routes::uriage::person_partner_totals),
+        )
         .route("/uriage/r2/pending", get(routes::uriage::r2_pending))
         .route(
             "/uriage/raw/{month}/{eigyosho_id}",

@@ -316,6 +316,10 @@ impl AppRepo for MockRepo {
                 yoshasaki_c: "000000".into(),
                 unko_date: "2026-06-15".into(),
                 uriage_date: "2026-06-15".into(),
+                tokuisaki_key: "TESTCUST-0".into(),
+                tokuisaki_n: "テスト得意先".into(),
+                yoshasaki_key: "000000-0".into(),
+                yoshasaki_n: "".into(),
             },
             // 入力担当 9999 (マスタ外) → B6 で表示のみ、$sum に積まない
             UriageRow {
@@ -336,6 +340,10 @@ impl AppRepo for MockRepo {
                 yoshasaki_c: "021970".into(),
                 unko_date: "2026-06-16".into(),
                 uriage_date: "2026-06-16".into(),
+                tokuisaki_key: "TESTCUST2-0".into(),
+                tokuisaki_n: "テスト得意先2".into(),
+                yoshasaki_key: "021970-0".into(),
+                yoshasaki_n: "テスト傭車先".into(),
             },
         ])
     }
@@ -766,6 +774,10 @@ pub fn build_app_full(
         .route(
             "/uriage/person-monthly-totals",
             get(routes::uriage::person_monthly_totals),
+        )
+        .route(
+            "/uriage/person-partner-totals",
+            get(routes::uriage::person_partner_totals),
         )
         .route("/uriage/r2/pending", get(routes::uriage::r2_pending))
         .route(
