@@ -57,6 +57,11 @@ pub struct RawUnchinRow {
     /// 着地N（卸地、自由入力の生文字列）。
     pub dest: String,
     pub sale_date: NaiveDateTime,
+    /// `得意先ﾏｽﾀ`/`傭車先ﾏｽﾀ` の `部門C`（**自社側**の受注部門/営業所コード。
+    /// 得意先・傭車先自身の拠点とは別軸、#92 follow-up 実機調査確定）。
+    pub bumon_code: String,
+    /// `部門ﾏｽﾀ.部門N`（自社営業所名）。未設定・未マッチ時は空文字。
+    pub bumon_name: String,
 }
 
 /// 取引先ごとの合計金額 (`/summary` 用)。
@@ -65,6 +70,9 @@ pub struct RawUnchinSummaryRow {
     pub partner_code: String,
     pub partner_name: String,
     pub total: i64,
+    /// `RawUnchinRow::bumon_code` と同義（自社側の受注部門/営業所コード）。
+    pub bumon_code: String,
+    pub bumon_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -81,6 +89,10 @@ pub struct UnchinCandidateRow {
     pub origin: String,
     pub dest: String,
     pub sale_date: String,
+    /// 自社側の受注部門コード (`得意先ﾏｽﾀ`/`傭車先ﾏｽﾀ`.`部門C`、#92 follow-up)。
+    pub bumon_code: String,
+    /// 自社側の受注部門名 (`部門ﾏｽﾀ`.`部門N`)。未マッチ時は空文字。
+    pub bumon_name: String,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -88,6 +100,8 @@ pub struct UnchinSummaryRow {
     pub partner_code: String,
     pub partner_name: String,
     pub total: i64,
+    pub bumon_code: String,
+    pub bumon_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -151,6 +165,8 @@ pub fn build_unchin_rows(raw: &[RawUnchinRow]) -> Vec<UnchinCandidateRow> {
             origin: r.origin.clone(),
             dest: r.dest.clone(),
             sale_date: r.sale_date.format("%Y-%m-%d").to_string(),
+            bumon_code: r.bumon_code.clone(),
+            bumon_name: r.bumon_name.clone(),
         })
         .collect()
 }
@@ -162,6 +178,8 @@ pub fn build_unchin_summary_rows(raw: &[RawUnchinSummaryRow]) -> Vec<UnchinSumma
             partner_code: r.partner_code.clone(),
             partner_name: r.partner_name.clone(),
             total: r.total,
+            bumon_code: r.bumon_code.clone(),
+            bumon_name: r.bumon_name.clone(),
         })
         .collect()
 }
