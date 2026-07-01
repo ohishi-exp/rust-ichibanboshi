@@ -85,6 +85,14 @@ pub async fn run(
             "/unchin/subcontractor-net-detail",
             get(routes::unchin::unchin_subcontractor_net_detail),
         )
+        .route(
+            "/unchin/customer-net",
+            get(routes::unchin::unchin_customer_net),
+        )
+        .route(
+            "/unchin/customer-net-detail",
+            get(routes::unchin::unchin_customer_net_detail),
+        )
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))
