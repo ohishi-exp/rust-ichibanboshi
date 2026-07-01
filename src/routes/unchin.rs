@@ -90,6 +90,25 @@ pub struct RawUnchinSubcontractorNetRow {
     pub bumon_name: String,
 }
 
+/// 特定の傭車先 (`傭車先C`+`傭車先H`) の運行 1 件分の両建て明細
+/// (`/subcontractor-net-detail` 用、`/subcontractor-net` のドリルダウン)。
+#[derive(Debug, Clone)]
+pub struct RawUnchinSubcontractorNetDetailRow {
+    pub item_code: String,
+    pub item_name: String,
+    /// その行の得意先N (同一運行の売上先)。
+    pub customer_name: String,
+    /// その行の得意先側金額 (`金額+割増+実費`)。
+    pub sales: i64,
+    /// その行の傭車先側金額 (`傭車金額+傭車割増+傭車実費`)。
+    pub payment: i64,
+    pub origin: String,
+    pub dest: String,
+    pub sale_date: NaiveDateTime,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
 // ══════════════════════════════════════════════════════════════
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
@@ -131,6 +150,22 @@ pub struct UnchinSubcontractorNetRow {
     pub bumon_name: String,
 }
 
+#[derive(Serialize, Debug, PartialEq)]
+pub struct UnchinSubcontractorNetDetailRow {
+    pub item_code: String,
+    pub item_name: String,
+    pub customer_name: String,
+    pub sales: i64,
+    pub payment: i64,
+    /// 差額 = sales - payment (行単位)。
+    pub diff: i64,
+    pub origin: String,
+    pub dest: String,
+    pub sale_date: String,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
 // ══════════════════════════════════════════════════════════════
 // Query パラメータ
 // ══════════════════════════════════════════════════════════════
@@ -158,6 +193,19 @@ pub struct UnchinSubcontractorNetQuery {
     /// `"with_billing_only"`(請求＋請求のみ, K IN (0,1)) |
     /// `"with_non_billing"`(請求＋非請求, K IN (0,2)、default)
     pub kind: Option<String>,
+}
+
+/// `/subcontractor-net-detail` 用 query。`code`/`h` で対象傭車先 (`傭車先C`+`傭車先H`)
+/// を一意に指定する (`/subcontractor-net` の `partner_code` = `"{code}-{h}"` を分割)。
+#[derive(Deserialize)]
+pub struct UnchinSubcontractorNetDetailQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub kind: Option<String>,
+    /// 傭車先C
+    pub code: String,
+    /// 傭車先H
+    pub h: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -234,6 +282,27 @@ pub fn build_unchin_subcontractor_net_rows(
             total_sales: r.total_sales,
             total_payment: r.total_payment,
             diff: r.total_sales - r.total_payment,
+            bumon_code: r.bumon_code.clone(),
+            bumon_name: r.bumon_name.clone(),
+        })
+        .collect()
+}
+
+/// Raw 傭車先ネット明細行リストをレスポンス行に変換する (行単位の差額計算含む)。
+pub fn build_unchin_subcontractor_net_detail_rows(
+    raw: &[RawUnchinSubcontractorNetDetailRow],
+) -> Vec<UnchinSubcontractorNetDetailRow> {
+    raw.iter()
+        .map(|r| UnchinSubcontractorNetDetailRow {
+            item_code: r.item_code.clone(),
+            item_name: r.item_name.clone(),
+            customer_name: r.customer_name.clone(),
+            sales: r.sales,
+            payment: r.payment,
+            diff: r.sales - r.payment,
+            origin: r.origin.clone(),
+            dest: r.dest.clone(),
+            sale_date: r.sale_date.format("%Y-%m-%d").to_string(),
             bumon_code: r.bumon_code.clone(),
             bumon_name: r.bumon_name.clone(),
         })
@@ -334,5 +403,35 @@ pub async fn unchin_subcontractor_net(
             unchin_kind_label(&kind)
         ),
         data: build_unchin_subcontractor_net_rows(&raw),
+    }))
+}
+
+/// GET /api/unchin/subcontractor-net-detail?from=&to=&kind=&code=&h=
+///
+/// `/subcontractor-net` の特定の傭車先 (`code`=傭車先C, `h`=傭車先H) について、
+/// 運行 (運転日報明細の行) 単位で得意先請求 (`sales`) と傭車支払 (`payment`)、
+/// 行単位の差額を返す (「同一運行内の両建て」のドリルダウン)。
+pub async fn unchin_subcontractor_net_detail(
+    Extension(repo): Extension<DynRepo>,
+    Query(params): Query<UnchinSubcontractorNetDetailQuery>,
+) -> Result<Json<ApiResponse<Vec<UnchinSubcontractorNetDetailRow>>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2024-01-01".to_string());
+    let to = params.to.unwrap_or_else(|| "2999-12-31".to_string());
+    let kind = params.kind.unwrap_or_default();
+    let kind_filter = unchin_kind_filter(&kind);
+
+    let raw = repo
+        .unchin_subcontractor_net_detail(&from, &to, &params.code, &params.h, kind_filter)
+        .await
+        .map_err(map_repo_err)?;
+
+    Ok(Json(ApiResponse {
+        source_table: format!(
+            "運転日報明細 (傭車先C={}, 傭車先H={} の両建て明細) [{}]",
+            params.code,
+            params.h,
+            unchin_kind_label(&kind)
+        ),
+        data: build_unchin_subcontractor_net_detail_rows(&raw),
     }))
 }
