@@ -16,8 +16,8 @@ use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
 use rust_ichibanboshi::routes::unchin::{
-    RawUnchinRow, RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow,
-    RawUnchinSummaryRow,
+    RawUnchinCustomerNetDetailRow, RawUnchinCustomerNetRow, RawUnchinRow,
+    RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use rust_ichibanboshi::routes::uriage::UriageRow;
 use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
@@ -463,6 +463,44 @@ impl AppRepo for MockRepo {
             bumon_name: "佐賀".into(),
         }])
     }
+
+    async fn unchin_customer_net(
+        &self,
+        _from: &str,
+        _to: &str,
+        _kind_filter: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetRow>, RepoError> {
+        Ok(vec![RawUnchinCustomerNetRow {
+            partner_code: "034760-015".into(),
+            partner_name: "全農物流㈱　九州支店".into(),
+            total_sales: 170_000,
+            total_payment: 120_000,
+            bumon_code: "010".into(),
+            bumon_name: "本社".into(),
+        }])
+    }
+
+    async fn unchin_customer_net_detail(
+        &self,
+        _from: &str,
+        _to: &str,
+        _code: &str,
+        _h: &str,
+        _kind_filter: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetDetailRow>, RepoError> {
+        Ok(vec![RawUnchinCustomerNetDetailRow {
+            item_code: "6301".into(),
+            item_name: "フレコン".into(),
+            subcontractor_name: "㈱九州運輸".into(),
+            sales: 30_000,
+            payment: 22_000,
+            origin: "釧路".into(),
+            dest: "八代".into(),
+            sale_date: dt(2026, 6, 20),
+            bumon_code: "010".into(),
+            bumon_name: "本社".into(),
+        }])
+    }
 }
 
 // ── ErrorRepo: 全メソッドがエラーを返す ──
@@ -614,6 +652,24 @@ impl AppRepo for ErrorRepo {
         _: &str,
         _: &str,
     ) -> Result<Vec<RawUnchinSubcontractorNetDetailRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn unchin_customer_net(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
+    async fn unchin_customer_net_detail(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetDetailRow>, RepoError> {
         Err(RepoError::PoolError)
     }
 }
@@ -769,6 +825,24 @@ impl AppRepo for QueryErrorRepo {
     ) -> Result<Vec<RawUnchinSubcontractorNetDetailRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn unchin_customer_net(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
+    async fn unchin_customer_net_detail(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetDetailRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
 }
 
 // ── ヘルパー ──
@@ -852,6 +926,14 @@ pub fn build_app_full(
         .route(
             "/unchin/subcontractor-net-detail",
             get(routes::unchin::unchin_subcontractor_net_detail),
+        )
+        .route(
+            "/unchin/customer-net",
+            get(routes::unchin::unchin_customer_net),
+        )
+        .route(
+            "/unchin/customer-net-detail",
+            get(routes::unchin::unchin_customer_net_detail),
         )
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))

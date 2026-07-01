@@ -109,6 +109,41 @@ pub struct RawUnchinSubcontractorNetDetailRow {
     pub bumon_name: String,
 }
 
+/// 得意先ごとの 売上/傭車支払 両建て合計 (`/customer-net` 用)。
+/// 「同一運行内の両建て」を得意先軸で見たもの (2026-07-01 user 確認:
+/// 「傭車先じゃなくて得意先にグラフ直して」)。自社便のみの得意先は
+/// `total_payment` が 0 になり `diff` = `total_sales` そのものになる。
+#[derive(Debug, Clone)]
+pub struct RawUnchinCustomerNetRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    /// その得意先への請求合計 (`金額+割増+実費`、#57 確定式)。
+    pub total_sales: i64,
+    /// その得意先の運行のうち傭車を使った分の支払合計 (`傭車金額+傭車割増+傭車実費`)。
+    pub total_payment: i64,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
+/// 特定の得意先 (`得意先C`+`得意先H`) の運行 1 件分の両建て明細
+/// (`/customer-net-detail` 用、`/customer-net` のドリルダウン)。
+#[derive(Debug, Clone)]
+pub struct RawUnchinCustomerNetDetailRow {
+    pub item_code: String,
+    pub item_name: String,
+    /// その行の傭車先N (自社便なら空文字、傭車先C='000000' がマスタに存在しないため)。
+    pub subcontractor_name: String,
+    /// その行の得意先側金額 (`金額+割増+実費`)。
+    pub sales: i64,
+    /// その行の傭車先側金額 (`傭車金額+傭車割増+傭車実費`、自社便なら 0)。
+    pub payment: i64,
+    pub origin: String,
+    pub dest: String,
+    pub sale_date: NaiveDateTime,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
 // ══════════════════════════════════════════════════════════════
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
@@ -166,6 +201,34 @@ pub struct UnchinSubcontractorNetDetailRow {
     pub bumon_name: String,
 }
 
+#[derive(Serialize, Debug, PartialEq)]
+pub struct UnchinCustomerNetRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    pub total_sales: i64,
+    pub total_payment: i64,
+    /// 差額 = total_sales - total_payment。
+    pub diff: i64,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct UnchinCustomerNetDetailRow {
+    pub item_code: String,
+    pub item_name: String,
+    pub subcontractor_name: String,
+    pub sales: i64,
+    pub payment: i64,
+    /// 差額 = sales - payment (行単位)。
+    pub diff: i64,
+    pub origin: String,
+    pub dest: String,
+    pub sale_date: String,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
 // ══════════════════════════════════════════════════════════════
 // Query パラメータ
 // ══════════════════════════════════════════════════════════════
@@ -205,6 +268,27 @@ pub struct UnchinSubcontractorNetDetailQuery {
     /// 傭車先C
     pub code: String,
     /// 傭車先H
+    pub h: String,
+}
+
+/// `/customer-net` 用 query。`partner_type` は無い (常に得意先起点)。
+#[derive(Deserialize)]
+pub struct UnchinCustomerNetQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub kind: Option<String>,
+}
+
+/// `/customer-net-detail` 用 query。`code`/`h` で対象得意先 (`得意先C`+`得意先H`)
+/// を一意に指定する。
+#[derive(Deserialize)]
+pub struct UnchinCustomerNetDetailQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub kind: Option<String>,
+    /// 得意先C
+    pub code: String,
+    /// 得意先H
     pub h: String,
 }
 
@@ -297,6 +381,44 @@ pub fn build_unchin_subcontractor_net_detail_rows(
             item_code: r.item_code.clone(),
             item_name: r.item_name.clone(),
             customer_name: r.customer_name.clone(),
+            sales: r.sales,
+            payment: r.payment,
+            diff: r.sales - r.payment,
+            origin: r.origin.clone(),
+            dest: r.dest.clone(),
+            sale_date: r.sale_date.format("%Y-%m-%d").to_string(),
+            bumon_code: r.bumon_code.clone(),
+            bumon_name: r.bumon_name.clone(),
+        })
+        .collect()
+}
+
+/// Raw 得意先ネット行リストをレスポンス行に変換する (差額計算含む)。
+pub fn build_unchin_customer_net_rows(
+    raw: &[RawUnchinCustomerNetRow],
+) -> Vec<UnchinCustomerNetRow> {
+    raw.iter()
+        .map(|r| UnchinCustomerNetRow {
+            partner_code: r.partner_code.clone(),
+            partner_name: r.partner_name.clone(),
+            total_sales: r.total_sales,
+            total_payment: r.total_payment,
+            diff: r.total_sales - r.total_payment,
+            bumon_code: r.bumon_code.clone(),
+            bumon_name: r.bumon_name.clone(),
+        })
+        .collect()
+}
+
+/// Raw 得意先ネット明細行リストをレスポンス行に変換する (行単位の差額計算含む)。
+pub fn build_unchin_customer_net_detail_rows(
+    raw: &[RawUnchinCustomerNetDetailRow],
+) -> Vec<UnchinCustomerNetDetailRow> {
+    raw.iter()
+        .map(|r| UnchinCustomerNetDetailRow {
+            item_code: r.item_code.clone(),
+            item_name: r.item_name.clone(),
+            subcontractor_name: r.subcontractor_name.clone(),
             sales: r.sales,
             payment: r.payment,
             diff: r.sales - r.payment,
@@ -433,5 +555,65 @@ pub async fn unchin_subcontractor_net_detail(
             unchin_kind_label(&kind)
         ),
         data: build_unchin_subcontractor_net_detail_rows(&raw),
+    }))
+}
+
+/// GET /api/unchin/customer-net?from=&to=&kind=
+///
+/// 得意先ごとに、請求合計 (`total_sales`) とその運行で傭車を使った分の支払合計
+/// (`total_payment`) を同一行から突き合わせ、差額 (`diff = total_sales -
+/// total_payment`、粗利に相当) を返す
+/// (2026-07-01 user 確認「傭車先じゃなくて得意先にグラフ直して」——
+/// `/subcontractor-net` を得意先軸で見たもの)。
+pub async fn unchin_customer_net(
+    Extension(repo): Extension<DynRepo>,
+    Query(params): Query<UnchinCustomerNetQuery>,
+) -> Result<Json<ApiResponse<Vec<UnchinCustomerNetRow>>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2024-01-01".to_string());
+    let to = params.to.unwrap_or_else(|| "2999-12-31".to_string());
+    let kind = params.kind.unwrap_or_default();
+    let kind_filter = unchin_kind_filter(&kind);
+
+    let raw = repo
+        .unchin_customer_net(&from, &to, kind_filter)
+        .await
+        .map_err(map_repo_err)?;
+
+    Ok(Json(ApiResponse {
+        source_table: format!(
+            "運転日報明細 (得意先ﾏｽﾀ + 傭車先側金額の両建て) [{}]",
+            unchin_kind_label(&kind)
+        ),
+        data: build_unchin_customer_net_rows(&raw),
+    }))
+}
+
+/// GET /api/unchin/customer-net-detail?from=&to=&kind=&code=&h=
+///
+/// `/customer-net` の特定の得意先 (`code`=得意先C, `h`=得意先H) について、
+/// 運行 (運転日報明細の行) 単位で請求 (`sales`) と傭車支払 (`payment`)、
+/// 行単位の差額を返す。自社便の行は `subcontractor_name` が空文字になる。
+pub async fn unchin_customer_net_detail(
+    Extension(repo): Extension<DynRepo>,
+    Query(params): Query<UnchinCustomerNetDetailQuery>,
+) -> Result<Json<ApiResponse<Vec<UnchinCustomerNetDetailRow>>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2024-01-01".to_string());
+    let to = params.to.unwrap_or_else(|| "2999-12-31".to_string());
+    let kind = params.kind.unwrap_or_default();
+    let kind_filter = unchin_kind_filter(&kind);
+
+    let raw = repo
+        .unchin_customer_net_detail(&from, &to, &params.code, &params.h, kind_filter)
+        .await
+        .map_err(map_repo_err)?;
+
+    Ok(Json(ApiResponse {
+        source_table: format!(
+            "運転日報明細 (得意先C={}, 得意先H={} の両建て明細) [{}]",
+            params.code,
+            params.h,
+            unchin_kind_label(&kind)
+        ),
+        data: build_unchin_customer_net_detail_rows(&raw),
     }))
 }
