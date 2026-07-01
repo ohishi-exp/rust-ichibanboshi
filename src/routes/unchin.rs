@@ -111,13 +111,14 @@ pub struct RawUnchinSubcontractorNetDetailRow {
 
 /// 得意先ごとの 売上/傭車支払 両建て合計 (`/customer-net` 用)。
 /// 「同一運行内の両建て」を得意先軸で見たもの (2026-07-01 user 確認:
-/// 「傭車先じゃなくて得意先にグラフ直して」)。自社便のみの得意先は
-/// `total_payment` が 0 になり `diff` = `total_sales` そのものになる。
+/// 「傭車先じゃなくて得意先にグラフ直して」)。自社便 (傭車先C='000000') の行は
+/// SQL 側で常に除外する (2026-07-01 user 確認「トグルじゃない もとからなくして
+/// グラフも」) — 傭車を使った運行の得意先のみが対象。
 #[derive(Debug, Clone)]
 pub struct RawUnchinCustomerNetRow {
     pub partner_code: String,
     pub partner_name: String,
-    /// その得意先への請求合計 (`金額+割増+実費`、#57 確定式)。
+    /// その得意先への請求合計のうち、傭車を使った運行分 (`金額+割増+実費`、#57 確定式)。
     pub total_sales: i64,
     /// その得意先の運行のうち傭車を使った分の支払合計 (`傭車金額+傭車割増+傭車実費`)。
     pub total_payment: i64,
@@ -127,15 +128,16 @@ pub struct RawUnchinCustomerNetRow {
 
 /// 特定の得意先 (`得意先C`+`得意先H`) の運行 1 件分の両建て明細
 /// (`/customer-net-detail` 用、`/customer-net` のドリルダウン)。
+/// 自社便 (傭車先C='000000') の行は SQL 側で除外済みのため含まれない。
 #[derive(Debug, Clone)]
 pub struct RawUnchinCustomerNetDetailRow {
     pub item_code: String,
     pub item_name: String,
-    /// その行の傭車先N (自社便なら空文字、傭車先C='000000' がマスタに存在しないため)。
+    /// その行の傭車先N。
     pub subcontractor_name: String,
     /// その行の得意先側金額 (`金額+割増+実費`)。
     pub sales: i64,
-    /// その行の傭車先側金額 (`傭車金額+傭車割増+傭車実費`、自社便なら 0)。
+    /// その行の傭車先側金額 (`傭車金額+傭車割増+傭車実費`)。
     pub payment: i64,
     pub origin: String,
     pub dest: String,
@@ -560,11 +562,12 @@ pub async fn unchin_subcontractor_net_detail(
 
 /// GET /api/unchin/customer-net?from=&to=&kind=
 ///
-/// 得意先ごとに、請求合計 (`total_sales`) とその運行で傭車を使った分の支払合計
+/// 得意先ごとに、傭車を使った運行の請求合計 (`total_sales`) とその支払合計
 /// (`total_payment`) を同一行から突き合わせ、差額 (`diff = total_sales -
 /// total_payment`、粗利に相当) を返す
 /// (2026-07-01 user 確認「傭車先じゃなくて得意先にグラフ直して」——
-/// `/subcontractor-net` を得意先軸で見たもの)。
+/// `/subcontractor-net` を得意先軸で見たもの)。自社便の運行は対象外
+/// (2026-07-01 user 確認「トグルじゃない もとからなくして グラフも」)。
 pub async fn unchin_customer_net(
     Extension(repo): Extension<DynRepo>,
     Query(params): Query<UnchinCustomerNetQuery>,
@@ -592,7 +595,7 @@ pub async fn unchin_customer_net(
 ///
 /// `/customer-net` の特定の得意先 (`code`=得意先C, `h`=得意先H) について、
 /// 運行 (運転日報明細の行) 単位で請求 (`sales`) と傭車支払 (`payment`)、
-/// 行単位の差額を返す。自社便の行は `subcontractor_name` が空文字になる。
+/// 行単位の差額を返す。自社便の行は対象外 (常に傭車を使った運行のみ)。
 pub async fn unchin_customer_net_detail(
     Extension(repo): Extension<DynRepo>,
     Query(params): Query<UnchinCustomerNetDetailQuery>,
