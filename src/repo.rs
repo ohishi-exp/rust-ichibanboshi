@@ -1150,19 +1150,27 @@ impl AppRepo for TiberiusRepo {
         //   非請求ダミー得意先が行数を食い潰し、本物の得意先が一切表示されない問題が
         //   起きていたため、TOP 上限を撤廃。summary endpoint (SQL 側 GROUP BY) を
         //   主に使う設計に変更したことで、行数による打ち切り自体が起きなくなった)
-        // マスタ参照は surcharge_base と同様にスカラサブクエリで引き、LEFT JOIN による
-        // ファンアウト (1 明細行が N 重複して返る) を避ける。
+        // マスタ参照は surcharge_base と同様にスカラサブクエリ (or OUTER APPLY) で引き、
+        // LEFT JOIN によるファンアウト (1 明細行が N 重複して返る) を避ける。
+        // `部門C`/`部門N` (自社側の受注部門/営業所) は #92 follow-up で追加:
+        // 得意先ﾏｽﾀ/傭車先ﾏｽﾀ 側の `部門C` は得意先・傭車先自身の拠点とは別軸で、
+        // 実機調査 (#93) 確定。OUTER APPLY で得意先N/傭車先N と部門C をまとめて引き、
+        // 部門ﾏｽﾀ を LEFT JOIN して部門N を解決する (m.部門C は最大1行に絞られているため
+        // 通常の LEFT JOIN でもファンアウトしない)。
         let query = if partner_type == "subcontractor" {
             format!(
                 "SELECT \
                  CONCAT(t.[傭車先C], '-', t.[傭車先H]), \
-                 ISNULL((SELECT TOP 1 c.[傭車先N] FROM [傭車先ﾏｽﾀ] c \
-                   WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]), ''), \
+                 ISNULL(m.[傭車先N], ''), \
                  ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
                  ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0), \
                  ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
-                 t.[売上年月日] \
+                 t.[売上年月日], \
+                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
                  FROM [運転日報明細] t \
+                 OUTER APPLY (SELECT TOP 1 c.[傭車先N], c.[部門C] FROM [傭車先ﾏｽﾀ] c \
+                   WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]) m \
+                 LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
                  WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                    AND t.[品名C] NOT IN ('9003', '9998') \
                    AND ISNULL(t.[傭車先C], '000000') != '000000' \
@@ -1174,13 +1182,16 @@ impl AppRepo for TiberiusRepo {
             format!(
                 "SELECT \
                  CONCAT(t.[得意先C], '-', t.[得意先H]), \
-                 ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
-                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), ''), \
+                 ISNULL(m.[得意先N], ''), \
                  ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
                  ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
                  ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
-                 t.[売上年月日] \
+                 t.[売上年月日], \
+                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
                  FROM [運転日報明細] t \
+                 OUTER APPLY (SELECT TOP 1 c.[得意先N], c.[部門C] FROM [得意先ﾏｽﾀ] c \
+                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]) m \
+                 LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
                  WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                    AND t.[品名C] NOT IN ('9003', '9998') \
                    {} \
@@ -1212,32 +1223,40 @@ impl AppRepo for TiberiusRepo {
 
         // 得意先 (or 傭車先) ごとに SUM/GROUP BY で集計する。結果行数 = 取引先数なので
         // raw 行 TOP-N 方式と違い一部の取引先が行数を食い潰して他が消える問題が起きない。
+        // `部門C`/`部門N` は #92 follow-up で追加 (OUTER APPLY の詳細は unchin_candidates
+        // のコメント参照)。APPLY/JOIN の出力列は非集約列なので GROUP BY にも含める必要がある。
         let query = if partner_type == "subcontractor" {
             format!(
                 "SELECT t.[傭車先C], t.[傭車先H], \
-                 ISNULL((SELECT TOP 1 c.[傭車先N] FROM [傭車先ﾏｽﾀ] c \
-                   WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]), ''), \
-                 SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)) \
+                 ISNULL(m.[傭車先N], ''), \
+                 SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)), \
+                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
                  FROM [運転日報明細] t \
+                 OUTER APPLY (SELECT TOP 1 c.[傭車先N], c.[部門C] FROM [傭車先ﾏｽﾀ] c \
+                   WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]) m \
+                 LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
                  WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                    AND t.[品名C] NOT IN ('9003', '9998') \
                    AND ISNULL(t.[傭車先C], '000000') != '000000' \
                    {} \
-                 GROUP BY t.[傭車先C], t.[傭車先H] \
+                 GROUP BY t.[傭車先C], t.[傭車先H], m.[傭車先N], m.[部門C], bm.[部門N] \
                  ORDER BY SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)) DESC",
                 kind_filter
             )
         } else {
             format!(
                 "SELECT t.[得意先C], t.[得意先H], \
-                 ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
-                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), ''), \
-                 SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) \
+                 ISNULL(m.[得意先N], ''), \
+                 SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)), \
+                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
                  FROM [運転日報明細] t \
+                 OUTER APPLY (SELECT TOP 1 c.[得意先N], c.[部門C] FROM [得意先ﾏｽﾀ] c \
+                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]) m \
+                 LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
                  WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                    AND t.[品名C] NOT IN ('9003', '9998') \
                    {} \
-                 GROUP BY t.[得意先C], t.[得意先H] \
+                 GROUP BY t.[得意先C], t.[得意先H], m.[得意先N], m.[部門C], bm.[部門N] \
                  ORDER BY SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) DESC",
                 kind_filter
             )
@@ -1334,6 +1353,8 @@ impl TiberiusRepo {
                 partner_code: format!("{}-{}", decode_cp932(r, 0), decode_cp932(r, 1)),
                 partner_name: decode_cp932(r, 2),
                 total: get_i64(r, 3),
+                bumon_code: decode_cp932(r, 4),
+                bumon_name: decode_cp932(r, 5),
             })
             .collect()
     }
@@ -1349,6 +1370,8 @@ impl TiberiusRepo {
                 origin: decode_cp932(r, 5),
                 dest: decode_cp932(r, 6),
                 sale_date: r.get(7).unwrap_or_default(),
+                bumon_code: decode_cp932(r, 8),
+                bumon_name: decode_cp932(r, 9),
             })
             .collect()
     }

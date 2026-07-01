@@ -357,6 +357,8 @@ impl AppRepo for MockRepo {
                 origin: "鳥栖".into(),
                 dest: "大石運輸  本社".into(),
                 sale_date: dt(2026, 6, 18),
+                bumon_code: "012".into(),
+                bumon_name: "佐賀".into(),
             }]);
         }
         Ok(vec![
@@ -369,6 +371,8 @@ impl AppRepo for MockRepo {
                 origin: "釧路".into(),
                 dest: "八代".into(),
                 sale_date: dt(2026, 6, 20),
+                bumon_code: "010".into(),
+                bumon_name: "本社".into(),
             },
             // 空品名コード (汎用コード、過剰集約の補正対象。#57 確定事項)
             RawUnchinRow {
@@ -380,6 +384,8 @@ impl AppRepo for MockRepo {
                 origin: "".into(),
                 dest: "福岡県北九州市".into(),
                 sale_date: dt(2026, 6, 19),
+                bumon_code: "010".into(),
+                bumon_name: "本社".into(),
             },
         ])
     }
@@ -396,12 +402,16 @@ impl AppRepo for MockRepo {
                 partner_code: "021970-000".into(),
                 partner_name: "㈱九州運輸".into(),
                 total: 28_000,
+                bumon_code: "012".into(),
+                bumon_name: "佐賀".into(),
             }]);
         }
         Ok(vec![RawUnchinSummaryRow {
             partner_code: "034760-015".into(),
             partner_name: "全農物流㈱　九州支店".into(),
             total: 170_000,
+            bumon_code: "010".into(),
+            bumon_name: "本社".into(),
         }])
     }
 }
