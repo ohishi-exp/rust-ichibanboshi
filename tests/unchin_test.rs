@@ -3,8 +3,9 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rust_ichibanboshi::routes::unchin::{
-    build_unchin_rows, build_unchin_subcontractor_net_rows, build_unchin_summary_rows,
-    normalize_partner_type, unchin_kind_filter, unchin_kind_label, RawUnchinRow,
+    build_unchin_rows, build_unchin_subcontractor_net_detail_rows,
+    build_unchin_subcontractor_net_rows, build_unchin_summary_rows, normalize_partner_type,
+    unchin_kind_filter, unchin_kind_label, RawUnchinRow, RawUnchinSubcontractorNetDetailRow,
     RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use tower::ServiceExt;
@@ -193,6 +194,62 @@ fn test_build_unchin_subcontractor_net_rows_negative_diff() {
 #[test]
 fn test_build_unchin_subcontractor_net_rows_empty() {
     assert!(build_unchin_subcontractor_net_rows(&[]).is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════
+// 純粋関数: build_unchin_subcontractor_net_detail_rows
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_build_unchin_subcontractor_net_detail_rows_positive_diff() {
+    let raw = vec![RawUnchinSubcontractorNetDetailRow {
+        item_code: "6301".into(),
+        item_name: "フレコン".into(),
+        customer_name: "㈱九州テスト物産".into(),
+        sales: 28_000,
+        payment: 20_000,
+        origin: "鳥栖".into(),
+        dest: "大石運輸  本社".into(),
+        sale_date: dt(2026, 6, 18),
+        bumon_code: "012".into(),
+        bumon_name: "佐賀".into(),
+    }];
+    let rows = build_unchin_subcontractor_net_detail_rows(&raw);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item_code, "6301");
+    assert_eq!(rows[0].item_name, "フレコン");
+    assert_eq!(rows[0].customer_name, "㈱九州テスト物産");
+    assert_eq!(rows[0].sales, 28_000);
+    assert_eq!(rows[0].payment, 20_000);
+    assert_eq!(rows[0].diff, 8_000);
+    assert_eq!(rows[0].origin, "鳥栖");
+    assert_eq!(rows[0].dest, "大石運輸  本社");
+    assert_eq!(rows[0].sale_date, "2026-06-18");
+    assert_eq!(rows[0].bumon_code, "012");
+    assert_eq!(rows[0].bumon_name, "佐賀");
+}
+
+#[test]
+fn test_build_unchin_subcontractor_net_detail_rows_negative_diff() {
+    let raw = vec![RawUnchinSubcontractorNetDetailRow {
+        item_code: "0000".into(),
+        item_name: "".into(),
+        customer_name: "".into(),
+        sales: 5_000,
+        payment: 9_000,
+        origin: "".into(),
+        dest: "".into(),
+        sale_date: dt(2026, 1, 1),
+        bumon_code: "".into(),
+        bumon_name: "".into(),
+    }];
+    let rows = build_unchin_subcontractor_net_detail_rows(&raw);
+    assert_eq!(rows[0].diff, -4_000);
+}
+
+#[test]
+fn test_build_unchin_subcontractor_net_detail_rows_empty() {
+    assert!(build_unchin_subcontractor_net_detail_rows(&[]).is_empty());
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -410,6 +467,86 @@ async fn test_unchin_subcontractor_net_query_error() {
         .oneshot(
             Request::builder()
                 .uri("/api/unchin/subcontractor-net")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+// ══════════════════════════════════════════════════════════════
+// ハンドラ: GET /api/unchin/subcontractor-net-detail
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_unchin_subcontractor_net_detail_ok_defaults() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/subcontractor-net-detail?code=021970&h=000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unchin_subcontractor_net_detail_ok_with_params() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/subcontractor-net-detail?from=2026-04-01&to=2026-07-01&kind=with_billing_only&code=021970&h=000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unchin_subcontractor_net_detail_missing_code_returns_400() {
+    // code/h は必須 query param (Deserialize が失敗 → axum が 400 Bad Request を返す)
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/subcontractor-net-detail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_unchin_subcontractor_net_detail_pool_error() {
+    let app = common::build_app(common::error_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/subcontractor-net-detail?code=021970&h=000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_unchin_subcontractor_net_detail_query_error() {
+    let app = common::build_app(common::query_error_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/unchin/subcontractor-net-detail?code=021970&h=000")
                 .body(Body::empty())
                 .unwrap(),
         )

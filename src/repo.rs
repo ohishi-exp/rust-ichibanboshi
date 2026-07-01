@@ -4,7 +4,10 @@ use std::sync::Arc;
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
-use crate::routes::unchin::{RawUnchinRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow};
+use crate::routes::unchin::{
+    RawUnchinRow, RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow,
+    RawUnchinSummaryRow,
+};
 use crate::routes::uriage::UriageRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
@@ -147,6 +150,17 @@ pub trait AppRepo: Send + Sync {
         to: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError>;
+
+    /// `unchin_subcontractor_net` のドリルダウン。特定の傭車先 (`code`=傭車先C,
+    /// `h`=傭車先H) について、運行 (行) 単位の得意先請求/傭車支払を返す。
+    async fn unchin_subcontractor_net_detail(
+        &self,
+        from: &str,
+        to: &str,
+        code: &str,
+        h: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetDetailRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -1337,6 +1351,55 @@ impl AppRepo for TiberiusRepo {
 
         Ok(Self::rows_to_unchin_subcontractor_net(&rows))
     }
+
+    async fn unchin_subcontractor_net_detail(
+        &self,
+        from: &str,
+        to: &str,
+        code: &str,
+        h: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetDetailRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // unchin_subcontractor_net のドリルダウン。特定の傭車先C+H に絞り込み、
+        // 集計せず運行 (行) 単位で 得意先側金額 と 傭車先側金額 を両方読む。
+        // 得意先N はその行の 得意先C/得意先H から OUTER APPLY で引く
+        // (unchin_summary の customer 側と同じ引き方)。
+        let query = format!(
+            "SELECT \
+             ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
+             ISNULL(cm.[得意先N], ''), \
+             ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
+             ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0), \
+             ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
+             t.[売上年月日], \
+             ISNULL(sm.[部門C], ''), ISNULL(bm.[部門N], '') \
+             FROM [運転日報明細] t \
+             OUTER APPLY (SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
+               WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]) cm \
+             OUTER APPLY (SELECT TOP 1 c.[部門C] FROM [傭車先ﾏｽﾀ] c \
+               WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]) sm \
+             LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = sm.[部門C] \
+             WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+               AND t.[品名C] NOT IN ('9003', '9998') \
+               AND t.[傭車先C] = @P3 AND t.[傭車先H] = @P4 \
+               {} \
+             ORDER BY t.[売上年月日] DESC",
+            kind_filter
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to, &code, &h])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_unchin_subcontractor_net_detail(&rows))
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -1438,6 +1501,25 @@ impl TiberiusRepo {
                 total_payment: get_i64(r, 4),
                 bumon_code: decode_cp932(r, 5),
                 bumon_name: decode_cp932(r, 6),
+            })
+            .collect()
+    }
+
+    fn rows_to_unchin_subcontractor_net_detail(
+        rows: &[tiberius::Row],
+    ) -> Vec<RawUnchinSubcontractorNetDetailRow> {
+        rows.iter()
+            .map(|r| RawUnchinSubcontractorNetDetailRow {
+                item_code: decode_cp932(r, 0),
+                item_name: decode_cp932(r, 1),
+                customer_name: decode_cp932(r, 2),
+                sales: get_i64(r, 3),
+                payment: get_i64(r, 4),
+                origin: decode_cp932(r, 5),
+                dest: decode_cp932(r, 6),
+                sale_date: r.get(7).unwrap_or_default(),
+                bumon_code: decode_cp932(r, 8),
+                bumon_name: decode_cp932(r, 9),
             })
             .collect()
     }
