@@ -279,11 +279,11 @@ fn test_build_unchin_customer_net_rows_positive_diff() {
 }
 
 #[test]
-fn test_build_unchin_customer_net_rows_own_fleet_only_diff_equals_sales() {
-    // 自社便のみの得意先は total_payment=0 → diff = total_sales
+fn test_build_unchin_customer_net_rows_zero_payment_diff_equals_sales() {
+    // total_payment=0 (SQL 側は自社便を除外済みだが、純粋関数は入力をそのまま計算する)
     let raw = vec![RawUnchinCustomerNetRow {
         partner_code: "099999-000".into(),
-        partner_name: "自社便のみテスト".into(),
+        partner_name: "ゼロ支払テスト".into(),
         total_sales: 50_000,
         total_payment: 0,
         bumon_code: "".into(),
@@ -327,8 +327,9 @@ fn test_build_unchin_customer_net_detail_rows_with_subcontractor() {
 }
 
 #[test]
-fn test_build_unchin_customer_net_detail_rows_own_fleet_empty_subcontractor_name() {
-    // 自社便の行は 傭車先C='000000' がマスタに存在しないため subcontractor_name が空文字
+fn test_build_unchin_customer_net_detail_rows_zero_payment() {
+    // payment=0 のエッジケース (SQL 側は自社便を除外済みだが、純粋関数は
+    // 入力をそのまま計算する)
     let raw = vec![RawUnchinCustomerNetDetailRow {
         item_code: "0000".into(),
         item_name: "".into(),
@@ -342,7 +343,6 @@ fn test_build_unchin_customer_net_detail_rows_own_fleet_empty_subcontractor_name
         bumon_name: "".into(),
     }];
     let rows = build_unchin_customer_net_detail_rows(&raw);
-    assert_eq!(rows[0].subcontractor_name, "");
     assert_eq!(rows[0].diff, 15_000);
 }
 

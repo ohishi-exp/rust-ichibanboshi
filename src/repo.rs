@@ -165,7 +165,8 @@ pub trait AppRepo: Send + Sync {
     /// 得意先ごとに、請求合計 (`total_sales`) と傭車を使った分の支払合計
     /// (`total_payment`) を同一行から同時集計する (`unchin_subcontractor_net`
     /// を得意先軸で見たもの、2026-07-01 user 確認)。`partner_type` は無い
-    /// (常に得意先起点、自社便含む全行が対象)。
+    /// (常に得意先起点)。自社便 (傭車先C='000000') の行は常に除外する
+    /// (2026-07-01 user 確認「トグルじゃない もとからなくして グラフも」)。
     async fn unchin_customer_net(
         &self,
         from: &str,
@@ -1432,10 +1433,11 @@ impl AppRepo for TiberiusRepo {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
 
         // 得意先C-得意先H ごとに GROUP BY し、請求合計 (金額+割増+実費) と
-        // 傭車支払合計 (傭車金額+傭車割増+傭車実費、自社便の行は 0) を同時に SUM する
+        // 傭車支払合計 (傭車金額+傭車割増+傭車実費) を同時に SUM する
         // (= unchin_subcontractor_net を得意先軸で見たもの、2026-07-01 user 確認
-        // 「傭車先じゃなくて得意先にグラフ直して」)。傭車先ガード (!= '000000') は
-        // 付けない — 自社便のみの得意先も対象に含め、その場合 diff = total_sales。
+        // 「傭車先じゃなくて得意先にグラフ直して」)。自社便 (傭車先C='000000') の行は
+        // 常に除外する — 自社便を含めるかのトグルは設けず、SQL 側で最初から対象外にする
+        // (2026-07-01 user 確認「トグルじゃない もとからなくして グラフも」)。
         let query = format!(
             "SELECT t.[得意先C], t.[得意先H], \
              ISNULL(m.[得意先N], ''), \
@@ -1448,6 +1450,7 @@ impl AppRepo for TiberiusRepo {
              LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                AND t.[品名C] NOT IN ('9003', '9998') \
+               AND ISNULL(t.[傭車先C], '000000') != '000000' \
                {} \
              GROUP BY t.[得意先C], t.[得意先H], m.[得意先N], m.[部門C], bm.[部門N] \
              ORDER BY SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) \
@@ -1479,8 +1482,9 @@ impl AppRepo for TiberiusRepo {
 
         // unchin_customer_net のドリルダウン。特定の得意先C+H に絞り込み、
         // 集計せず運行 (行) 単位で 得意先側金額 と 傭車先側金額 を両方読む。
-        // 傭車先N はその行の 傭車先C/傭車先H から OUTER APPLY で引く
-        // (自社便は 傭車先C='000000' がマスタに存在しないため空文字になる)。
+        // 傭車先N はその行の 傭車先C/傭車先H から OUTER APPLY で引く。自社便
+        // (傭車先C='000000') の行は unchin_customer_net と同じガードで常に除外する
+        // (2026-07-01 user 確認「トグルじゃない もとからなくして グラフも」)。
         let query = format!(
             "SELECT \
              ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
@@ -1499,6 +1503,7 @@ impl AppRepo for TiberiusRepo {
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                AND t.[品名C] NOT IN ('9003', '9998') \
                AND t.[得意先C] = @P3 AND t.[得意先H] = @P4 \
+               AND ISNULL(t.[傭車先C], '000000') != '000000' \
                {} \
              ORDER BY t.[売上年月日] DESC",
             kind_filter
