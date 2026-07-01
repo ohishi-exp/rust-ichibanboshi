@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
-use crate::routes::unchin::{RawUnchinRow, RawUnchinSummaryRow};
+use crate::routes::unchin::{RawUnchinRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow};
 use crate::routes::uriage::UriageRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
@@ -135,6 +135,18 @@ pub trait AppRepo: Send + Sync {
         partner_type: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinSummaryRow>, RepoError>;
+
+    /// 傭車先ごとに、その傭車先が使われた運行の得意先請求合計 (`total_sales`) と
+    /// その傭車先への支払合計 (`total_payment`) を同一行から同時集計する
+    /// (2026-07-01 user 確認: 「同一運行内の両建て」— 名寄せではなく、
+    /// 運転日報明細の同一行にある 得意先側金額 と 傭車先側金額 を突き合わせる)。
+    /// `partner_type` は無い (常に傭車先 != '000000' の行のみ対象)。
+    async fn unchin_subcontractor_net(
+        &self,
+        from: &str,
+        to: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -1279,6 +1291,52 @@ impl AppRepo for TiberiusRepo {
 
         Ok(Self::rows_to_unchin_summary(&rows))
     }
+
+    async fn unchin_subcontractor_net(
+        &self,
+        from: &str,
+        to: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 傭車先C-傭車先H ごとに GROUP BY し、同一行にある得意先側金額
+        // (金額+割増+実費) と傭車先側金額 (傭車金額+傭車割増+傭車実費) を
+        // 同時に SUM する (= 「その傭車先を使った運行の得意先請求合計」と
+        // 「その傭車先への支払合計」、2026-07-01 user 確認「同一運行内の両建て」)。
+        // フォーミュラは unchin_summary と同じ式に揃える (税抜カラムを使う
+        // uriage 側の月計一致式とは別物、#57 確定式のまま踏襲)。
+        let query = format!(
+            "SELECT t.[傭車先C], t.[傭車先H], \
+             ISNULL(m.[傭車先N], ''), \
+             SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)), \
+             SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)), \
+             ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
+             FROM [運転日報明細] t \
+             OUTER APPLY (SELECT TOP 1 c.[傭車先N], c.[部門C] FROM [傭車先ﾏｽﾀ] c \
+               WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]) m \
+             LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
+             WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+               AND t.[品名C] NOT IN ('9003', '9998') \
+               AND ISNULL(t.[傭車先C], '000000') != '000000' \
+               {} \
+             GROUP BY t.[傭車先C], t.[傭車先H], m.[傭車先N], m.[部門C], bm.[部門N] \
+             ORDER BY SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) \
+               - SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)) DESC",
+            kind_filter
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_unchin_subcontractor_net(&rows))
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -1365,6 +1423,21 @@ impl TiberiusRepo {
                 total: get_i64(r, 3),
                 bumon_code: decode_cp932(r, 4),
                 bumon_name: decode_cp932(r, 5),
+            })
+            .collect()
+    }
+
+    fn rows_to_unchin_subcontractor_net(
+        rows: &[tiberius::Row],
+    ) -> Vec<RawUnchinSubcontractorNetRow> {
+        rows.iter()
+            .map(|r| RawUnchinSubcontractorNetRow {
+                partner_code: format!("{}-{}", decode_cp932(r, 0), decode_cp932(r, 1)),
+                partner_name: decode_cp932(r, 2),
+                total_sales: get_i64(r, 3),
+                total_payment: get_i64(r, 4),
+                bumon_code: decode_cp932(r, 5),
+                bumon_name: decode_cp932(r, 6),
             })
             .collect()
     }
