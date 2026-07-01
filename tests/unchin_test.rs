@@ -75,6 +75,8 @@ fn test_build_unchin_rows_normal_and_edges() {
             origin: "釧路".into(),
             dest: "八代".into(),
             sale_date: dt(2026, 6, 20),
+            bumon_code: "010".into(),
+            bumon_name: "本社".into(),
         },
         // エッジ: 空品名コード・空積地
         RawUnchinRow {
@@ -86,6 +88,8 @@ fn test_build_unchin_rows_normal_and_edges() {
             origin: "".into(),
             dest: "福岡県北九州市".into(),
             sale_date: dt(2026, 6, 19),
+            bumon_code: "".into(),
+            bumon_name: "".into(),
         },
     ];
 
@@ -101,12 +105,16 @@ fn test_build_unchin_rows_normal_and_edges() {
     assert_eq!(first.origin, "釧路");
     assert_eq!(first.dest, "八代");
     assert_eq!(first.sale_date, "2026-06-20");
+    assert_eq!(first.bumon_code, "010");
+    assert_eq!(first.bumon_name, "本社");
 
     let second = &rows[1];
     assert_eq!(second.item_code, "0000");
     assert_eq!(second.item_name, "");
     assert_eq!(second.origin, "");
     assert_eq!(second.dest, "福岡県北九州市");
+    assert_eq!(second.bumon_code, "");
+    assert_eq!(second.bumon_name, "");
 }
 
 #[test]
@@ -124,11 +132,15 @@ fn test_build_unchin_summary_rows() {
         partner_code: "034760-015".into(),
         partner_name: "全農物流㈱　九州支店".into(),
         total: 170_000,
+        bumon_code: "010".into(),
+        bumon_name: "本社".into(),
     }];
     let rows = build_unchin_summary_rows(&raw);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].partner_code, "034760-015");
     assert_eq!(rows[0].total, 170_000);
+    assert_eq!(rows[0].bumon_code, "010");
+    assert_eq!(rows[0].bumon_name, "本社");
 }
 
 #[test]
