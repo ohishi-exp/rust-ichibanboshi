@@ -5,8 +5,8 @@ use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
 use crate::routes::unchin::{
-    RawUnchinRow, RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow,
-    RawUnchinSummaryRow,
+    RawUnchinCustomerNetDetailRow, RawUnchinCustomerNetRow, RawUnchinRow,
+    RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use crate::routes::uriage::UriageRow;
 
@@ -161,6 +161,28 @@ pub trait AppRepo: Send + Sync {
         h: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinSubcontractorNetDetailRow>, RepoError>;
+
+    /// 得意先ごとに、請求合計 (`total_sales`) と傭車を使った分の支払合計
+    /// (`total_payment`) を同一行から同時集計する (`unchin_subcontractor_net`
+    /// を得意先軸で見たもの、2026-07-01 user 確認)。`partner_type` は無い
+    /// (常に得意先起点、自社便含む全行が対象)。
+    async fn unchin_customer_net(
+        &self,
+        from: &str,
+        to: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetRow>, RepoError>;
+
+    /// `unchin_customer_net` のドリルダウン。特定の得意先 (`code`=得意先C,
+    /// `h`=得意先H) について、運行 (行) 単位の請求/傭車支払を返す。
+    async fn unchin_customer_net_detail(
+        &self,
+        from: &str,
+        to: &str,
+        code: &str,
+        h: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetDetailRow>, RepoError>;
 }
 
 pub type DynRepo = Arc<dyn AppRepo>;
@@ -1400,6 +1422,99 @@ impl AppRepo for TiberiusRepo {
 
         Ok(Self::rows_to_unchin_subcontractor_net_detail(&rows))
     }
+
+    async fn unchin_customer_net(
+        &self,
+        from: &str,
+        to: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 得意先C-得意先H ごとに GROUP BY し、請求合計 (金額+割増+実費) と
+        // 傭車支払合計 (傭車金額+傭車割増+傭車実費、自社便の行は 0) を同時に SUM する
+        // (= unchin_subcontractor_net を得意先軸で見たもの、2026-07-01 user 確認
+        // 「傭車先じゃなくて得意先にグラフ直して」)。傭車先ガード (!= '000000') は
+        // 付けない — 自社便のみの得意先も対象に含め、その場合 diff = total_sales。
+        let query = format!(
+            "SELECT t.[得意先C], t.[得意先H], \
+             ISNULL(m.[得意先N], ''), \
+             SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)), \
+             SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)), \
+             ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
+             FROM [運転日報明細] t \
+             OUTER APPLY (SELECT TOP 1 c.[得意先N], c.[部門C] FROM [得意先ﾏｽﾀ] c \
+               WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]) m \
+             LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = m.[部門C] \
+             WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+               AND t.[品名C] NOT IN ('9003', '9998') \
+               {} \
+             GROUP BY t.[得意先C], t.[得意先H], m.[得意先N], m.[部門C], bm.[部門N] \
+             ORDER BY SUM(ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0)) \
+               - SUM(ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0)) DESC",
+            kind_filter
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_unchin_customer_net(&rows))
+    }
+
+    async fn unchin_customer_net_detail(
+        &self,
+        from: &str,
+        to: &str,
+        code: &str,
+        h: &str,
+        kind_filter: &str,
+    ) -> Result<Vec<RawUnchinCustomerNetDetailRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // unchin_customer_net のドリルダウン。特定の得意先C+H に絞り込み、
+        // 集計せず運行 (行) 単位で 得意先側金額 と 傭車先側金額 を両方読む。
+        // 傭車先N はその行の 傭車先C/傭車先H から OUTER APPLY で引く
+        // (自社便は 傭車先C='000000' がマスタに存在しないため空文字になる)。
+        let query = format!(
+            "SELECT \
+             ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
+             ISNULL(sm.[傭車先N], ''), \
+             ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
+             ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0), \
+             ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
+             t.[売上年月日], \
+             ISNULL(cm.[部門C], ''), ISNULL(bm.[部門N], '') \
+             FROM [運転日報明細] t \
+             OUTER APPLY (SELECT TOP 1 c.[傭車先N] FROM [傭車先ﾏｽﾀ] c \
+               WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]) sm \
+             OUTER APPLY (SELECT TOP 1 c.[部門C] FROM [得意先ﾏｽﾀ] c \
+               WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]) cm \
+             LEFT JOIN [部門ﾏｽﾀ] bm ON bm.[部門C] = cm.[部門C] \
+             WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+               AND t.[品名C] NOT IN ('9003', '9998') \
+               AND t.[得意先C] = @P3 AND t.[得意先H] = @P4 \
+               {} \
+             ORDER BY t.[売上年月日] DESC",
+            kind_filter
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to, &code, &h])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_unchin_customer_net_detail(&rows))
+    }
 }
 
 // ── Row → Raw 変換ヘルパー ──
@@ -1513,6 +1628,38 @@ impl TiberiusRepo {
                 item_code: decode_cp932(r, 0),
                 item_name: decode_cp932(r, 1),
                 customer_name: decode_cp932(r, 2),
+                sales: get_i64(r, 3),
+                payment: get_i64(r, 4),
+                origin: decode_cp932(r, 5),
+                dest: decode_cp932(r, 6),
+                sale_date: r.get(7).unwrap_or_default(),
+                bumon_code: decode_cp932(r, 8),
+                bumon_name: decode_cp932(r, 9),
+            })
+            .collect()
+    }
+
+    fn rows_to_unchin_customer_net(rows: &[tiberius::Row]) -> Vec<RawUnchinCustomerNetRow> {
+        rows.iter()
+            .map(|r| RawUnchinCustomerNetRow {
+                partner_code: format!("{}-{}", decode_cp932(r, 0), decode_cp932(r, 1)),
+                partner_name: decode_cp932(r, 2),
+                total_sales: get_i64(r, 3),
+                total_payment: get_i64(r, 4),
+                bumon_code: decode_cp932(r, 5),
+                bumon_name: decode_cp932(r, 6),
+            })
+            .collect()
+    }
+
+    fn rows_to_unchin_customer_net_detail(
+        rows: &[tiberius::Row],
+    ) -> Vec<RawUnchinCustomerNetDetailRow> {
+        rows.iter()
+            .map(|r| RawUnchinCustomerNetDetailRow {
+                item_code: decode_cp932(r, 0),
+                item_name: decode_cp932(r, 1),
+                subcontractor_name: decode_cp932(r, 2),
                 sales: get_i64(r, 3),
                 payment: get_i64(r, 4),
                 origin: decode_cp932(r, 5),
