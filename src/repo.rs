@@ -1050,6 +1050,12 @@ impl AppRepo for TiberiusRepo {
                  ISNULL(t.[傭車先C], '000000') AS [傭車先C], \
                  CONVERT(varchar(10), t.[運行年月日], 23) AS [運行年月日], \
                  CONVERT(varchar(10), t.[売上年月日], 23) AS [売上年月日], \
+                 CONCAT(ISNULL(t.[得意先C], ''), '-', ISNULL(t.[得意先H], '')) AS [得意先複合キー], \
+                 ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c \
+                   WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]), '') AS [得意先N], \
+                 CONCAT(ISNULL(t.[傭車先C], ''), '-', ISNULL(t.[傭車先H], '')) AS [傭車先複合キー], \
+                 ISNULL((SELECT TOP 1 y.[傭車先N] FROM [傭車先ﾏｽﾀ] y \
+                   WHERE y.[傭車先C] = t.[傭車先C] AND y.[傭車先H] = t.[傭車先H]), '') AS [傭車先N], \
                  t.[管理C] AS [管理C], t.[LC] AS [LC]";
 
         // 各 case 共通の WHERE 述語 (日付・品名・日報K・請求K・備考2 系)
@@ -1343,6 +1349,10 @@ impl TiberiusRepo {
                 // CONVERT(varchar(10), …, 23) で 'YYYY-MM-DD' 文字列が返る (locale 非依存)
                 unko_date: decode_cp932(r, 15),
                 uriage_date: decode_cp932(r, 16),
+                tokuisaki_key: decode_cp932(r, 17),
+                tokuisaki_n: decode_cp932(r, 18),
+                yoshasaki_key: decode_cp932(r, 19),
+                yoshasaki_n: decode_cp932(r, 20),
             })
             .collect()
     }

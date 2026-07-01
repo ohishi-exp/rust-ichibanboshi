@@ -82,6 +82,18 @@ pub struct UriageRow {
     /// verify_debug の debug 表示で「PHP `/print-json` が 売上年月日 でフィルタしている
     /// 場合、Rust の 運行年月日 フィルタとは pick する行が変わる」可能性を確認する用途。
     pub uriage_date: String,
+    /// 得意先複合キー (`得意先C`+`-`+`得意先H`)。得意先ﾏｽﾀは `得意先C` 単体では
+    /// 一意にならない (#57 実機調査確定、`unchin.rs` と同じ罠) ため複合キーで扱う。
+    /// 担当者×得意先 内訳 (Refs 担当者ドリルダウン) 用。
+    pub tokuisaki_key: String,
+    /// 得意先名 (`得意先ﾏｽﾀ.得意先N`、TOP 1 スカラサブクエリで解決)。
+    pub tokuisaki_n: String,
+    /// 傭車先複合キー (`傭車先C`+`-`+`傭車先H`)。`yoshasaki_c` (自車/傭車判定専用、
+    /// `"000000"` 比較のみに使う) とは別に持つ — 傭車先H を欠くと名寄せがズレる
+    /// (#57 と同じ罠)。担当者×傭車先 内訳用。
+    pub yoshasaki_key: String,
+    /// 傭車先名 (`傭車先ﾏｽﾀ.傭車先N`)。
+    pub yoshasaki_n: String,
 }
 
 /// `cal_total()` (PHP 803-819) 等価。営業所別月次集計で使う 1 行ぶんのサブ
@@ -157,6 +169,22 @@ pub struct RowDecision {
     pub matched: bool,
     /// 振替後担当 (`$tanto`)。空文字なら表示しない or 未確定。
     pub tanto: String,
+    /// この行が `sum` (担当者別集計) に実際に積算されたかどうか。
+    ///
+    /// `tanto` は「表示用の担当者名」であって積算有無とは独立 (B4/B6 は tanto が
+    /// 埋まっても集計しないケースがある)。このフラグは既存の `sum` 計算を一切
+    /// 変えず、`accumulate()` を呼んだかどうかをそのまま記録するだけの追加情報
+    /// (Refs 担当者×得意先/傭車先 ドリルダウン)。`compute_person_partner_sum_by_day`
+    /// が「担当者集計と同じ行だけ」を得意先/傭車先で再集計する際に使う。
+    pub aggregated: bool,
+    /// この行の得意先側加算額 (`金額+値引+割増+実費`、`accumulate()` に渡した
+    /// `kingaku_sum` と同値)。`compute_person_sum` の外へ formula を複製せず、
+    /// 唯一の計算元から得意先内訳を再集計できるようにするための追加情報。
+    pub kingaku_sum: i64,
+    /// この行の傭車先側加算額 (`accumulate()` に渡した `yosha_sum` と同値。
+    /// 横横=1 の行は「金額側」がここにコピーされる点に注意、`compute_person_sum`
+    /// のコメント参照)。
+    pub yosha_sum: i64,
 }
 
 /// `compute_person_sum` の戻り値。PHP では `['sum' => ..., 'rows' => ...]`。
@@ -209,6 +237,9 @@ pub fn compute_person_sum(
                 ck: false,
                 matched: false,
                 tanto: String::new(),
+                aggregated: false,
+                kingaku_sum: 0,
+                yosha_sum: 0,
             });
             continue;
         }
@@ -268,6 +299,8 @@ pub fn compute_person_sum(
         let should_aggregate = uriage_diff || !other.contains_key(&ichi.kado_bumon);
 
         let mut tanto = String::new();
+        // `accumulate()` を実際に呼んだかどうか (aggregated フラグ用、sum 計算には無関係)。
+        let mut aggregated = false;
 
         // print.php:284-355 — 6 段階 if-elseif
         if let Some(fr) = uriage_fr_name
@@ -278,6 +311,7 @@ pub fn compute_person_sum(
             tanto.push_str(fr);
             if should_aggregate {
                 accumulate(&mut sum, fr, kingaku_sum, yosha_sum, ichi.yokoyoko);
+                aggregated = true;
             }
         } else if let Some(to) = uriage_to_name
             .as_deref()
@@ -287,6 +321,7 @@ pub fn compute_person_sum(
             tanto.push_str(to);
             if should_aggregate {
                 accumulate(&mut sum, to, kingaku_sum, yosha_sum, ichi.yokoyoko);
+                aggregated = true;
             }
         } else if person_names.contains(lookup_key.as_str()) {
             // B3: 備考2 を空白除去・「売上」除去した結果がマスタに居る
@@ -299,6 +334,7 @@ pub fn compute_person_sum(
                 ichi.biko2 != "表示" && (ichi.seikyu_k != 2 || ichi.biko2.contains("売上"));
             if allow_seikyu && should_aggregate {
                 accumulate(&mut sum, &lookup_key, kingaku_sum, yosha_sum, ichi.yokoyoko);
+                aggregated = true;
             }
             tanto = lookup_key.clone();
         } else if ichi.biko2 == "表示のみ" && ichi.seikyu_k != 2 {
@@ -320,6 +356,7 @@ pub fn compute_person_sum(
             if !(ichi.biko2 == "表示" && ichi.seikyu_k == 2) && should_aggregate {
                 let name = name.clone();
                 accumulate(&mut sum, &name, kingaku_sum, yosha_sum, ichi.yokoyoko);
+                aggregated = true;
             }
         } else {
             // B6: いずれも該当せず
@@ -338,6 +375,9 @@ pub fn compute_person_sum(
             ck,
             matched,
             tanto,
+            aggregated,
+            kingaku_sum,
+            yosha_sum,
         });
     }
 
@@ -392,6 +432,147 @@ pub fn compute_person_sum_by_day(
         }
     }
     out
+}
+
+/// 得意先 or 傭車先の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartnerKind {
+    Customer,
+    Subcontractor,
+}
+
+impl PartnerKind {
+    /// SQLite `partner_kind` カラム / HTTP query param の文字列表現。
+    /// `unchin.rs::normalize_partner_type` と同じ語彙 (`"customer"`/`"subcontractor"`)。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Customer => "customer",
+            Self::Subcontractor => "subcontractor",
+        }
+    }
+}
+
+/// 担当者×得意先/傭車先 1 キーぶんの集計値。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PartnerAccum {
+    /// 得意先名 or 傭車先名 (`得意先ﾏｽﾀ.得意先N` / `傭車先ﾏｽﾀ.傭車先N`)。
+    pub partner_name: String,
+    pub kingaku: i64,
+    pub kensuu: i64,
+    /// 横横=0 のみの金額累計 (横横除外フィルタ用、`PersonAccum.kingaku_y0` と同じ考え方)。
+    pub kingaku_y0: i64,
+    pub kensuu_y0: i64,
+}
+
+/// `(担当者名, 得意先/傭車先種別, 取引先複合キー)`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PersonPartnerKey {
+    pub person_name: String,
+    pub partner_kind: PartnerKind,
+    /// 得意先複合キー (`得意先C-得意先H`) or 傭車先複合キー (`傭車先C-傭車先H`)。
+    pub partner_code: String,
+}
+
+/// 日次集計版・担当者×得意先/傭車先 内訳 (`compute_person_sum` の後段レイヤ)。
+///
+/// **`compute_person_sum` の 6 段階 if-elseif には一切触れない** (リファクタ禁止
+/// 制約を遵守)。代わりに `compute_person_sum` が確定させた `RowDecision`
+/// (`aggregated`/`tanto`/`kingaku_sum`/`yosha_sum`) をそのまま再利用し、
+/// 「担当者集計に実際に積算された行」だけをさらに得意先/傭車先で細分する。
+///
+/// - 得意先内訳は `kingaku_sum` (`PersonAccum.kingaku` と同じ加算元) を積む
+/// - 傭車先内訳は `yosha_sum` (`PersonAccum.yosha_kingaku` と同じ加算元、横横=1 の
+///   行では金額側がコピーされている点に注意) を積む
+///
+/// これにより各内訳の SUM は必ず対応する `PersonAccum` の値と一致する
+/// (`tests/uriage_test.rs` の consistency テストで担保)。
+///
+/// 返り値は `unko_date` → `(担当者, 種別, 取引先複合キー)` → `PartnerAccum`。
+pub fn compute_person_partner_sum_by_day(
+    rows: &[UriageRow],
+    persons: &HashMap<i32, String>,
+    other: &HashMap<String, String>,
+    cal: bool,
+) -> HashMap<String, HashMap<PersonPartnerKey, PartnerAccum>> {
+    let mut by_day: HashMap<String, Vec<UriageRow>> = HashMap::new();
+    for r in rows {
+        by_day
+            .entry(r.unko_date.clone())
+            .or_default()
+            .push(r.clone());
+    }
+
+    let mut out: HashMap<String, HashMap<PersonPartnerKey, PartnerAccum>> = HashMap::new();
+    for (date, day_rows) in by_day {
+        // compute_person_sum を再実行して RowDecision (aggregated/tanto/各 sum) を得る。
+        // compute_person_sum_by_day と同様に日単位で呼ぶ (cal 判定が日内で閉じるため)。
+        let result = compute_person_sum(&day_rows, persons, other, cal);
+        let mut per_day: HashMap<PersonPartnerKey, PartnerAccum> = HashMap::new();
+
+        for (row, decision) in day_rows.iter().zip(result.rows.iter()) {
+            if !decision.aggregated {
+                continue;
+            }
+            accumulate_partner(
+                &mut per_day,
+                &decision.tanto,
+                PartnerKind::Customer,
+                &row.tokuisaki_key,
+                &row.tokuisaki_n,
+                decision.kingaku_sum,
+                row.yokoyoko,
+            );
+            accumulate_partner(
+                &mut per_day,
+                &decision.tanto,
+                PartnerKind::Subcontractor,
+                &row.yoshasaki_key,
+                &row.yoshasaki_n,
+                decision.yosha_sum,
+                row.yokoyoko,
+            );
+        }
+
+        let non_zero: HashMap<PersonPartnerKey, PartnerAccum> = per_day
+            .into_iter()
+            .filter(|(_, v)| {
+                v.kensuu != 0 || v.kingaku != 0 || v.kensuu_y0 != 0 || v.kingaku_y0 != 0
+            })
+            .collect();
+        if !non_zero.is_empty() {
+            out.insert(date, non_zero);
+        }
+    }
+    out
+}
+
+/// `compute_person_partner_sum_by_day` の集計加算 (`accumulate()` の
+/// (担当者, 取引先) 版)。
+fn accumulate_partner(
+    sum: &mut HashMap<PersonPartnerKey, PartnerAccum>,
+    person_name: &str,
+    partner_kind: PartnerKind,
+    partner_code: &str,
+    partner_name: &str,
+    amount: i64,
+    yokoyoko: i32,
+) {
+    let key = PersonPartnerKey {
+        person_name: person_name.to_string(),
+        partner_kind,
+        partner_code: partner_code.to_string(),
+    };
+    let acc = sum.entry(key).or_insert_with(|| PartnerAccum {
+        partner_name: partner_name.to_string(),
+        ..Default::default()
+    });
+    acc.kingaku += amount;
+    acc.kensuu += 1;
+    if yokoyoko == 0 {
+        acc.kingaku_y0 += amount;
+        acc.kensuu_y0 += 1;
+    }
 }
 
 /// 集計加算 (`$sum[$name]['金額'] += k_sum` 相当)。
@@ -684,6 +865,10 @@ struct RawRowOut<'a> {
     yosha_jippi: i64,
     shain_r: &'a str,
     yoshasaki_c: &'a str,
+    tokuisaki_key: &'a str,
+    tokuisaki_n: &'a str,
+    yoshasaki_key: &'a str,
+    yoshasaki_n: &'a str,
 }
 
 impl<'a> From<&'a UriageRow> for RawRowOut<'a> {
@@ -705,6 +890,10 @@ impl<'a> From<&'a UriageRow> for RawRowOut<'a> {
             yosha_jippi: r.yosha_jippi,
             shain_r: &r.shain_r,
             yoshasaki_c: &r.yoshasaki_c,
+            tokuisaki_key: &r.tokuisaki_key,
+            tokuisaki_n: &r.tokuisaki_n,
+            yoshasaki_key: &r.yoshasaki_key,
+            yoshasaki_n: &r.yoshasaki_n,
         }
     }
 }
@@ -867,6 +1056,41 @@ async fn recalc_one(
                 .await;
             return job;
         }
+    }
+
+    // 担当者×得意先/傭車先 内訳 (Refs 担当者ドリルダウン)。person daily と同じ rows/masters
+    // から計算する (compute_person_sum の再実行コストは低い、cal=true/false の2回のみ)。
+    let partner_daily_cal = compute_person_partner_sum_by_day(&rows, &persons, &other, true);
+    let partner_daily_nocal = compute_person_partner_sum_by_day(&rows, &persons, &other, false);
+    if let Err(e) = store
+        .upsert_person_partner_daily(month, eigyosho_id, true, &partner_daily_cal, calculated_at)
+        .await
+    {
+        let msg = format!("sqlite upsert_partner_daily(cal=true): {e}");
+        job.status = "failed".to_string();
+        job.error = Some(msg.clone());
+        let _ = store
+            .record_recalc_failed(month, eigyosho_id, &msg, calculated_at)
+            .await;
+        return job;
+    }
+    if let Err(e) = store
+        .upsert_person_partner_daily(
+            month,
+            eigyosho_id,
+            false,
+            &partner_daily_nocal,
+            calculated_at,
+        )
+        .await
+    {
+        let msg = format!("sqlite upsert_partner_daily(cal=false): {e}");
+        job.status = "failed".to_string();
+        job.error = Some(msg.clone());
+        let _ = store
+            .record_recalc_failed(month, eigyosho_id, &msg, calculated_at)
+            .await;
+        return job;
     }
 
     // recalc_jobs に記録 (fingerprint + raw_path + status='computed')
@@ -1304,6 +1528,67 @@ pub async fn person_monthly_totals(
         to: q.to,
         cal: q.cal,
         rows,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// HTTP handler: GET /api/uriage/person-partner-totals
+//   担当者ドリルダウン (得意先別・傭車先別 内訳)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct PersonPartnerTotalsQuery {
+    /// 担当者名 (`uriage_person_daily.person_name` と同じ namespace、URL エンコード必須)。
+    pub person: String,
+    /// 期間下限 (`YYYY-MM`、inclusive)
+    pub from: String,
+    /// 期間上限 (`YYYY-MM`、inclusive)
+    pub to: String,
+    /// `cal` フラグ (省略時 true、別営業所合算)
+    #[serde(default = "default_cal")]
+    pub cal: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersonPartnerTotalsResponse {
+    pub person: String,
+    pub from: String,
+    pub to: String,
+    pub cal: bool,
+    /// 得意先別内訳 (`kingaku` DESC)。
+    pub customers: Vec<crate::sqlite::PersonPartnerTotalRow>,
+    /// 傭車先別内訳 (`kingaku` DESC、`compute_person_partner_sum_by_day` のコメント参照:
+    /// 横横=1 の行では金額側がここにコピーされているため、実際の外部業者への支払いと
+    /// 完全一致するとは限らない)。
+    pub subcontractors: Vec<crate::sqlite::PersonPartnerTotalRow>,
+}
+
+/// GET `/api/uriage/person-partner-totals?person=<name>&from=YYYY-MM&to=YYYY-MM&cal=true`
+///
+/// 指定担当者の期間内 得意先別・傭車先別 内訳を返す (全営業所合算)。
+/// 「担当者 売上構成順位」テーブルからのドリルダウン用データソース。
+pub async fn person_partner_totals(
+    Extension(store): Extension<DynLocalStore>,
+    Query(q): Query<PersonPartnerTotalsQuery>,
+) -> Result<Json<PersonPartnerTotalsResponse>, StatusCode> {
+    if q.person.is_empty() || q.from.is_empty() || q.to.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let customers = store
+        .person_partner_totals(&q.person, &q.from, &q.to, q.cal, PartnerKind::Customer)
+        .await
+        .map_err(map_local_store_err)?;
+    let subcontractors = store
+        .person_partner_totals(&q.person, &q.from, &q.to, q.cal, PartnerKind::Subcontractor)
+        .await
+        .map_err(map_local_store_err)?;
+    Ok(Json(PersonPartnerTotalsResponse {
+        person: q.person,
+        from: q.from,
+        to: q.to,
+        cal: q.cal,
+        customers,
+        subcontractors,
     }))
 }
 
