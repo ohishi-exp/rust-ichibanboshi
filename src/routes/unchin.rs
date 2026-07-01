@@ -75,6 +75,21 @@ pub struct RawUnchinSummaryRow {
     pub bumon_name: String,
 }
 
+/// 傭車先ごとの 売上(得意先請求)/支払 両建て合計 (`/subcontractor-net` 用)。
+/// 「同一運行内の両建て」— 名寄せではなく、運転日報明細の同一行にある
+/// 得意先側金額と傭車先側金額を突き合わせる (2026-07-01 user 確認)。
+#[derive(Debug, Clone)]
+pub struct RawUnchinSubcontractorNetRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    /// その傭車先が使われた運行の得意先請求合計 (`金額+割増+実費`、#57 確定式)。
+    pub total_sales: i64,
+    /// その傭車先への支払合計 (`傭車金額+傭車割増+傭車実費`)。
+    pub total_payment: i64,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
 // ══════════════════════════════════════════════════════════════
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
@@ -104,6 +119,18 @@ pub struct UnchinSummaryRow {
     pub bumon_name: String,
 }
 
+#[derive(Serialize, Debug, PartialEq)]
+pub struct UnchinSubcontractorNetRow {
+    pub partner_code: String,
+    pub partner_name: String,
+    pub total_sales: i64,
+    pub total_payment: i64,
+    /// 差額 = total_sales - total_payment。
+    pub diff: i64,
+    pub bumon_code: String,
+    pub bumon_name: String,
+}
+
 // ══════════════════════════════════════════════════════════════
 // Query パラメータ
 // ══════════════════════════════════════════════════════════════
@@ -116,6 +143,18 @@ pub struct UnchinQuery {
     pub to: Option<String>,
     /// `"customer"`（得意先、default）| `"subcontractor"`（傭車先）
     pub partner_type: Option<String>,
+    /// `"with_billing_only"`(請求＋請求のみ, K IN (0,1)) |
+    /// `"with_non_billing"`(請求＋非請求, K IN (0,2)、default)
+    pub kind: Option<String>,
+}
+
+/// `/subcontractor-net` 用 query。`partner_type` は無い (常に傭車先起点)。
+#[derive(Deserialize)]
+pub struct UnchinSubcontractorNetQuery {
+    /// 売上年月日 下限 (YYYY-MM-DD、含む)
+    pub from: Option<String>,
+    /// 売上年月日 上限 (YYYY-MM-DD、含まない)
+    pub to: Option<String>,
     /// `"with_billing_only"`(請求＋請求のみ, K IN (0,1)) |
     /// `"with_non_billing"`(請求＋非請求, K IN (0,2)、default)
     pub kind: Option<String>,
@@ -178,6 +217,23 @@ pub fn build_unchin_summary_rows(raw: &[RawUnchinSummaryRow]) -> Vec<UnchinSumma
             partner_code: r.partner_code.clone(),
             partner_name: r.partner_name.clone(),
             total: r.total,
+            bumon_code: r.bumon_code.clone(),
+            bumon_name: r.bumon_name.clone(),
+        })
+        .collect()
+}
+
+/// Raw 傭車先ネット行リストをレスポンス行に変換する (差額計算含む)。
+pub fn build_unchin_subcontractor_net_rows(
+    raw: &[RawUnchinSubcontractorNetRow],
+) -> Vec<UnchinSubcontractorNetRow> {
+    raw.iter()
+        .map(|r| UnchinSubcontractorNetRow {
+            partner_code: r.partner_code.clone(),
+            partner_name: r.partner_name.clone(),
+            total_sales: r.total_sales,
+            total_payment: r.total_payment,
+            diff: r.total_sales - r.total_payment,
             bumon_code: r.bumon_code.clone(),
             bumon_name: r.bumon_name.clone(),
         })
@@ -249,5 +305,34 @@ pub async fn unchin_summary(
             unchin_kind_label(&kind)
         ),
         data: build_unchin_summary_rows(&raw),
+    }))
+}
+
+/// GET /api/unchin/subcontractor-net?from=&to=&kind=
+///
+/// 傭車先ごとに、その傭車先が使われた運行の得意先請求合計 (`total_sales`) と
+/// その傭車先への支払合計 (`total_payment`) を同一行から突き合わせ、
+/// 差額 (`diff = total_sales - total_payment`) を返す
+/// (2026-07-01 user 確認「同一運行内の両建て」— 傭車先名と得意先名の名寄せではない)。
+pub async fn unchin_subcontractor_net(
+    Extension(repo): Extension<DynRepo>,
+    Query(params): Query<UnchinSubcontractorNetQuery>,
+) -> Result<Json<ApiResponse<Vec<UnchinSubcontractorNetRow>>>, StatusCode> {
+    let from = params.from.unwrap_or_else(|| "2024-01-01".to_string());
+    let to = params.to.unwrap_or_else(|| "2999-12-31".to_string());
+    let kind = params.kind.unwrap_or_default();
+    let kind_filter = unchin_kind_filter(&kind);
+
+    let raw = repo
+        .unchin_subcontractor_net(&from, &to, kind_filter)
+        .await
+        .map_err(map_repo_err)?;
+
+    Ok(Json(ApiResponse {
+        source_table: format!(
+            "運転日報明細 (傭車先ﾏｽﾀ + 得意先側金額の両建て) [{}]",
+            unchin_kind_label(&kind)
+        ),
+        data: build_unchin_subcontractor_net_rows(&raw),
     }))
 }
