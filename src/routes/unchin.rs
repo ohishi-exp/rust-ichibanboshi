@@ -62,6 +62,11 @@ pub struct RawUnchinRow {
     pub bumon_code: String,
     /// `部門ﾏｽﾀ.部門N`（自社営業所名）。未設定・未マッチ時は空文字。
     pub bumon_name: String,
+    /// 車輌C+`-`+車輌H（`車輌ﾏｽﾀ`の主キーと同じ複合キー。車輌Hは拠点・処理区分の
+    /// 枝番で、`車輌C`単体では車両を一意に特定できない。得意先C/H・傭車先C/Hと
+    /// 同じパターン、#72 実機調査確定）。dtako 実運行との突合キーに使う
+    /// (ohishi-exp/nuxt-dtako-admin#198 Phase 8)。
+    pub vehicle_code: String,
 }
 
 /// 取引先ごとの合計金額 (`/summary` 用)。
@@ -164,6 +169,8 @@ pub struct UnchinCandidateRow {
     pub bumon_code: String,
     /// 自社側の受注部門名 (`部門ﾏｽﾀ`.`部門N`)。未マッチ時は空文字。
     pub bumon_name: String,
+    /// 車輌C+`-`+車輌H (`車輌ﾏｽﾀ`主キー相当の複合キー、#72)。
+    pub vehicle_code: String,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -340,6 +347,7 @@ pub fn build_unchin_rows(raw: &[RawUnchinRow]) -> Vec<UnchinCandidateRow> {
             sale_date: r.sale_date.format("%Y-%m-%d").to_string(),
             bumon_code: r.bumon_code.clone(),
             bumon_name: r.bumon_name.clone(),
+            vehicle_code: r.vehicle_code.clone(),
         })
         .collect()
 }

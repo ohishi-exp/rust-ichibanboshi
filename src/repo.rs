@@ -1221,7 +1221,8 @@ impl AppRepo for TiberiusRepo {
                  ISNULL(t.[傭車金額], 0) + ISNULL(t.[傭車割増], 0) + ISNULL(t.[傭車実費], 0), \
                  ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
                  t.[売上年月日], \
-                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
+                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], ''), \
+                 CONCAT(ISNULL(t.[車輌C], ''), '-', ISNULL(t.[車輌H], '')) \
                  FROM [運転日報明細] t \
                  OUTER APPLY (SELECT TOP 1 c.[傭車先N], c.[部門C] FROM [傭車先ﾏｽﾀ] c \
                    WHERE c.[傭車先C] = t.[傭車先C] AND c.[傭車先H] = t.[傭車先H]) m \
@@ -1242,7 +1243,8 @@ impl AppRepo for TiberiusRepo {
                  ISNULL(t.[金額], 0) + ISNULL(t.[割増], 0) + ISNULL(t.[実費], 0), \
                  ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
                  t.[売上年月日], \
-                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], '') \
+                 ISNULL(m.[部門C], ''), ISNULL(bm.[部門N], ''), \
+                 CONCAT(ISNULL(t.[車輌C], ''), '-', ISNULL(t.[車輌H], '')) \
                  FROM [運転日報明細] t \
                  OUTER APPLY (SELECT TOP 1 c.[得意先N], c.[部門C] FROM [得意先ﾏｽﾀ] c \
                    WHERE c.[得意先C] = t.[得意先C] AND c.[得意先H] = t.[得意先H]) m \
@@ -1689,6 +1691,7 @@ impl TiberiusRepo {
                 sale_date: r.get(7).unwrap_or_default(),
                 bumon_code: decode_cp932(r, 8),
                 bumon_name: decode_cp932(r, 9),
+                vehicle_code: decode_cp932(r, 10),
             })
             .collect()
     }
