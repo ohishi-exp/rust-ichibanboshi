@@ -370,6 +370,7 @@ impl AppRepo for MockRepo {
                 sale_date: dt(2026, 6, 18),
                 bumon_code: "012".into(),
                 bumon_name: "佐賀".into(),
+                vehicle_code: "0272-01".into(),
             }]);
         }
         Ok(vec![
@@ -384,6 +385,7 @@ impl AppRepo for MockRepo {
                 sale_date: dt(2026, 6, 20),
                 bumon_code: "010".into(),
                 bumon_name: "本社".into(),
+                vehicle_code: "0501-00".into(),
             },
             // 空品名コード (汎用コード、過剰集約の補正対象。#57 確定事項)
             RawUnchinRow {
@@ -397,6 +399,7 @@ impl AppRepo for MockRepo {
                 sale_date: dt(2026, 6, 19),
                 bumon_code: "010".into(),
                 bumon_name: "本社".into(),
+                vehicle_code: "".into(),
             },
         ])
     }
