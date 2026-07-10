@@ -80,8 +80,9 @@ fn test_build_unchin_rows_normal_and_edges() {
             sale_date: dt(2026, 6, 20),
             bumon_code: "010".into(),
             bumon_name: "本社".into(),
+            vehicle_code: "0272-01".into(),
         },
-        // エッジ: 空品名コード・空積地
+        // エッジ: 空品名コード・空積地・空車輌 (車輌C/H が未設定の行)
         RawUnchinRow {
             partner_code: "034760-015".into(),
             partner_name: "全農物流㈱　九州支店".into(),
@@ -93,6 +94,7 @@ fn test_build_unchin_rows_normal_and_edges() {
             sale_date: dt(2026, 6, 19),
             bumon_code: "".into(),
             bumon_name: "".into(),
+            vehicle_code: "-".into(),
         },
     ];
 
@@ -110,6 +112,7 @@ fn test_build_unchin_rows_normal_and_edges() {
     assert_eq!(first.sale_date, "2026-06-20");
     assert_eq!(first.bumon_code, "010");
     assert_eq!(first.bumon_name, "本社");
+    assert_eq!(first.vehicle_code, "0272-01");
 
     let second = &rows[1];
     assert_eq!(second.item_code, "0000");
@@ -118,6 +121,7 @@ fn test_build_unchin_rows_normal_and_edges() {
     assert_eq!(second.dest, "福岡県北九州市");
     assert_eq!(second.bumon_code, "");
     assert_eq!(second.bumon_name, "");
+    assert_eq!(second.vehicle_code, "-");
 }
 
 #[test]
