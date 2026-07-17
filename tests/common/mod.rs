@@ -238,6 +238,14 @@ impl AppRepo for MockRepo {
         ])
     }
 
+    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
+        Ok(vec![
+            ("1001".into(), "田中太郎".into(), "田中".into()),
+            ("1002".into(), "佐藤花子".into(), "佐藤".into()),
+            ("9999".into(), "".into(), "".into()), // 名前未設定行
+        ])
+    }
+
     async fn surcharge_base(
         &self,
         _from: &str,
@@ -603,6 +611,9 @@ impl AppRepo for ErrorRepo {
     async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::PoolError)
     }
+    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
+        Err(RepoError::PoolError)
+    }
     async fn surcharge_base(
         &self,
         _: &str,
@@ -774,6 +785,9 @@ impl AppRepo for QueryErrorRepo {
     async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
     async fn surcharge_base(
         &self,
         _: &str,
@@ -920,6 +934,7 @@ pub fn build_app_full(
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
+        .route("/employees", get(routes::employees::employees))
         .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/unchin/summary", get(routes::unchin::unchin_summary))
         .route(

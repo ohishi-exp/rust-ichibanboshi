@@ -75,6 +75,7 @@ pub async fn run(
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
+        .route("/employees", get(routes::employees::employees))
         .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/unchin/summary", get(routes::unchin::unchin_summary))
         .route(

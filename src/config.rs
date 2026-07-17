@@ -50,7 +50,7 @@ pub struct DatabaseConfig {
 }
 
 /// Auth configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct AuthConfig {
     /// JWT secret — must match rust-alc-api's JWT_SECRET
     #[serde(default)]
@@ -172,14 +172,6 @@ impl Default for DatabaseConfig {
             password: String::new(),
             port: None,
             trust_server_certificate: true,
-        }
-    }
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            jwt_secret: String::new(),
         }
     }
 }
