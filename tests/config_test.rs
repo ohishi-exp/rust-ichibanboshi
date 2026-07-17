@@ -258,7 +258,7 @@ fn test_config_from_args_with_config_file_and_overrides() {
     std::fs::create_dir_all(&dir).unwrap();
     let config_path = dir.join("test_config2.toml");
     let mut f = std::fs::File::create(&config_path).unwrap();
-    write!(f, "port = 5555\n").unwrap();
+    writeln!(f, "port = 5555").unwrap();
 
     let args = AppArgs {
         console: true,
