@@ -55,6 +55,7 @@ pub trait AppRepo: Send + Sync {
         year: i32,
     ) -> Result<(Vec<RawMonthTotalRow>, Vec<RawMonthTotalRow>), RepoError>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn daily(
         &self,
         from: &str,
@@ -91,6 +92,11 @@ pub trait AppRepo: Send + Sync {
 
     /// 車種ﾏｽﾀ (車種C, 車種N) の一覧。燃費マスタ (車種C キー) の編集 UI 用 (#12)。
     async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError>;
+
+    /// 社員ﾏｽﾀ (社員C, 社員N, 社員R) の一覧。nuxt-trouble の担当者マスタ手動同期用 (#74)。
+    /// 社員ﾏｽﾀ には同一 社員C の複数行があり得る (uriage の TOP 1 スカラサブクエリと
+    /// 同じ事情) ため、社員C で GROUP BY して 1 行に潰す。
+    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError>;
 
     // ── surcharge (燃料サーチャージ基礎データ、#12) ──
     async fn surcharge_base(
@@ -930,6 +936,36 @@ impl AppRepo for TiberiusRepo {
         Ok(rows
             .iter()
             .map(|row| (decode_cp932(row, 0), decode_cp932(row, 1)))
+            .collect())
+    }
+
+    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        // 社員C は数値型の可能性があるため CONVERT で varchar に寄せる。
+        // 同一 社員C の複数行は GROUP BY で 1 行に潰す (MAX は NULL を無視するので
+        // 外側の ISNULL で空文字に落とす)。
+        let stream = conn
+            .simple_query(
+                "SELECT CONVERT(varchar(20), [社員C]) AS [社員C], \
+                 ISNULL(MAX([社員N]), '') AS [社員N], \
+                 ISNULL(MAX([社員R]), '') AS [社員R] \
+                 FROM [社員ﾏｽﾀ] GROUP BY [社員C] ORDER BY [社員C]",
+            )
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    decode_cp932(row, 0),
+                    decode_cp932(row, 1),
+                    decode_cp932(row, 2),
+                )
+            })
             .collect())
     }
 

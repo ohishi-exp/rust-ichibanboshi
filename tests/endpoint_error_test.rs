@@ -598,3 +598,33 @@ async fn test_vehicles_query_error() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+#[tokio::test]
+async fn test_employees_pool_error() {
+    let app = common::build_app(common::error_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/employees")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_employees_query_error() {
+    let app = common::build_app(common::query_error_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/employees")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
