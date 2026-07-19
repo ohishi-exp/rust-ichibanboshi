@@ -3,11 +3,17 @@
 //! nuxt-dtako-admin の運行収支分析 (一番星売上 × デジタコ実績) が、運行詳細で
 //! 選択した区間の車番+運行日から伝票候補を検索するために使う。
 //!
-//! 積地・卸地 (`発地N`/`着地N`) は `docs/plan-unchin-rate-list.md` (#57 実機調査)
-//! で自由入力・粒度不揃い（市町村名/県+市/施設名混在、空文字率 3 割弱）と判明済み
-//! のため、`surcharge_base` のような県正規化はせず生の文字列をそのまま返す
-//! (`unchin.rs` と同型の判断)。突合方式 (NFKC正規化・部分一致等) は消費側
-//! (nuxt-dtako-admin) の責務とする。
+//! 積地・卸地は 2 系統のデータを両方返す (#12 実機調査):
+//! - `origin_area_name`/`dest_area_name`: `発地域C`/`着地域C` → `地域ﾏｽﾀ.地域N`。
+//!   マスタ由来で **市区町村レベルまで届く** (例 `001401`=神奈川県横浜市)。
+//!   `surcharge_base` は請求書地図のため県レベルまで丸める (`normalize_prefecture`)
+//!   が、突合精度を優先するここでは**丸めず生値を返す**。dtako 側の市町村名との
+//!   一次的な突合キーはこちらを想定
+//! - `origin`/`dest`: `発地N`/`着地N` (自由入力の生文字列)。`docs/plan-unchin-rate-list.md`
+//!   (#57 実機調査) で粒度不揃い (市町村名/県+市/施設名混在)・空文字率 3 割弱と
+//!   判明済みだが、施設名等マスタに無い detail を持つ場合があるため補助信号として残す
+//!   (`unchin.rs` と同型の判断)。突合方式 (NFKC正規化・部分一致等) は消費側
+//!   (nuxt-dtako-admin) の責務とする。
 //!
 //! 金額は月計一致ルール (CLAUDE.md) に従い `税抜金額+税抜割増+税抜実費-値引`
 //! (自車) / `税抜傭車金額+税抜傭車割増+税抜傭車実費-傭車値引` (傭車) を使う。
@@ -49,6 +55,10 @@ pub struct RawVehicleDailyRow {
     /// 同じ簡略化、表示名の解決用途で金額計算には影響しない)。
     pub customer_code: String,
     pub customer_name: String,
+    /// `発地域C` → `地域ﾏｽﾀ.地域N` (未丸め、市区町村まで届きうる)。
+    pub origin_area_name: String,
+    /// `着地域C` → `地域ﾏｽﾀ.地域N` (未丸め)。
+    pub dest_area_name: String,
     /// `発地N` (積地、自由入力の生文字列)。
     pub origin: String,
     /// `着地N` (卸地、自由入力の生文字列)。
@@ -74,6 +84,8 @@ pub struct VehicleDailyRow {
     pub vehicle_number: String,
     pub customer_code: String,
     pub customer_name: String,
+    pub origin_area_name: String,
+    pub dest_area_name: String,
     pub origin: String,
     pub dest: String,
     /// `傭車先C != "000000"`。
@@ -94,6 +106,8 @@ pub fn build_vehicle_daily_rows(raw: &[RawVehicleDailyRow]) -> Vec<VehicleDailyR
                 vehicle_number: r.vehicle_number.clone(),
                 customer_code: r.customer_code.clone(),
                 customer_name: r.customer_name.clone(),
+                origin_area_name: r.origin_area_name.clone(),
+                dest_area_name: r.dest_area_name.clone(),
                 origin: r.origin.clone(),
                 dest: r.dest.clone(),
                 is_subcontracted,

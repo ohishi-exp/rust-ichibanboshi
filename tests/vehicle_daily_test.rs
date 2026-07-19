@@ -14,12 +14,15 @@ use common::dt;
 #[test]
 fn test_build_vehicle_daily_rows_self_and_subcontract() {
     let raw = vec![
-        // 自車 (傭車先C='000000') → self_amount を使う
+        // 自車 (傭車先C='000000') → self_amount を使う。origin_area_name は #12 実機調査の
+        // 例 (神奈川県横浜市、市区町村レベル)。
         RawVehicleDailyRow {
             sale_date: dt(2026, 6, 21),
             vehicle_number: "8504".into(),
             customer_code: "000001".into(),
             customer_name: "㈱田浦畜産".into(),
+            origin_area_name: "長崎県".into(),
+            dest_area_name: "神奈川県横浜市".into(),
             origin: "釧路".into(),
             dest: "福岡県北九州市".into(),
             subcontractor_code: "000000".into(),
@@ -33,6 +36,8 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             vehicle_number: "8504".into(),
             customer_code: "000002".into(),
             customer_name: "".into(),
+            origin_area_name: "".into(),
+            dest_area_name: "".into(),
             origin: "".into(),
             dest: "".into(),
             subcontractor_code: "001234".into(),
@@ -50,6 +55,8 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(first.vehicle_number, "8504");
     assert_eq!(first.customer_code, "000001");
     assert_eq!(first.customer_name, "㈱田浦畜産");
+    assert_eq!(first.origin_area_name, "長崎県");
+    assert_eq!(first.dest_area_name, "神奈川県横浜市");
     assert_eq!(first.origin, "釧路");
     assert_eq!(first.dest, "福岡県北九州市");
     assert!(!first.is_subcontracted);
@@ -61,6 +68,8 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert!(second.is_subcontracted);
     assert_eq!(second.amount, 40_000);
     // 積地・卸地・得意先名は空文字のまま passthrough (surcharge_base 同様に県正規化しない)
+    assert_eq!(second.origin_area_name, "");
+    assert_eq!(second.dest_area_name, "");
     assert_eq!(second.origin, "");
     assert_eq!(second.dest, "");
     assert_eq!(second.customer_name, "");
