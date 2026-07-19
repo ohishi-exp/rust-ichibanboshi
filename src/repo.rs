@@ -255,6 +255,26 @@ fn get_i32(row: &tiberius::Row, idx: usize) -> i32 {
     row.try_get::<i32, _>(idx).ok().flatten().unwrap_or(0)
 }
 
+/// `get_i64` と同じ decimal/f64/i32 の順で試すが、端数を切り捨てない (`単価`/`数量` 用)。
+fn get_f64(row: &tiberius::Row, idx: usize) -> f64 {
+    row.try_get::<f64, _>(idx)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            row.try_get::<tiberius::numeric::Numeric, _>(idx)
+                .ok()
+                .flatten()
+                .and_then(|d| format!("{}", d).parse::<f64>().ok())
+        })
+        .or_else(|| {
+            row.try_get::<i32, _>(idx)
+                .ok()
+                .flatten()
+                .map(|v| v as f64)
+        })
+        .unwrap_or(0.0)
+}
+
 #[async_trait]
 impl AppRepo for TiberiusRepo {
     async fn health_check(&self) -> Result<(), RepoError> {
@@ -1062,6 +1082,9 @@ impl AppRepo for TiberiusRepo {
         // surcharge_base と同じくスカラサブクエリ (TOP 1、得意先C 単独)。
         // 自車/傭車の金額は両方取得し、ロジック層 (build_vehicle_daily_rows) が
         // 傭車先C で選択する (月計一致ルール、CLAUDE.md)。
+        // 品名(品名C/品名N)・数量・単価・単位は nuxt-dtako-admin#330 実データ検証で追加
+        // 要望が出た項目 (同一日でも複数明細で単価が異なりうるため)。schema確認済み
+        // (数量/単価は decimal NOT NULL、単位は varchar nullable)。
         let query = format!(
             "SELECT TOP {} \
              t.[売上年月日], \
@@ -1074,6 +1097,8 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[傭車先C], ''), \
              ISNULL(t.[税抜金額],0)+ISNULL(t.[税抜割増],0)+ISNULL(t.[税抜実費],0)-ISNULL(t.[値引],0), \
              ISNULL(t.[税抜傭車金額],0)+ISNULL(t.[税抜傭車割増],0)+ISNULL(t.[税抜傭車実費],0)-ISNULL(t.[傭車値引],0), \
+             ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
+             ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), ISNULL(t.[単位], ''), \
              CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
              FROM [運転日報明細] t \
              WHERE t.[車輌C] = @P1 AND t.[売上年月日] >= @P2 AND t.[売上年月日] < @P3 \
@@ -1828,7 +1853,12 @@ impl TiberiusRepo {
                 subcontractor_code: decode_cp932(r, 8),
                 self_amount: get_i64(r, 9),
                 subcontract_amount: get_i64(r, 10),
-                row_id: decode_cp932(r, 11),
+                item_code: decode_cp932(r, 11),
+                item_name: decode_cp932(r, 12),
+                quantity: get_f64(r, 13),
+                unit_price: get_f64(r, 14),
+                unit: decode_cp932(r, 15),
+                row_id: decode_cp932(r, 16),
             })
             .collect()
     }
