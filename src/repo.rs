@@ -1055,8 +1055,10 @@ impl AppRepo for TiberiusRepo {
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
 
+        // 積地・卸地は 2 系統返す (#12 実機調査): 発地域C/着地域C → 地域ﾏｽﾀ.地域N は
+        // 市区町村レベルまで届くマスタ由来値 (surcharge_base と違い県へ丸めない)。
         // 発地N/着地N は自由入力・粒度不揃い (docs/plan-unchin-rate-list.md #57 実機
-        // 調査) のため県正規化はせず生値を返す (unchin.rs と同型)。得意先名の解決は
+        // 調査) だが施設名等の補助信号として残す (unchin.rs と同型)。得意先名の解決は
         // surcharge_base と同じくスカラサブクエリ (TOP 1、得意先C 単独)。
         // 自車/傭車の金額は両方取得し、ロジック層 (build_vehicle_daily_rows) が
         // 傭車先C で選択する (月計一致ルール、CLAUDE.md)。
@@ -1066,6 +1068,8 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[車輌C], ''), \
              ISNULL(t.[得意先C], ''), \
              ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = t.[得意先C]), ''), \
+             ISNULL((SELECT TOP 1 o.[地域N] FROM [地域ﾏｽﾀ] o WHERE o.[地域C] = t.[発地域C]), ''), \
+             ISNULL((SELECT TOP 1 d.[地域N] FROM [地域ﾏｽﾀ] d WHERE d.[地域C] = t.[着地域C]), ''), \
              ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
              ISNULL(t.[傭車先C], ''), \
              ISNULL(t.[税抜金額],0)+ISNULL(t.[税抜割増],0)+ISNULL(t.[税抜実費],0)-ISNULL(t.[値引],0), \
@@ -1817,12 +1821,14 @@ impl TiberiusRepo {
                 vehicle_number: decode_cp932(r, 1),
                 customer_code: decode_cp932(r, 2),
                 customer_name: decode_cp932(r, 3),
-                origin: decode_cp932(r, 4),
-                dest: decode_cp932(r, 5),
-                subcontractor_code: decode_cp932(r, 6),
-                self_amount: get_i64(r, 7),
-                subcontract_amount: get_i64(r, 8),
-                row_id: decode_cp932(r, 9),
+                origin_area_name: decode_cp932(r, 4),
+                dest_area_name: decode_cp932(r, 5),
+                origin: decode_cp932(r, 6),
+                dest: decode_cp932(r, 7),
+                subcontractor_code: decode_cp932(r, 8),
+                self_amount: get_i64(r, 9),
+                subcontract_amount: get_i64(r, 10),
+                row_id: decode_cp932(r, 11),
             })
             .collect()
     }

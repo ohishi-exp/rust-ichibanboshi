@@ -307,12 +307,14 @@ impl AppRepo for MockRepo {
         _limit: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         Ok(vec![
-            // 自車 (傭車先C='000000')
+            // 自車 (傭車先C='000000')。origin_area_name は #12 実機調査の例 (市区町村レベル)。
             RawVehicleDailyRow {
                 sale_date: dt(2026, 6, 21),
                 vehicle_number: vehicle.to_string(),
                 customer_code: "000001".into(),
                 customer_name: "㈱田浦畜産".into(),
+                origin_area_name: "長崎県".into(),
+                dest_area_name: "神奈川県横浜市".into(),
                 origin: "釧路".into(),
                 dest: "福岡県北九州市".into(),
                 subcontractor_code: "000000".into(),
@@ -326,6 +328,8 @@ impl AppRepo for MockRepo {
                 vehicle_number: vehicle.to_string(),
                 customer_code: "000002".into(),
                 customer_name: "".into(),
+                origin_area_name: "".into(),
+                dest_area_name: "".into(),
                 origin: "".into(),
                 dest: "".into(),
                 subcontractor_code: "001234".into(),
