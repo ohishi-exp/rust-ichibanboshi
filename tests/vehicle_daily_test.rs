@@ -28,9 +28,14 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             subcontractor_code: "000000".into(),
             self_amount: 65_000,
             subcontract_amount: 999_999, // 自車なので使われないはず
+            item_code: "0001".into(),
+            item_name: "冷凍食品".into(),
+            quantity: 10.5,
+            unit_price: 6190.47, // 単価は decimal で端数を持ちうる (実データ検証で確認済み)
+            unit: "個".into(),
             row_id: "20260621-1001".into(),
         },
-        // 傭車 (傭車先C!='000000') → subcontract_amount を使う
+        // 傭車 (傭車先C!='000000') → subcontract_amount を使う。品名/数量/単価/単位も未入力のエッジ。
         RawVehicleDailyRow {
             sale_date: dt(2026, 6, 20),
             vehicle_number: "8504".into(),
@@ -43,6 +48,11 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             subcontractor_code: "001234".into(),
             self_amount: 999_999, // 傭車なので使われないはず
             subcontract_amount: 40_000,
+            item_code: "".into(),
+            item_name: "".into(),
+            quantity: 0.0,
+            unit_price: 0.0,
+            unit: "".into(),
             row_id: "20260620-1002".into(),
         },
     ];
@@ -61,6 +71,11 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(first.dest, "福岡県北九州市");
     assert!(!first.is_subcontracted);
     assert_eq!(first.amount, 65_000);
+    assert_eq!(first.item_code, "0001");
+    assert_eq!(first.item_name, "冷凍食品");
+    assert_eq!(first.quantity, 10.5);
+    assert_eq!(first.unit_price, 6190.47);
+    assert_eq!(first.unit, "個");
     assert_eq!(first.row_id, "20260621-1001");
 
     let second = &rows[1];
@@ -73,6 +88,12 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(second.origin, "");
     assert_eq!(second.dest, "");
     assert_eq!(second.customer_name, "");
+    // 品名/数量/単価/単位が未入力の明細は 0/空文字で passthrough (ISNULLの既定値と一致)
+    assert_eq!(second.item_code, "");
+    assert_eq!(second.item_name, "");
+    assert_eq!(second.quantity, 0.0);
+    assert_eq!(second.unit_price, 0.0);
+    assert_eq!(second.unit, "");
 }
 
 #[test]
