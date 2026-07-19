@@ -23,6 +23,12 @@
 //! 同一日でも複数明細で単価が異なることがあり突合精度の判断材料に必要と判明)。
 //! いずれも `INFORMATION_SCHEMA.COLUMNS` (`/api/schema/columns?table=運転日報明細`) で
 //! 実在確認済み: `数量`/`単価` は `decimal` (NOT NULL)、`単位` は `varchar` (nullable)。
+//!
+//! `vehicle` は任意化されている (#79)。nuxt-dtako-admin#330 PR5「類似運行検索」が
+//! 積地・卸地ペア/得意先だけで車輌を横断して検索する必要があるため、`customer`
+//! (得意先C、完全一致) / `origin`/`dest` (地域名、部分一致) の絞り込みを追加した。
+//! `vehicle`/`customer`/`origin`/`dest` は **最低 1 つ必須** (全件スキャン防止、
+//! SQL Server/Tunnel の負荷対策)。
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -157,33 +163,60 @@ pub struct VehicleDailyQuery {
     pub from: String,
     /// 売上年月日の上限 (YYYY-MM-DD、**含まない**。他 endpoint と同じ半開区間)。
     pub to: String,
-    /// `車輌C` (車番)。空文字は 400。
-    pub vehicle: String,
+    /// `車輌C` (車番、完全一致)。
+    pub vehicle: Option<String>,
+    /// `得意先C` (完全一致)。
+    pub customer: Option<String>,
+    /// 積地 (`origin_area_name`/`origin` のいずれかに部分一致)。
+    pub origin: Option<String>,
+    /// 卸地 (`dest_area_name`/`dest` のいずれかに部分一致)。
+    pub dest: Option<String>,
     /// 取得上限件数 (1..=5000、default 500)。
     pub limit: Option<i32>,
+}
+
+/// クエリ値の前後空白を trim し、空文字なら絞り込みなし (`None`) 扱いにする。
+fn normalize_filter(s: &Option<String>) -> Option<&str> {
+    s.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }
 
 // ══════════════════════════════════════════════════════════════
 // ハンドラ
 // ══════════════════════════════════════════════════════════════
 
-/// GET /api/sales/vehicle-daily?from=&to=&vehicle=&limit=
+/// GET /api/sales/vehicle-daily?from=&to=&vehicle=&customer=&origin=&dest=&limit=
+///
+/// `vehicle`/`customer`/`origin`/`dest` は最低 1 つ必須 (#79)。日付レンジのみでの
+/// 全件スキャンは SQL Server/Tunnel への負荷が大きいため 400 で拒否する。
 pub async fn vehicle_daily(
     Extension(repo): Extension<DynRepo>,
     Query(params): Query<VehicleDailyQuery>,
 ) -> Result<Json<ApiResponse<Vec<VehicleDailyRow>>>, StatusCode> {
-    if params.vehicle.trim().is_empty() {
+    let vehicle = normalize_filter(&params.vehicle);
+    let customer = normalize_filter(&params.customer);
+    let origin = normalize_filter(&params.origin);
+    let dest = normalize_filter(&params.dest);
+
+    if vehicle.is_none() && customer.is_none() && origin.is_none() && dest.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
     let limit = params.limit.unwrap_or(500).clamp(1, 5000);
 
     let raw = repo
-        .vehicle_daily(&params.from, &params.to, &params.vehicle, limit)
+        .vehicle_daily(
+            &params.from,
+            &params.to,
+            vehicle,
+            customer,
+            origin,
+            dest,
+            limit,
+        )
         .await
         .map_err(map_repo_err)?;
 
     Ok(Json(ApiResponse {
-        source_table: "運転日報明細 + 得意先ﾏｽﾀ".to_string(),
+        source_table: "運転日報明細 + 得意先ﾏｽﾀ + 地域ﾏｽﾀ".to_string(),
         data: build_vehicle_daily_rows(&raw),
     }))
 }

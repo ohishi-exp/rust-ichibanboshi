@@ -136,8 +136,9 @@ async fn test_vehicle_daily_ok_with_limit() {
 }
 
 #[tokio::test]
-async fn test_vehicle_daily_missing_vehicle_param_is_bad_request() {
-    // vehicle が必須パラメータ自体無い場合は axum の Query extractor が 400 を返す
+async fn test_vehicle_daily_no_filters_is_bad_request() {
+    // vehicle/customer/origin/dest が 1 つも無い → ハンドラ側の絞り込み必須チェックで 400
+    // (#79: vehicle は任意化されたため、以前と違い axum の Query extractor では拒否されない)
     let app = common::build_app(common::mock_repo());
     let res = app
         .oneshot(
@@ -152,19 +153,74 @@ async fn test_vehicle_daily_missing_vehicle_param_is_bad_request() {
 }
 
 #[tokio::test]
-async fn test_vehicle_daily_empty_vehicle_is_bad_request() {
-    // vehicle パラメータはあるが空文字/空白のみ → ハンドラ側の trim().is_empty() チェック
+async fn test_vehicle_daily_blank_filters_is_bad_request() {
+    // 全パラメータはあるが空文字/空白のみ → trim().is_empty() で無視され結局 0 件、400
     let app = common::build_app(common::mock_repo());
     let res = app
         .oneshot(
             Request::builder()
-                .uri("/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01&vehicle=%20")
+                .uri(
+                    "/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01\
+                     &vehicle=%20&customer=&origin=&dest=",
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_vehicle_daily_customer_only_searches_across_vehicles() {
+    // #79 の主目的: vehicle を指定せず customer だけで車輌を横断して検索できること
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01&customer=000001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let data = json["data"].as_array().unwrap();
+    // customer=000001 は車輌 8504 と 9012 の両方に存在する (mock フィクスチャ)
+    assert_eq!(data.len(), 2);
+    let vehicles: std::collections::HashSet<_> = data
+        .iter()
+        .map(|r| r["vehicle_number"].as_str().unwrap())
+        .collect();
+    assert!(vehicles.contains("8504"));
+    assert!(vehicles.contains("9012"));
+}
+
+#[tokio::test]
+async fn test_vehicle_daily_origin_partial_match() {
+    // origin は地域ﾏｽﾀ由来 (origin_area_name) と自由入力 (origin) のいずれかへの部分一致
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01&origin=%E9%95%B7%E5%B4%8E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let data = json["data"].as_array().unwrap();
+    // "長崎" は "長崎県" (row1) と "長崎県佐世保市" (row3) の両方に部分一致する
+    assert_eq!(data.len(), 2);
 }
 
 #[tokio::test]
