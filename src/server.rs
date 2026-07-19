@@ -73,6 +73,10 @@ pub async fn run(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
         )
+        .route(
+            "/sales/vehicle-daily",
+            get(routes::vehicle_daily::vehicle_daily),
+        )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
         .route("/employees", get(routes::employees::employees))
