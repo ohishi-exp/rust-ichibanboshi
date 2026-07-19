@@ -303,14 +303,19 @@ impl AppRepo for MockRepo {
         &self,
         _from: &str,
         _to: &str,
-        vehicle: &str,
+        vehicle: Option<&str>,
+        customer: Option<&str>,
+        origin: Option<&str>,
+        dest: Option<&str>,
         _limit: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
-        Ok(vec![
+        // 実 SQL の `(@Pn IS NULL OR ...)` 絞り込みを模倣する固定フィクスチャ 3 行
+        // (#79: customer/origin/dest 絞り込み + vehicle 任意化・車輌横断検索のテスト用)。
+        let rows = vec![
             // 自車 (傭車先C='000000')。origin_area_name は #12 実機調査の例 (市区町村レベル)。
             RawVehicleDailyRow {
                 sale_date: dt(2026, 6, 21),
-                vehicle_number: vehicle.to_string(),
+                vehicle_number: "8504".into(),
                 customer_code: "000001".into(),
                 customer_name: "㈱田浦畜産".into(),
                 origin_area_name: "長崎県".into(),
@@ -330,7 +335,7 @@ impl AppRepo for MockRepo {
             // 傭車 (傭車先C!='000000')。得意先名・積地・卸地・品名/数量/単価が未マップ/空文字のエッジ。
             RawVehicleDailyRow {
                 sale_date: dt(2026, 6, 20),
-                vehicle_number: vehicle.to_string(),
+                vehicle_number: "8504".into(),
                 customer_code: "000002".into(),
                 customer_name: "".into(),
                 origin_area_name: "".into(),
@@ -347,7 +352,38 @@ impl AppRepo for MockRepo {
                 unit: "".into(),
                 row_id: "20260620-1002".into(),
             },
-        ])
+            // 別車輌・同得意先。customer/origin/dest だけの車輌横断検索 (#79 の主目的) の
+            // テスト用に、vehicle_number/積地・卸地とも row 1 と異なる値にしてある。
+            RawVehicleDailyRow {
+                sale_date: dt(2026, 6, 22),
+                vehicle_number: "9012".into(),
+                customer_code: "000001".into(),
+                customer_name: "㈱田浦畜産".into(),
+                origin_area_name: "長崎県佐世保市".into(),
+                dest_area_name: "東京都".into(),
+                origin: "".into(),
+                dest: "".into(),
+                subcontractor_code: "000000".into(),
+                self_amount: 80_000,
+                subcontract_amount: 0,
+                item_code: "0002".into(),
+                item_name: "冷蔵食品".into(),
+                quantity: 5.0,
+                unit_price: 16000.0,
+                unit: "個".into(),
+                row_id: "20260622-1003".into(),
+            },
+        ];
+
+        Ok(rows
+            .into_iter()
+            .filter(|r| vehicle.is_none_or(|v| r.vehicle_number == v))
+            .filter(|r| customer.is_none_or(|c| r.customer_code == c))
+            .filter(|r| {
+                origin.is_none_or(|o| r.origin_area_name.contains(o) || r.origin.contains(o))
+            })
+            .filter(|r| dest.is_none_or(|d| r.dest_area_name.contains(d) || r.dest.contains(d)))
+            .collect())
     }
 
     async fn uriage_rows(
@@ -679,7 +715,10 @@ impl AppRepo for ErrorRepo {
         &self,
         _: &str,
         _: &str,
-        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
         _: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         Err(RepoError::PoolError)
@@ -862,7 +901,10 @@ impl AppRepo for QueryErrorRepo {
         &self,
         _: &str,
         _: &str,
-        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
         _: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
