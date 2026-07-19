@@ -30,3 +30,6 @@ path = "src/routes/surcharge.rs"
 
 [[files]]
 path = "src/routes/unchin.rs"
+
+[[files]]
+path = "src/routes/vehicle_daily.rs"
