@@ -20,6 +20,7 @@ use rust_ichibanboshi::routes::unchin::{
     RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use rust_ichibanboshi::routes::uriage::UriageRow;
+use rust_ichibanboshi::routes::vehicle_daily::RawVehicleDailyRow;
 use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
 use uuid::Uuid;
 
@@ -294,6 +295,43 @@ impl AppRepo for MockRepo {
                 row_id: "20260620-1002".into(),
                 input_staff_code: "".into(),
                 input_staff_name: "".into(),
+            },
+        ])
+    }
+
+    async fn vehicle_daily(
+        &self,
+        _from: &str,
+        _to: &str,
+        vehicle: &str,
+        _limit: i32,
+    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
+        Ok(vec![
+            // 自車 (傭車先C='000000')
+            RawVehicleDailyRow {
+                sale_date: dt(2026, 6, 21),
+                vehicle_number: vehicle.to_string(),
+                customer_code: "000001".into(),
+                customer_name: "㈱田浦畜産".into(),
+                origin: "釧路".into(),
+                dest: "福岡県北九州市".into(),
+                subcontractor_code: "000000".into(),
+                self_amount: 65_000,
+                subcontract_amount: 0,
+                row_id: "20260621-1001".into(),
+            },
+            // 傭車 (傭車先C!='000000')。得意先名・積地・卸地が未マップ/空文字のエッジ。
+            RawVehicleDailyRow {
+                sale_date: dt(2026, 6, 20),
+                vehicle_number: vehicle.to_string(),
+                customer_code: "000002".into(),
+                customer_name: "".into(),
+                origin: "".into(),
+                dest: "".into(),
+                subcontractor_code: "001234".into(),
+                self_amount: 0,
+                subcontract_amount: 40_000,
+                row_id: "20260620-1002".into(),
             },
         ])
     }
@@ -623,6 +661,15 @@ impl AppRepo for ErrorRepo {
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
         Err(RepoError::PoolError)
     }
+    async fn vehicle_daily(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
     async fn uriage_rows(
         &self,
         _: &str,
@@ -797,6 +844,15 @@ impl AppRepo for QueryErrorRepo {
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn vehicle_daily(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
     async fn uriage_rows(
         &self,
         _: &str,
@@ -931,6 +987,10 @@ pub fn build_app_full(
         .route(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
+        )
+        .route(
+            "/sales/vehicle-daily",
+            get(routes::vehicle_daily::vehicle_daily),
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))

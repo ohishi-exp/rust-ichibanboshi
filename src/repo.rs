@@ -9,6 +9,7 @@ use crate::routes::unchin::{
     RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use crate::routes::uriage::UriageRow;
+use crate::routes::vehicle_daily::RawVehicleDailyRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
 #[async_trait]
@@ -106,6 +107,15 @@ pub trait AppRepo: Send + Sync {
         kind_filter: &str,
         limit: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError>;
+
+    // ── vehicle_daily (車番×期間の伝票明細、nuxt-dtako-admin#330) ──
+    async fn vehicle_daily(
+        &self,
+        from: &str,
+        to: &str,
+        vehicle: &str,
+        limit: i32,
+    ) -> Result<Vec<RawVehicleDailyRow>, RepoError>;
 
     // ── uriage (担当者別売上、#762) ──
     /// `[運転日報明細]` から `compute_person_sum` の入力 1 行を取得する。
@@ -1036,6 +1046,49 @@ impl AppRepo for TiberiusRepo {
         Ok(Self::rows_to_surcharge(&rows))
     }
 
+    async fn vehicle_daily(
+        &self,
+        from: &str,
+        to: &str,
+        vehicle: &str,
+        limit: i32,
+    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
+        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+
+        // 発地N/着地N は自由入力・粒度不揃い (docs/plan-unchin-rate-list.md #57 実機
+        // 調査) のため県正規化はせず生値を返す (unchin.rs と同型)。得意先名の解決は
+        // surcharge_base と同じくスカラサブクエリ (TOP 1、得意先C 単独)。
+        // 自車/傭車の金額は両方取得し、ロジック層 (build_vehicle_daily_rows) が
+        // 傭車先C で選択する (月計一致ルール、CLAUDE.md)。
+        let query = format!(
+            "SELECT TOP {} \
+             t.[売上年月日], \
+             ISNULL(t.[車輌C], ''), \
+             ISNULL(t.[得意先C], ''), \
+             ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = t.[得意先C]), ''), \
+             ISNULL(t.[発地N], ''), ISNULL(t.[着地N], ''), \
+             ISNULL(t.[傭車先C], ''), \
+             ISNULL(t.[税抜金額],0)+ISNULL(t.[税抜割増],0)+ISNULL(t.[税抜実費],0)-ISNULL(t.[値引],0), \
+             ISNULL(t.[税抜傭車金額],0)+ISNULL(t.[税抜傭車割増],0)+ISNULL(t.[税抜傭車実費],0)-ISNULL(t.[傭車値引],0), \
+             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
+             FROM [運転日報明細] t \
+             WHERE t.[車輌C] = @P1 AND t.[売上年月日] >= @P2 AND t.[売上年月日] < @P3 \
+             ORDER BY t.[売上年月日], t.[管理C]",
+            limit.clamp(1, 5000)
+        );
+
+        let stream = conn
+            .query(&query, &[&vehicle, &from, &to])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_vehicle_daily(&rows))
+    }
+
     async fn uriage_rows(
         &self,
         from: &str,
@@ -1753,6 +1806,23 @@ impl TiberiusRepo {
                 row_id: decode_cp932(r, 15),
                 input_staff_code: decode_cp932(r, 16),
                 input_staff_name: decode_cp932(r, 17),
+            })
+            .collect()
+    }
+
+    fn rows_to_vehicle_daily(rows: &[tiberius::Row]) -> Vec<RawVehicleDailyRow> {
+        rows.iter()
+            .map(|r| RawVehicleDailyRow {
+                sale_date: r.get(0).unwrap_or_default(),
+                vehicle_number: decode_cp932(r, 1),
+                customer_code: decode_cp932(r, 2),
+                customer_name: decode_cp932(r, 3),
+                origin: decode_cp932(r, 4),
+                dest: decode_cp932(r, 5),
+                subcontractor_code: decode_cp932(r, 6),
+                self_amount: get_i64(r, 7),
+                subcontract_amount: get_i64(r, 8),
+                row_id: decode_cp932(r, 9),
             })
             .collect()
     }
