@@ -108,12 +108,17 @@ pub trait AppRepo: Send + Sync {
         limit: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError>;
 
-    // ── vehicle_daily (車番×期間の伝票明細、nuxt-dtako-admin#330) ──
+    // ── vehicle_daily (車番×期間の伝票明細、nuxt-dtako-admin#330。customer/origin/dest
+    //    絞り込み + vehicle 任意化は #79、PR5「類似運行検索・比較ページ」依存) ──
+    #[allow(clippy::too_many_arguments)]
     async fn vehicle_daily(
         &self,
         from: &str,
         to: &str,
-        vehicle: &str,
+        vehicle: Option<&str>,
+        customer: Option<&str>,
+        origin: Option<&str>,
+        dest: Option<&str>,
         limit: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError>;
 
@@ -1070,7 +1075,10 @@ impl AppRepo for TiberiusRepo {
         &self,
         from: &str,
         to: &str,
-        vehicle: &str,
+        vehicle: Option<&str>,
+        customer: Option<&str>,
+        origin: Option<&str>,
+        dest: Option<&str>,
         limit: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
@@ -1085,6 +1093,14 @@ impl AppRepo for TiberiusRepo {
         // 品名(品名C/品名N)・数量・単価・単位は nuxt-dtako-admin#330 実データ検証で追加
         // 要望が出た項目 (同一日でも複数明細で単価が異なりうるため)。schema確認済み
         // (数量/単価は decimal NOT NULL、単位は varchar nullable)。
+        //
+        // vehicle/customer/origin/dest は全て任意 (#79、nuxt-dtako-admin#330 PR5
+        // 「類似運行検索」が車輌を横断して積地・卸地/得意先で絞る必要があるため)。
+        // `(@Pn IS NULL OR ...)` 形で毎回 6 パラメータ固定のバインドにし、動的な
+        // クエリ文字列組み立て (injection リスク) を避ける。呼び出し側 (handler) が
+        // 4 パラメータ最低 1 つ必須をバリデーションする (全件スキャン防止)。
+        // origin/dest は 地域ﾏｽﾀ由来 (市区町村レベル) と自由入力のどちらかに部分一致
+        // すれば hit とする (NFKC 正規化等の高度な突合は消費側の責務)。
         let query = format!(
             "SELECT TOP {} \
              t.[売上年月日], \
@@ -1101,13 +1117,34 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), ISNULL(t.[単位], ''), \
              CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
              FROM [運転日報明細] t \
-             WHERE t.[車輌C] = @P1 AND t.[売上年月日] >= @P2 AND t.[売上年月日] < @P3 \
+             WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
+               AND (@P3 IS NULL OR t.[車輌C] = @P3) \
+               AND (@P4 IS NULL OR t.[得意先C] = @P4) \
+               AND (@P5 IS NULL \
+                 OR ISNULL((SELECT TOP 1 om.[地域N] FROM [地域ﾏｽﾀ] om WHERE om.[地域C] = t.[発地域C]), '') LIKE @P5 \
+                 OR ISNULL(t.[発地N], '') LIKE @P5) \
+               AND (@P6 IS NULL \
+                 OR ISNULL((SELECT TOP 1 dm.[地域N] FROM [地域ﾏｽﾀ] dm WHERE dm.[地域C] = t.[着地域C]), '') LIKE @P6 \
+                 OR ISNULL(t.[着地N], '') LIKE @P6) \
              ORDER BY t.[売上年月日], t.[管理C]",
             limit.clamp(1, 5000)
         );
 
+        let origin_pattern = origin.map(|s| format!("%{s}%"));
+        let dest_pattern = dest.map(|s| format!("%{s}%"));
+
         let stream = conn
-            .query(&query, &[&vehicle, &from, &to])
+            .query(
+                &query,
+                &[
+                    &from,
+                    &to,
+                    &vehicle,
+                    &customer,
+                    &origin_pattern,
+                    &dest_pattern,
+                ],
+            )
             .await
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
         let rows = stream
