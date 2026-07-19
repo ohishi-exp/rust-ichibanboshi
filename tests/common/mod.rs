@@ -320,9 +320,14 @@ impl AppRepo for MockRepo {
                 subcontractor_code: "000000".into(),
                 self_amount: 65_000,
                 subcontract_amount: 0,
+                item_code: "0001".into(),
+                item_name: "冷凍食品".into(),
+                quantity: 10.5,
+                unit_price: 6190.47,
+                unit: "個".into(),
                 row_id: "20260621-1001".into(),
             },
-            // 傭車 (傭車先C!='000000')。得意先名・積地・卸地が未マップ/空文字のエッジ。
+            // 傭車 (傭車先C!='000000')。得意先名・積地・卸地・品名/数量/単価が未マップ/空文字のエッジ。
             RawVehicleDailyRow {
                 sale_date: dt(2026, 6, 20),
                 vehicle_number: vehicle.to_string(),
@@ -335,6 +340,11 @@ impl AppRepo for MockRepo {
                 subcontractor_code: "001234".into(),
                 self_amount: 0,
                 subcontract_amount: 40_000,
+                item_code: "".into(),
+                item_name: "".into(),
+                quantity: 0.0,
+                unit_price: 0.0,
+                unit: "".into(),
                 row_id: "20260620-1002".into(),
             },
         ])

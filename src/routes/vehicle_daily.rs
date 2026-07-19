@@ -18,6 +18,11 @@
 //! 金額は月計一致ルール (CLAUDE.md) に従い `税抜金額+税抜割増+税抜実費-値引`
 //! (自車) / `税抜傭車金額+税抜傭車割増+税抜傭車実費-傭車値引` (傭車) を使う。
 //! `金額` 列は使わない。傭車判定は `傭車先C='000000'` (自車) / それ以外 (傭車)。
+//!
+//! 品名 (`品名C`/`品名N`) と数量・単価・単位も返す (nuxt-dtako-admin#330 実データ検証で、
+//! 同一日でも複数明細で単価が異なることがあり突合精度の判断材料に必要と判明)。
+//! いずれも `INFORMATION_SCHEMA.COLUMNS` (`/api/schema/columns?table=運転日報明細`) で
+//! 実在確認済み: `数量`/`単価` は `decimal` (NOT NULL)、`単位` は `varchar` (nullable)。
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -69,6 +74,16 @@ pub struct RawVehicleDailyRow {
     pub self_amount: i64,
     /// 傭車側 `税抜傭車金額+税抜傭車割増+税抜傭車実費-傭車値引`。
     pub subcontract_amount: i64,
+    /// `品名C`。
+    pub item_code: String,
+    /// `品名N`。同一日でも複数明細で品名・単価が異なりうる (nuxt-dtako-admin#330 実データ検証)。
+    pub item_name: String,
+    /// `数量` (decimal)。
+    pub quantity: f64,
+    /// `単価` (decimal、端数を持ちうるため f64 で保持)。
+    pub unit_price: f64,
+    /// `単位` (例: `個`/`t`)。
+    pub unit: String,
     /// 行 ID = `管理年月日`(yyyymmdd) + '-' + `管理C`。`surcharge.rs`/`uriage.rs` と
     /// 同じ安定キー (値カラムに依存しないため編集されても不変)。
     pub row_id: String,
@@ -93,6 +108,11 @@ pub struct VehicleDailyRow {
     /// 月計一致ルール適用済みの金額 (`self_amount` / `subcontract_amount` を
     /// `is_subcontracted` で選択)。
     pub amount: i64,
+    pub item_code: String,
+    pub item_name: String,
+    pub quantity: f64,
+    pub unit_price: f64,
+    pub unit: String,
     pub row_id: String,
 }
 
@@ -116,6 +136,11 @@ pub fn build_vehicle_daily_rows(raw: &[RawVehicleDailyRow]) -> Vec<VehicleDailyR
                 } else {
                     r.self_amount
                 },
+                item_code: r.item_code.clone(),
+                item_name: r.item_name.clone(),
+                quantity: r.quantity,
+                unit_price: r.unit_price,
+                unit: r.unit.clone(),
                 row_id: r.row_id.clone(),
             }
         })
