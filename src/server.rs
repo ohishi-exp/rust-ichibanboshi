@@ -144,6 +144,7 @@ pub async fn run(
         )
         .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
+        .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll));
 
     let schema_routes = Router::new()
