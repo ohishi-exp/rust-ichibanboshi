@@ -66,6 +66,18 @@ pub fn parse_kydata_db_name(name: &str) -> Option<(String, i32)> {
     Some((company.to_string(), nendo_digits.parse().ok()?))
 }
 
+/// `KYCOMSTD.SELDATA.KCODE` を DB 名由来の会社コード (4 桁ゼロ埋め、[`parse_kydata_db_name`]
+/// が返す表記) に正規化する。KCODE が数値列でゼロ埋めが失われている場合に突合キーを
+/// 一致させるための防御 (#86)。数字以外や 4 桁超はそのまま (trim のみ) 返す。
+pub fn normalize_company_code(code: &str) -> String {
+    let trimmed = code.trim();
+    if trimmed.len() < 4 && !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        format!("{trimmed:0>4}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 賃金期間 (対象月) の範囲を "YYYY-MM-DD" の半開区間で返す。
 pub fn month_period(year: i32, month: u32) -> (String, String) {
     let from = format!("{year:04}-{month:02}-01");

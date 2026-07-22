@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use rust_ichibanboshi::kyuyo::logic::{
     build_companies, build_payroll_rows, email_allowed, employee_code_key, kydata_db_name,
-    month_period, nendo_for_month, normalize_emails, parse_kydata_db_name, parse_month,
-    taikeikouno, RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES, MONEY_COLUMNS,
+    month_period, nendo_for_month, normalize_company_code, normalize_emails, parse_kydata_db_name,
+    parse_month, taikeikouno, RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES, MONEY_COLUMNS,
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -67,6 +67,21 @@ fn test_parse_kydata_db_name() {
     assert_eq!(parse_kydata_db_name("KYDATA0100126C"), None); // 区切り無し
     assert_eq!(parse_kydata_db_name("OTHER0100_126C"), None);
     assert_eq!(parse_kydata_db_name("KYDATA0100_1a6C"), None); // 年度に非数字
+}
+
+#[test]
+fn test_normalize_company_code() {
+    // #86: KCODE が数値列でゼロ埋めが失われるケースを 4 桁に正規化
+    assert_eq!(normalize_company_code("100"), "0100");
+    assert_eq!(normalize_company_code(" 100 "), "0100"); // trim してから判定
+    assert_eq!(normalize_company_code("1"), "0001");
+    // 既に 4 桁ならそのまま
+    assert_eq!(normalize_company_code("0100"), "0100");
+    // 数字以外・4 桁超・空は trim のみ
+    assert_eq!(normalize_company_code("10A"), "10A");
+    assert_eq!(normalize_company_code("12345"), "12345");
+    assert_eq!(normalize_company_code(""), "");
+    assert_eq!(normalize_company_code("   "), "");
 }
 
 #[test]
