@@ -12,6 +12,7 @@ use crate::auth::JwtSecret;
 use crate::cakephp::CakephpClient;
 use crate::config::{Config, RawConfig};
 use crate::db;
+use crate::kyuyo;
 use crate::repo::TiberiusRepo;
 use crate::routes;
 use crate::sqlite::{DynLocalStore, LocalStore};
@@ -38,6 +39,19 @@ pub async fn run(
     let raw_cfg = Arc::new(RawConfig {
         dir: config.raw.dir.clone(),
     });
+
+    // 給与大臣 (OHKEN) 読み取り (#82)。未設定なら stub を挿して該当ルートだけ 503。
+    // pool は起動時テストなし — 給与大臣 PC 停止でも本サービス全体は起動する
+    let kyuyo_repo: kyuyo::repo::DynKyuyoRepo = if config.kyuyo.db_enabled() {
+        let pool = kyuyo::repo::create_kyuyo_pool(&config.kyuyo).await?;
+        Arc::new(kyuyo::repo::TiberiusKyuyoRepo::new(pool))
+    } else {
+        tracing::info!("kyuyo database not configured — /api/kyuyo/* returns 503");
+        Arc::new(kyuyo::repo::NotConfiguredKyuyoRepo)
+    };
+    let kyuyo_auth = Arc::new(kyuyo::introspect::KyuyoAuthState::from_config(
+        &config.kyuyo,
+    ));
 
     let jwt_secret = JwtSecret(config.auth.jwt_secret.clone());
 
@@ -126,7 +140,9 @@ pub async fn run(
             "/uriage/verify-history",
             get(routes::uriage::verify_history),
         )
-        .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs));
+        .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs))
+        .route("/kyuyo/companies", get(routes::kyuyo::companies))
+        .route("/kyuyo/payroll", get(routes::kyuyo::payroll));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
@@ -143,7 +159,9 @@ pub async fn run(
         .layer(Extension(local_store))
         .layer(Extension(cakephp_client))
         .layer(Extension(raw_cfg))
-        .layer(Extension(jwt_secret));
+        .layer(Extension(jwt_secret))
+        .layer(Extension(kyuyo_repo))
+        .layer(Extension(kyuyo_auth));
 
     let addr = config.addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;
