@@ -14,10 +14,19 @@ path = "src/auth.rs"
 path = "src/config.rs"
 
 [[files]]
+path = "src/kyuyo/introspect.rs"
+
+[[files]]
+path = "src/kyuyo/logic.rs"
+
+[[files]]
 path = "src/routes/employees.rs"
 
 [[files]]
 path = "src/routes/health.rs"
+
+[[files]]
+path = "src/routes/kyuyo.rs"
 
 [[files]]
 path = "src/routes/sales.rs"
