@@ -1,6 +1,10 @@
 use rust_ichibanboshi::config::{AppArgs, Config};
 use std::io::Write;
 
+/// exe 隣接 `ichibanboshi.toml` を書くテストと、default locations を読むテストの
+/// 直列化。並列実行だと書いた一時 toml を別テストが読んでしまう。
+static EXE_TOML_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_config_defaults_from_empty_toml() {
     let config: Config = toml::from_str("").unwrap();
@@ -132,6 +136,7 @@ fn test_config_file_not_found() {
 
 #[test]
 fn test_config_from_args_no_overrides() {
+    let _g = EXE_TOML_LOCK.lock().unwrap();
     let args = AppArgs {
         console: true,
         config: None,
@@ -275,6 +280,7 @@ fn test_config_from_args_with_config_file_and_overrides() {
 
 #[test]
 fn test_load_default_locations_exe_adjacent() {
+    let _g = EXE_TOML_LOCK.lock().unwrap();
     // テストバイナリの隣に ichibanboshi.toml を置いてカバー
     let exe_path = std::env::current_exe().unwrap();
     let exe_dir = exe_path.parent().unwrap();
@@ -297,4 +303,49 @@ fn test_load_default_locations_exe_adjacent() {
     if !existed {
         std::fs::remove_file(&config_path).ok();
     }
+}
+
+// ══════════════════════════════════════════════════════════════
+// [kyuyo] (給与大臣読み取り、Refs #82)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_kyuyo_config_defaults_fail_closed() {
+    let config: Config = toml::from_str("").unwrap();
+    assert_eq!(config.kyuyo.port, 14330);
+    assert_eq!(config.kyuyo.user, "kyuyo_reader");
+    assert_eq!(config.kyuyo.app_origin, "https://dtako.ippoan.org");
+    assert_eq!(config.kyuyo.timeout_secs, 10);
+    assert!(config.kyuyo.host.is_empty());
+    assert!(config.kyuyo.allowed_emails.is_empty());
+    // 未設定は無効 (fail-closed)
+    assert!(!config.kyuyo.db_enabled());
+    assert!(!config.kyuyo.auth_configured());
+}
+
+#[test]
+fn test_kyuyo_config_enabled() {
+    let toml_str = r#"
+[kyuyo]
+host = "kyuyo-pc.example"
+port = 14330
+password = "secret"
+auth_worker_origin = "https://auth.example.com"
+introspect_secret = "shared"
+allowed_emails = ["keiri@example.com"]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.kyuyo.db_enabled());
+    assert!(config.kyuyo.auth_configured());
+    assert_eq!(config.kyuyo.allowed_emails, vec!["keiri@example.com"]);
+}
+
+#[test]
+fn test_kyuyo_config_partial_is_disabled() {
+    // host だけ / password 無しでは db_enabled にならない
+    let config: Config = toml::from_str("[kyuyo]\nhost = \"x\"\n").unwrap();
+    assert!(!config.kyuyo.db_enabled());
+    // introspect_secret 無しでは auth_configured にならない
+    let config: Config = toml::from_str("[kyuyo]\nauth_worker_origin = \"https://a\"\n").unwrap();
+    assert!(!config.kyuyo.auth_configured());
 }

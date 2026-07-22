@@ -15,3 +15,15 @@ jwt_secret = ""
 
 [cors]
 allowed_origins = ["https://ichibanboshi.mtamaramu.com", "https://rust-ichiban.mtamaramu.com", "http://localhost:3000"]
+
+# 給与大臣 (OHKEN) 読み取り (Refs #82)。実値はホスト上でのみ記入する
+# (repo にはコミットしない — secrets-inventory 参照)。
+# [kyuyo]
+# host = "<給与PC-HOST>"
+# port = 14330
+# user = "kyuyo_reader"
+# password = "<kyuyo_reader パスワード>"
+# auth_worker_origin = "<auth-worker origin (実稼働は auth-staging 側)>"
+# introspect_secret = "<INTERNAL_SHARED_SECRET_KYUYO>"
+# app_origin = "https://dtako.ippoan.org"
+# allowed_emails = ["<許可する email>"]

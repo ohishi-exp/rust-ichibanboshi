@@ -1,5 +1,6 @@
 pub mod employees;
 pub mod health;
+pub mod kyuyo;
 pub mod sales;
 pub mod schema;
 pub mod surcharge;
