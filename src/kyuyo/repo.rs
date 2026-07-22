@@ -49,7 +49,13 @@ impl std::fmt::Display for KyuyoRepoError {
 #[async_trait]
 pub trait KyuyoRepo: Send + Sync {
     /// `sys.databases` から KYDATA DB の (名前, HAS_DBACCESS) 一覧。
+    /// HAS_DBACCESS は AUTO_CLOSE の全 DB を開いて回るため**遅い** (〜10 秒) —
+    /// 権限抜けの網羅検知が要る時 (フル更新 / ヘルスチェック) だけ使う。
     async fn list_kydata_databases(&self) -> Result<Vec<(String, Option<i32>)>, KyuyoRepoError>;
+
+    /// `sys.databases` から KYDATA DB 名だけの一覧 (メタデータのみ、ミリ秒)。
+    /// 消費側の差分更新用 (Refs nuxt-dtako-admin#369)。
+    async fn list_kydata_database_names(&self) -> Result<Vec<String>, KyuyoRepoError>;
 
     /// `KYCOMSTD.SELDATA` から会社コード → 会社名。
     async fn company_names(&self) -> Result<Vec<(String, String)>, KyuyoRepoError>;
@@ -81,6 +87,9 @@ pub struct NotConfiguredKyuyoRepo;
 #[async_trait]
 impl KyuyoRepo for NotConfiguredKyuyoRepo {
     async fn list_kydata_databases(&self) -> Result<Vec<(String, Option<i32>)>, KyuyoRepoError> {
+        Err(KyuyoRepoError::NotConfigured)
+    }
+    async fn list_kydata_database_names(&self) -> Result<Vec<String>, KyuyoRepoError> {
         Err(KyuyoRepoError::NotConfigured)
     }
     async fn company_names(&self) -> Result<Vec<(String, String)>, KyuyoRepoError> {
@@ -198,6 +207,25 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .iter()
             .map(|r| (get_str(r, 0), r.try_get::<i32, _>(1).ok().flatten()))
             .collect())
+    }
+
+    async fn list_kydata_database_names(&self) -> Result<Vec<String>, KyuyoRepoError> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
+        // HAS_DBACCESS 無し = sys.databases のメタデータだけ読む (どの DB も開かず
+        // ミリ秒で返る)。消費側 (D1 リスト) の差分更新用
+        let stream = conn
+            .simple_query("SELECT name FROM sys.databases WHERE name LIKE 'KYDATA%' ORDER BY name")
+            .await
+            .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
+        Ok(rows.iter().map(|r| get_str(r, 0)).collect())
     }
 
     async fn company_names(&self) -> Result<Vec<(String, String)>, KyuyoRepoError> {
