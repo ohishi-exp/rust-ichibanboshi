@@ -6,11 +6,11 @@ Refs #81
 
 nuxt-dtako-admin の給与比較 (#253/#268 系) は現在、給与大臣から手動エクスポートした XLS を
 R2 に取り込んでいる。この XLS 手動エクスポートを廃止し、給与大臣の実体 DB
-(SQL Server 2008 R2、インスタンス `OHKEN`, `172.18.21.62,14330`) から直接読み取る
-API (#2) を作るための、前提スキーマ調査。
+(SQL Server 2008 R2、インスタンス `OHKEN`。ホスト/ポートの実値は repo に書かず
+実行時に受け取る) から直接読み取る API (#82) を作るための、前提スキーマ調査。
 
 調査は ohishi-data 上で `kyuyo_reader` (db_datareader、読み取り専用) を使い、
-`172.18.21.62,14330` へ TOP 付き SELECT のみで実施した (フルスキャン回避)。
+給与大臣 PC へ TOP 付き SELECT のみで実施した (フルスキャン回避)。
 
 ## 接続方法
 
@@ -32,8 +32,9 @@ MinProtocol = TLSv1
 CipherString = DEFAULT@SECLEVEL=1
 EOF
 
+# KYUYO_SQL_SERVER は "<給与PC-HOST>,<PORT>" 形式。パスワードともども実行時に受け取る
 OPENSSL_CONF=/tmp/openssl-tls1.cnf /opt/mssql-tools18/bin/sqlcmd \
-  -S 172.18.21.62,14330 -U kyuyo_reader -P "$KYUYO_READER_PASSWORD" -C \
+  -S "$KYUYO_SQL_SERVER" -U kyuyo_reader -P "$KYUYO_READER_PASSWORD" -C \
   -d KYDATA0100_126C -Q "SELECT TOP 5 * FROM KYUYO"
 ```
 
