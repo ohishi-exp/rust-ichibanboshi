@@ -16,6 +16,7 @@ use rust_ichibanboshi::kyuyo::repo::{
     DynKyuyoRepo, KyuyoRepo, KyuyoRepoError, NotConfiguredKyuyoRepo,
 };
 use rust_ichibanboshi::routes;
+use rust_ichibanboshi::routes::kyuyo::KyuyoLimiter;
 use tower::ServiceExt;
 
 // ══════════════════════════════════════════════════════════════
@@ -51,7 +52,8 @@ struct MockKyuyoRepo {
     names: Vec<(String, String)>,
     names_error: bool,
     payroll: Vec<RawKyuyoRow>,
-    payroll_error: bool,
+    /// Some(message) で payroll_month が QueryError(message) を返す。
+    payroll_error: Option<String>,
     koumoku: Vec<(String, String)>,
     koumoku_error: bool,
     shukei: Vec<RawShukeiRow>,
@@ -81,8 +83,8 @@ impl KyuyoRepo for MockKyuyoRepo {
         _from: &str,
         _to: &str,
     ) -> Result<Vec<RawKyuyoRow>, KyuyoRepoError> {
-        if self.payroll_error {
-            return Err(KyuyoRepoError::QueryError("boom".to_string()));
+        if let Some(message) = &self.payroll_error {
+            return Err(KyuyoRepoError::QueryError(message.clone()));
         }
         Ok(self.payroll.clone())
     }
@@ -115,6 +117,7 @@ fn build_app(repo: DynKyuyoRepo, auth: KyuyoAuthState) -> Router {
         .route("/api/kyuyo/payroll", get(routes::kyuyo::payroll))
         .layer(Extension(repo))
         .layer(Extension(Arc::new(auth)))
+        .layer(Extension(Arc::new(KyuyoLimiter::default())))
 }
 
 async fn get_json(app: Router, uri: &str, with_token: bool) -> (StatusCode, serde_json::Value) {
@@ -353,35 +356,37 @@ async fn test_payroll_bad_company_and_month() {
 }
 
 #[tokio::test]
-async fn test_payroll_db_missing() {
+async fn test_payroll_db_open_error_is_404() {
+    // 存在しない年度 DB / restore 由来の権限抜けは SQL Server error 4060
+    // ("Cannot open database") として現れる → 404 に変換 (500 にしない)
     let repo = MockKyuyoRepo {
-        databases: vec![("KYDATA0100_125C".to_string(), Some(1))],
+        payroll_error: Some(
+            "Cannot open database \"KYDATA0100_126C\" requested by the login.".to_string(),
+        ),
         ..Default::default()
     };
     let app = build_app(Arc::new(repo), auth_ok());
     let (status, body) = get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body["error"].as_str().unwrap().contains("KYDATA0100_126C"));
-}
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("KYDATA0100_126C"));
+    assert!(message.contains("権限の再付与"));
 
-#[tokio::test]
-async fn test_payroll_db_inaccessible() {
-    // restore 由来の権限抜けは 500 でなく明示エラー (#82 受け入れ条件)
+    // エラー番号 (4060) だけでメッセージ文言が違う場合も 404 に拾う
     let repo = MockKyuyoRepo {
-        databases: vec![("KYDATA0100_126C".to_string(), Some(0))],
+        payroll_error: Some("Error 4060: database unavailable".to_string()),
         ..Default::default()
     };
     let app = build_app(Arc::new(repo), auth_ok());
-    let (status, body) = get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(body["error"].as_str().unwrap().contains("権限の再付与"));
+    let (status, _) = get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn test_payroll_query_errors_bubble_up() {
-    // payroll_month 失敗
+    // payroll_month 失敗 (DB open 系でない一般エラーは 500 のまま)
     let mut repo = repo_with_june_data();
-    repo.payroll_error = true;
+    repo.payroll_error = Some("boom".to_string());
     let app = build_app(Arc::new(repo), auth_ok());
     let (status, _) = get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

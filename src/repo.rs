@@ -271,12 +271,7 @@ fn get_f64(row: &tiberius::Row, idx: usize) -> f64 {
                 .flatten()
                 .and_then(|d| format!("{}", d).parse::<f64>().ok())
         })
-        .or_else(|| {
-            row.try_get::<i32, _>(idx)
-                .ok()
-                .flatten()
-                .map(|v| v as f64)
-        })
+        .or_else(|| row.try_get::<i32, _>(idx).ok().flatten().map(|v| v as f64))
         .unwrap_or(0.0)
 }
 
