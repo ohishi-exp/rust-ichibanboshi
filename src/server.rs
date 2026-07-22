@@ -52,6 +52,8 @@ pub async fn run(
     let kyuyo_auth = Arc::new(kyuyo::introspect::KyuyoAuthState::from_config(
         &config.kyuyo,
     ));
+    // 給与 DB (OHKEN、非力な PC) を触る区間の同時実行制限 (Refs #369)
+    let kyuyo_limiter = Arc::new(routes::kyuyo::KyuyoLimiter::new());
 
     let jwt_secret = JwtSecret(config.auth.jwt_secret.clone());
 
@@ -161,7 +163,8 @@ pub async fn run(
         .layer(Extension(raw_cfg))
         .layer(Extension(jwt_secret))
         .layer(Extension(kyuyo_repo))
-        .layer(Extension(kyuyo_auth));
+        .layer(Extension(kyuyo_auth))
+        .layer(Extension(kyuyo_limiter));
 
     let addr = config.addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;

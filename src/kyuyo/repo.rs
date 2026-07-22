@@ -210,9 +210,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         // 素の KCODE を get_str (try_get::<&str>) に渡すと型不一致で Err → 空文字化し、
         // 全社が "" キーに衝突して名前が消える (#86)
         let stream = conn
-            .simple_query(
-                "SELECT CAST(KCODE AS varchar(10)), CONAME1 FROM [KYCOMSTD].dbo.SELDATA",
-            )
+            .simple_query("SELECT CAST(KCODE AS varchar(10)), CONAME1 FROM [KYCOMSTD].dbo.SELDATA")
             .await
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         let rows = stream
