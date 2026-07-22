@@ -71,6 +71,16 @@ impl KyuyoRepo for MockKyuyoRepo {
         }
         Ok(self.databases.clone())
     }
+    async fn list_kydata_database_names(&self) -> Result<Vec<String>, KyuyoRepoError> {
+        if self.databases_query_error {
+            return Err(KyuyoRepoError::QueryError("boom".to_string()));
+        }
+        Ok(self
+            .databases
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect())
+    }
     async fn company_names(&self) -> Result<Vec<(String, String)>, KyuyoRepoError> {
         if self.names_error {
             return Err(KyuyoRepoError::QueryError("no kycomstd".to_string()));
@@ -114,6 +124,7 @@ impl KyuyoRepo for MockKyuyoRepo {
 fn build_app(repo: DynKyuyoRepo, auth: KyuyoAuthState) -> Router {
     Router::new()
         .route("/api/kyuyo/companies", get(routes::kyuyo::companies))
+        .route("/api/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/api/kyuyo/payroll", get(routes::kyuyo::payroll))
         .layer(Extension(repo))
         .layer(Extension(Arc::new(auth)))
@@ -259,6 +270,51 @@ async fn test_companies_query_error() {
     let app = build_app(Arc::new(repo), auth_ok());
     let (status, _) = get_json(app, "/api/kyuyo/companies", true).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/databases (高速一覧)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_databases_ok() {
+    let repo = MockKyuyoRepo {
+        databases: vec![
+            ("KYDATA0100_126C".to_string(), Some(1)),
+            ("KYDATA0200_126C".to_string(), Some(0)), // 権限に関係なく名前は返る
+        ],
+        ..Default::default()
+    };
+    let app = build_app(Arc::new(repo), auth_ok());
+    let (status, body) = get_json(app, "/api/kyuyo/databases", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["databases"].as_array().unwrap(),
+        &vec![
+            serde_json::json!("KYDATA0100_126C"),
+            serde_json::json!("KYDATA0200_126C"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_databases_requires_token_and_maps_errors() {
+    // 認可ゲートは他の kyuyo ルートと同一
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/databases", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let repo = MockKyuyoRepo {
+        databases_query_error: true,
+        ..Default::default()
+    };
+    let app = build_app(Arc::new(repo), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/databases", true).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let app = build_app(Arc::new(NotConfiguredKyuyoRepo), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/databases", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // ══════════════════════════════════════════════════════════════

@@ -100,6 +100,42 @@ fn map_repo_err(e: KyuyoRepoError) -> ApiError {
 }
 
 // ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/databases (高速な DB 名一覧 — 差分更新用)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Debug)]
+pub struct DatabasesResponse {
+    /// `KYDATA{会社4桁}_{年度3桁}C` 形式の DB 名一覧 (昇順)。
+    pub databases: Vec<String>,
+}
+
+/// KYDATA DB 名の一覧のみ (`sys.databases` メタデータ、ミリ秒)。
+/// 消費側 (nuxt-dtako-admin) が D1 に持つリストとの差分更新に使う。
+/// 会社名・権限チェック込みの完全版は [`companies`] (遅い方)。
+pub async fn databases(
+    Extension(repo): Extension<DynKyuyoRepo>,
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
+    headers: HeaderMap,
+) -> Result<Json<DatabasesResponse>, ApiError> {
+    authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+
+    let _permit = limiter
+        .semaphore
+        .acquire()
+        .await
+        .expect("kyuyo limiter semaphore closed");
+
+    let databases = repo
+        .list_kydata_database_names()
+        .await
+        .map_err(map_repo_err)?;
+    Ok(Json(DatabasesResponse { databases }))
+}
+
+// ══════════════════════════════════════════════════════════════
 // GET /api/kyuyo/companies
 // ══════════════════════════════════════════════════════════════
 
