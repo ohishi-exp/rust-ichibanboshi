@@ -14,7 +14,9 @@ use bb8::Pool;
 use bb8_tiberius::ConnectionManager;
 use tiberius::{Config as TiberiusConfig, EncryptionLevel};
 
-use super::logic::{RawKyuyoRow, RawShukeiRow, MAX_MONTH_INDEX, MONEY_COLUMNS};
+use super::logic::{
+    normalize_company_code, RawKyuyoRow, RawShukeiRow, MAX_MONTH_INDEX, MONEY_COLUMNS,
+};
 use crate::config::KyuyoConfig;
 
 pub type KyuyoDbPool = Pool<ConnectionManager>;
@@ -204,8 +206,13 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
+        // KCODE の実列型 (数値/固定長文字列等) によらず &str で取れるよう CAST する。
+        // 素の KCODE を get_str (try_get::<&str>) に渡すと型不一致で Err → 空文字化し、
+        // 全社が "" キーに衝突して名前が消える (#86)
         let stream = conn
-            .simple_query("SELECT KCODE, CONAME1 FROM [KYCOMSTD].dbo.SELDATA")
+            .simple_query(
+                "SELECT CAST(KCODE AS varchar(10)), CONAME1 FROM [KYCOMSTD].dbo.SELDATA",
+            )
             .await
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         let rows = stream
@@ -214,7 +221,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         Ok(rows
             .iter()
-            .map(|r| (get_str(r, 0), get_str(r, 1)))
+            .map(|r| (normalize_company_code(&get_str(r, 0)), get_str(r, 1)))
             .collect())
     }
 
