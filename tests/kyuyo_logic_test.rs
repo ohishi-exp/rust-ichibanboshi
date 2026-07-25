@@ -168,6 +168,17 @@ fn raw_row(shain: i32, code: &str, taikei: i32, money: &[(usize, i64)]) -> RawKy
 
 /// 項目マスタ 1 件。`kazei` 1/2 = 支給・0 = 控除、`meisai` 1 = 単価項目 (Refs #93)。
 fn koumoku_row(key: &str, name: &str, kazei: i32, meisai: i32) -> (String, RawKoumokuRow) {
+    koumoku_row_gengaku(key, name, kazei, meisai, 0)
+}
+
+/// 減額項目 (`gengaku` = 1) を含めて組み立てる版 (Refs #87)。
+fn koumoku_row_gengaku(
+    key: &str,
+    name: &str,
+    kazei: i32,
+    meisai: i32,
+    gengaku: i32,
+) -> (String, RawKoumokuRow) {
     (
         key.to_string(),
         RawKoumokuRow {
@@ -175,6 +186,7 @@ fn koumoku_row(key: &str, name: &str, kazei: i32, meisai: i32) -> (String, RawKo
             name: name.to_string(),
             kazei,
             meisai,
+            gengaku,
         },
     )
 }
@@ -333,6 +345,45 @@ fn test_build_payroll_rows_payments_matching_soshikyu_has_no_warning() {
     assert_eq!(rows[0].payments.values().sum::<i64>(), 208_000);
     assert_eq!(rows[0].deductions["所得税"], 7_830);
     assert_eq!(rows[0].overtime_rate, Some(1_318.0));
+}
+
+#[test]
+fn test_build_payroll_rows_gengaku_item_is_subtracted_from_payments() {
+    // 減額項目 (GENGAKU=1) は MONEY に絶対値が正で入るが SOSHIKYU は差し引き済み。
+    // 素直に足すと差額の 2 倍 (ここでは 4,492) ぶん過大になる — 0200社 2026-06 の
+    // 8 名で実測した形 (Refs #87)
+    let koumoku = HashMap::from([
+        koumoku_row("01018", "基本給", 1, 0),
+        koumoku_row_gengaku("01022", "時間修正控除", 1, 0, 1),
+    ]);
+    let raw = vec![raw_row(4, "1771", 1, &[(0, 200_000), (4, 2_246)])];
+    let shukei = vec![RawShukeiRow {
+        shain: 4,
+        month_index: 5,
+        soshikyu: 197_754,
+        kazei: 197_754,
+        hoken: 0,
+        zei: 0,
+        shokoujo: 0,
+    }];
+
+    let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &shukei);
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(rows[0].payments["時間修正控除"], -2_246);
+    assert_eq!(rows[0].payments.values().sum::<i64>(), 197_754);
+    // 控除側へ移すのは誤り — deduction_total は HOKEN+ZEI+SHOKOUJO が正
+    assert!(rows[0].deductions.is_empty());
+    assert_eq!(rows[0].totals.as_ref().unwrap().deduction_total, 0);
+}
+
+#[test]
+fn test_build_payroll_rows_gengaku_on_deduction_side_keeps_sign() {
+    // 控除側 (kazei=0) の GENGAKU は符号を触らない。SOSHIKYU 突合の対象外で、
+    // 反転すると控除額が負になるだけ
+    let koumoku = HashMap::from([koumoku_row_gengaku("01018", "その他控除", 0, 0, 1)]);
+    let raw = vec![raw_row(4, "1771", 1, &[(0, 5_000)])];
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert_eq!(rows[0].deductions["その他控除"], 5_000);
 }
 
 #[test]
