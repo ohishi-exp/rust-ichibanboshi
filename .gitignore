@@ -2,3 +2,6 @@
 *.msi
 .env
 nuxt-ichibanboshi
+
+# ローカルの worktree (コミットしない)
+.worktrees/

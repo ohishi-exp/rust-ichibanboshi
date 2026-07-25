@@ -408,6 +408,12 @@ pub struct RawEmployeeRow {
     pub taikyu: i32,
     /// `SHOZOKU.SNAME` (所属表示名、trim 済み)。
     pub department: String,
+    /// `SHOZOKU.INCODE` (所属コード)。並べ替えの基準に使う (給与大臣が持つ所属の順序)。
+    pub department_code: i32,
+    /// `SHOZOKU.NAME1` (営業所名、trim 済み)。`SNAME` から切り出す必要が無くなる。
+    pub branch_name: String,
+    /// `SHOZOKU.NAME2` (職種名、trim 済み)。
+    pub job_name: String,
     /// `SHOZOKU.TAIKEI` (給与体系コード)。
     pub taikei: i32,
 }
@@ -426,6 +432,14 @@ pub struct EmployeeRow {
     pub employee_name: String,
     /// 所属 (`SHOZOKU.SNAME`)。
     pub department: String,
+    /// 所属コード (`SHOZOKU.INCODE`)。**並べ替えの基準**に使う — 表示名の文字順では
+    /// なく給与大臣が持つ所属の順序で並べたいため (Refs nuxt-dtako-admin#409)。
+    pub department_code: i32,
+    /// 営業所名 (`SHOZOKU.NAME1`)。拠点はこれをそのまま使えるので、表示名からの
+    /// 切り出し (全角スペース揺れの正規化・前方一致) が要らなくなる。
+    pub branch_name: String,
+    /// 職種名 (`SHOZOKU.NAME2`)。
+    pub job_name: String,
     /// 給与体系コード (`SHOZOKU.TAIKEI`)。
     pub taikei: i32,
     /// `SHAIN1.TAIKYU != 0` (退職済み)。
@@ -453,6 +467,9 @@ pub fn build_employee_rows(raw: &[RawEmployeeRow]) -> Vec<EmployeeRow> {
             employee_code_key: key,
             employee_name: r.employee_name.clone(),
             department: r.department.clone(),
+            department_code: r.department_code,
+            branch_name: r.branch_name.clone(),
+            job_name: r.job_name.clone(),
             taikei: r.taikei,
             retired: r.taikyu != 0,
         });

@@ -534,12 +534,17 @@ fn test_derived_impls_are_exercised() {
 // ══════════════════════════════════════════════════════════════
 
 fn raw_employee(code: &str, name: &str, dept: &str, taikei: i32, taikyu: i32) -> RawEmployeeRow {
+    // SHOZOKU は営業所名 (NAME1) と職種名 (NAME2) を別に持ち、SNAME はその結合
+    let mut parts = dept.split('　');
     RawEmployeeRow {
         employee_code: code.to_string(),
         employee_name: name.to_string(),
         taikyu,
         department: dept.to_string(),
         taikei,
+        department_code: 14,
+        branch_name: parts.next().unwrap_or("").to_string(),
+        job_name: parts.next().unwrap_or("").to_string(),
     }
 }
 
@@ -558,6 +563,18 @@ fn build_employee_rows_maps_and_sorts_by_numeric_code() {
     assert_eq!(rows[0].employee_code_key, "941");
     assert_eq!(rows[0].department, "本社　乗務員");
     assert_eq!(rows[0].taikei, 1);
+}
+
+#[test]
+fn build_employee_rows_exposes_shozoku_code_and_split_names() {
+    // 消費側 (nuxt-dtako-admin#409) は拠点を SNAME から切り出していたが、SHOZOKU は
+    // 営業所名と職種名を別に持つ。並べ替えの基準に使う所属コードも合わせて返す
+    let rows = build_employee_rows(&[raw_employee("1771", "鈴木　花子", "本社　乗務員", 1, 0)]);
+    assert_eq!(rows[0].department_code, 14);
+    assert_eq!(rows[0].branch_name, "本社");
+    assert_eq!(rows[0].job_name, "乗務員");
+    // SNAME は従来どおり結合済みの表示名
+    assert_eq!(rows[0].department, "本社　乗務員");
 }
 
 #[test]
