@@ -346,6 +346,7 @@ fn repo_with_june_data() -> MockKyuyoRepo {
             name: "基本給".to_string(),
             kazei: 1,
             meisai: 0,
+            gengaku: 0,
         }],
         shukei: vec![
             RawShukeiRow {

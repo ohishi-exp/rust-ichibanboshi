@@ -160,8 +160,7 @@ pub struct RawKyuyoRow {
 ///
 /// **支給/控除は `KAZEI` (課税区分) で分ける** — `KUBUN` (1〜5) は支給項目と控除項目が
 /// 同じ値に混在しており機械判定できないことを実データで確認した (#93、#81 の懸念どおり)。
-/// `GENGAKU` も使わない (「その他減額」が既に `SOSHIKYU` に含まれる例があり、控除側へ
-/// 倒すと合計が合わなくなる)。
+/// `GENGAKU` は**バケツ分けには使わない**が、符号には使う (下記)。
 #[derive(Debug, Clone)]
 pub struct RawKoumokuRow {
     /// 「体系(2桁) + 項目番号(3桁)」の合成キー (trim 済み)。
@@ -172,6 +171,13 @@ pub struct RawKoumokuRow {
     pub kazei: i32,
     /// 1 = 明細に出る単価項目 (残業単価・基本単価 等)。支給でも控除でもない。
     pub meisai: i32,
+    /// 1 = 減額項目 (「時間修正控除」「遅早控除」等)。支給側に居ても**マイナス**で効く。
+    ///
+    /// `MONEY` には絶対値が正で入っているが `SHUKEI1.SOSHIKYU` は差し引き済みなので、
+    /// そのまま足すと差額の 2 倍ぶん過大になる (0200社 2026-06 の 8 名で実測、Refs #87)。
+    /// 控除側へ移すのは誤り — `deduction_total` は `HOKEN+ZEI+SHOKOUJO` が正で、
+    /// 減額項目はそこに含まれない。
+    pub gengaku: i32,
 }
 
 /// `SHUKEI1` の 1 社員 × 1 支給回の計算済み集計。
@@ -256,9 +262,12 @@ const RATE_SCALE: f64 = 100.0;
 ///   項目ごとに 5 区分 (割増基礎 × 最低賃金) を割り当てるため — 合計値だけでは足りない
 /// - **`MEISAI=1` は単価項目**で支給でも控除でもない。基本単価/残業単価として抽出し、
 ///   `payments`/`deductions` のどちらにも入れない (入れると合計が合わなくなる)
+/// - **`GENGAKU=1` は減額項目**。支給側に居ても符号を反転して足す (`SOSHIKYU` が
+///   差し引き済みのため。控除側へ移すのは誤り — Refs [`RawKoumokuRow::gengaku`])
 /// - 項目名が引けない非ゼロ金額は `MONEY{NN}` キーで**支給側**に入れ warning を出す
 ///   (区分不明を控除に倒すと支給合計が過少になり、突合で気付けなくなるため)
 /// - 同名項目は合算する (給与比較の SalaryCsvRow と同じ規則)
+/// - 最後に `payments` 合計と `SHUKEI1.SOSHIKYU` を突き合わせ、ズレたら warning を出す
 pub fn build_payroll_rows(
     raw: &[RawKyuyoRow],
     koumoku: &HashMap<String, RawKoumokuRow>,
@@ -306,7 +315,14 @@ pub fn build_payroll_rows(
                 } else {
                     &mut payments
                 };
-                *bucket.entry(item.name.clone()).or_insert(0) += amount;
+                // 支給側の減額項目 (GENGAKU=1) は符号を反転する。SOSHIKYU は既に
+                // 差し引き済みなので、正のまま足すと差額の 2 倍ぶん過大になる
+                let signed = if item.gengaku == 1 && item.kazei != 0 {
+                    -amount
+                } else {
+                    *amount
+                };
+                *bucket.entry(item.name.clone()).or_insert(0) += signed;
             }
 
             let totals = match shukei_by_key.get(&(r.shain, r.month_index)) {
