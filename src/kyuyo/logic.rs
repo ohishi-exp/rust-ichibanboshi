@@ -156,6 +156,24 @@ pub struct RawKyuyoRow {
     pub money: Vec<i64>,
 }
 
+/// `KOUMOKU` (支給/控除項目マスタ) の 1 行。
+///
+/// **支給/控除は `KAZEI` (課税区分) で分ける** — `KUBUN` (1〜5) は支給項目と控除項目が
+/// 同じ値に混在しており機械判定できないことを実データで確認した (#93、#81 の懸念どおり)。
+/// `GENGAKU` も使わない (「その他減額」が既に `SOSHIKYU` に含まれる例があり、控除側へ
+/// 倒すと合計が合わなくなる)。
+#[derive(Debug, Clone)]
+pub struct RawKoumokuRow {
+    /// 「体系(2桁) + 項目番号(3桁)」の合成キー (trim 済み)。
+    pub taikeikouno: String,
+    /// 項目名 (trim 済み)。
+    pub name: String,
+    /// 課税区分。1/2 = 支給 (2 は通勤手当の非課税枠)、0 = 控除。
+    pub kazei: i32,
+    /// 1 = 明細に出る単価項目 (残業単価・基本単価 等)。支給でも控除でもない。
+    pub meisai: i32,
+}
+
 /// `SHUKEI1` の 1 社員 × 1 支給回の計算済み集計。
 #[derive(Debug, Clone)]
 pub struct RawShukeiRow {
@@ -214,20 +232,36 @@ pub struct PayrollRow {
     pub period_end: String,
     /// `SHAIN1.TAIKYU != 0` (退職済み)。
     pub retired: bool,
-    /// 支給/控除項目名 → 金額 (円)。0 円の項目は含めない。同名項目は合算。
-    pub amounts: BTreeMap<String, i64>,
+    /// **支給**項目名 → 金額 (円)。`KOUMOKU.KAZEI IN (1,2)`。0 円は含めない。同名は合算。
+    /// この合計が `totals.soshikyu` と一致する (#93 で 0100 社 52 名で実証)。
+    pub payments: BTreeMap<String, i64>,
+    /// **控除**項目名 → 金額 (円)。`KOUMOKU.KAZEI = 0` かつ単価項目でないもの。
+    pub deductions: BTreeMap<String, i64>,
+    /// 基本単価 (日額、円)。`MEISAI=1` の「基本単価」項目。DB は ×100 の固定小数。
+    pub base_rate: Option<f64>,
+    /// 残業単価 (時給、円)。`MEISAI=1` の「残業単価」項目。
+    pub overtime_rate: Option<f64>,
     /// `SHUKEI1` の計算済み合計。該当行が無い場合は null (warning を併記)。
     pub totals: Option<PayrollTotals>,
 }
 
+/// 単価項目 (`MEISAI=1`) の DB 値は ×100 の固定小数 (`1318.00` 円が `131800`)。
+const RATE_SCALE: f64 = 100.0;
+
 /// `KYUYO` 生行 + 項目マスタ + `SHUKEI1` 集計から給与行を組み立てる。
 ///
-/// - `koumoku`: `TAIKEIKOUNO` (trim 済み) → 項目名 (trim 済み)
-/// - 項目名が引けない非ゼロ金額は `MONEY{NN}` キーで返し warning を出す
+/// - `koumoku`: `TAIKEIKOUNO` (trim 済み) → 項目マスタ行
+/// - **支給/控除は `KAZEI` で分ける** (`1,2` = 支給 / `0` = 控除)。`KUBUN` は両者が
+///   混在しており使えない (#93 実証)。項目別の区分が要るのは、消費側の給与比較が
+///   項目ごとに 5 区分 (割増基礎 × 最低賃金) を割り当てるため — 合計値だけでは足りない
+/// - **`MEISAI=1` は単価項目**で支給でも控除でもない。基本単価/残業単価として抽出し、
+///   `payments`/`deductions` のどちらにも入れない (入れると合計が合わなくなる)
+/// - 項目名が引けない非ゼロ金額は `MONEY{NN}` キーで**支給側**に入れ warning を出す
+///   (区分不明を控除に倒すと支給合計が過少になり、突合で気付けなくなるため)
 /// - 同名項目は合算する (給与比較の SalaryCsvRow と同じ規則)
 pub fn build_payroll_rows(
     raw: &[RawKyuyoRow],
-    koumoku: &HashMap<String, String>,
+    koumoku: &HashMap<String, RawKoumokuRow>,
     shukei: &[RawShukeiRow],
 ) -> (Vec<PayrollRow>, Vec<String>) {
     let shukei_by_key: HashMap<(i32, i32), &RawShukeiRow> = shukei
@@ -239,23 +273,40 @@ pub fn build_payroll_rows(
     let mut rows: Vec<PayrollRow> = raw
         .iter()
         .map(|r| {
-            let mut amounts: BTreeMap<String, i64> = BTreeMap::new();
+            let mut payments: BTreeMap<String, i64> = BTreeMap::new();
+            let mut deductions: BTreeMap<String, i64> = BTreeMap::new();
+            let mut base_rate: Option<f64> = None;
+            let mut overtime_rate: Option<f64> = None;
             for (n, amount) in r.money.iter().enumerate() {
                 if *amount == 0 {
                     continue;
                 }
                 let key = taikeikouno(r.taikei, n);
-                let name = match koumoku.get(&key) {
-                    Some(name) if !name.is_empty() => name.clone(),
-                    _ => {
-                        warnings.insert(format!(
-                            "項目マスタ未解決: TAIKEIKOUNO={key} (体系{}, MONEY{n:02})",
-                            r.taikei
-                        ));
-                        format!("MONEY{n:02}")
-                    }
+                let Some(item) = koumoku.get(&key).filter(|i| !i.name.is_empty()) else {
+                    warnings.insert(format!(
+                        "項目マスタ未解決: TAIKEIKOUNO={key} (体系{}, MONEY{n:02})",
+                        r.taikei
+                    ));
+                    *payments.entry(format!("MONEY{n:02}")).or_insert(0) += amount;
+                    continue;
                 };
-                *amounts.entry(name).or_insert(0) += amount;
+                if item.meisai == 1 {
+                    // 単価項目。名前で基本単価/残業単価だけを拾う (通勤単価・休日単価は
+                    // 消費側が使わないので落とす — 必要になったら足す)
+                    let rate = *amount as f64 / RATE_SCALE;
+                    match item.name.as_str() {
+                        "基本単価" => base_rate = Some(rate),
+                        "残業単価" => overtime_rate = Some(rate),
+                        _ => {}
+                    }
+                    continue;
+                }
+                let bucket = if item.kazei == 0 {
+                    &mut deductions
+                } else {
+                    &mut payments
+                };
+                *bucket.entry(item.name.clone()).or_insert(0) += amount;
             }
 
             let totals = match shukei_by_key.get(&(r.shain, r.month_index)) {
@@ -291,7 +342,10 @@ pub fn build_payroll_rows(
                 period_start: r.period_start.clone(),
                 period_end: r.period_end.clone(),
                 retired: r.taikyu != 0,
-                amounts,
+                payments,
+                deductions,
+                base_rate,
+                overtime_rate,
                 totals,
             }
         })
@@ -381,7 +435,8 @@ pub fn build_employee_rows(raw: &[RawEmployeeRow]) -> Vec<EmployeeRow> {
     rows.sort_by(|a, b| {
         let an = a.employee_code_key.parse::<u64>().ok();
         let bn = b.employee_code_key.parse::<u64>().ok();
-        an.cmp(&bn).then_with(|| a.employee_code.cmp(&b.employee_code))
+        an.cmp(&bn)
+            .then_with(|| a.employee_code.cmp(&b.employee_code))
     });
     rows
 }

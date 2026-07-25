@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::kyuyo::introspect::{authorize, KyuyoAuthState};
 use crate::kyuyo::logic::{
     build_companies, build_employee_rows, build_payroll_rows, kydata_db_name, month_period,
-    nendo_for_month, parse_month, CompanyInfo, EmployeeRow, PayrollRow, ALLOWED_COMPANIES,
+    nendo_for_month, parse_month, CompanyInfo, EmployeeRow, PayrollRow, RawKoumokuRow,
+    ALLOWED_COMPANIES,
 };
 use crate::kyuyo::repo::{DynKyuyoRepo, KyuyoRepoError};
 
@@ -356,11 +357,12 @@ pub async fn payroll(
         .await
         .map_err(|e| map_db_open_err(e, &db))?;
 
-    let koumoku: HashMap<String, String> = repo
+    let koumoku: HashMap<String, RawKoumokuRow> = repo
         .koumoku(&db)
         .await
         .map_err(map_repo_err)?
         .into_iter()
+        .map(|r| (r.taikeikouno.clone(), r))
         .collect();
 
     // 対象月に現れた支給回インデックスごとに SHUKEI1 の計算済み集計を引く

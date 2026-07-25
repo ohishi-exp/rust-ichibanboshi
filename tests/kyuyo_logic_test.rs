@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use rust_ichibanboshi::kyuyo::logic::{
     build_companies, build_employee_rows, build_payroll_rows, email_allowed, employee_code_key,
     kydata_db_name, month_period, nendo_for_month, normalize_company_code, normalize_emails,
-    parse_kydata_db_name, parse_month, taikeikouno, RawEmployeeRow, RawKyuyoRow, RawShukeiRow,
-    ALLOWED_COMPANIES, MONEY_COLUMNS,
+    parse_kydata_db_name, parse_month, taikeikouno, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow,
+    RawShukeiRow, ALLOWED_COMPANIES, MONEY_COLUMNS,
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -166,13 +166,26 @@ fn raw_row(shain: i32, code: &str, taikei: i32, money: &[(usize, i64)]) -> RawKy
     }
 }
 
-fn koumoku_taikei1() -> HashMap<String, String> {
-    // #81 実データ検証の 4 項目 (体系 1)
+/// 項目マスタ 1 件。`kazei` 1/2 = 支給・0 = 控除、`meisai` 1 = 単価項目 (Refs #93)。
+fn koumoku_row(key: &str, name: &str, kazei: i32, meisai: i32) -> (String, RawKoumokuRow) {
+    (
+        key.to_string(),
+        RawKoumokuRow {
+            taikeikouno: key.to_string(),
+            name: name.to_string(),
+            kazei,
+            meisai,
+        },
+    )
+}
+
+fn koumoku_taikei1() -> HashMap<String, RawKoumokuRow> {
+    // #81 実データ検証の 4 項目 (体系 1、いずれも支給)
     HashMap::from([
-        ("01018".to_string(), "基本給".to_string()),
-        ("01022".to_string(), "住宅手当".to_string()),
-        ("01024".to_string(), "無事故手当".to_string()),
-        ("01028".to_string(), "家畜運搬手当".to_string()),
+        koumoku_row("01018", "基本給", 1, 0),
+        koumoku_row("01022", "住宅手当", 1, 0),
+        koumoku_row("01024", "無事故手当", 1, 0),
+        koumoku_row("01028", "家畜運搬手当", 1, 0),
     ])
 }
 
@@ -211,11 +224,12 @@ fn test_build_payroll_rows_maps_items_and_totals() {
     assert_eq!(row.period_end, "2026-05-31");
     assert!(!row.retired);
 
-    assert_eq!(row.amounts.len(), 4);
-    assert_eq!(row.amounts["基本給"], 83_418);
-    assert_eq!(row.amounts["住宅手当"], 9_000);
-    assert_eq!(row.amounts["無事故手当"], 27_000);
-    assert_eq!(row.amounts["家畜運搬手当"], 52_000);
+    assert_eq!(row.payments.len(), 4);
+    assert_eq!(row.payments["基本給"], 83_418);
+    assert_eq!(row.payments["住宅手当"], 9_000);
+    assert_eq!(row.payments["無事故手当"], 27_000);
+    assert_eq!(row.payments["家畜運搬手当"], 52_000);
+    assert!(row.deductions.is_empty());
 
     // #81 の恒等式: 控除合計 94,728 / 差引 309,317
     let totals = row.totals.as_ref().expect("totals");
@@ -232,13 +246,13 @@ fn test_build_payroll_rows_maps_items_and_totals() {
 fn test_build_payroll_rows_merges_same_item_name() {
     // 同名項目は合算 (SalaryCsvRow と同じ規則)。体系 1 の 01018/01022 を同名にする
     let koumoku = HashMap::from([
-        ("01018".to_string(), "調整手当".to_string()),
-        ("01022".to_string(), "調整手当".to_string()),
+        koumoku_row("01018", "調整手当", 1, 0),
+        koumoku_row("01022", "調整手当", 1, 0),
     ]);
     let raw = vec![raw_row(4, "0941  ", 1, &[(0, 1_000), (4, 234)])];
     let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &[]);
-    assert_eq!(rows[0].amounts.len(), 1);
-    assert_eq!(rows[0].amounts["調整手当"], 1_234);
+    assert_eq!(rows[0].payments.len(), 1);
+    assert_eq!(rows[0].payments["調整手当"], 1_234);
     // SHUKEI1 欠落 warning も同時に立つ
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("SHUKEI1"));
@@ -248,11 +262,13 @@ fn test_build_payroll_rows_merges_same_item_name() {
 #[test]
 fn test_build_payroll_rows_unmapped_item_falls_back_with_warning() {
     // 項目マスタに無い列 / 名前が空の列は MONEY{NN} キー + warning
-    let koumoku = HashMap::from([("01019".to_string(), "".to_string())]);
+    let koumoku = HashMap::from([koumoku_row("01019", "", 1, 0)]);
     let raw = vec![raw_row(4, "1", 1, &[(1, 500), (7, 300)])];
     let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &[]);
-    assert_eq!(rows[0].amounts["MONEY01"], 500);
-    assert_eq!(rows[0].amounts["MONEY07"], 300);
+    // 区分不明は**支給側**へ入れる (控除に倒すと支給合計が過少になり突合で気付けない)
+    assert_eq!(rows[0].payments["MONEY01"], 500);
+    assert_eq!(rows[0].payments["MONEY07"], 300);
+    assert!(rows[0].deductions.is_empty());
     // 未解決 2 件 + SHUKEI1 欠落 1 件
     assert_eq!(warnings.len(), 3);
     assert!(warnings.iter().any(|w| w.contains("01019")));
@@ -277,7 +293,8 @@ fn test_build_payroll_rows_zero_amounts_excluded_and_retired_flag() {
         }],
     );
     assert!(warnings.is_empty());
-    assert!(rows[0].amounts.is_empty()); // 全項目 0 円 → amounts 空
+    assert!(rows[0].payments.is_empty()); // 全項目 0 円 → 支給も控除も空
+    assert!(rows[0].deductions.is_empty());
     assert!(rows[0].retired);
     assert_eq!(rows[0].totals.as_ref().unwrap().net_pay, 0);
 }
@@ -418,7 +435,9 @@ fn build_employee_rows_maps_and_sorts_by_numeric_code() {
         raw_employee("0941", "山田　太郎", "本社　乗務員", 1, 0),
     ]);
     assert_eq!(
-        rows.iter().map(|r| r.employee_code.as_str()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| r.employee_code.as_str())
+            .collect::<Vec<_>>(),
         vec!["0941", "1771"]
     );
     assert_eq!(rows[0].employee_code_key, "941");
@@ -445,4 +464,83 @@ fn build_employee_rows_dedupes_same_code_first_wins() {
 #[test]
 fn build_employee_rows_empty_input() {
     assert!(build_employee_rows(&[]).is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════
+// 支給/控除の分離と単価の抽出 (Refs #93)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_build_payroll_rows_splits_payments_and_deductions_by_kazei() {
+    // KUBUN では支給/控除を分けられない (実データで混在) ため KAZEI で判定する。
+    // KAZEI 1/2 = 支給 (2 は通勤手当の非課税枠)、0 = 控除。
+    let koumoku = HashMap::from([
+        koumoku_row("01018", "基本給", 1, 0),
+        koumoku_row("01021", "通勤手当", 2, 0),
+        koumoku_row("01066", "健康保険料", 0, 0),
+        koumoku_row("01070", "所得税", 0, 0),
+    ]);
+    let raw = vec![raw_row(
+        4,
+        "1771",
+        1,
+        &[(0, 83_418), (3, 4_100), (48, 12_000), (52, 3_500)],
+    )];
+    let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &[]);
+    let row = &rows[0];
+
+    assert_eq!(row.payments.len(), 2);
+    assert_eq!(row.payments["基本給"], 83_418);
+    assert_eq!(row.payments["通勤手当"], 4_100); // KAZEI=2 も支給側
+    assert_eq!(row.deductions.len(), 2);
+    assert_eq!(row.deductions["健康保険料"], 12_000);
+    assert_eq!(row.deductions["所得税"], 3_500);
+    // SHUKEI1 欠落 warning のみ (項目は全て解決している)
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("SHUKEI1"));
+}
+
+#[test]
+fn test_build_payroll_rows_extracts_rates_from_meisai_items() {
+    // 単価は MEISAI=1 の項目として MONEY 枠内にある (新規テーブル不要)。
+    // DB 値は ×100 の固定小数。実データ: 残業単価 MONEY60 = 131800 → 1318.00 円で、
+    // 残業時間 59.00h × 1318.00 = 77,762 円が残業手当 (MONEY24) と一致する。
+    let koumoku = HashMap::from([
+        koumoku_row("01042", "残業手当", 1, 0),
+        koumoku_row("01078", "残業単価", 0, 1),
+        koumoku_row("01079", "通勤単価", 0, 1),
+        koumoku_row("01080", "基本単価", 0, 1),
+    ]);
+    let raw = vec![raw_row(
+        4,
+        "1771",
+        1,
+        &[(24, 77_762), (60, 131_800), (61, 5_000), (62, 367_900)],
+    )];
+    let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &[]);
+    let row = &rows[0];
+
+    assert_eq!(row.overtime_rate, Some(1_318.0));
+    assert_eq!(row.base_rate, Some(3_679.0));
+    // 単価項目は支給にも控除にも入れない (入れると合計が合わなくなる)。
+    // 通勤単価・休日単価は消費側が使わないので落とす
+    assert_eq!(row.payments.len(), 1);
+    assert_eq!(row.payments["残業手当"], 77_762);
+    assert!(row.deductions.is_empty());
+    assert_eq!(warnings.len(), 1); // SHUKEI1 欠落のみ
+
+    // 実データの整合: 残業時間 × 残業単価 = 残業手当
+    let overtime_pay = (59.0_f64 * row.overtime_rate.unwrap()).round() as i64;
+    assert_eq!(overtime_pay, row.payments["残業手当"]);
+}
+
+#[test]
+fn test_build_payroll_rows_rates_absent_when_no_meisai_items() {
+    let (rows, _) = build_payroll_rows(
+        &[raw_row(4, "1771", 1, &[(0, 1_000)])],
+        &koumoku_taikei1(),
+        &[],
+    );
+    assert_eq!(rows[0].base_rate, None);
+    assert_eq!(rows[0].overtime_rate, None);
 }
