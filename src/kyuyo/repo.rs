@@ -376,7 +376,14 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
-        let query = format!("SELECT TAIKEIKOUNO, NAME, KAZEI, MEISAI FROM [{db}].dbo.KOUMOKU");
+        // KAZEI/MEISAI は実列型が int ではない (smallint 等) ので CAST してから渡す。
+        // 素で try_get::<i32> すると型不一致で Err → unwrap_or(0) が効き、全項目が
+        // kazei=0 (控除) / meisai≠1 (単価除外が効かない) に化ける。KCODE (#86) と
+        // 同じ罠で、本番では payments が全件空・単価が deductions に混入していた
+        let query = format!(
+            "SELECT TAIKEIKOUNO, NAME, CAST(ISNULL(KAZEI, 0) AS int), \
+             CAST(ISNULL(MEISAI, 0) AS int) FROM [{db}].dbo.KOUMOKU"
+        );
         let stream = conn
             .simple_query(&query)
             .await

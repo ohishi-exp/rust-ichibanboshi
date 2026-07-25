@@ -311,6 +311,16 @@ pub fn build_payroll_rows(
 
             let totals = match shukei_by_key.get(&(r.shain, r.month_index)) {
                 Some(s) => {
+                    // 支給合計の自己突合 (Refs #87)。項目別の区分 (KAZEI/MEISAI) が
+                    // 壊れても payments が静かに欠けるだけで応答は 200 のまま返るため、
+                    // SHUKEI1 の集計値と突き合わせて食い違いを warning に出す
+                    let payments_total: i64 = payments.values().sum();
+                    if payments_total != s.soshikyu {
+                        warnings.insert(format!(
+                            "支給合計が SHUKEI1 と不一致: SHAIN={} MONTH={} payments={payments_total} SOSHIKYU={}",
+                            r.shain, r.month_index, s.soshikyu
+                        ));
+                    }
                     let deduction_total = s.hoken + s.zei + s.shokoujo;
                     Some(PayrollTotals {
                         soshikyu: s.soshikyu,
