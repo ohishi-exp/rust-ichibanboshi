@@ -8,7 +8,7 @@
 //! - 支給/控除項目: `MONEY00..79` ↔ `KOUMOKU.TAIKEIKOUNO = 体系(2桁) + (18+列番号)(3桁)`
 //! - 支給合計等は `SHUKEI1` の計算済み列 (`SOSHIKYU{NN}` 等、NN = MONTH) を使う
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -307,6 +307,83 @@ pub fn build_payroll_rows(
     });
 
     (rows, warnings.into_iter().collect())
+}
+
+// ══════════════════════════════════════════════════════════════
+// employees (社員の識別情報のみ — 金額を持たない)
+// ══════════════════════════════════════════════════════════════
+
+/// 社員マスタ (`SHAIN1` × `SHOZOKU`) の生行。
+///
+/// **給与明細 (`KYUYO`) は読まない** — 所属は `SHAIN1.SHOZOKU` が持っており
+/// (docs/kyuyo-daijin-schema.md の社員マスタ節)、社員一覧を得るのに支給実績を
+/// 経由する必要が無い。金額列 (`MONEY00..79`) は SELECT にも現れない。
+#[derive(Debug, Clone)]
+pub struct RawEmployeeRow {
+    /// `SHAIN1.CODE` (社員番号、trim 済み)。
+    pub employee_code: String,
+    /// `SHAIN1.NAME` (氏名、trim 済み)。
+    pub employee_name: String,
+    /// `SHAIN1.TAIKYU` (0=在籍中)。
+    pub taikyu: i32,
+    /// `SHOZOKU.SNAME` (所属表示名、trim 済み)。
+    pub department: String,
+    /// `SHOZOKU.TAIKEI` (給与体系コード)。
+    pub taikei: i32,
+}
+
+/// 社員 1 名の識別情報 (金額なし)。
+///
+/// 消費者は ohishi-exp/nuxt-dtako-admin の社員マスタ (D1、Refs #367) —
+/// 給与明細 CSV をブラウザに貼らずに社員マスタを作るための供給元。
+/// **支給額・控除額は一切含めない**(「金額はブラウザから出さない」方針)。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct EmployeeRow {
+    /// 社員番号 (`SHAIN1.CODE` trim 済み、前ゼロは残す)。
+    pub employee_code: String,
+    /// 前ゼロ除去済みの突合キー。
+    pub employee_code_key: String,
+    pub employee_name: String,
+    /// 所属 (`SHOZOKU.SNAME`)。
+    pub department: String,
+    /// 給与体系コード (`SHOZOKU.TAIKEI`)。
+    pub taikei: i32,
+    /// `SHAIN1.TAIKYU != 0` (退職済み)。
+    pub retired: bool,
+}
+
+/// 社員マスタの生行を応答形に整える。
+///
+/// `SHAIN1` は 1 社員 1 行なので畳み込みは不要 — 突合キーの生成と並べ替えだけ。
+/// **同じ社員番号が複数行あった場合は先勝ち**で 1 件に落とす (再利用された
+/// 社員番号や DEL フラグの運用揺れで重複しても、消費側の社員マスタが
+/// (会社, 給与コード) を主キーにしているため 2 件返しても意味が無い)。
+/// 並びは社員番号の数値順 → 原文順 ([`build_payroll_rows`] と同じ)。
+/// 退職者 (`TAIKYU != 0`) も `retired: true` で含める — 過去月の突合に要る。
+pub fn build_employee_rows(raw: &[RawEmployeeRow]) -> Vec<EmployeeRow> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows: Vec<EmployeeRow> = Vec::new();
+    for r in raw {
+        let key = employee_code_key(&r.employee_code);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        rows.push(EmployeeRow {
+            employee_code: r.employee_code.clone(),
+            employee_code_key: key,
+            employee_name: r.employee_name.clone(),
+            department: r.department.clone(),
+            taikei: r.taikei,
+            retired: r.taikyu != 0,
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        let an = a.employee_code_key.parse::<u64>().ok();
+        let bn = b.employee_code_key.parse::<u64>().ok();
+        an.cmp(&bn).then_with(|| a.employee_code.cmp(&b.employee_code))
+    });
+    rows
 }
 
 // ══════════════════════════════════════════════════════════════
