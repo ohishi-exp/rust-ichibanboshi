@@ -11,7 +11,7 @@ use axum::{Extension, Router};
 use rust_ichibanboshi::kyuyo::introspect::{
     IntrospectApi, IntrospectError, IntrospectResult, KyuyoAuthState,
 };
-use rust_ichibanboshi::kyuyo::logic::{RawKyuyoRow, RawShukeiRow, MONEY_COLUMNS};
+use rust_ichibanboshi::kyuyo::logic::{RawEmployeeRow, RawKyuyoRow, RawShukeiRow, MONEY_COLUMNS};
 use rust_ichibanboshi::kyuyo::repo::{
     DynKyuyoRepo, KyuyoRepo, KyuyoRepoError, NotConfiguredKyuyoRepo,
 };
@@ -58,6 +58,9 @@ struct MockKyuyoRepo {
     koumoku_error: bool,
     shukei: Vec<RawShukeiRow>,
     shukei_error: bool,
+    employees: Vec<RawEmployeeRow>,
+    /// Some(message) で employees が QueryError(message) を返す。
+    employees_error: Option<String>,
 }
 
 #[async_trait]
@@ -98,6 +101,13 @@ impl KyuyoRepo for MockKyuyoRepo {
         }
         Ok(self.payroll.clone())
     }
+    async fn employees(&self, _db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError> {
+        if let Some(message) = &self.employees_error {
+            return Err(KyuyoRepoError::QueryError(message.clone()));
+        }
+        Ok(self.employees.clone())
+    }
+
     async fn koumoku(&self, _db: &str) -> Result<Vec<(String, String)>, KyuyoRepoError> {
         if self.koumoku_error {
             return Err(KyuyoRepoError::QueryError("boom".to_string()));
@@ -126,6 +136,7 @@ fn build_app(repo: DynKyuyoRepo, auth: KyuyoAuthState) -> Router {
         .route("/api/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/api/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/api/kyuyo/payroll", get(routes::kyuyo::payroll))
+        .route("/api/kyuyo/employees", get(routes::kyuyo::employees))
         .layer(Extension(repo))
         .layer(Extension(Arc::new(auth)))
         .layer(Extension(Arc::new(KyuyoLimiter::default())))
@@ -510,4 +521,110 @@ fn test_kyuyo_repo_error_display() {
         KyuyoRepoError::QueryError("q".to_string()).to_string(),
         "kyuyo query error: q"
     );
+}
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/employees (識別情報のみ、Refs ohishi-exp/nuxt-dtako-admin#367)
+// ══════════════════════════════════════════════════════════════
+
+fn employee_row(code: &str, name: &str, dept: &str, taikei: i32, taikyu: i32) -> RawEmployeeRow {
+    RawEmployeeRow {
+        employee_code: code.to_string(),
+        employee_name: name.to_string(),
+        taikyu,
+        department: dept.to_string(),
+        taikei,
+    }
+}
+
+fn repo_with_employees() -> MockKyuyoRepo {
+    MockKyuyoRepo {
+        names: vec![("0100".to_string(), "有限会社　大石運輸".to_string())],
+        employees: vec![
+            employee_row("0941", "山田　太郎", "本社　乗務員", 1, 0),
+            employee_row("1771", "鈴木　花子", "本社　事務", 2, 1),
+        ],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn employees_returns_identity_only_with_company_name() {
+    let app = build_app(Arc::new(repo_with_employees()), auth_ok());
+    let (status, json) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["company"], "0100");
+    assert_eq!(json["company_name"], "有限会社　大石運輸");
+    assert_eq!(json["database"], "KYDATA0100_126C");
+    let rows = json["employees"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    // 社員番号の数値順 (941 < 1771)
+    assert_eq!(rows[0]["employee_code"], "0941");
+    assert_eq!(rows[0]["employee_code_key"], "941");
+    assert_eq!(rows[0]["department"], "本社　乗務員");
+    assert_eq!(rows[0]["taikei"], 1);
+    assert_eq!(rows[0]["retired"], false);
+    assert_eq!(rows[1]["employee_code_key"], "1771");
+    assert_eq!(rows[1]["retired"], true);
+    // 金額系のキーは一切出ない
+    assert!(rows[0].get("amounts").is_none());
+    assert!(rows[0].get("totals").is_none());
+}
+
+#[tokio::test]
+async fn employees_validates_company_and_month() {
+    let app = build_app(Arc::new(repo_with_employees()), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/employees?company=9999&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let app = build_app(Arc::new(repo_with_employees()), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026/06", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn employees_requires_auth() {
+    let app = build_app(Arc::new(repo_with_employees()), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn employees_maps_db_open_error_to_404() {
+    let mut repo = repo_with_employees();
+    repo.employees_error = Some("Cannot open database \"KYDATA0100_126C\"".to_string());
+    let app = build_app(Arc::new(repo), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn employees_survives_company_name_failure_with_warning() {
+    let mut repo = repo_with_employees();
+    repo.names_error = true;
+    let app = build_app(Arc::new(repo), auth_ok());
+    let (status, json) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["company_name"], "");
+    assert_eq!(json["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(json["employees"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn employees_returns_503_when_db_not_configured() {
+    let app = build_app(Arc::new(NotConfiguredKyuyoRepo), auth_ok());
+    let (status, _) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn employees_company_name_empty_when_not_in_master() {
+    // KYCOMSTD は読めるが対象会社の行が無い (会社名だけ空、warning は出ない)
+    let mut repo = repo_with_employees();
+    repo.names = vec![("0200".to_string(), "大石運輸倉庫株式会社".to_string())];
+    let app = build_app(Arc::new(repo), auth_ok());
+    let (status, json) = get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["company_name"], "");
+    assert!(json["warnings"].as_array().unwrap().is_empty());
 }

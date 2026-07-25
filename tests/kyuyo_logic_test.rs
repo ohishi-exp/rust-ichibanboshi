@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 
 use rust_ichibanboshi::kyuyo::logic::{
-    build_companies, build_payroll_rows, email_allowed, employee_code_key, kydata_db_name,
-    month_period, nendo_for_month, normalize_company_code, normalize_emails, parse_kydata_db_name,
-    parse_month, taikeikouno, RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES, MONEY_COLUMNS,
+    build_companies, build_employee_rows, build_payroll_rows, email_allowed, employee_code_key,
+    kydata_db_name, month_period, nendo_for_month, normalize_company_code, normalize_emails,
+    parse_kydata_db_name, parse_month, taikeikouno, RawEmployeeRow, RawKyuyoRow, RawShukeiRow,
+    ALLOWED_COMPANIES, MONEY_COLUMNS,
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -394,4 +395,54 @@ fn test_derived_impls_are_exercised() {
     let (companies, _) =
         build_companies(&[("KYDATA0100_126C".to_string(), Some(1))], &HashMap::new());
     assert!(format!("{:?}", companies[0]).contains("CompanyInfo"));
+}
+
+// ══════════════════════════════════════════════════════════════
+// build_employee_rows (社員マスタ、Refs ohishi-exp/nuxt-dtako-admin#367)
+// ══════════════════════════════════════════════════════════════
+
+fn raw_employee(code: &str, name: &str, dept: &str, taikei: i32, taikyu: i32) -> RawEmployeeRow {
+    RawEmployeeRow {
+        employee_code: code.to_string(),
+        employee_name: name.to_string(),
+        taikyu,
+        department: dept.to_string(),
+        taikei,
+    }
+}
+
+#[test]
+fn build_employee_rows_maps_and_sorts_by_numeric_code() {
+    let rows = build_employee_rows(&[
+        raw_employee("1771", "鈴木　花子", "本社　事務", 2, 0),
+        raw_employee("0941", "山田　太郎", "本社　乗務員", 1, 0),
+    ]);
+    assert_eq!(
+        rows.iter().map(|r| r.employee_code.as_str()).collect::<Vec<_>>(),
+        vec!["0941", "1771"]
+    );
+    assert_eq!(rows[0].employee_code_key, "941");
+    assert_eq!(rows[0].department, "本社　乗務員");
+    assert_eq!(rows[0].taikei, 1);
+}
+
+#[test]
+fn build_employee_rows_flags_retired() {
+    let rows = build_employee_rows(&[raw_employee("1", "退職　太郎", "本社", 1, 1)]);
+    assert!(rows[0].retired);
+}
+
+#[test]
+fn build_employee_rows_dedupes_same_code_first_wins() {
+    let rows = build_employee_rows(&[
+        raw_employee("0007", "先勝ち", "本社", 1, 0),
+        raw_employee("7", "後", "支社", 2, 0),
+    ]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].employee_name, "先勝ち");
+}
+
+#[test]
+fn build_employee_rows_empty_input() {
+    assert!(build_employee_rows(&[]).is_empty());
 }
