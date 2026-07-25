@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::kyuyo::introspect::{authorize, KyuyoAuthState};
 use crate::kyuyo::logic::{
-    build_companies, build_payroll_rows, kydata_db_name, month_period, nendo_for_month,
-    parse_month, CompanyInfo, PayrollRow, ALLOWED_COMPANIES,
+    build_companies, build_employee_rows, build_payroll_rows, kydata_db_name, month_period,
+    nendo_for_month, parse_month, CompanyInfo, EmployeeRow, PayrollRow, ALLOWED_COMPANIES,
 };
 use crate::kyuyo::repo::{DynKyuyoRepo, KyuyoRepoError};
 
@@ -182,6 +182,104 @@ pub async fn companies(
 
     Ok(Json(CompaniesResponse {
         companies,
+        warnings,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/employees?company=0100&month=2026-06 (識別情報のみ)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct EmployeesQuery {
+    /// 会社コード 4 桁 ([`ALLOWED_COMPANIES`] のみ)。
+    pub company: String,
+    /// 参照する年度 DB を決めるための月 "YYYY-MM"。
+    /// **賃金期間の絞り込みには使わない** (社員マスタは支給実績と独立)。
+    pub month: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct EmployeesResponse {
+    pub company: String,
+    /// `KYCOMSTD.SELDATA.CONAME1` 由来の正式会社名 (取れなければ空文字 + warning)。
+    /// 消費側 (社員マスタ) はこれを会社ラベルに使う (Refs nuxt-dtako-admin#367)。
+    pub company_name: String,
+    pub month: String,
+    /// 参照した年度 DB 名。
+    pub database: String,
+    pub employees: Vec<EmployeeRow>,
+    pub warnings: Vec<String>,
+}
+
+/// 会社×年度の**社員マスタ** (社員番号・氏名・所属・給与体系・退職フラグ)。
+///
+/// 金額は一切返さない — 消費者は ohishi-exp/nuxt-dtako-admin の社員マスタ
+/// (Refs #367) で、給与明細 CSV をブラウザに貼らずに社員を登録するために使う。
+/// [`payroll`] と違い `KYUYO` を読まないので、その月に支給が無い社員 (入社直後
+/// など) も返る。
+pub async fn employees(
+    Extension(repo): Extension<DynKyuyoRepo>,
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
+    headers: HeaderMap,
+    Query(params): Query<EmployeesQuery>,
+) -> Result<Json<EmployeesResponse>, ApiError> {
+    authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+
+    if !ALLOWED_COMPANIES.contains(&params.company.as_str()) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "company は {} のいずれかで指定してください",
+                ALLOWED_COMPANIES.join(" / ")
+            ),
+        ));
+    }
+    let Some((year, month)) = parse_month(&params.month) else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください",
+        ));
+    };
+
+    let db = kydata_db_name(&params.company, nendo_for_month(year, month));
+
+    // payroll と同じ理由で DB を触る区間を直列化する (OHKEN は同時 2 接続)
+    let _permit = limiter
+        .semaphore
+        .acquire()
+        .await
+        .expect("kyuyo limiter semaphore closed");
+
+    let raw = repo
+        .employees(&db)
+        .await
+        .map_err(|e| map_db_open_err(e, &db))?;
+
+    // 会社名は補助情報 — KYCOMSTD が読めなくても社員一覧自体は返す
+    let mut warnings: Vec<String> = Vec::new();
+    let company_name = match repo.company_names().await {
+        Ok(pairs) => pairs
+            .into_iter()
+            .find(|(code, _)| code == &params.company)
+            .map(|(_, name)| name)
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("kyuyo company_names error: {e}");
+            warnings.push("会社名マスタ (KYCOMSTD) を読めませんでした".to_string());
+            String::new()
+        }
+    };
+
+    Ok(Json(EmployeesResponse {
+        company: params.company,
+        company_name,
+        month: params.month,
+        database: db,
+        employees: build_employee_rows(&raw),
         warnings,
     }))
 }

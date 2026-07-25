@@ -15,7 +15,8 @@ use bb8_tiberius::ConnectionManager;
 use tiberius::{Config as TiberiusConfig, EncryptionLevel};
 
 use super::logic::{
-    normalize_company_code, RawKyuyoRow, RawShukeiRow, MAX_MONTH_INDEX, MONEY_COLUMNS,
+    normalize_company_code, RawEmployeeRow, RawKyuyoRow, RawShukeiRow, MAX_MONTH_INDEX,
+    MONEY_COLUMNS,
 };
 use crate::config::KyuyoConfig;
 
@@ -68,6 +69,11 @@ pub trait KyuyoRepo: Send + Sync {
         to: &str,
     ) -> Result<Vec<RawKyuyoRow>, KyuyoRepoError>;
 
+    /// 指定 DB の**社員マスタ** (`SHAIN1` × `SHOZOKU`)。給与明細 (`KYUYO`) は
+    /// 読まないので金額列は SELECT にも現れない。
+    /// 消費者は社員マスタ (Refs ohishi-exp/nuxt-dtako-admin#367)。
+    async fn employees(&self, db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError>;
+
     /// 指定 DB の `KOUMOKU` (TAIKEIKOUNO, NAME) 一覧。
     async fn koumoku(&self, db: &str) -> Result<Vec<(String, String)>, KyuyoRepoError>;
 
@@ -101,6 +107,9 @@ impl KyuyoRepo for NotConfiguredKyuyoRepo {
         _from: &str,
         _to: &str,
     ) -> Result<Vec<RawKyuyoRow>, KyuyoRepoError> {
+        Err(KyuyoRepoError::NotConfigured)
+    }
+    async fn employees(&self, _db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError> {
         Err(KyuyoRepoError::NotConfigured)
     }
     async fn koumoku(&self, _db: &str) -> Result<Vec<(String, String)>, KyuyoRepoError> {
@@ -314,6 +323,45 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
                 money: (0..MONEY_COLUMNS)
                     .map(|n| get_i32(r, 10 + n) as i64)
                     .collect(),
+            })
+            .collect())
+    }
+
+    async fn employees(&self, db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError> {
+        validate_db_name(db)?;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
+
+        // 社員マスタ直読み — 給与明細 (KYUYO) は経由しない。所属は SHAIN1.SHOZOKU が
+        // 持つ (docs/kyuyo-daijin-schema.md の社員マスタ節)。金額列には触れない。
+        let query = format!(
+            "SELECT s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
+             ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int) \
+             FROM [{db}].dbo.SHAIN1 s1 \
+             LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = s1.SHOZOKU \
+             ORDER BY s1.CODE"
+        );
+
+        let stream = conn
+            .simple_query(&query)
+            .await
+            .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| RawEmployeeRow {
+                employee_code: get_str(r, 0),
+                employee_name: get_str(r, 1),
+                taikyu: get_i32(r, 2),
+                department: get_str(r, 3),
+                taikei: get_i32(r, 4),
             })
             .collect())
     }
