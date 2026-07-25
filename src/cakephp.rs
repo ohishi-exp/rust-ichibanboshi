@@ -4,7 +4,7 @@
 //! `/editable-months` を社内 LAN HTTP で pull する。token 不要 (社内網)、
 //! base URL は config (空文字なら fetch 系 endpoint は 503 を返す)。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -111,6 +111,20 @@ pub struct PrintJsonResponse {
     pub sum: serde_json::Value,
 }
 
+/// `/time-card/daily-json?month=YYYY-MM` のレスポンス (Refs
+/// ohishi-exp/nuxt-dtako-admin#424 / yhonda-ohishi/nginx#773, #776)。
+///
+/// **行は `serde_json::Value` のまま持つ** — このサービスは中継であって解釈者では
+/// ないので、上流が項目を足しても型を触らずに素通しできるようにする。同じ理由で
+/// `deny_unknown_fields` は付けず、トップレベルの未知フィールドも `extra` に拾って
+/// 再シリアライズ時に復元する。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimecardDailyResponse {
+    pub rows: Vec<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
 /// CakePHP fetch client。
 ///
 /// `base_url` 空文字なら NotConfigured を返す。
@@ -190,6 +204,25 @@ impl CakephpClient {
                 urlencode(date)
             )
         };
+        self.get_json(&url).await
+    }
+
+    /// `/time-card/daily-json?month=YYYY-MM`
+    ///
+    /// 勤怠 (タイムカード) の日別データ。1 社員 × 1 日 = 1 行で、日跨ぎ勤務は
+    /// 始業日に寄せてある。中抜けの内訳は各行の `sessions` に入る。
+    pub async fn fetch_timecard_daily(
+        &self,
+        month: &str,
+    ) -> Result<TimecardDailyResponse, CakephpError> {
+        if !self.is_enabled() {
+            return Err(CakephpError::NotConfigured);
+        }
+        let url = format!(
+            "{}/time-card/daily-json?month={}",
+            self.base_url.trim_end_matches('/'),
+            urlencode(month)
+        );
         self.get_json(&url).await
     }
 
