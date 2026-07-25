@@ -26,6 +26,9 @@ path = "src/routes/employees.rs"
 path = "src/routes/health.rs"
 
 [[files]]
+path = "src/routes/kintai.rs"
+
+[[files]]
 path = "src/routes/kyuyo.rs"
 
 [[files]]
