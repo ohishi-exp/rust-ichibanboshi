@@ -209,7 +209,10 @@ fn test_build_payroll_rows_maps_items_and_totals() {
     }];
 
     let (rows, warnings) = build_payroll_rows(&raw, &koumoku_taikei1(), &shukei);
-    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    // この fixture は #81 で名寄せ検証した 4 項目だけの部分集合で、実際の行には
+    // 残業手当などがまだ載る。よって支給合計の自己突合 (Refs #87) は不一致側に立つ
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("支給合計が SHUKEI1 と不一致"));
     assert_eq!(rows.len(), 1);
 
     let row = &rows[0];
@@ -297,6 +300,67 @@ fn test_build_payroll_rows_zero_amounts_excluded_and_retired_flag() {
     assert!(rows[0].deductions.is_empty());
     assert!(rows[0].retired);
     assert_eq!(rows[0].totals.as_ref().unwrap().net_pay, 0);
+}
+
+#[test]
+fn test_build_payroll_rows_payments_matching_soshikyu_has_no_warning() {
+    // 支給項目が揃っていれば payments 合計 = SOSHIKYU で warning は立たない。
+    // 控除 (kazei=0) と単価 (meisai=1) は支給合計に足さないことも同時に確かめる
+    let koumoku = HashMap::from([
+        koumoku_row("01018", "基本給", 1, 0),
+        koumoku_row("01022", "通勤手当", 2, 0),
+        koumoku_row("01024", "所得税", 0, 0),
+        koumoku_row("01026", "残業単価", 1, 1),
+    ]);
+    let raw = vec![raw_row(
+        4,
+        "1771",
+        1,
+        &[(0, 200_000), (4, 8_000), (6, 7_830), (8, 131_800)],
+    )];
+    let shukei = vec![RawShukeiRow {
+        shain: 4,
+        month_index: 5,
+        soshikyu: 208_000,
+        kazei: 200_000,
+        hoken: 0,
+        zei: 7_830,
+        shokoujo: 0,
+    }];
+
+    let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &shukei);
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(rows[0].payments.values().sum::<i64>(), 208_000);
+    assert_eq!(rows[0].deductions["所得税"], 7_830);
+    assert_eq!(rows[0].overtime_rate, Some(1_318.0));
+}
+
+#[test]
+fn test_build_payroll_rows_warns_when_kazei_flags_are_all_zero() {
+    // 本番で起きた退行の再現 (Refs #87): KOUMOKU.KAZEI/MEISAI が CAST 漏れで全件 0 に
+    // なると、支給項目も単価も deductions に落ち payments が空のまま 200 で返る
+    let koumoku = HashMap::from([
+        koumoku_row("01018", "基本給", 0, 0),
+        koumoku_row("01026", "残業単価", 0, 0),
+    ]);
+    let raw = vec![raw_row(4, "1771", 1, &[(0, 200_000), (8, 131_800)])];
+    let shukei = vec![RawShukeiRow {
+        shain: 4,
+        month_index: 5,
+        soshikyu: 200_000,
+        kazei: 200_000,
+        hoken: 0,
+        zei: 0,
+        shokoujo: 0,
+    }];
+
+    let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &shukei);
+    assert!(rows[0].payments.is_empty());
+    assert_eq!(rows[0].overtime_rate, None);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("支給合計が SHUKEI1 と不一致"));
+    assert!(warnings[0].contains("payments=0"));
+    assert!(warnings[0].contains("SOSHIKYU=200000"));
 }
 
 #[test]
