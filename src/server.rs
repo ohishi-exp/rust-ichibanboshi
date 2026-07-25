@@ -143,6 +143,7 @@ pub async fn run(
             get(routes::uriage::verify_history),
         )
         .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs))
+        .route("/kintai/daily", get(routes::kintai::daily))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))

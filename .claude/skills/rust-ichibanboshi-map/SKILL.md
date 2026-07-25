@@ -30,6 +30,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
 | `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
+| `src/routes/kintai.rs` | `/api/kintai/daily` 勤怠 (タイムカード) の中継 (#99、下記) |
 
 ## entrypoint / Axum router (`src/server.rs::run`)
 
@@ -40,6 +41,9 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
   `kind=transport`/`all` で切替) を 得意先 / 積地県 / 卸地県 / 車種 / 売上年月日 / 運賃 / 請求日(入金予定)
   に展開。県正規化 (`地域N` → 都道府県) は `normalize_prefecture` 純粋関数。残マスタ (燃費/距離/軽油価格/
   対象得意先) は scope 外 (#12 残課題)。
+- `/api/kintai/daily?month=YYYY-MM`: 社内 CakePHP (`yhonda-ohishi/nginx`) のタイムカード日別
+  データを Cloudflare Worker (nuxt-dtako-admin の dtako-scraper-relay) へ**中継するだけ**。
+  詳細は下記「勤怠の中継」節。
 - `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
@@ -124,6 +128,30 @@ SQL Server (CAPE#01、172.18.21.102)
 - `r2_pending` view の条件: `status='computed' AND r2_synced_at IS NULL AND raw_path IS NOT NULL
   AND (fingerprint_before IS NULL OR fingerprint_before != fingerprint_after)`。
   fingerprint 変化なし (= データ同じ) なら R2 への再送信は不要。
+
+## 勤怠 (タイムカード) の中継 — `/api/kintai/daily` (Refs #99, ohishi-exp/nuxt-dtako-admin#424)
+
+nuxt-dtako-admin の給与比較を**本社事務員等 (デジタコに乗らない人)** へ広げるため、勤務実績を
+社内 CakePHP (`yhonda-ohishi/nginx` の `GET /time-card/daily-json?month=`) から供給する経路。
+CakePHP は LAN 内にしか居ないので、**同一ホストで動く本サービスが橋渡し**する。
+
+- **`[cakephp] base_url` は `http://127.0.0.1:120`** (loopback の plain HTTP)。
+  `https://ohishi-dev.ohishi.local` は使っていない — **DNS も TLS も経路に入らない 1 hop**
+  (`ohishi-dev.ohishi.local` は同ホスト上でも名前解決できない。443/TLS へ移すなら別途手当てが要る)
+- **中継だけ。解釈も変換もしない。** 行は `serde_json::Value` のまま素通しし、トップレベルの
+  未知フィールドも `#[serde(flatten)]` で拾って復元する — 上流が項目を足しても型を触らずに済む
+- **ID 変換・突合はしない** — CakePHP の `drivers.id` は乗務員CD (= 一番星 `社員ﾏｽﾀ.社員C`) と
+  同一番号体系で、本社事務員も含まれる。受け手がそのまま引き当てる
+- **認可は CF Access Service Token (edge)** で `/employees` と同じ扱い。前例のコピーではなく
+  **データの ACL で選んでいる**: 応答は識別情報と時刻だけで金額を含まず、消費者が
+  Cloudflare Worker の DO なのでブラウザ JWT を持てないため。**金額を足すなら `/kyuyo/*` と同じ
+  in-service gate へ移すこと**
+- `month` は `YYYY-MM` 必須 (上流の `HolidaysTrait` が月単位 API のため)。不正は 400、
+  `base_url` 未設定は 503、上流の非 2xx / 非 JSON / 到達不能は 502
+- **上流が非 JSON (ログイン画面の HTML) を返したら 502 `parse failed`** — CakePHP 側の
+  `AppController::addUnauthenticatedActions` に action 名を足し忘れた時にこうなる (yhonda-ohishi/nginx#773)
+- テストは `tests/kintai_test.rs` (wiremock で CakePHP を stub)。`src/routes/kintai.rs` は
+  coverage_100 登録済み
 
 ## 燃料サーチャージ基礎データ (`/api/surcharge/base`、Refs #12)
 
