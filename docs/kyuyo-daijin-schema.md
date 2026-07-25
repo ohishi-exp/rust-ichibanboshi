@@ -286,6 +286,11 @@ FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='SHAIN1'
 | `INCODE` | 所属コード (`KYUYO.SHOZOKU`, `SHAIN1.SHOZOKU` と結合) |
 | `NAME1`/`NAME2` | 営業所名/職種名 (例: `本社` / `乗務員`) |
 | `SNAME` | 表示用の結合名 (例: `本社　乗務員`) |
+
+> **拠点が要るなら `SNAME` から切り出さず `NAME1` を使う。** `SNAME` は結合済みで
+> 区切りの全角スペースの数に揺れがあり (`本社  乗務員` と `本社 乗務員` が実在)、
+> 前方一致でまとめる羽目になる。並べ替えの基準は `INCODE` — 表示名の文字順ではなく
+> 給与大臣が持つ所属の順序で並ぶ。`/api/kyuyo/employees` は 3 つとも返す (Refs #98)。
 | `TAIKEI` | **KOUMOKU.TAIKEIKOUNO の先頭2桁と対応する体系コード** (前述) |
 
 ## 結論: API で発行すべき SELECT 文の草案
