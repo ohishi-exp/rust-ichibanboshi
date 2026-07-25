@@ -195,6 +195,12 @@ TAIKEIKOUNO = RIGHT('0' + CAST(SHOZOKU.TAIKEI AS varchar), 2)
 控除側へ移すのは誤り。`deduction_total` は `HOKEN+ZEI+SHOKOUJO` が正で、減額項目は
 そこに含まれないため、移すと今度は控除合計が過大になる。
 
+**重要: 減額なのに `GENGAKU=0` で、`MONEY` に最初から負値が入っている項目もある。**
+0300社 2026-06 の「特別調整手当」(1 名、−54,178) がそれで、符号を触らないのが正しい。
+`GENGAKU=1` だけを反転する現行実装はこれを二重反転しない (もし反転していれば
+`108,356` 円ズレて突合で落ちる)。**「名前が減額っぽいから」で反転してはいけない** —
+判断は `GENGAKU` だけを見る。
+
 ### 読み出し時の型の罠 (Rust/tiberius)
 
 `KOUMOKU` のフラグ列 (`KAZEI`/`MEISAI`/`GENGAKU`) は `int` **ではない**。tiberius の
