@@ -15,8 +15,8 @@ use bb8_tiberius::ConnectionManager;
 use tiberius::{Config as TiberiusConfig, EncryptionLevel};
 
 use super::logic::{
-    normalize_company_code, RawEmployeeRow, RawKyuyoRow, RawShukeiRow, MAX_MONTH_INDEX,
-    MONEY_COLUMNS,
+    normalize_company_code, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
+    MAX_MONTH_INDEX, MONEY_COLUMNS,
 };
 use crate::config::KyuyoConfig;
 
@@ -74,8 +74,11 @@ pub trait KyuyoRepo: Send + Sync {
     /// 消費者は社員マスタ (Refs ohishi-exp/nuxt-dtako-admin#367)。
     async fn employees(&self, db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError>;
 
-    /// 指定 DB の `KOUMOKU` (TAIKEIKOUNO, NAME) 一覧。
-    async fn koumoku(&self, db: &str) -> Result<Vec<(String, String)>, KyuyoRepoError>;
+    /// 指定 DB の `KOUMOKU` 一覧 (項目マスタ)。
+    ///
+    /// `KAZEI` (課税区分) が支給/控除を分ける唯一の信頼できるフラグ、`MEISAI` が
+    /// 単価項目の目印 (Refs #93 の実データ検証)。`KUBUN` は支給/控除が混在するので使わない。
+    async fn koumoku(&self, db: &str) -> Result<Vec<RawKoumokuRow>, KyuyoRepoError>;
 
     /// 指定 DB の `SHUKEI1` から支給回インデックス `month_index` の計算済み集計。
     async fn shukei_totals(
@@ -112,7 +115,7 @@ impl KyuyoRepo for NotConfiguredKyuyoRepo {
     async fn employees(&self, _db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError> {
         Err(KyuyoRepoError::NotConfigured)
     }
-    async fn koumoku(&self, _db: &str) -> Result<Vec<(String, String)>, KyuyoRepoError> {
+    async fn koumoku(&self, _db: &str) -> Result<Vec<RawKoumokuRow>, KyuyoRepoError> {
         Err(KyuyoRepoError::NotConfigured)
     }
     async fn shukei_totals(
@@ -366,14 +369,14 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .collect())
     }
 
-    async fn koumoku(&self, db: &str) -> Result<Vec<(String, String)>, KyuyoRepoError> {
+    async fn koumoku(&self, db: &str) -> Result<Vec<RawKoumokuRow>, KyuyoRepoError> {
         validate_db_name(db)?;
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
-        let query = format!("SELECT TAIKEIKOUNO, NAME FROM [{db}].dbo.KOUMOKU");
+        let query = format!("SELECT TAIKEIKOUNO, NAME, KAZEI, MEISAI FROM [{db}].dbo.KOUMOKU");
         let stream = conn
             .simple_query(&query)
             .await
@@ -384,7 +387,12 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         Ok(rows
             .iter()
-            .map(|r| (get_str(r, 0), get_str(r, 1)))
+            .map(|r| RawKoumokuRow {
+                taikeikouno: get_str(r, 0),
+                name: get_str(r, 1),
+                kazei: get_i32(r, 2),
+                meisai: get_i32(r, 3),
+            })
             .collect())
     }
 
