@@ -340,9 +340,12 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
 
         // 社員マスタ直読み — 給与明細 (KYUYO) は経由しない。所属は SHAIN1.SHOZOKU が
         // 持つ (docs/kyuyo-daijin-schema.md の社員マスタ節)。金額列には触れない。
+        // INCODE/TAIKEI は実列型が int とは限らないので CAST する (KAZEI/MEISAI で
+        // 同じ罠を踏み、payments が全件空になった — Refs #95)
         let query = format!(
             "SELECT s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
-             ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int) \
+             ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), \
+             CAST(ISNULL(sz.INCODE, 0) AS int), ISNULL(sz.NAME1, ''), ISNULL(sz.NAME2, '') \
              FROM [{db}].dbo.SHAIN1 s1 \
              LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = s1.SHOZOKU \
              ORDER BY s1.CODE"
@@ -365,6 +368,9 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
                 taikyu: get_i32(r, 2),
                 department: get_str(r, 3),
                 taikei: get_i32(r, 4),
+                department_code: get_i32(r, 5),
+                branch_name: get_str(r, 6),
+                job_name: get_str(r, 7),
             })
             .collect())
     }

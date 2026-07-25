@@ -544,12 +544,16 @@ fn test_kyuyo_repo_error_display() {
 // ══════════════════════════════════════════════════════════════
 
 fn employee_row(code: &str, name: &str, dept: &str, taikei: i32, taikyu: i32) -> RawEmployeeRow {
+    let mut parts = dept.split('　');
     RawEmployeeRow {
         employee_code: code.to_string(),
         employee_name: name.to_string(),
         taikyu,
         department: dept.to_string(),
         taikei,
+        department_code: 14,
+        branch_name: parts.next().unwrap_or("").to_string(),
+        job_name: parts.next().unwrap_or("").to_string(),
     }
 }
 
