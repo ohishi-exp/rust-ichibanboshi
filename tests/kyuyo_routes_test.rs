@@ -394,8 +394,14 @@ async fn test_payroll_ok() {
     // SHAIN=2 は SHUKEI1 に month_index=5 の行が無い → totals null + warning
     assert!(rows[0]["totals"].is_null());
     let warnings = body["warnings"].as_array().unwrap();
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].as_str().unwrap().contains("SHAIN=2"));
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("SHAIN=2")));
+    // fixture は #81 の 4 項目だけなので支給合計の自己突合は不一致側 (Refs #87)
+    assert!(warnings
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("支給合計が SHUKEI1 と不一致")));
 }
 
 #[tokio::test]
