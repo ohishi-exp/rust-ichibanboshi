@@ -91,6 +91,27 @@ pub struct CakephpConfig {
     pub sqlite_path: String,
 }
 
+/// 拘束サマリ store configuration (Refs #106 Phase 3)
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestraintConfig {
+    /// 拘束サマリ SQLite のパス。空 = 無効 (push / wage-source は 503)。
+    /// relay の resummarize (全月) で再構築できる写し (docs/plan-kyuyo-sqlite-store.md)。
+    #[serde(default = "default_restraint_sqlite_path")]
+    pub sqlite_path: String,
+}
+
+impl Default for RestraintConfig {
+    fn default() -> Self {
+        Self {
+            sqlite_path: default_restraint_sqlite_path(),
+        }
+    }
+}
+
+fn default_restraint_sqlite_path() -> String {
+    "/opt/ichibanboshi/restraint_local.sqlite".to_string()
+}
+
 /// Raw NDJSON.gz 出力 configuration (Phase 2: R2 warm backup の input、issue #762)
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawConfig {
@@ -196,6 +217,9 @@ pub struct Config {
 
     #[serde(default)]
     pub kyuyo: KyuyoConfig,
+
+    #[serde(default)]
+    pub restraint: RestraintConfig,
 }
 
 fn default_port() -> u16 {
@@ -367,6 +391,7 @@ impl Config {
             cakephp: CakephpConfig::default(),
             raw: RawConfig::default(),
             kyuyo: KyuyoConfig::default(),
+            restraint: RestraintConfig::default(),
         })
     }
 }
