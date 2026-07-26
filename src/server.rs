@@ -55,6 +55,21 @@ pub async fn run(
     // 給与 DB (OHKEN、非力な PC) を触る区間の同時実行制限 (Refs #369)
     let kyuyo_limiter = Arc::new(routes::kyuyo::KyuyoLimiter::new());
 
+    // 給与の SQLite derived store (Refs #106 Phase 1)。open 失敗は Noop に落として
+    // live 読みへフォールバック — キャッシュの健全性で読み機能を殺さない
+    let kyuyo_store: kyuyo::store::DynKyuyoStore = if config.kyuyo.sqlite_path.is_empty() {
+        tracing::info!("kyuyo sqlite_path is empty — derived store disabled (live reads only)");
+        Arc::new(kyuyo::store::NoopKyuyoStore)
+    } else {
+        match kyuyo::store::KyuyoStore::open(&config.kyuyo.sqlite_path) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                tracing::warn!("kyuyo store open failed — falling back to live reads: {e}");
+                Arc::new(kyuyo::store::NoopKyuyoStore)
+            }
+        }
+    };
+
     let jwt_secret = JwtSecret(config.auth.jwt_secret.clone());
 
     let origins: Vec<_> = config
@@ -147,7 +162,8 @@ pub async fn run(
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
-        .route("/kyuyo/employees", get(routes::kyuyo::employees));
+        .route("/kyuyo/employees", get(routes::kyuyo::employees))
+        .route("/kyuyo/sync", post(routes::kyuyo::sync));
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
@@ -167,7 +183,8 @@ pub async fn run(
         .layer(Extension(jwt_secret))
         .layer(Extension(kyuyo_repo))
         .layer(Extension(kyuyo_auth))
-        .layer(Extension(kyuyo_limiter));
+        .layer(Extension(kyuyo_limiter))
+        .layer(Extension(kyuyo_store));
 
     let addr = config.addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;

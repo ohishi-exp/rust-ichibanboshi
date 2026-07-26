@@ -22,6 +22,7 @@ use crate::kyuyo::logic::{
     ALLOWED_COMPANIES,
 };
 use crate::kyuyo::repo::{DynKyuyoRepo, KyuyoRepoError};
+use crate::kyuyo::store::DynKyuyoStore;
 
 /// エラーレスポンス本文。
 #[derive(Serialize, Debug)]
@@ -75,6 +76,25 @@ fn map_db_open_err(e: KyuyoRepoError, db: &str) -> ApiError {
         }
     }
     map_repo_err(e)
+}
+
+/// company / month の共通検証。OK なら (year, month) を返す。
+fn validate_company_month(company: &str, month: &str) -> Result<(i32, u32), ApiError> {
+    if !ALLOWED_COMPANIES.contains(&company) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "company は {} のいずれかで指定してください",
+                ALLOWED_COMPANIES.join(" / ")
+            ),
+        ));
+    }
+    parse_month(month).ok_or_else(|| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください",
+        )
+    })
 }
 
 fn map_repo_err(e: KyuyoRepoError) -> ApiError {
@@ -211,43 +231,27 @@ pub struct EmployeesResponse {
     pub database: String,
     pub employees: Vec<EmployeeRow>,
     pub warnings: Vec<String>,
+    /// このデータの出どころ (Refs #106): "cache" = SQLite derived store /
+    /// "live" = OHKEN 直読み (write-through でキャッシュ済み)。
+    pub source: &'static str,
+    /// キャッシュの鮮度 (RFC3339)。live 読みでは今回の取得時刻。
+    pub synced_at: String,
 }
 
-/// 会社×年度の**社員マスタ** (社員番号・氏名・所属・給与体系・退職フラグ)。
-///
-/// 金額は一切返さない — 消費者は ohishi-exp/nuxt-dtako-admin の社員マスタ
-/// (Refs #367) で、給与明細 CSV をブラウザに貼らずに社員を登録するために使う。
-/// [`payroll`] と違い `KYUYO` を読まないので、その月に支給が無い社員 (入社直後
-/// など) も返る。
-pub async fn employees(
-    Extension(repo): Extension<DynKyuyoRepo>,
-    Extension(auth): Extension<Arc<KyuyoAuthState>>,
-    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
-    headers: HeaderMap,
-    Query(params): Query<EmployeesQuery>,
-) -> Result<Json<EmployeesResponse>, ApiError> {
-    authorize(&headers, &auth)
-        .await
-        .map_err(|(status, message)| err(status, message))?;
+/// 社員マスタの live 読み結果 (read-through と sync の共通部)。
+struct EmployeesLive {
+    employees: Vec<EmployeeRow>,
+    company_name: String,
+    warnings: Vec<String>,
+}
 
-    if !ALLOWED_COMPANIES.contains(&params.company.as_str()) {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "company は {} のいずれかで指定してください",
-                ALLOWED_COMPANIES.join(" / ")
-            ),
-        ));
-    }
-    let Some((year, month)) = parse_month(&params.month) else {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "month は YYYY-MM で指定してください",
-        ));
-    };
-
-    let db = kydata_db_name(&params.company, nendo_for_month(year, month));
-
+/// OHKEN から社員マスタを読む (従来の employees 本体)。
+async fn fetch_employees_live(
+    repo: &DynKyuyoRepo,
+    limiter: &KyuyoLimiter,
+    company: &str,
+    db: &str,
+) -> Result<EmployeesLive, ApiError> {
     // payroll と同じ理由で DB を触る区間を直列化する (OHKEN は同時 2 接続)
     let _permit = limiter
         .semaphore
@@ -256,16 +260,16 @@ pub async fn employees(
         .expect("kyuyo limiter semaphore closed");
 
     let raw = repo
-        .employees(&db)
+        .employees(db)
         .await
-        .map_err(|e| map_db_open_err(e, &db))?;
+        .map_err(|e| map_db_open_err(e, db))?;
 
     // 会社名は補助情報 — KYCOMSTD が読めなくても社員一覧自体は返す
     let mut warnings: Vec<String> = Vec::new();
     let company_name = match repo.company_names().await {
         Ok(pairs) => pairs
             .into_iter()
-            .find(|(code, _)| code == &params.company)
+            .find(|(code, _)| code == company)
             .map(|(_, name)| name)
             .unwrap_or_default(),
         Err(e) => {
@@ -275,13 +279,83 @@ pub async fn employees(
         }
     };
 
+    Ok(EmployeesLive {
+        employees: build_employee_rows(&raw),
+        company_name,
+        warnings,
+    })
+}
+
+/// 会社×年度の**社員マスタ** (社員番号・氏名・所属・給与体系・退職フラグ)。
+///
+/// 金額は一切返さない — 消費者は ohishi-exp/nuxt-dtako-admin の社員マスタ
+/// (Refs #367) で、給与明細 CSV をブラウザに貼らずに社員を登録するために使う。
+/// [`payroll`] と違い `KYUYO` を読まないので、その月に支給が無い社員 (入社直後
+/// など) も返る。
+///
+/// Refs #106: read-through — SQLite derived store に (company, 年度) があれば
+/// OHKEN に触らず返す。miss は live 読み + write-through。強制引き直しは [`sync`]。
+pub async fn employees(
+    Extension(repo): Extension<DynKyuyoRepo>,
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
+    Extension(store): Extension<DynKyuyoStore>,
+    headers: HeaderMap,
+    Query(params): Query<EmployeesQuery>,
+) -> Result<Json<EmployeesResponse>, ApiError> {
+    authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+
+    let (year, month) = validate_company_month(&params.company, &params.month)?;
+    let nendo = nendo_for_month(year, month);
+    let db = kydata_db_name(&params.company, nendo);
+
+    match store.get_employees(&params.company, nendo).await {
+        Ok(Some(cached)) => {
+            return Ok(Json(EmployeesResponse {
+                company: params.company,
+                company_name: cached.company_name,
+                month: params.month,
+                database: db,
+                employees: cached.employees,
+                warnings: cached.warnings,
+                source: "cache",
+                synced_at: cached.synced_at,
+            }));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("kyuyo store read failed — live fallback: {e}");
+        }
+    }
+
+    let live = fetch_employees_live(&repo, &limiter, &params.company, &db).await?;
+    let synced_at = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = store
+        .put_employees(
+            &params.company,
+            nendo,
+            &live.employees,
+            &live.company_name,
+            &live.warnings,
+            &synced_at,
+        )
+        .await
+    {
+        // live 応答はそのまま返す — キャッシュ書き込み失敗で読みを殺さない
+        tracing::warn!("kyuyo store write failed (employees): {e}");
+    }
+
     Ok(Json(EmployeesResponse {
         company: params.company,
-        company_name,
+        company_name: live.company_name,
         month: params.month,
         database: db,
-        employees: build_employee_rows(&raw),
-        warnings,
+        employees: live.employees,
+        warnings: live.warnings,
+        source: "live",
+        synced_at,
     }))
 }
 
@@ -305,38 +379,28 @@ pub struct PayrollResponse {
     pub database: String,
     pub rows: Vec<PayrollRow>,
     pub warnings: Vec<String>,
+    /// このデータの出どころ (Refs #106): "cache" = SQLite derived store /
+    /// "live" = OHKEN 直読み (write-through でキャッシュ済み)。
+    pub source: &'static str,
+    /// キャッシュの鮮度 (RFC3339)。live 読みでは今回の取得時刻。
+    pub synced_at: String,
 }
 
-/// 会社×月の給与明細 (社員×支給項目×金額 + SHUKEI1 計算済み合計)。
-pub async fn payroll(
-    Extension(repo): Extension<DynKyuyoRepo>,
-    Extension(auth): Extension<Arc<KyuyoAuthState>>,
-    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
-    headers: HeaderMap,
-    Query(params): Query<PayrollQuery>,
-) -> Result<Json<PayrollResponse>, ApiError> {
-    authorize(&headers, &auth)
-        .await
-        .map_err(|(status, message)| err(status, message))?;
+/// 給与明細の live 読み結果 (read-through と sync の共通部)。
+struct PayrollLive {
+    rows: Vec<PayrollRow>,
+    warnings: Vec<String>,
+}
 
-    if !ALLOWED_COMPANIES.contains(&params.company.as_str()) {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "company は {} のいずれかで指定してください",
-                ALLOWED_COMPANIES.join(" / ")
-            ),
-        ));
-    }
-    let Some((year, month)) = parse_month(&params.month) else {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "month は YYYY-MM で指定してください",
-        ));
-    };
-
-    let db = kydata_db_name(&params.company, nendo_for_month(year, month));
-
+/// OHKEN から給与明細を読む (従来の payroll 本体)。
+async fn fetch_payroll_live(
+    repo: &DynKyuyoRepo,
+    limiter: &KyuyoLimiter,
+    month_label: &str,
+    db: &str,
+    year: i32,
+    month: u32,
+) -> Result<PayrollLive, ApiError> {
     // OHKEN は同時 2 接続 + AUTO_CLOSE で重いので、給与 DB を触る区間全体を
     // セマフォで直列化する — 並列に叩かれてもプール枯渇 (15s timeout → 偽 503)
     // にならず順番待ちになる (本番ヘルスチェックの並列実行で実害があった)
@@ -353,12 +417,12 @@ pub async fn payroll(
     // HAS_DBACCESS による権限抜けの網羅検知は /api/kyuyo/companies に残っている
     let (from, to) = month_period(year, month);
     let raw = repo
-        .payroll_month(&db, &from, &to)
+        .payroll_month(db, &from, &to)
         .await
-        .map_err(|e| map_db_open_err(e, &db))?;
+        .map_err(|e| map_db_open_err(e, db))?;
 
     let koumoku: HashMap<String, RawKoumokuRow> = repo
-        .koumoku(&db)
+        .koumoku(db)
         .await
         .map_err(map_repo_err)?
         .into_iter()
@@ -372,21 +436,178 @@ pub async fn payroll(
     month_indexes.dedup();
     let mut shukei = Vec::new();
     for idx in month_indexes {
-        shukei.extend(repo.shukei_totals(&db, idx).await.map_err(map_repo_err)?);
+        shukei.extend(repo.shukei_totals(db, idx).await.map_err(map_repo_err)?);
     }
 
     let (rows, mut warnings) = build_payroll_rows(&raw, &koumoku, &shukei);
     if rows.is_empty() {
         warnings.push(format!(
             "{} の {} に賃金期間が一致する支給回がありません",
-            db, params.month
+            db, month_label
         ));
     }
+    Ok(PayrollLive { rows, warnings })
+}
+
+/// 会社×月の給与明細 (社員×支給項目×金額 + SHUKEI1 計算済み合計)。
+///
+/// Refs #106: read-through — SQLite derived store に (company, month) があれば
+/// OHKEN に触らず返す (給与大臣 PC 停止中でも sync 済み月は表示できる)。
+/// miss は live 読み + write-through。強制引き直しは [`sync`]。
+pub async fn payroll(
+    Extension(repo): Extension<DynKyuyoRepo>,
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
+    Extension(store): Extension<DynKyuyoStore>,
+    headers: HeaderMap,
+    Query(params): Query<PayrollQuery>,
+) -> Result<Json<PayrollResponse>, ApiError> {
+    authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+
+    let (year, month) = validate_company_month(&params.company, &params.month)?;
+    let db = kydata_db_name(&params.company, nendo_for_month(year, month));
+
+    match store.get_payroll(&params.company, &params.month).await {
+        Ok(Some(cached)) => {
+            return Ok(Json(PayrollResponse {
+                company: params.company,
+                month: params.month,
+                database: db,
+                rows: cached.rows,
+                warnings: cached.warnings,
+                source: "cache",
+                synced_at: cached.synced_at,
+            }));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("kyuyo store read failed — live fallback: {e}");
+        }
+    }
+
+    let live = fetch_payroll_live(&repo, &limiter, &params.month, &db, year, month).await?;
+    let synced_at = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = store
+        .put_payroll(
+            &params.company,
+            &params.month,
+            &live.rows,
+            &live.warnings,
+            &synced_at,
+        )
+        .await
+    {
+        // live 応答はそのまま返す — キャッシュ書き込み失敗で読みを殺さない
+        tracing::warn!("kyuyo store write failed (payroll): {e}");
+    }
+
     Ok(Json(PayrollResponse {
         company: params.company,
         month: params.month,
         database: db,
-        rows,
+        rows: live.rows,
+        warnings: live.warnings,
+        source: "live",
+        synced_at,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/kyuyo/sync?company=0100&month=2026-06 (強制引き直し、Refs #106)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct SyncQuery {
+    /// 会社コード 4 桁 ([`ALLOWED_COMPANIES`] のみ)。
+    pub company: String,
+    /// 対象月 "YYYY-MM"。
+    pub month: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SyncResponse {
+    pub company: String,
+    pub month: String,
+    pub database: String,
+    /// 保存した給与明細の行数。
+    pub payroll_rows: usize,
+    /// 保存した社員マスタの人数。
+    pub employees: usize,
+    pub synced_at: String,
+    pub warnings: Vec<String>,
+}
+
+/// キャッシュの有無に関わらず OHKEN から引き直して derived store を上書きする
+/// (= 画面の「再取得」ボタン。給与の遡り修正・社員マスタ更新の後に使う)。
+///
+/// 給与明細と社員マスタ (同じ年度 DB) をまとめて更新する。read-through と違い、
+/// **store へ書けなければ 500 で loud fail** — sync の成功 = キャッシュが最新、
+/// を成立させるため。
+pub async fn sync(
+    Extension(repo): Extension<DynKyuyoRepo>,
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    Extension(limiter): Extension<Arc<KyuyoLimiter>>,
+    Extension(store): Extension<DynKyuyoStore>,
+    headers: HeaderMap,
+    Query(params): Query<SyncQuery>,
+) -> Result<Json<SyncResponse>, ApiError> {
+    authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+
+    let (year, month) = validate_company_month(&params.company, &params.month)?;
+    let nendo = nendo_for_month(year, month);
+    let db = kydata_db_name(&params.company, nendo);
+
+    let payroll = fetch_payroll_live(&repo, &limiter, &params.month, &db, year, month).await?;
+    let employees = fetch_employees_live(&repo, &limiter, &params.company, &db).await?;
+
+    let synced_at = chrono::Utc::now().to_rfc3339();
+    store
+        .put_payroll(
+            &params.company,
+            &params.month,
+            &payroll.rows,
+            &payroll.warnings,
+            &synced_at,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("kyuyo store write failed (sync payroll): {e}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "キャッシュへの保存に失敗しました (payroll)",
+            )
+        })?;
+    store
+        .put_employees(
+            &params.company,
+            nendo,
+            &employees.employees,
+            &employees.company_name,
+            &employees.warnings,
+            &synced_at,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("kyuyo store write failed (sync employees): {e}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "キャッシュへの保存に失敗しました (employees)",
+            )
+        })?;
+
+    let mut warnings = payroll.warnings;
+    warnings.extend(employees.warnings);
+    Ok(Json(SyncResponse {
+        company: params.company,
+        month: params.month,
+        database: db,
+        payroll_rows: payroll.rows.len(),
+        employees: employees.employees.len(),
+        synced_at,
         warnings,
     }))
 }
