@@ -543,7 +543,14 @@ fn test_kyuyo_repo_error_display() {
 // GET /api/kyuyo/employees (識別情報のみ、Refs ohishi-exp/nuxt-dtako-admin#367)
 // ══════════════════════════════════════════════════════════════
 
-fn employee_row(code: &str, name: &str, dept: &str, taikei: i32, taikyu: i32) -> RawEmployeeRow {
+fn employee_row(
+    code: &str,
+    name: &str,
+    dept: &str,
+    taikei: i32,
+    taikyu: i32,
+    kkubun: i32,
+) -> RawEmployeeRow {
     let mut parts = dept.split('　');
     RawEmployeeRow {
         employee_code: code.to_string(),
@@ -554,6 +561,7 @@ fn employee_row(code: &str, name: &str, dept: &str, taikei: i32, taikyu: i32) ->
         department_code: 14,
         branch_name: parts.next().unwrap_or("").to_string(),
         job_name: parts.next().unwrap_or("").to_string(),
+        kkubun,
     }
 }
 
@@ -561,8 +569,10 @@ fn repo_with_employees() -> MockKyuyoRepo {
     MockKyuyoRepo {
         names: vec![("0100".to_string(), "有限会社　大石運輸".to_string())],
         employees: vec![
-            employee_row("0941", "山田　太郎", "本社　乗務員", 1, 0),
-            employee_row("1771", "鈴木　花子", "本社　事務", 2, 1),
+            // 乗務員 (TAIKEI=1) が日給、事務 (TAIKEI=2) が月給 — 実データでは
+            // この対応は固定ではない (Refs #101) が、応答に両区分が出ることを見る
+            employee_row("0941", "山田　太郎", "本社　乗務員", 1, 0, 2),
+            employee_row("1771", "鈴木　花子", "本社　事務", 2, 1, 1),
         ],
         ..Default::default()
     }
@@ -584,8 +594,11 @@ async fn employees_returns_identity_only_with_company_name() {
     assert_eq!(rows[0]["employee_code_key"], "941");
     assert_eq!(rows[0]["department"], "本社　乗務員");
     assert_eq!(rows[0]["taikei"], 1);
+    // 給与区分 (SHAIN3.KKUBUN) — 消費側が単価の掛け方を決めるのに使う (Refs #101)
+    assert_eq!(rows[0]["kkubun"], 2);
     assert_eq!(rows[0]["retired"], false);
     assert_eq!(rows[1]["employee_code_key"], "1771");
+    assert_eq!(rows[1]["kkubun"], 1);
     assert_eq!(rows[1]["retired"], true);
     // 金額系のキーは一切出ない (社員マスタ API は identity only)
     assert!(rows[0].get("payments").is_none());

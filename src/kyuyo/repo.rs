@@ -342,12 +342,18 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         // 持つ (docs/kyuyo-daijin-schema.md の社員マスタ節)。金額列には触れない。
         // INCODE/TAIKEI は実列型が int とは限らないので CAST する (KAZEI/MEISAI で
         // 同じ罠を踏み、payments が全件空になった — Refs #95)
+        //
+        // 給与区分 (KKUBUN) は **SHAIN3** にあり、SHOZOKU.TAIKEI とは独立した軸
+        // (Refs #101)。同じ TAIKEI=1 (乗務員) でも月給/日給/時給が混在し、TAIKEI=2
+        // (事務員) にも時給者がいるので、TAIKEI から給与区分を推定してはいけない。
         let query = format!(
             "SELECT s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
              ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), \
-             CAST(ISNULL(sz.INCODE, 0) AS int), ISNULL(sz.NAME1, ''), ISNULL(sz.NAME2, '') \
+             CAST(ISNULL(sz.INCODE, 0) AS int), ISNULL(sz.NAME1, ''), ISNULL(sz.NAME2, ''), \
+             CAST(ISNULL(s3.KKUBUN, 0) AS int) \
              FROM [{db}].dbo.SHAIN1 s1 \
              LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = s1.SHOZOKU \
+             LEFT JOIN [{db}].dbo.SHAIN3 s3 ON s3.INCODE = s1.INCODE \
              ORDER BY s1.CODE"
         );
 
@@ -371,6 +377,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
                 department_code: get_i32(r, 5),
                 branch_name: get_str(r, 6),
                 job_name: get_str(r, 7),
+                kkubun: get_i32(r, 8),
             })
             .collect())
     }
