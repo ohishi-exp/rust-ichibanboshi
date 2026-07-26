@@ -7,22 +7,33 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::{Extension, Router};
 use rust_ichibanboshi::cakephp::CakephpClient;
+use rust_ichibanboshi::kintai_store::{
+    CachedKintai, DynKintaiStore, KintaiStore, KintaiStoreApi, KintaiStoreError, NoopKintaiStore,
+};
 use rust_ichibanboshi::routes;
 use tower::ServiceExt;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn app(base_url: String) -> Router {
+/// derived store を差し込む版 (Refs #106 Phase 2)。cache 系のテストで使う。
+fn app_with_store(base_url: String, store: DynKintaiStore) -> Router {
     Router::new()
         .route("/api/kintai/daily", get(routes::kintai::daily))
         .layer(Extension(Arc::new(
             CakephpClient::new(base_url, 5).expect("client"),
         )))
+        .layer(Extension(store))
+}
+
+/// 従来テスト用 — store は Noop (= 常に素通し中継)。
+fn app(base_url: String) -> Router {
+    app_with_store(base_url, Arc::new(NoopKintaiStore))
 }
 
 async fn call(app: Router, uri: &str) -> (StatusCode, String) {
@@ -96,7 +107,11 @@ async fn empty_rows_is_ok() {
 
     let (status, body) = call(app(server.uri()), "/api/kintai/daily?month=2026-06").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, r#"{"rows":[]}"#);
+    // メタ (source / synced_at) が足される以外は素通し
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["rows"].as_array().unwrap().is_empty());
+    assert_eq!(v["source"], "live");
+    assert!(v["synced_at"].as_str().unwrap().contains("T"));
 }
 
 #[tokio::test]
@@ -162,4 +177,165 @@ async fn upstream_unreachable_is_502() {
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(body.contains("fetch failed"));
+}
+
+// ══════════════════════════════════════════════════════════════
+// SQLite derived store (read-through / refresh、Refs #106 Phase 2)
+// ══════════════════════════════════════════════════════════════
+
+/// テスト用の故障 / 破損 store。
+#[derive(Default)]
+struct BrokenKintaiStore {
+    fail_get: bool,
+    corrupt: bool,
+    fail_put: bool,
+}
+
+#[async_trait]
+impl KintaiStoreApi for BrokenKintaiStore {
+    async fn get_daily(&self, _month: &str) -> Result<Option<CachedKintai>, KintaiStoreError> {
+        if self.fail_get {
+            return Err(KintaiStoreError::QueryError("boom".to_string()));
+        }
+        if self.corrupt {
+            return Ok(Some(CachedKintai {
+                response_json: "not-json".to_string(),
+                synced_at: "2026-07-26T00:00:00Z".to_string(),
+            }));
+        }
+        Ok(None)
+    }
+
+    async fn put_daily(
+        &self,
+        _month: &str,
+        _response_json: &str,
+        _row_count: usize,
+        _synced_at: &str,
+    ) -> Result<(), KintaiStoreError> {
+        if self.fail_put {
+            return Err(KintaiStoreError::QueryError("boom".to_string()));
+        }
+        Ok(())
+    }
+}
+
+fn memory_store() -> DynKintaiStore {
+    Arc::new(KintaiStore::open(":memory:").expect("in-memory store"))
+}
+
+#[tokio::test]
+async fn read_through_serves_cache_without_cakephp() {
+    // 1 回目: live + write-through
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM_BODY))
+        .mount(&server)
+        .await;
+    let store = memory_store();
+    let (status, live) = call(
+        app_with_store(server.uri(), store.clone()),
+        "/api/kintai/daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let live: serde_json::Value = serde_json::from_str(&live).unwrap();
+    assert_eq!(live["source"], "live");
+
+    // 2 回目: 上流到達不能でも (= CakePHP 停止相当) キャッシュから返る
+    let (status, cached) = call(
+        app_with_store("http://127.0.0.1:1".to_string(), store.clone()),
+        "/api/kintai/daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
+    assert_eq!(cached["source"], "cache");
+    assert_eq!(cached["synced_at"], live["synced_at"]);
+    assert_eq!(cached["rows"], live["rows"]);
+    // 上流の未知フィールドもキャッシュ経由で保存される (素通し方針の維持)
+    assert_eq!(cached["generated_at"], live["generated_at"]);
+
+    // 別月は miss → 上流到達不能なら 502 (キャッシュの取り違えをしない)
+    let (status, _) = call(
+        app_with_store("http://127.0.0.1:1".to_string(), store),
+        "/api/kintai/daily?month=2026-05",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn refresh_bypasses_cache_and_overwrites() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM_BODY))
+        .mount(&server)
+        .await;
+    let store = memory_store();
+    // 古い内容をキャッシュに仕込む
+    store
+        .put_daily("2026-06", r#"{"rows":[]}"#, 0, "2026-07-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    // refresh=1 はキャッシュを飛ばして上流から引き直し、上書きする
+    let (status, body) = call(
+        app_with_store(server.uri(), store.clone()),
+        "/api/kintai/daily?month=2026-06&refresh=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["source"], "live");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+
+    // 上書き後の read は新しい内容の cache
+    let (status, body) = call(
+        app_with_store("http://127.0.0.1:1".to_string(), store),
+        "/api/kintai/daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["source"], "cache");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn store_failures_fall_back_to_live_relay() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM_BODY))
+        .mount(&server)
+        .await;
+
+    // get 失敗 + put 失敗 → live 中継はそのまま成功 (warn ログのみ)
+    let store: DynKintaiStore = Arc::new(BrokenKintaiStore {
+        fail_get: true,
+        fail_put: true,
+        ..Default::default()
+    });
+    let (status, body) = call(
+        app_with_store(server.uri(), store),
+        "/api/kintai/daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["source"], "live");
+
+    // 破損キャッシュ (parse 不能) → live へフォールバック
+    let store: DynKintaiStore = Arc::new(BrokenKintaiStore {
+        corrupt: true,
+        ..Default::default()
+    });
+    let (status, body) = call(
+        app_with_store(server.uri(), store),
+        "/api/kintai/daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["source"], "live");
 }

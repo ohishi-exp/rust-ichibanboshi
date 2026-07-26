@@ -32,11 +32,16 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
+use crate::kintai_store::DynKintaiStore;
 
-/// `?month=YYYY-MM`
+/// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
+/// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
+/// これを付ける)。
 #[derive(Debug, Deserialize)]
 pub struct DailyQuery {
     pub month: Option<String>,
+    #[serde(default)]
+    pub refresh: Option<String>,
 }
 
 /// 対象月の書式検証。`YYYY-MM` で月は 01-12。
@@ -83,10 +88,29 @@ fn map_cakephp_err(e: CakephpError) -> (StatusCode, String) {
     }
 }
 
+/// 応答へ出どころメタを足す (素通し方針のため型は変えず extra に載せる)。
+fn with_source_meta(
+    mut resp: TimecardDailyResponse,
+    source: &str,
+    synced_at: &str,
+) -> TimecardDailyResponse {
+    resp.extra
+        .insert("source".to_string(), serde_json::Value::from(source));
+    resp.extra
+        .insert("synced_at".to_string(), serde_json::Value::from(synced_at));
+    resp
+}
+
 /// GET /api/kintai/daily?month=YYYY-MM — タイムカード日別データの中継。
+///
+/// Refs #106 Phase 2: read-through — derived store に月があれば CakePHP に触らず
+/// 返す (`source:"cache"`)。miss / `refresh=1` は従来どおり CakePHP から取得し
+/// write-through で保存する (`source:"live"`)。保存するのは**上流応答の verbatim
+/// JSON** (メタ注入前) — 素通し方針を保存でも維持する。
 pub async fn daily(
     Query(params): Query<DailyQuery>,
     Extension(cakephp): Extension<Arc<CakephpClient>>,
+    Extension(store): Extension<DynKintaiStore>,
 ) -> Result<Json<TimecardDailyResponse>, (StatusCode, String)> {
     let month = params.month.unwrap_or_default();
     if !is_valid_month(&month) {
@@ -94,6 +118,28 @@ pub async fn daily(
             StatusCode::BAD_REQUEST,
             "month は YYYY-MM で指定してください".to_string(),
         ));
+    }
+    let force_refresh = params.refresh.as_deref() == Some("1");
+    if !force_refresh {
+        match store.get_daily(&month).await {
+            Ok(Some(cached)) => {
+                match serde_json::from_str::<TimecardDailyResponse>(&cached.response_json) {
+                    Ok(resp) => {
+                        let rows = resp.rows.len();
+                        tracing::info!(month = %month, rows, "kintai daily served from cache");
+                        return Ok(Json(with_source_meta(resp, "cache", &cached.synced_at)));
+                    }
+                    Err(e) => {
+                        // schema 版の上げ忘れ等 — live へフォールバック (読みを殺さない)
+                        tracing::warn!("kintai store corrupt row — live fallback: {e}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("kintai store read failed — live fallback: {e}");
+            }
+        }
     }
     let resp = cakephp
         .fetch_timecard_daily(&month)
@@ -103,7 +149,14 @@ pub async fn daily(
     // マクロ内に到達しない region が残る (coverage_100 の対象なので実害がある)
     let rows = resp.rows.len();
     tracing::info!(month = %month, rows, "kintai daily relayed");
-    Ok(Json(resp))
+    let synced_at = chrono::Utc::now().to_rfc3339();
+    // String キー + JSON 値しか持たない型なので serialize は失敗しない
+    let json = serde_json::to_string(&resp).expect("TimecardDailyResponse serialize");
+    if let Err(e) = store.put_daily(&month, &json, rows, &synced_at).await {
+        // live 応答はそのまま返す — キャッシュ書き込み失敗で中継を殺さない
+        tracing::warn!("kintai store write failed: {e}");
+    }
+    Ok(Json(with_source_meta(resp, "live", &synced_at)))
 }
 
 #[cfg(test)]
