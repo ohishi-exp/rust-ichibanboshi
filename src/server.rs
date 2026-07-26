@@ -55,6 +55,22 @@ pub async fn run(
     // 給与 DB (OHKEN、非力な PC) を触る区間の同時実行制限 (Refs #369)
     let kyuyo_limiter = Arc::new(routes::kyuyo::KyuyoLimiter::new());
 
+    // タイムカードの SQLite derived store (Refs #106 Phase 2)。open 失敗は Noop に
+    // 落として CakePHP 素通し中継を維持する
+    let kintai_store: crate::kintai_store::DynKintaiStore = if config.cakephp.sqlite_path.is_empty()
+    {
+        tracing::info!("kintai sqlite_path is empty — derived store disabled (relay only)");
+        Arc::new(crate::kintai_store::NoopKintaiStore)
+    } else {
+        match crate::kintai_store::KintaiStore::open(&config.cakephp.sqlite_path) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                tracing::warn!("kintai store open failed — falling back to relay only: {e}");
+                Arc::new(crate::kintai_store::NoopKintaiStore)
+            }
+        }
+    };
+
     // 給与の SQLite derived store (Refs #106 Phase 1)。open 失敗は Noop に落として
     // live 読みへフォールバック — キャッシュの健全性で読み機能を殺さない
     let kyuyo_store: kyuyo::store::DynKyuyoStore = if config.kyuyo.sqlite_path.is_empty() {
@@ -184,7 +200,8 @@ pub async fn run(
         .layer(Extension(kyuyo_repo))
         .layer(Extension(kyuyo_auth))
         .layer(Extension(kyuyo_limiter))
-        .layer(Extension(kyuyo_store));
+        .layer(Extension(kyuyo_store))
+        .layer(Extension(kintai_store));
 
     let addr = config.addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;

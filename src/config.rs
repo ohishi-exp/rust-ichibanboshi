@@ -84,6 +84,11 @@ pub struct CakephpConfig {
     /// HTTP request timeout (秒)。default 30 秒
     #[serde(default = "default_cakephp_timeout_secs")]
     pub timeout_secs: u64,
+
+    /// タイムカード derived store (SQLite、Refs #106 Phase 2) のパス。
+    /// 空 = 無効 (常に CakePHP 素通し)。キャッシュ扱い — 消して再 sync で再構築可。
+    #[serde(default = "default_kintai_sqlite_path")]
+    pub sqlite_path: String,
 }
 
 /// Raw NDJSON.gz 出力 configuration (Phase 2: R2 warm backup の input、issue #762)
@@ -235,6 +240,10 @@ fn default_kyuyo_user() -> String {
 fn default_kyuyo_app_origin() -> String {
     "https://dtako.ippoan.org".to_string()
 }
+fn default_kintai_sqlite_path() -> String {
+    "/opt/ichibanboshi/kintai_local.sqlite".to_string()
+}
+
 fn default_kyuyo_sqlite_path() -> String {
     "/opt/ichibanboshi/kyuyo_local.sqlite".to_string()
 }
@@ -295,6 +304,7 @@ impl Default for CakephpConfig {
         Self {
             base_url: String::new(),
             timeout_secs: default_cakephp_timeout_secs(),
+            sqlite_path: default_kintai_sqlite_path(),
         }
     }
 }
