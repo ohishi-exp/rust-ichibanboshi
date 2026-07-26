@@ -12,7 +12,7 @@ use rust_ichibanboshi::kyuyo::introspect::{
     IntrospectApi, IntrospectError, IntrospectResult, KyuyoAuthState,
 };
 use rust_ichibanboshi::kyuyo::logic::{
-    RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow, MONEY_COLUMNS,
+    RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow, KINDATA_COLUMNS, MONEY_COLUMNS,
 };
 use rust_ichibanboshi::kyuyo::repo::{
     DynKyuyoRepo, KyuyoRepo, KyuyoRepoError, NotConfiguredKyuyoRepo,
@@ -176,6 +176,7 @@ fn raw_row(shain: i32, code: &str, month_index: i32, base_pay: i64) -> RawKyuyoR
         department: "本社　乗務員".to_string(),
         taikei: 1,
         money,
+        kindata: vec![0i64; KINDATA_COLUMNS],
     }
 }
 
