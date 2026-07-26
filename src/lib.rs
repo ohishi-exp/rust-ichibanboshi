@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cakephp;
 pub mod config;
 pub mod db;
+pub mod kintai_store;
 pub mod kyuyo;
 pub mod repo;
 pub mod routes;
