@@ -31,6 +31,10 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
 | `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
 | `src/routes/kintai.rs` | `/api/kintai/daily` 勤怠 (タイムカード) の中継 (#99、下記) |
+| `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
+| `src/kyuyo/logic.rs` | 給与の純粋ロジック (項目マッピング・行組み立て)。**coverage 100% 対象** |
+| `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層 |
+| `src/kyuyo/introspect.rs` | `/api/kyuyo/*` の in-service gate (auth-worker introspect + email allowlist) |
 
 ## entrypoint / Axum router (`src/server.rs::run`)
 
@@ -152,6 +156,34 @@ CakePHP は LAN 内にしか居ないので、**同一ホストで動く本サ�
   `AppController::addUnauthenticatedActions` に action 名を足し忘れた時にこうなる (yhonda-ohishi/nginx#773)
 - テストは `tests/kintai_test.rs` (wiremock で CakePHP を stub)。`src/routes/kintai.rs` は
   coverage_100 登録済み
+
+## 給与 (給与大臣) の読み出し — `/api/kyuyo/*`
+
+一番星とは**別の SQL Server** (給与大臣、年度ごとに `KYDATA{会社}_{年度}` の DB が分かれる)。
+pool も repo trait も分離してある (`src/kyuyo/repo.rs`)。認可は**ブラウザ JWT の in-service gate**
+(auth-worker introspect + email allowlist) — 金額を返すので `/kintai/*` の Service Token とは扱いが違う。
+
+**項目マスタ `KOUMOKU.TAIKEIKOUNO` = 体系コード(2桁) + 項目番号(3桁)** で、`KYUYO` の列と
+項目番号帯が対応する。**帯ごとに列がまったく別**なのが要点:
+
+| 項目番号 | 内容 | `KYUYO` の列 | 組み立て |
+| --- | --- | --- | --- |
+| 001〜017 | **勤怠** (出勤日数・公休日数・有休日数・欠勤日数・残業時間・遅刻回数 等) | `KINDATA0000, KINDATA0100, .., KINDATA1600` (17列・100刻み) | `kintai_taikeikouno(taikei, n)` = `1 + n` |
+| 018〜097 | 支給・控除 | `MONEY00 〜 MONEY79` (80列) | `taikeikouno(taikei, n)` = `18 + n` |
+
+- **`KINDATA*` は全社・全項目で `raw / 100` = 実数** (Refs #103、実データ 4 社で確定)。
+  **「回数」系も例外ではない** — 遅刻回数の生値 `800` は 8 回で、割らないと 800 回になる。
+  実測: 残業時間 `5900`=59.00h / 有休日数 `50`,`150`,`250`=0.5,1.5,2.5 日 (半休も整合) /
+  残業時間 `13750`=137.50h
+- **`KOUMOKU.NUMMODE` (1〜4) は参照しない。** 「表示モード」という名前でスケール区分に見えるうえ、
+  同じ項目 (残業時間) でも会社によって 2 だったり 4 だったりするが、これは**給与大臣 UI 側の
+  表示書式**で格納スケールとは無関係
+- 応答は `payments` (支給) / `deductions` (控除) / `attendance` (勤怠、除算済みの実数) の 3 本立て。
+  **勤怠を金額に混ぜない** — 混ぜると `payments` 合計と `SHUKEI1.SOSHIKYU` の自己突合が壊れる
+- 支給/控除の分け方は **`KAZEI`** (1/2=支給・0=控除)。`KUBUN` は両者が混在していて使えない (#93)。
+  `MEISAI=1` は単価項目でどちらにも入れない。`GENGAKU=1` は支給側でも符号反転 (#87)
+- 0 の項目は落とす — 体系によって未定義の項目番号があり、拾うと「項目マスタ未解決」warning が全社で毎回出る
+- スキーマの一次情報は `docs/kyuyo-daijin-schema.md`
 
 ## 燃料サーチャージ基礎データ (`/api/surcharge/base`、Refs #12)
 

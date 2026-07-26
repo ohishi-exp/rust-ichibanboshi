@@ -18,6 +18,13 @@ pub const ALLOWED_COMPANIES: [&str; 4] = ["0100", "0200", "0300", "0400"];
 /// `KYUYO.MONEY00..79` の列数。
 pub const MONEY_COLUMNS: usize = 80;
 
+/// `KYUYO.KINDATA0000, KINDATA0100, .., KINDATA1600` の列数 (勤怠系、Refs #103)。
+///
+/// 支給・控除の `MONEY00..79` (項目番号 018〜097) とは**別の列**で、こちらは
+/// 項目番号 001〜017 (出勤日数・公休日数・有休日数・欠勤日数・残業時間・遅刻回数 等)。
+/// 列名は 100 刻み (`KINDATA{NN}00`)。
+pub const KINDATA_COLUMNS: usize = 17;
+
 /// `SHUKEI1` の支給回インデックス上限 (列 `SOSHIKYU00`..`SOSHIKYU21`)。
 pub const MAX_MONTH_INDEX: i32 = 21;
 
@@ -95,6 +102,12 @@ pub fn taikeikouno(taikei: i32, money_index: usize) -> String {
     format!("{:02}{:03}", taikei.clamp(0, 99), 18 + money_index)
 }
 
+/// 勤怠系の `KOUMOKU.TAIKEIKOUNO` (Refs #103)。
+/// `kindata_index` は `KINDATA{NN}00` の連番 (0..=16)、項目番号は `1 + N`。
+pub fn kintai_taikeikouno(taikei: i32, kindata_index: usize) -> String {
+    format!("{:02}{:03}", taikei.clamp(0, 99), 1 + kindata_index)
+}
+
 /// `SHAIN1.CODE` (前ゼロ + 末尾スペース埋め) から dtako 側と突合するキーを作る。
 /// trim + 前ゼロ除去。全部ゼロなら "0"。
 pub fn employee_code_key(code: &str) -> String {
@@ -154,6 +167,9 @@ pub struct RawKyuyoRow {
     pub taikei: i32,
     /// `MONEY00..79` (円、[`MONEY_COLUMNS`] 個)。
     pub money: Vec<i64>,
+    /// `KINDATA0000, KINDATA0100, .., KINDATA1600` (生値、[`KINDATA_COLUMNS`] 個、Refs #103)。
+    /// **×100 の固定小数のまま**運ぶ ([`KINDATA_SCALE`] で実数に戻す)。
+    pub kindata: Vec<i64>,
 }
 
 /// `KOUMOKU` (支給/控除項目マスタ) の 1 行。
@@ -247,12 +263,29 @@ pub struct PayrollRow {
     pub base_rate: Option<f64>,
     /// 残業単価 (時給、円)。`MEISAI=1` の「残業単価」項目。
     pub overtime_rate: Option<f64>,
+    /// **勤怠**項目名 → 値 (日数・時間・回数、Refs #103)。`KINDATA*` 由来で
+    /// [`KINDATA_SCALE`] 除算済みの実数。0 は含めない。同名は合算。
+    ///
+    /// 単位は項目ごとに違う (出勤日数=日 / 残業時間=時間 / 遅刻回数=回)。名前が
+    /// そのまま給与明細の【 勤怠 】欄の見出しなので、消費側は名前で引く。
+    pub attendance: BTreeMap<String, f64>,
     /// `SHUKEI1` の計算済み合計。該当行が無い場合は null (warning を併記)。
     pub totals: Option<PayrollTotals>,
 }
 
 /// 単価項目 (`MEISAI=1`) の DB 値は ×100 の固定小数 (`1318.00` 円が `131800`)。
 const RATE_SCALE: f64 = 100.0;
+
+/// 勤怠列 (`KINDATA*`) の DB 値も ×100 の固定小数 (Refs #103、実データ 4 社で確定)。
+///
+/// **全社・全項目で一律**。「回数」系も例外ではない — 遅刻回数の生値 `800` は 8 回で、
+/// 割らずに使うと 800 回になる。実測: 残業時間 `5900`=59.00h / 有休日数 `50`,`150`,`250`
+/// = 0.5,1.5,2.5 日 (半休も整合) / 遅刻回数 `800`=8 回 / 残業時間 `13750`=137.50h。
+///
+/// **`KOUMOKU.NUMMODE` (1〜4) は参照しない**。「表示モード」という名前でスケール区分に
+/// 見えるうえ、同じ項目 (残業時間) でも会社によって 2 だったり 4 だったりするが、
+/// これは給与大臣 UI 側の表示書式で**格納スケールとは無関係**。値によらず一律 `/100`。
+const KINDATA_SCALE: f64 = 100.0;
 
 /// `KYUYO` 生行 + 項目マスタ + `SHUKEI1` 集計から給与行を組み立てる。
 ///
@@ -325,6 +358,27 @@ pub fn build_payroll_rows(
                 *bucket.entry(item.name.clone()).or_insert(0) += signed;
             }
 
+            // 勤怠 (KINDATA*、Refs #103)。金額とは別の列・別の項目番号帯なので
+            // payments/deductions には混ぜない。**0 は入れない** — 体系によって
+            // 未定義の項目番号があり、拾うと「項目マスタ未解決」の warning が
+            // 全社で毎回出てしまう (金額側と同じ作法)
+            let mut attendance: BTreeMap<String, f64> = BTreeMap::new();
+            for (n, raw_value) in r.kindata.iter().enumerate() {
+                if *raw_value == 0 {
+                    continue;
+                }
+                let key = kintai_taikeikouno(r.taikei, n);
+                let Some(item) = koumoku.get(&key).filter(|i| !i.name.is_empty()) else {
+                    warnings.insert(format!(
+                        "勤怠の項目マスタ未解決: TAIKEIKOUNO={key} (体系{}, KINDATA{n:02}00)",
+                        r.taikei
+                    ));
+                    continue;
+                };
+                *attendance.entry(item.name.clone()).or_insert(0.0) +=
+                    *raw_value as f64 / KINDATA_SCALE;
+            }
+
             let totals = match shukei_by_key.get(&(r.shain, r.month_index)) {
                 Some(s) => {
                     // 支給合計の自己突合 (Refs #87)。項目別の区分 (KAZEI/MEISAI) が
@@ -372,6 +426,7 @@ pub fn build_payroll_rows(
                 deductions,
                 base_rate,
                 overtime_rate,
+                attendance,
                 totals,
             }
         })
