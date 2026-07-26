@@ -416,6 +416,8 @@ pub struct RawEmployeeRow {
     pub job_name: String,
     /// `SHOZOKU.TAIKEI` (給与体系コード)。
     pub taikei: i32,
+    /// `SHAIN3.KKUBUN` (給与区分: 1=月給 / 2=日給 / 3=時給 / 4=その他、0=未設定)。
+    pub kkubun: i32,
 }
 
 /// 社員 1 名の識別情報 (金額なし)。
@@ -440,8 +442,14 @@ pub struct EmployeeRow {
     pub branch_name: String,
     /// 職種名 (`SHOZOKU.NAME2`)。
     pub job_name: String,
-    /// 給与体系コード (`SHOZOKU.TAIKEI`)。
+    /// 給与体系コード (`SHOZOKU.TAIKEI`)。**部署の体系**であって給与区分ではない。
     pub taikei: i32,
+    /// 給与区分 (`SHAIN3.KKUBUN`): **1=月給 / 2=日給 / 3=時給 / 4=その他**、0=未設定。
+    ///
+    /// 「単価が日額か時給か月額か」を決める唯一の軸で、`taikei` とは**独立**している
+    /// (同じ TAIKEI=1 の乗務員でも月給/日給/時給が混在し、TAIKEI=2 の事務員にも
+    /// 時給者がいる — Refs #101 の実機調査)。消費者はこれを見て単価の掛け方を変える。
+    pub kkubun: i32,
     /// `SHAIN1.TAIKYU != 0` (退職済み)。
     pub retired: bool,
 }
@@ -471,6 +479,7 @@ pub fn build_employee_rows(raw: &[RawEmployeeRow]) -> Vec<EmployeeRow> {
             branch_name: r.branch_name.clone(),
             job_name: r.job_name.clone(),
             taikei: r.taikei,
+            kkubun: r.kkubun,
             retired: r.taikyu != 0,
         });
     }
