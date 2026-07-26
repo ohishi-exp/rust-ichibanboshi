@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 給与比較 API の対象会社 (#81 で確定した現行 4 社。0500/0900 は廃業済み DB のみ)。
 pub const ALLOWED_COMPANIES: [&str; 4] = ["0100", "0200", "0300", "0400"];
@@ -218,7 +218,7 @@ pub struct RawShukeiRow {
 // ══════════════════════════════════════════════════════════════
 
 /// `SHUKEI1` 由来の計算済み合計。控除合計・差引は #81 の式で導出する。
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PayrollTotals {
     /// 総支給額。
     pub soshikyu: i64,
@@ -236,8 +236,9 @@ pub struct PayrollTotals {
     pub net_pay: i64,
 }
 
-/// 社員 × 支給回の給与 1 行。
-#[derive(Debug, Clone, Serialize)]
+/// 社員 × 支給回の給与 1 行。SQLite derived store (store.rs) が row_json として
+/// verbatim 保存 → 復元するため Deserialize も持つ。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PayrollRow {
     /// 社員番号 (`SHAIN1.CODE` trim 済み、前ゼロは残す)。
     pub employee_code: String,
@@ -517,7 +518,8 @@ pub fn normalize_hire_date(raw: &str) -> Option<String> {
 /// 消費者は ohishi-exp/nuxt-dtako-admin の社員マスタ (D1、Refs #367) —
 /// 給与明細 CSV をブラウザに貼らずに社員マスタを作るための供給元。
 /// **支給額・控除額は一切含めない**(「金額はブラウザから出さない」方針)。
-#[derive(Debug, Clone, Serialize, PartialEq)]
+/// SQLite derived store (store.rs) が verbatim 保存 → 復元するため Deserialize も持つ。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EmployeeRow {
     /// 社員番号 (`SHAIN1.CODE` trim 済み、前ゼロは残す)。
     pub employee_code: String,

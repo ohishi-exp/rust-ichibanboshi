@@ -138,6 +138,12 @@ pub struct KyuyoConfig {
     /// introspect HTTP timeout (秒)。
     #[serde(default = "default_kyuyo_timeout_secs")]
     pub timeout_secs: u64,
+
+    /// 給与 derived store (SQLite) のパス。空 = 無効 (常に live 読み)。
+    /// キャッシュ扱い — 消して再 sync で全量再構築できる
+    /// (docs/plan-kyuyo-sqlite-store.md)。
+    #[serde(default = "default_kyuyo_sqlite_path")]
+    pub sqlite_path: String,
 }
 
 impl KyuyoConfig {
@@ -229,6 +235,10 @@ fn default_kyuyo_user() -> String {
 fn default_kyuyo_app_origin() -> String {
     "https://dtako.ippoan.org".to_string()
 }
+fn default_kyuyo_sqlite_path() -> String {
+    "/opt/ichibanboshi/kyuyo_local.sqlite".to_string()
+}
+
 fn default_kyuyo_timeout_secs() -> u64 {
     10
 }
@@ -245,6 +255,7 @@ impl Default for KyuyoConfig {
             app_origin: default_kyuyo_app_origin(),
             allowed_emails: Vec::new(),
             timeout_secs: default_kyuyo_timeout_secs(),
+            sqlite_path: default_kyuyo_sqlite_path(),
         }
     }
 }

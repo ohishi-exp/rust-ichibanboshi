@@ -11,11 +11,16 @@ use axum::{Extension, Router};
 use rust_ichibanboshi::kyuyo::introspect::{
     IntrospectApi, IntrospectError, IntrospectResult, KyuyoAuthState,
 };
+use rust_ichibanboshi::kyuyo::logic::{EmployeeRow, PayrollRow};
 use rust_ichibanboshi::kyuyo::logic::{
     RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow, KINDATA_COLUMNS, MONEY_COLUMNS,
 };
 use rust_ichibanboshi::kyuyo::repo::{
     DynKyuyoRepo, KyuyoRepo, KyuyoRepoError, NotConfiguredKyuyoRepo,
+};
+use rust_ichibanboshi::kyuyo::store::{
+    CachedEmployees, CachedPayroll, DynKyuyoStore, KyuyoStore, KyuyoStoreApi, KyuyoStoreError,
+    NoopKyuyoStore,
 };
 use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::kyuyo::KyuyoLimiter;
@@ -133,15 +138,23 @@ impl KyuyoRepo for MockKyuyoRepo {
     }
 }
 
-fn build_app(repo: DynKyuyoRepo, auth: KyuyoAuthState) -> Router {
+/// derived store を差し込む版 (Refs #106)。cache 系のテストで使う。
+fn build_app_with_store(repo: DynKyuyoRepo, auth: KyuyoAuthState, store: DynKyuyoStore) -> Router {
     Router::new()
         .route("/api/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/api/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/api/kyuyo/payroll", get(routes::kyuyo::payroll))
         .route("/api/kyuyo/employees", get(routes::kyuyo::employees))
+        .route("/api/kyuyo/sync", axum::routing::post(routes::kyuyo::sync))
         .layer(Extension(repo))
         .layer(Extension(Arc::new(auth)))
         .layer(Extension(Arc::new(KyuyoLimiter::default())))
+        .layer(Extension(store))
+}
+
+/// 従来テスト用 — store は Noop (= 常に live 読み、write-through は無視)。
+fn build_app(repo: DynKyuyoRepo, auth: KyuyoAuthState) -> Router {
+    build_app_with_store(repo, auth, Arc::new(NoopKyuyoStore))
 }
 
 async fn get_json(app: Router, uri: &str, with_token: bool) -> (StatusCode, serde_json::Value) {
@@ -674,4 +687,275 @@ async fn employees_company_name_empty_when_not_in_master() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["company_name"], "");
     assert!(json["warnings"].as_array().unwrap().is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════
+// SQLite derived store (read-through / sync、Refs #106)
+// ══════════════════════════════════════════════════════════════
+
+/// テスト用の故障 store。get / put の失敗を個別に注入する。
+#[derive(Default)]
+struct FailStore {
+    fail_get: bool,
+    fail_put_payroll: bool,
+    fail_put_employees: bool,
+}
+
+#[async_trait]
+impl KyuyoStoreApi for FailStore {
+    async fn get_payroll(
+        &self,
+        _company: &str,
+        _month: &str,
+    ) -> Result<Option<CachedPayroll>, KyuyoStoreError> {
+        if self.fail_get {
+            return Err(KyuyoStoreError::QueryError("boom".to_string()));
+        }
+        Ok(None)
+    }
+
+    async fn put_payroll(
+        &self,
+        _company: &str,
+        _month: &str,
+        _rows: &[PayrollRow],
+        _warnings: &[String],
+        _synced_at: &str,
+    ) -> Result<(), KyuyoStoreError> {
+        if self.fail_put_payroll {
+            return Err(KyuyoStoreError::QueryError("boom".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn get_employees(
+        &self,
+        _company: &str,
+        _nendo: i32,
+    ) -> Result<Option<CachedEmployees>, KyuyoStoreError> {
+        if self.fail_get {
+            return Err(KyuyoStoreError::QueryError("boom".to_string()));
+        }
+        Ok(None)
+    }
+
+    async fn put_employees(
+        &self,
+        _company: &str,
+        _nendo: i32,
+        _employees: &[EmployeeRow],
+        _company_name: &str,
+        _warnings: &[String],
+        _synced_at: &str,
+    ) -> Result<(), KyuyoStoreError> {
+        if self.fail_put_employees {
+            return Err(KyuyoStoreError::QueryError("boom".to_string()));
+        }
+        Ok(())
+    }
+}
+
+fn memory_store() -> DynKyuyoStore {
+    Arc::new(KyuyoStore::open(":memory:").expect("in-memory store"))
+}
+
+async fn post_json(app: Router, uri: &str, with_token: bool) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder().uri(uri).method("POST");
+    if with_token {
+        builder = builder.header("Authorization", "Bearer tok");
+    }
+    let res = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    (status, json)
+}
+
+#[tokio::test]
+async fn payroll_read_through_serves_cache_without_ohken() {
+    // 1 回目: live 読み + write-through
+    let store = memory_store();
+    let app = build_app_with_store(Arc::new(repo_with_june_data()), auth_ok(), store.clone());
+    let (status, live) = get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["source"], "live");
+    assert!(live["synced_at"].as_str().unwrap().contains("T"));
+
+    // 2 回目: repo が全部エラーでも (= OHKEN 停止相当) キャッシュから返る
+    let broken = MockKyuyoRepo {
+        payroll_error: Some("down".to_string()),
+        ..Default::default()
+    };
+    let app = build_app_with_store(Arc::new(broken), auth_ok(), store);
+    let (status, cached) =
+        get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached["source"], "cache");
+    assert_eq!(cached["synced_at"], live["synced_at"]);
+    // 行・warning は live 応答と等価 (順序含む)
+    assert_eq!(cached["rows"], live["rows"]);
+    assert_eq!(cached["warnings"], live["warnings"]);
+    assert_eq!(cached["database"], live["database"]);
+}
+
+#[tokio::test]
+async fn employees_read_through_serves_cache_without_ohken() {
+    let store = memory_store();
+    let app = build_app_with_store(Arc::new(repo_with_employees()), auth_ok(), store.clone());
+    let (status, live) =
+        get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["source"], "live");
+
+    let broken = MockKyuyoRepo {
+        employees_error: Some("down".to_string()),
+        ..Default::default()
+    };
+    let app = build_app_with_store(Arc::new(broken), auth_ok(), store);
+    let (status, cached) =
+        get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached["source"], "cache");
+    assert_eq!(cached["employees"], live["employees"]);
+    assert_eq!(cached["company_name"], live["company_name"]);
+    assert_eq!(cached["warnings"], live["warnings"]);
+}
+
+#[tokio::test]
+async fn store_failures_fall_back_to_live_reads() {
+    // get も put も失敗する store — live 読みはそのまま成功する (warn ログのみ)
+    let store: DynKyuyoStore = Arc::new(FailStore {
+        fail_get: true,
+        fail_put_payroll: true,
+        fail_put_employees: true,
+    });
+    let app = build_app_with_store(Arc::new(repo_with_june_data()), auth_ok(), store.clone());
+    let (status, body) = get_json(app, "/api/kyuyo/payroll?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["source"], "live");
+
+    let app = build_app_with_store(Arc::new(repo_with_employees()), auth_ok(), store);
+    let (status, body) =
+        get_json(app, "/api/kyuyo/employees?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["source"], "live");
+}
+
+#[tokio::test]
+async fn sync_overwrites_cache_and_reports_counts() {
+    let store = memory_store();
+    // 社員マスタも給与も持つ repo (fixture を合成)
+    let mut repo = repo_with_june_data();
+    let employees_fixture = repo_with_employees();
+    repo.employees = employees_fixture.employees;
+    repo.names = employees_fixture.names;
+    let app = build_app_with_store(Arc::new(repo), auth_ok(), store.clone());
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/kyuyo/sync?company=0100&month=2026-06",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["company"], "0100");
+    assert_eq!(body["database"], "KYDATA0100_126C");
+    assert_eq!(body["payroll_rows"], 2);
+    assert_eq!(body["employees"], 2);
+    let first_synced_at = body["synced_at"].as_str().unwrap().to_string();
+
+    // sync 後の read は cache から (OHKEN 停止相当でも返る)
+    let broken = MockKyuyoRepo {
+        payroll_error: Some("down".to_string()),
+        employees_error: Some("down".to_string()),
+        ..Default::default()
+    };
+    let app_broken = build_app_with_store(Arc::new(broken), auth_ok(), store.clone());
+    let (status, cached) = get_json(
+        app_broken.clone(),
+        "/api/kyuyo/payroll?company=0100&month=2026-06",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached["source"], "cache");
+    let (status, cached) = get_json(
+        app_broken,
+        "/api/kyuyo/employees?company=0100&month=2026-06",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached["source"], "cache");
+
+    // 再 sync はキャッシュ有無に関わらず上書き (synced_at が進む)
+    let (status, body) = post_json(app, "/api/kyuyo/sync?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["synced_at"].as_str().unwrap() >= first_synced_at.as_str());
+}
+
+#[tokio::test]
+async fn sync_requires_token_and_validates_params() {
+    let app = build_app_with_store(Arc::new(repo_with_june_data()), auth_ok(), memory_store());
+    let (status, _) = post_json(
+        app.clone(),
+        "/api/kyuyo/sync?company=0100&month=2026-06",
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/kyuyo/sync?company=9999&month=2026-06",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("company"));
+
+    let (status, body) = post_json(app, "/api/kyuyo/sync?company=0100&month=junk", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("YYYY-MM"));
+}
+
+#[tokio::test]
+async fn sync_propagates_source_errors() {
+    // OHKEN 停止中の sync は従来のエラー変換どおり (503)
+    let app = build_app_with_store(Arc::new(NotConfiguredKyuyoRepo), auth_ok(), memory_store());
+    let (status, _) = post_json(app, "/api/kyuyo/sync?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn sync_fails_loud_when_store_write_fails() {
+    let mut repo = repo_with_june_data();
+    let employees_fixture = repo_with_employees();
+    repo.employees = employees_fixture.employees;
+    repo.names = employees_fixture.names;
+    let repo = Arc::new(repo);
+
+    // payroll 書き込み失敗 → 500
+    let store: DynKyuyoStore = Arc::new(FailStore {
+        fail_put_payroll: true,
+        ..Default::default()
+    });
+    let app = build_app_with_store(repo.clone(), auth_ok(), store);
+    let (status, body) = post_json(app, "/api/kyuyo/sync?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body["error"].as_str().unwrap().contains("payroll"));
+
+    // employees 書き込み失敗 → 500
+    let store: DynKyuyoStore = Arc::new(FailStore {
+        fail_put_employees: true,
+        ..Default::default()
+    });
+    let app = build_app_with_store(repo, auth_ok(), store);
+    let (status, body) = post_json(app, "/api/kyuyo/sync?company=0100&month=2026-06", true).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body["error"].as_str().unwrap().contains("employees"));
 }
