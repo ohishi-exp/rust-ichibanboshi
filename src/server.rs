@@ -198,6 +198,7 @@ pub async fn run(
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
         .route("/kyuyo/employees", get(routes::kyuyo::employees))
         .route("/kyuyo/sync", post(routes::kyuyo::sync))
+        .route("/kyuyo/synced-months", get(routes::kyuyo::synced_months))
         .route(
             "/restraint/summaries",
             axum::routing::put(routes::restraint::put_summaries),

@@ -61,6 +61,15 @@ pub struct CachedEmployees {
     pub synced_at: String,
 }
 
+/// sync 済み給与明細 1 件 (メタのみ)。
+#[derive(Debug, Clone)]
+pub struct PayrollSyncedRow {
+    pub company: String,
+    pub month: String,
+    pub synced_at: String,
+    pub row_count: i64,
+}
+
 /// store の trait 面。route handler はこれ経由でしか触らない (テストで差し替え可)。
 #[async_trait]
 pub trait KyuyoStoreApi: Send + Sync {
@@ -84,6 +93,10 @@ pub trait KyuyoStoreApi: Send + Sync {
         company: &str,
         nendo: i32,
     ) -> Result<Option<CachedEmployees>, KyuyoStoreError>;
+
+    /// sync 済み給与明細 (payroll scope) の一覧 (Refs nuxt-dtako-admin#460)。
+    /// 月タブの「給与取り込み済み」表示用のメタデータのみ — 金額は含まない。
+    async fn payroll_synced(&self) -> Result<Vec<PayrollSyncedRow>, KyuyoStoreError>;
 
     async fn put_employees(
         &self,
@@ -130,6 +143,10 @@ impl KyuyoStoreApi for NoopKyuyoStore {
         _nendo: i32,
     ) -> Result<Option<CachedEmployees>, KyuyoStoreError> {
         Ok(None)
+    }
+
+    async fn payroll_synced(&self) -> Result<Vec<PayrollSyncedRow>, KyuyoStoreError> {
+        Ok(Vec::new())
     }
 
     async fn put_employees(
@@ -468,6 +485,50 @@ impl KyuyoStoreApi for KyuyoStore {
             )
             .map_err(q)?;
             tx.commit().map_err(q)
+        })
+        .await
+        .map_err(|e| KyuyoStoreError::JoinError(e.to_string()))?
+    }
+
+    async fn payroll_synced(&self) -> Result<Vec<PayrollSyncedRow>, KyuyoStoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT scope, synced_at, row_count FROM kyuyo_sync_state
+                     WHERE scope LIKE 'payroll:%'
+                     ORDER BY scope ASC",
+                )
+                .map_err(q)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(q)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(q)?;
+            // scope = 'payroll:{company}:{month}'。形が合わない行は無視 (書き込みは
+            // 本 store 経由のみなので実際には出ない)
+            Ok(rows
+                .into_iter()
+                .filter_map(|(scope, synced_at, row_count)| {
+                    let mut parts = scope.splitn(3, ':');
+                    let _kind = parts.next()?;
+                    let company = parts.next()?.to_string();
+                    let month = parts.next()?.to_string();
+                    Some(PayrollSyncedRow {
+                        company,
+                        month,
+                        synced_at,
+                        row_count,
+                    })
+                })
+                .collect())
         })
         .await
         .map_err(|e| KyuyoStoreError::JoinError(e.to_string()))?
