@@ -16,7 +16,7 @@ use tiberius::{Config as TiberiusConfig, EncryptionLevel};
 
 use super::logic::{
     normalize_company_code, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
-    MAX_MONTH_INDEX, MONEY_COLUMNS,
+    KINDATA_COLUMNS, MAX_MONTH_INDEX, MONEY_COLUMNS,
 };
 use crate::config::KyuyoConfig;
 
@@ -283,6 +283,13 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
             .collect::<Vec<_>>()
             .join(", ");
 
+        // 勤怠系は別の列 (KINDATA0000, KINDATA0100, .., KINDATA1600 の 17 列・100 刻み)。
+        // 項目番号 001〜017 で、MONEY (018〜097) とは項目帯そのものが違う (Refs #103)
+        let kindata_select: String = (0..KINDATA_COLUMNS)
+            .map(|n| format!("CAST(ISNULL(k.KINDATA{n:02}00, 0) AS int)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
         // 日付は CONVERT(varchar(10), _, 120) = "YYYY-MM-DD" (2008 互換) に寄せて
         // tiberius の型差 (datetime/smalldatetime) を吸収する。月の特定は固定式でなく
         // CHINGINKIKANST の範囲照合 (#83 レビュー結論: 月内複数支給・欠月に強い)
@@ -293,7 +300,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
              CONVERT(varchar(10), k.CHINGINKIKANEN, 120), \
              s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
              ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), \
-             {money_select} \
+             {money_select}, {kindata_select} \
              FROM [{db}].dbo.KYUYO k \
              JOIN [{db}].dbo.SHAIN1 s1 ON s1.INCODE = k.SHAIN \
              LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = k.SHOZOKU \
@@ -325,6 +332,9 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
                 taikei: get_i32(r, 9),
                 money: (0..MONEY_COLUMNS)
                     .map(|n| get_i32(r, 10 + n) as i64)
+                    .collect(),
+                kindata: (0..KINDATA_COLUMNS)
+                    .map(|n| get_i32(r, 10 + MONEY_COLUMNS + n) as i64)
                     .collect(),
             })
             .collect())

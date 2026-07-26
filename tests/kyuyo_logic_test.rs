@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use rust_ichibanboshi::kyuyo::logic::{
     build_companies, build_employee_rows, build_payroll_rows, email_allowed, employee_code_key,
-    kydata_db_name, month_period, nendo_for_month, normalize_company_code, normalize_emails,
-    parse_kydata_db_name, parse_month, taikeikouno, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow,
-    RawShukeiRow, ALLOWED_COMPANIES, MONEY_COLUMNS,
+    kintai_taikeikouno, kydata_db_name, month_period, nendo_for_month, normalize_company_code,
+    normalize_emails, parse_kydata_db_name, parse_month, taikeikouno, RawEmployeeRow,
+    RawKoumokuRow, RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES, KINDATA_COLUMNS, MONEY_COLUMNS,
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -147,9 +147,24 @@ fn test_normalize_and_allow_emails() {
 // ══════════════════════════════════════════════════════════════
 
 fn raw_row(shain: i32, code: &str, taikei: i32, money: &[(usize, i64)]) -> RawKyuyoRow {
+    raw_row_with_kindata(shain, code, taikei, money, &[])
+}
+
+/// 勤怠 (`KINDATA*`) つきの生行 (Refs #103)。値は**生の ×100 固定小数**で渡す。
+fn raw_row_with_kindata(
+    shain: i32,
+    code: &str,
+    taikei: i32,
+    money: &[(usize, i64)],
+    kindata: &[(usize, i64)],
+) -> RawKyuyoRow {
     let mut m = vec![0i64; MONEY_COLUMNS];
     for (idx, v) in money {
         m[*idx] = *v;
+    }
+    let mut k = vec![0i64; KINDATA_COLUMNS];
+    for (idx, v) in kindata {
+        k[*idx] = *v;
     }
     RawKyuyoRow {
         shain,
@@ -163,6 +178,7 @@ fn raw_row(shain: i32, code: &str, taikei: i32, money: &[(usize, i64)]) -> RawKy
         department: "本社　乗務員".to_string(),
         taikei,
         money: m,
+        kindata: k,
     }
 }
 
@@ -712,4 +728,149 @@ fn test_build_payroll_rows_rates_absent_when_no_meisai_items() {
     );
     assert_eq!(rows[0].base_rate, None);
     assert_eq!(rows[0].overtime_rate, None);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 勤怠 (KINDATA*) — Refs #103
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_kintai_taikeikouno_maps_to_item_numbers_1_to_17() {
+    // 勤怠は項目番号 001〜017 (MONEY の 018〜097 とは別の帯)
+    assert_eq!(kintai_taikeikouno(1, 0), "01001");
+    assert_eq!(kintai_taikeikouno(1, 16), "01017");
+    assert_eq!(kintai_taikeikouno(2, 4), "02005");
+    // 体系コードは 2 桁に丸める (MONEY 側と同じ規則)
+    assert_eq!(kintai_taikeikouno(0, 0), "00001");
+    assert_eq!(kintai_taikeikouno(-5, 0), "00001");
+    assert_eq!(kintai_taikeikouno(1234, 0), "99001");
+    // MONEY 側と衝突しない (018 未満と 018 以上)
+    assert_eq!(taikeikouno(1, 0), "01018");
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_divides_raw_by_100() {
+    // 実データ (0100 社): 残業時間 raw 5900 = 59.00h、有休日数 raw 150 = 1.5 日
+    let raw = vec![raw_row_with_kindata(
+        1,
+        "1771",
+        1,
+        &[(0, 83_418)],
+        &[(0, 2_100), (4, 5_900), (6, 150)],
+    )];
+    let koumoku = HashMap::from([
+        koumoku_row("01018", "基本給", 1, 0),
+        koumoku_row("01001", "出勤日数", 0, 0),
+        koumoku_row("01005", "残業時間", 0, 0),
+        koumoku_row("01007", "有休日数", 0, 0),
+    ]);
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    let a = &rows[0].attendance;
+    assert_eq!(a.get("出勤日数"), Some(&21.0));
+    assert_eq!(a.get("残業時間"), Some(&59.0));
+    // 半休 (前休・後休) が 0.5 で表現できることの確認
+    assert_eq!(a.get("有休日数"), Some(&1.5));
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_scales_counts_too() {
+    // **回数系も ×100**。遅刻回数 raw 800 は 8 回 — 割らないと 800 回になる
+    let raw = vec![raw_row_with_kindata(
+        1,
+        "1771",
+        2,
+        &[],
+        &[(8, 800), (9, 100)],
+    )];
+    let koumoku = HashMap::from([
+        koumoku_row("02009", "遅刻回数", 0, 0),
+        koumoku_row("02010", "早退回数", 0, 0),
+    ]);
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert_eq!(rows[0].attendance.get("遅刻回数"), Some(&8.0));
+    assert_eq!(rows[0].attendance.get("早退回数"), Some(&1.0));
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_keeps_sub_hour_precision() {
+    // 実データ (0200/0400 社): raw 13750 = 137.50h、raw 7497 = 74.97h
+    let raw = vec![raw_row_with_kindata(1, "1771", 1, &[], &[(4, 13_750)])];
+    let koumoku = HashMap::from([koumoku_row("01005", "残業時間", 0, 0)]);
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert_eq!(rows[0].attendance.get("残業時間"), Some(&137.5));
+
+    let raw = vec![raw_row_with_kindata(1, "1771", 1, &[], &[(4, 7_497)])];
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert_eq!(rows[0].attendance.get("残業時間"), Some(&74.97));
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_is_separate_from_payments() {
+    // 勤怠は payments/deductions のどちらにも混ざらない (合計が狂わない)
+    let raw = vec![raw_row_with_kindata(
+        1,
+        "1771",
+        1,
+        &[(0, 83_418)],
+        &[(0, 2_100)],
+    )];
+    let koumoku = HashMap::from([
+        koumoku_row("01018", "基本給", 1, 0),
+        koumoku_row("01001", "出勤日数", 0, 0),
+    ]);
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert_eq!(rows[0].payments.get("基本給"), Some(&83_418));
+    assert!(!rows[0].payments.contains_key("出勤日数"));
+    assert!(!rows[0].deductions.contains_key("出勤日数"));
+    assert_eq!(rows[0].attendance.len(), 1);
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_skips_zero_without_warning() {
+    // 体系によって未定義の項目番号があるので、0 を拾うと warning が全社で毎回出る
+    let raw = vec![raw_row_with_kindata(1, "1771", 1, &[], &[])];
+    let (rows, warnings) = build_payroll_rows(&raw, &HashMap::new(), &[]);
+    assert!(rows[0].attendance.is_empty());
+    assert!(warnings.iter().all(|w| !w.contains("勤怠")));
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_warns_on_unresolved_item() {
+    // 名前が引けない非ゼロ値は捨てるが warning は出す (金額側は支給へ倒すが、
+    // 勤怠は名前が無いと単位すら分からないので合算しない)
+    let raw = vec![raw_row_with_kindata(1, "1771", 1, &[], &[(3, 2_100)])];
+    let (rows, warnings) = build_payroll_rows(&raw, &HashMap::new(), &[]);
+    assert!(rows[0].attendance.is_empty());
+    assert!(warnings.iter().any(|w| w.contains("勤怠の項目マスタ未解決")
+        && w.contains("01004")
+        && w.contains("KINDATA0300")));
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_ignores_empty_item_name() {
+    let raw = vec![raw_row_with_kindata(1, "1771", 1, &[], &[(0, 2_100)])];
+    let koumoku = HashMap::from([koumoku_row("01001", "", 0, 0)]);
+    let (rows, warnings) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert!(rows[0].attendance.is_empty());
+    assert!(warnings
+        .iter()
+        .any(|w| w.contains("勤怠の項目マスタ未解決")));
+}
+
+#[test]
+fn test_build_payroll_rows_attendance_sums_same_name() {
+    // 同名項目は合算する (payments と同じ規則)
+    let raw = vec![raw_row_with_kindata(
+        1,
+        "1771",
+        1,
+        &[],
+        &[(0, 2_100), (1, 50)],
+    )];
+    let koumoku = HashMap::from([
+        koumoku_row("01001", "出勤日数", 0, 0),
+        koumoku_row("01002", "出勤日数", 0, 0),
+    ]);
+    let (rows, _) = build_payroll_rows(&raw, &koumoku, &[]);
+    assert_eq!(rows[0].attendance.get("出勤日数"), Some(&21.5));
 }
