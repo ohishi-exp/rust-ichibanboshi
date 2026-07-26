@@ -20,7 +20,7 @@ use rust_ichibanboshi::kyuyo::repo::{
 };
 use rust_ichibanboshi::kyuyo::store::{
     CachedEmployees, CachedPayroll, DynKyuyoStore, KyuyoStore, KyuyoStoreApi, KyuyoStoreError,
-    NoopKyuyoStore,
+    NoopKyuyoStore, PayrollSyncedRow,
 };
 use rust_ichibanboshi::routes;
 use rust_ichibanboshi::routes::kyuyo::KyuyoLimiter;
@@ -146,6 +146,10 @@ fn build_app_with_store(repo: DynKyuyoRepo, auth: KyuyoAuthState, store: DynKyuy
         .route("/api/kyuyo/payroll", get(routes::kyuyo::payroll))
         .route("/api/kyuyo/employees", get(routes::kyuyo::employees))
         .route("/api/kyuyo/sync", axum::routing::post(routes::kyuyo::sync))
+        .route(
+            "/api/kyuyo/synced-months",
+            get(routes::kyuyo::synced_months),
+        )
         .layer(Extension(repo))
         .layer(Extension(Arc::new(auth)))
         .layer(Extension(Arc::new(KyuyoLimiter::default())))
@@ -753,6 +757,13 @@ impl KyuyoStoreApi for FailStore {
         }
         Ok(())
     }
+
+    async fn payroll_synced(&self) -> Result<Vec<PayrollSyncedRow>, KyuyoStoreError> {
+        if self.fail_get {
+            return Err(KyuyoStoreError::QueryError("boom".to_string()));
+        }
+        Ok(Vec::new())
+    }
 }
 
 fn memory_store() -> DynKyuyoStore {
@@ -958,4 +969,51 @@ async fn sync_fails_loud_when_store_write_fails() {
     let (status, body) = post_json(app, "/api/kyuyo/sync?company=0100&month=2026-06", true).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body["error"].as_str().unwrap().contains("employees"));
+}
+
+#[tokio::test]
+async fn synced_months_lists_payroll_scopes_only() {
+    let store = memory_store();
+    // payroll 2 件 + employees 1 件を保存 — employees scope は一覧に出ない
+    let mut repo = repo_with_june_data();
+    let employees_fixture = repo_with_employees();
+    repo.employees = employees_fixture.employees;
+    repo.names = employees_fixture.names;
+    let app = build_app_with_store(Arc::new(repo), auth_ok(), store.clone());
+    post_json(
+        app.clone(),
+        "/api/kyuyo/sync?company=0100&month=2026-06",
+        true,
+    )
+    .await;
+    let (status, body) = get_json(app.clone(), "/api/kyuyo/synced-months", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["company"], "0100");
+    assert_eq!(entries[0]["month"], "2026-06");
+    assert_eq!(entries[0]["row_count"], 2);
+    assert!(entries[0]["synced_at"].as_str().unwrap().contains("T"));
+
+    // 認可は他の kyuyo route と同じ
+    let (status, _) = get_json(app, "/api/kyuyo/synced-months", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn synced_months_empty_and_error_paths() {
+    // Noop (無効) は空
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth_ok());
+    let (status, body) = get_json(app, "/api/kyuyo/synced-months", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["entries"].as_array().unwrap().is_empty());
+
+    // store 故障は 500
+    let store: DynKyuyoStore = Arc::new(FailStore {
+        fail_get: true,
+        ..Default::default()
+    });
+    let app = build_app_with_store(Arc::new(MockKyuyoRepo::default()), auth_ok(), store);
+    let (status, _) = get_json(app, "/api/kyuyo/synced-months", true).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }

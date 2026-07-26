@@ -22,7 +22,7 @@ use crate::kyuyo::logic::{
     ALLOWED_COMPANIES,
 };
 use crate::kyuyo::repo::{DynKyuyoRepo, KyuyoRepoError};
-use crate::kyuyo::store::DynKyuyoStore;
+use crate::kyuyo::store::{DynKyuyoStore, PayrollSyncedRow};
 
 /// エラーレスポンス本文。
 #[derive(Serialize, Debug)]
@@ -511,6 +511,54 @@ pub async fn payroll(
         warnings: live.warnings,
         source: "live",
         synced_at,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/synced-months (sync 済み月の一覧、Refs nuxt-dtako-admin#460)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Debug)]
+pub struct SyncedMonthEntry {
+    pub company: String,
+    pub month: String,
+    pub synced_at: String,
+    pub row_count: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SyncedMonthsResponse {
+    pub entries: Vec<SyncedMonthEntry>,
+}
+
+/// derived store に給与明細が入っている (会社, 月) の一覧。消費側 (nuxt-dtako-admin
+/// の月タブ) が「給与取り込み済み」バッジを出すためのメタデータのみ — 金額は返さない。
+/// OHKEN には触らない (SQLite のみ、ミリ秒)。
+pub async fn synced_months(
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    Extension(store): Extension<DynKyuyoStore>,
+    headers: HeaderMap,
+) -> Result<Json<SyncedMonthsResponse>, ApiError> {
+    authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+    let rows: Vec<PayrollSyncedRow> = store.payroll_synced().await.map_err(|e| {
+        tracing::error!("kyuyo store synced_months error: {e}");
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "キャッシュ一覧の読み出しに失敗しました",
+        )
+    })?;
+    Ok(Json(SyncedMonthsResponse {
+        entries: rows
+            .into_iter()
+            .map(|r| SyncedMonthEntry {
+                company: r.company,
+                month: r.month,
+                synced_at: r.synced_at,
+                row_count: r.row_count,
+            })
+            .collect(),
     }))
 }
 
