@@ -32,6 +32,9 @@ path = "src/routes/kintai.rs"
 path = "src/routes/kyuyo.rs"
 
 [[files]]
+path = "src/routes/restraint.rs"
+
+[[files]]
 path = "src/routes/sales.rs"
 
 [[files]]

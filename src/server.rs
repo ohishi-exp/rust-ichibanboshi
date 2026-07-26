@@ -71,6 +71,24 @@ pub async fn run(
         }
     };
 
+    // 拘束サマリ store (Refs #106 Phase 3)。open 失敗は Disabled (route が 503) —
+    // このストアはキャッシュではなく relay push の一次置き場のため fail-closed
+    let restraint_store: crate::restraint_store::DynRestraintStore =
+        if config.restraint.sqlite_path.is_empty() {
+            tracing::info!("restraint sqlite_path is empty — /api/restraint/* returns 503");
+            Arc::new(crate::restraint_store::DisabledRestraintStore)
+        } else {
+            match crate::restraint_store::RestraintStore::open(&config.restraint.sqlite_path) {
+                Ok(store) => Arc::new(store),
+                Err(e) => {
+                    tracing::warn!(
+                        "restraint store open failed — /api/restraint/* returns 503: {e}"
+                    );
+                    Arc::new(crate::restraint_store::DisabledRestraintStore)
+                }
+            }
+        };
+
     // 給与の SQLite derived store (Refs #106 Phase 1)。open 失敗は Noop に落として
     // live 読みへフォールバック — キャッシュの健全性で読み機能を殺さない
     let kyuyo_store: kyuyo::store::DynKyuyoStore = if config.kyuyo.sqlite_path.is_empty() {
@@ -179,7 +197,15 @@ pub async fn run(
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
         .route("/kyuyo/employees", get(routes::kyuyo::employees))
-        .route("/kyuyo/sync", post(routes::kyuyo::sync));
+        .route("/kyuyo/sync", post(routes::kyuyo::sync))
+        .route(
+            "/restraint/summaries",
+            axum::routing::put(routes::restraint::put_summaries),
+        )
+        .route(
+            "/restraint/wage-source",
+            get(routes::restraint::wage_source),
+        );
 
     let schema_routes = Router::new()
         .route("/schema/tables", get(routes::schema::list_tables))
@@ -201,7 +227,8 @@ pub async fn run(
         .layer(Extension(kyuyo_auth))
         .layer(Extension(kyuyo_limiter))
         .layer(Extension(kyuyo_store))
-        .layer(Extension(kintai_store));
+        .layer(Extension(kintai_store))
+        .layer(Extension(restraint_store));
 
     let addr = config.addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;

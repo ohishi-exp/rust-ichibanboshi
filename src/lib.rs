@@ -5,6 +5,7 @@ pub mod db;
 pub mod kintai_store;
 pub mod kyuyo;
 pub mod repo;
+pub mod restraint_store;
 pub mod routes;
 pub mod server;
 #[cfg(windows)]
