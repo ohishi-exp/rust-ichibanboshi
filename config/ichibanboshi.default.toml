@@ -28,3 +28,6 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # introspect_secret = "<INTERNAL_SHARED_SECRET_KYUYO>"
 # app_origin = "https://dtako.ippoan.org"
 # allowed_emails = ["<許可する email>"]
+# 給与 derived store (SQLite、Refs #106)。省略時 /opt/ichibanboshi/kyuyo_local.sqlite、
+# 空文字で無効 (常に live 読み)。キャッシュ扱い — 消して再 sync で全量再構築できる
+# sqlite_path = "/opt/ichibanboshi/kyuyo_local.sqlite"
