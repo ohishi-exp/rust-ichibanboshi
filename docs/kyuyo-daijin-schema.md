@@ -285,7 +285,26 @@ FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='SHAIN1'
 `SHAINID` テーブルは `INCODE`/`JKID`/`KSID` 等を持つ別システム連携用の紐付けテーブルで、
 本Issueの給与比較スコープでは使わなくてよさそう (未使用と判断)。
 
-`SHAIN2`〜`SHAIN8` は未調査 (本Issueのスコープ外、`SHAIN1` で必要な情報は揃っている)。
+### 入社日・退社日は `SHAIN2` (2026-07-26 追記)
+
+**`SHAIN1` には入社日が無い。`SHAIN2` にある。** `SHAIN1 JOIN SHAIN2 ON INCODE` の
+サンプル 15 件で裏付け済み。
+
+| 列 | 意味 | 根拠 |
+|---|---|---|
+| `DAYBIRTH` (datetime) | 生年月日 | 1963〜2004 年生まれの妥当な分布 |
+| `DAYNYU` (datetime) | **入社日** | 2003〜2026 年。役職者ほど古く、新卒 (2026-04-01) が複数人一致 |
+| `DAYTAI` (datetime) | 退社日 | **在籍中 (`TAIKYU=0`) は全員 `1970-01-02`** = 未設定センチネル。退職済み (`TAIKYU=1`) だけ実日付 |
+| `TAIKBN` | 退社区分 | `TAIKYU=0`→`0`、`TAIKYU=1`→`1` か `2` で完全に一致 |
+
+> **`DAYTAI` を NULL 判定に使うな。** 未設定は NULL ではなく `1970-01-02` が入る。
+> そのまま最終在籍日として扱うと在籍者が全員 1970 年退職になる。API 応答では
+> `normalize_retire_date` がセンチネルを `None` に倒している。
+
+`SHAIN3`〜`SHAIN8` のうち `SHAIN3.KKUBUN` (給与区分、Refs #101) 以外は未調査。
+
+> 旧記述「`SHAIN2`〜`SHAIN8` は未調査 (`SHAIN1` で必要な情報は揃っている)」は
+> **入社日を探す時に「給与大臣に無い」と誤読させた**ので上の節に差し替えた。
 
 ## 所属マスタ (`SHOZOKU`)
 

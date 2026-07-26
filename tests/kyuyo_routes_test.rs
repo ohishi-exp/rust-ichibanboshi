@@ -563,6 +563,10 @@ fn employee_row(
         branch_name: parts.next().unwrap_or("").to_string(),
         job_name: parts.next().unwrap_or("").to_string(),
         kkubun,
+        hire_date: "2020-04-01".to_string(),
+        // 在籍中は NULL でなくセンチネル `1970-01-02` が入る (実データ)
+        retire_date: "1970-01-02".to_string(),
+        taikbn: 0,
     }
 }
 
