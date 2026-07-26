@@ -356,14 +356,24 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         // 給与区分 (KKUBUN) は **SHAIN3** にあり、SHOZOKU.TAIKEI とは独立した軸
         // (Refs #101)。同じ TAIKEI=1 (乗務員) でも月給/日給/時給が混在し、TAIKEI=2
         // (事務員) にも時給者がいるので、TAIKEI から給与区分を推定してはいけない。
+        //
+        // 入社日/退社日は **SHAIN2** (DAYNYU/DAYTAI、どちらも datetime)。SHAIN1 では
+        // ない — docs/kyuyo-daijin-schema.md が SHAIN1 の 23 列中 6 列しか書いておらず
+        // SHAIN2〜8 を「未調査」としているため、給与大臣に無いと誤読しやすい
+        // (2026-07-26 に実データ 15 件で確定)。日付は他のルートと同じく
+        // CONVERT(varchar(10), _, 120) で "YYYY-MM-DD" に寄せる (SQL 2008 互換)。
         let query = format!(
             "SELECT s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
              ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), \
              CAST(ISNULL(sz.INCODE, 0) AS int), ISNULL(sz.NAME1, ''), ISNULL(sz.NAME2, ''), \
-             CAST(ISNULL(s3.KKUBUN, 0) AS int) \
+             CAST(ISNULL(s3.KKUBUN, 0) AS int), \
+             ISNULL(CONVERT(varchar(10), s2.DAYNYU, 120), ''), \
+             ISNULL(CONVERT(varchar(10), s2.DAYTAI, 120), ''), \
+             CAST(ISNULL(s2.TAIKBN, 0) AS int) \
              FROM [{db}].dbo.SHAIN1 s1 \
              LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = s1.SHOZOKU \
              LEFT JOIN [{db}].dbo.SHAIN3 s3 ON s3.INCODE = s1.INCODE \
+             LEFT JOIN [{db}].dbo.SHAIN2 s2 ON s2.INCODE = s1.INCODE \
              ORDER BY s1.CODE"
         );
 
@@ -388,6 +398,9 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
                 branch_name: get_str(r, 6),
                 job_name: get_str(r, 7),
                 kkubun: get_i32(r, 8),
+                hire_date: get_str(r, 9),
+                retire_date: get_str(r, 10),
+                taikbn: get_i32(r, 11),
             })
             .collect())
     }

@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use rust_ichibanboshi::kyuyo::logic::{
     build_companies, build_employee_rows, build_payroll_rows, email_allowed, employee_code_key,
     kintai_taikeikouno, kydata_db_name, month_period, nendo_for_month, normalize_company_code,
-    normalize_emails, parse_kydata_db_name, parse_month, taikeikouno, RawEmployeeRow,
-    RawKoumokuRow, RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES, KINDATA_COLUMNS, MONEY_COLUMNS,
+    normalize_emails, normalize_hire_date, normalize_retire_date, parse_kydata_db_name,
+    parse_month, taikeikouno, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
+    ALLOWED_COMPANIES, KINDATA_COLUMNS, MONEY_COLUMNS,
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -569,6 +570,10 @@ fn raw_employee(
         branch_name: parts.next().unwrap_or("").to_string(),
         job_name: parts.next().unwrap_or("").to_string(),
         kkubun,
+        hire_date: "2020-04-01".to_string(),
+        // 在籍中は NULL でなくセンチネル `1970-01-02` が入る (実データ)
+        retire_date: "1970-01-02".to_string(),
+        taikbn: 0,
     }
 }
 
@@ -600,6 +605,56 @@ fn build_employee_rows_exposes_shozoku_code_and_split_names() {
     assert_eq!(rows[0].job_name, "乗務員");
     // SNAME は従来どおり結合済みの表示名
     assert_eq!(rows[0].department, "本社　乗務員");
+}
+
+#[test]
+fn build_employee_rows_exposes_hire_date_and_nulls_the_retire_sentinel() {
+    // 在籍日数を出す消費者 (nuxt-dtako-admin#445) 向け。入社日は SHAIN1 ではなく
+    // SHAIN2.DAYNYU にある
+    let rows = build_employee_rows(&[raw_employee("0941", "山田　太郎", "本社　乗務員", 1, 0, 2)]);
+    assert_eq!(rows[0].hire_date.as_deref(), Some("2020-04-01"));
+    // 在籍中の DAYTAI は 1970-01-02 (未設定センチネル) なので None に倒す —
+    // そのまま返すと消費側が「1970 年に退職した人」として扱ってしまう
+    assert_eq!(rows[0].retire_date, None);
+    assert_eq!(rows[0].taikbn, 0);
+}
+
+#[test]
+fn build_employee_rows_keeps_real_retire_date() {
+    let mut raw = raw_employee("1771", "鈴木　花子", "本社　事務", 2, 1, 1);
+    raw.retire_date = "2026-01-26".to_string();
+    raw.taikbn = 2;
+    let rows = build_employee_rows(&[raw]);
+    assert_eq!(rows[0].retire_date.as_deref(), Some("2026-01-26"));
+    assert_eq!(rows[0].taikbn, 2);
+    assert!(rows[0].retired);
+}
+
+#[test]
+fn normalize_retire_date_drops_sentinel_and_blank() {
+    assert_eq!(normalize_retire_date("1970-01-02"), None);
+    assert_eq!(normalize_retire_date(""), None);
+    assert_eq!(normalize_retire_date("   "), None);
+    assert_eq!(
+        normalize_retire_date(" 2025-12-19 ").as_deref(),
+        Some("2025-12-19")
+    );
+}
+
+#[test]
+fn normalize_hire_date_keeps_1970_02_because_it_is_not_a_sentinel_here() {
+    // センチネルは**退社日にだけ**ある概念。入社日で同じ値を潰すと、
+    // 実在の日付を静かに落とすことになる
+    assert_eq!(
+        normalize_hire_date("1970-01-02").as_deref(),
+        Some("1970-01-02")
+    );
+    assert_eq!(normalize_hire_date(""), None);
+    assert_eq!(normalize_hire_date("  "), None);
+    assert_eq!(
+        normalize_hire_date(" 2003-06-01 ").as_deref(),
+        Some("2003-06-01")
+    );
 }
 
 #[test]
