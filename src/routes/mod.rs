@@ -2,6 +2,7 @@ pub mod employees;
 pub mod health;
 pub mod kintai;
 pub mod kyuyo;
+pub mod restraint;
 pub mod sales;
 pub mod schema;
 pub mod surcharge;
