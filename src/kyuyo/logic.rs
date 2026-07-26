@@ -473,6 +473,43 @@ pub struct RawEmployeeRow {
     pub taikei: i32,
     /// `SHAIN3.KKUBUN` (給与区分: 1=月給 / 2=日給 / 3=時給 / 4=その他、0=未設定)。
     pub kkubun: i32,
+    /// `SHAIN2.DAYNYU` (入社日、"YYYY-MM-DD")。読めなければ空文字。
+    pub hire_date: String,
+    /// `SHAIN2.DAYTAI` (退社日、"YYYY-MM-DD")。**在籍中はセンチネル値**が入る
+    /// ([`normalize_retire_date`])。
+    pub retire_date: String,
+    /// `SHAIN2.TAIKBN` (退社区分: 0=在籍中 / 1,2=退職)。
+    pub taikbn: i32,
+}
+
+/// 退社日の未設定センチネル。
+///
+/// 給与大臣は**在籍中の社員の `SHAIN2.DAYTAI` に NULL ではなく `1970-01-02`** を
+/// 入れる (2026-07-26 実データ確認: `TAIKYU=0` の社員は全員この値、退職済みの
+/// 3 名だけ実日付)。そのまま最終在籍日として扱うと在籍者が全員 1970 年退職に
+/// なるので、応答では `None` に倒す。
+const RETIRE_DATE_SENTINEL: &str = "1970-01-02";
+
+/// 退社日を正規化する。センチネル・空文字は `None`。
+///
+/// **在籍フラグ (`taikyu` / `taikbn`) は見ない** — 「日付が入っているか」の判定で
+/// あって「退職済みか」とは別の問い。実データでは一致しているが、片方の運用が
+/// 崩れた時に静かに嘘の日付を返さないよう独立させる。
+pub fn normalize_retire_date(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s == RETIRE_DATE_SENTINEL {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// 入社日を正規化する。空文字は `None` (センチネルの概念は無い)。
+pub fn normalize_hire_date(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 /// 社員 1 名の識別情報 (金額なし)。
@@ -507,6 +544,18 @@ pub struct EmployeeRow {
     pub kkubun: i32,
     /// `SHAIN1.TAIKYU != 0` (退職済み)。
     pub retired: bool,
+    /// 入社日 (`SHAIN2.DAYNYU`、"YYYY-MM-DD")。未設定は `null`。
+    ///
+    /// 消費者 (nuxt-dtako-admin の出勤日数) は**在籍日数**を出すのに使う —
+    /// 「月日数 − 公休 − 有休 − 欠勤」で逆算すると途中入社の人が在籍していない日まで
+    /// 出勤に数えられる (Refs nuxt-dtako-admin#445)。
+    pub hire_date: Option<String>,
+    /// 退社日 (`SHAIN2.DAYTAI`、"YYYY-MM-DD")。**在籍中は `null`**
+    /// (給与大臣のセンチネル `1970-01-02` は [`normalize_retire_date`] で潰す)。
+    pub retire_date: Option<String>,
+    /// 退社区分 (`SHAIN2.TAIKBN`): 0=在籍中 / 1,2=退職。`retired` と実データで
+    /// 完全に一致するが、由来が別テーブルなので突合できるよう両方返す。
+    pub taikbn: i32,
 }
 
 /// 社員マスタの生行を応答形に整える。
@@ -536,6 +585,9 @@ pub fn build_employee_rows(raw: &[RawEmployeeRow]) -> Vec<EmployeeRow> {
             taikei: r.taikei,
             kkubun: r.kkubun,
             retired: r.taikyu != 0,
+            hire_date: normalize_hire_date(&r.hire_date),
+            retire_date: normalize_retire_date(&r.retire_date),
+            taikbn: r.taikbn,
         });
     }
 
