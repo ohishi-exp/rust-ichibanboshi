@@ -141,6 +141,15 @@ pub enum ShiftSource {
     Rest,
 }
 
+/// 勤務を構成した打刻 1 つ (Refs #128)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Punch {
+    /// 打刻時刻 (`YYYY-MM-DD HH:MM:SS`)。**秒を落とさない** — 打刻カードの元の値。
+    pub at: String,
+    /// `始業` / `終業`。
+    pub state: String,
+}
+
 /// 日別サマリ 1 行。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DaySummary {
@@ -149,6 +158,16 @@ pub struct DaySummary {
     pub start: String,
     pub end: String,
     pub source: ShiftSource,
+    /// この勤務の中にあった**打刻そのもの** (時刻順、Refs #128)。
+    ///
+    /// `start` / `end` は勤務としての解釈 (分に丸め、24 時間で打ち切り) が入っているが、
+    /// **こちらは生の打刻**。社内タイムカード表は打刻を日ごとに並べただけのもので、
+    /// 勤務という単位を持たないため、同じ表を作るには元の時刻が要る。
+    ///
+    /// - **打ち切り前の区間から拾う** — 24 時間で切ると、切った先にある終業打刻が
+    ///   落ちる (実測: 乗務員 1194 の 2026-04-01 始業 → 2026-04-03 16:47 終業)
+    /// - 休息イベント由来の勤務 (`source: rest`) は空
+    pub punches: Vec<Punch>,
     /// 始業日が日曜か。
     pub is_legal_holiday: bool,
     /// 拘束が 24 時間を超えたため打ち切ったか。**改善基準告示に照らして違反**であり、
@@ -270,6 +289,23 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
         .collect()
 }
 
+/// 区間 `[from, to]` に入る打刻 (`始業` / `終業`) を時刻順に拾う (Refs #128)。
+///
+/// **両端を含む** — 勤務の始業・終業そのものを落とさないため。比較は**分に丸めてから**
+/// 行う: 勤務の端は秒を切り捨ててあるので、`16:47:04` の終業打刻を `16:47:00` の
+/// 終業と比べると範囲外になって落ちる。
+fn punches_in(events: &[Event], from: NaiveDateTime, to: NaiveDateTime) -> Vec<Punch> {
+    events
+        .iter()
+        .filter(|e| e.source == "timecard" && (e.state == "始業" || e.state == "終業"))
+        .filter(|e| floor_min(e.start) >= from && floor_min(e.start) <= to)
+        .map(|e| Punch {
+            at: e.start.format(FMT).to_string(),
+            state: e.state.clone(),
+        })
+        .collect()
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -346,6 +382,10 @@ fn working_intervals(
 /// 実働区間を**時刻順に 1 分ずつ**歩いて、経過実働で所定内 / 法定内残業 / 法定時間外に
 /// 振り分けながら、その分が深夜帯かを見る。1 勤務は最長でも数千分なので素直に回す。
 fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
+    // **打刻は打ち切り前の区間から拾う** — 24 時間で切ると、切った先にある終業打刻
+    // (実測: 乗務員 1194 の 2026-04-03 16:47) が落ちる。拘束の値は打ち切ったままでよいが、
+    // 打刻カードとして出す側にはその時刻が要る (Refs #128)
+    let punches = punches_in(events, shift.start, shift.end);
     // 24 時間を超える拘束はここで打ち切る (法令違反なので積み上げる意味がない)
     let over_24h = (shift.end - shift.start).num_minutes() > MAX_RESTRAINT_MINUTES;
     let shift = &Shift {
@@ -402,6 +442,7 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
         source: shift.source,
+        punches,
         is_legal_holiday,
         over_24h,
         restraint_minutes: (shift.end - shift.start).num_minutes(),
@@ -931,6 +972,80 @@ mod tests {
         assert!(d.over_24h);
         assert_eq!(d.break_minutes, 0);
         assert_eq!(d.working_minutes, 1440);
+    }
+
+    // --- 勤務を構成した打刻 (Refs #128) ---
+
+    #[test]
+    fn punches_keep_the_raw_stamps() {
+        // 秒を落とさない (打刻カードの元の値)
+        let rows = vec![
+            tc("2026-06-02 09:25:37", "始業"),
+            tc("2026-06-02 19:39:04", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(
+            d.punches,
+            vec![
+                Punch { at: "2026-06-02 09:25:37".into(), state: "始業".into() },
+                Punch { at: "2026-06-02 19:39:04".into(), state: "終業".into() },
+            ]
+        );
+        // 勤務としての解釈 (分に丸め) は start / end のまま
+        assert_eq!(d.start, "2026-06-02 09:25:00");
+    }
+
+    #[test]
+    fn punches_survive_the_24h_cap() {
+        // 乗務員 1194 / 2026-04 と同じ形 — 打刻が運行 1 本 (2 晩) を挟み 43 時間になる。
+        // 拘束は 24 時間で打ち切るが、**切った先にある終業打刻を落とさない**
+        let rows = vec![
+            tc("2026-06-01 21:31:32", "始業"),
+            tc("2026-06-03 16:47:04", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(d.over_24h);
+        assert_eq!(d.restraint_minutes, 1440);
+        // end は打ち切り後 (実在しない時刻)
+        assert_eq!(d.end, "2026-06-02 21:31:00");
+        // 打刻は実際の終業まで残る
+        assert_eq!(d.punches.len(), 2);
+        assert_eq!(d.punches[1].at, "2026-06-03 16:47:04");
+    }
+
+    #[test]
+    fn punches_are_empty_for_rest_shifts() {
+        let rows = vec![
+            ev("2026-06-01 16:19:00", "2026-06-02 04:42:00", "休息"),
+            ev("2026-06-02 16:18:00", "2026-06-03 06:01:00", "休息"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.source, ShiftSource::Rest);
+        assert!(d.punches.is_empty());
+    }
+
+    #[test]
+    fn punches_exclude_other_shifts_and_non_punch_events() {
+        let rows = vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            dtako("2026-06-02 06:30:00", "運行開始"),
+            tc("2026-06-02 15:00:00", "終業"),
+            // 次の勤務の打刻は混ぜない
+            tc("2026-06-02 20:00:00", "始業"),
+            tc("2026-06-03 05:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].punches.len(), 2);
+        assert_eq!(days[0].punches[1].at, "2026-06-02 15:00:00");
+        assert_eq!(days[1].punches[0].at, "2026-06-02 20:00:00");
+    }
+
+    #[test]
+    fn punch_traits_are_wired() {
+        let p = Punch { at: "2026-06-02 09:25:37".into(), state: "始業".into() };
+        assert_eq!(p.clone(), p);
+        assert!(format!("{p:?}").contains("始業"));
     }
 
     // --- 乗務員ごとの分割 (Refs #125) ---
