@@ -13,7 +13,11 @@
 //!    運行終了 → 終業打刻が中央 +3 分、逆転ゼロ)
 //! 2. **打刻が無ければ休息イベント** — 休息の終了 = 始業、休息の開始 = 終業
 //!
-//! **運行の開始・終了では切らない。** 実測では運行の継ぎ目が 4〜112 分 (中央 8 分)
+//! **運行の開始・終了では切らない。同日の運行の継ぎ目は「作業」**であって休憩ではない
+//! (拘束にも実働にも残す)。ただし継ぎ目に終業打刻があればそこで勤務が切れ、次の始業まで
+//! は休息になる — 打刻優先の規則がそのまま効く。実測 (96 名 / 2026-06) では同日の継ぎ目
+//! 95 箇所の内訳が「終業打刻あり 27 / 何もない 68 / 休息イベントあり 0」で、この 2 通りで
+//! 全件を処理できる。 実測では運行の継ぎ目が 4〜112 分 (中央 8 分)
 //! しかなく、勤務の切れ目ではない (荷を降ろして次の伝票を積んで出るだけ)。運行で
 //! 切ると乗務員 1119 の 2026-06 は 28 勤務になるが、切らないと 1 か月が 1 勤務
 //! (拘束 767 時間) になる。休息で切ると 26 勤務・拘束 16,394 分で、現行の
@@ -444,6 +448,10 @@ mod tests {
         json!({"datetime": datetime, "end_datetime": null, "source": "timecard", "state": state})
     }
 
+    fn dtako(datetime: &str, state: &str) -> serde_json::Value {
+        json!({"datetime": datetime, "end_datetime": null, "source": "dtako", "state": state})
+    }
+
     fn ev(start: &str, end: &str, state: &str) -> serde_json::Value {
         json!({"datetime": start, "end_datetime": end, "source": "dtako_events", "state": state})
     }
@@ -810,6 +818,49 @@ mod tests {
             daily_summary(&rows, "2026-06", &KosokuParams::default())[0].break_minutes,
             0
         );
+    }
+
+    // --- 同日の運行の継ぎ目 ---
+
+    #[test]
+    fn same_day_run_joint_without_punch_is_work_not_break() {
+        // 乗務員 1029 / 2026-06-23 と同じ形 — 継ぎ目 5 分、間に打刻なし (2 本目は
+        // 同じ乗務員の 06-24 で観測した 1 分の継ぎ目を同日に寄せたもの)。
+        // 継ぎ目は勤務の中に残り、休憩にも入らない (作業として拘束・実働に計上)
+        let rows = vec![
+            tc("2026-06-23 00:04:00", "始業"),
+            dtako("2026-06-23 00:18:00", "運行終了"),
+            dtako("2026-06-23 00:23:00", "運行開始"),
+            dtako("2026-06-23 02:15:00", "運行終了"),
+            dtako("2026-06-23 02:16:00", "運行開始"),
+            tc("2026-06-23 15:03:00", "終業"),
+        ];
+        let d = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].restraint_minutes, 899);
+        assert_eq!(d[0].break_minutes, 0);
+        assert_eq!(d[0].working_minutes, 899);
+    }
+
+    #[test]
+    fn same_day_run_joint_with_close_punch_splits_into_two_shifts() {
+        // 乗務員 1026 / 2026-06-02 と同じ形 — 継ぎ目 14:07→23:26 に終業打刻がある。
+        // 勤務が切れ、間の時間は拘束に入らない (休息)
+        let rows = vec![
+            tc("2026-06-02 01:28:00", "始業"),
+            dtako("2026-06-02 14:07:00", "運行終了"),
+            tc("2026-06-02 14:14:00", "終業"),
+            tc("2026-06-02 23:32:00", "始業"),
+            dtako("2026-06-02 23:26:00", "運行開始"),
+            tc("2026-06-03 15:13:00", "終業"),
+        ];
+        let d = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].restraint_minutes, 766);
+        assert_eq!(d[1].restraint_minutes, 941);
+        // 14:14〜23:32 の 558 分はどちらの拘束にも入らない
+        assert_eq!(d[0].end, "2026-06-02 14:14:00");
+        assert_eq!(d[1].start, "2026-06-02 23:32:00");
     }
 
     // --- 24 時間超の打ち切り ---
