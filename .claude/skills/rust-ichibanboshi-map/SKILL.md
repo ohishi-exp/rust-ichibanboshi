@@ -179,6 +179,11 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
   `db` コンテナ (172.18.21.35 をマスタにしたレプリカ) へ loopback 1 hop。**password /
   database はデプロイ先の toml でのみ設定**し、未設定なら 503 fail-closed
   (`DisabledKintaiEventsRepo` — 空配列を返して「0 件」に見せない)
+- **乗務員は `対象乗務員CD` で引く (`乗務員CD1` ではない)。** 2 名乗務・交替の運行では
+  運行まるごとが `乗務員CD1` = 別の乗務員のまま記録されるため、`乗務員CD1` で引くと
+  他人の運行を拾い、引かれた側は取りこぼす (実測: 2026-06 の 1740 は 休息+休憩が
+  `乗務員CD1` 114 件 / `対象乗務員CD` 83 件)。速度も `対象乗務員CD` は
+  `idx_driver_datetime` の covering index が効いて 0.2 秒 → 0.4 ミリ秒 (#126)
 - 読むのは 5 テーブル: `time_card_dstate` (打刻 30/31) / `time_card_dtako` (運行の確定
   イベント 10/11/20、`unko_no` 付き) / `time_card_dtako_state` (名称マスタ) /
   `dtako_events` (デジタコ生イベント、区間持ち) / `dtako_cars` (車番)。`UNION ALL` して
