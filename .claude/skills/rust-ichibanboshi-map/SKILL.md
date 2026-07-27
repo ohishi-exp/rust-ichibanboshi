@@ -30,9 +30,9 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
 | `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
-| `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) / `/api/kintai/events` (MariaDB 直読み) / `/api/kintai/kosoku-daily` (日別サマリ) (#99 / #116 / #118、下記) |
-| `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116) |
-| `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
+| `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) / `/api/kintai/events` (MariaDB 直読み) / `/api/kintai/kosoku-daily` (日別サマリ、`driver` 省略で全乗務員) (#99 / #116 / #118 / #125、下記) |
+| `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116)。1 名分の `EVENTS_SQL` と全乗務員の `ALL_EVENTS_SQL` (#125) |
+| `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
 | `src/kyuyo/logic.rs` | 給与の純粋ロジック (項目マッピング・行組み立て)。**coverage 100% 対象** |
 | `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層 |
@@ -53,8 +53,9 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - `/api/kintai/events?month=YYYY-MM&driver=N`: **打刻と運行イベントの生時系列**
   (#114 / #116、拘束時間の打刻基準化 Phase 1)。ここだけ CakePHP を経由せず
   **社内 MariaDB を直読み**する。`driver` 必須・キャッシュ無し・未設定は 503。
-- `/api/kintai/kosoku-daily?month=YYYY-MM&driver=N`: **打刻基準の日別サマリ** (#118、Phase 2)。
-  `events` の生行を `src/kosoku.rs` の純粋ロジックで畳む。**金額は含めない**。下記「日別サマリ」節。
+- `/api/kintai/kosoku-daily?month=YYYY-MM[&driver=N]`: **打刻基準の日別サマリ** (#118、Phase 2)。
+  `events` の生行を `src/kosoku.rs` の純粋ロジックで畳む。**金額は含めない**。
+  **`driver` 省略で全乗務員** (#125、`{month, drivers:[{driver, days}]}`)。下記「日別サマリ」節。
 - `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
@@ -192,8 +193,9 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
   上流 `daily-json` の `queryEnd` と同じ考え方
 - 日時は SQL の `DATE_FORMAT` で文字列にして取り出す — driver の時刻型と timezone 解釈を
   経路に持ち込まない
-- **`driver` は必須** (省略・非数字・負値・桁溢れは 400)。生イベントは日別サマリより
-  1 桁多く、全乗務員を返す用途がここには無い
+- **`/events` の `driver` は必須** (省略・非数字・負値・桁溢れは 400)。生イベントは日別サマリより
+  1 桁多く、全乗務員を返す用途がここには無い (`kosoku-daily` は #125 で省略可になったが、
+  **こちらは必須のまま**)
 - **キャッシュを持たない**。調査用途で頻度が低く常に最新の打刻が要るため
 - 認可は `daily` と同じ CF Access Service Token (edge)。応答は識別情報と時刻・車番だけで
   **金額を含まない**。金額を足すなら `/kyuyo/*` の in-service gate へ移すこと
@@ -232,6 +234,33 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
 - 認可は `events` と同じ CF Access Service Token (edge) — **応答に金額を含めない**ため
 - テストは `src/kosoku.rs` の unit test (規則の網羅) と `tests/kosoku_daily_test.rs`
   (route の配線・検証・失敗の写し方) の 2 段
+
+#### `driver` 省略 = 全乗務員 (#125)
+
+画面 (nuxt-dtako-admin のタイムカード表) は全乗務員ぶんが要る。1 名ずつ叩くと
+**96 名で約 3 秒**かかるので 1 リクエストにまとめた (**実測 0.25 秒**)。
+
+| 呼び方 | 応答 |
+|---|---|
+| `driver=1051` | `{month, driver, days}` — **既存の形は変えない** |
+| 省略 | `{month, drivers: [{driver, days}]}` (乗務員CD 昇順) |
+| `driver=` (空) | **400**。省略ではなく不正として扱う — front の入れ忘れで約 1 MB を返さない |
+
+- **一括の SQL は `ALL_EVENTS_SQL`** (`src/kintai_repo.rs`)。`EVENTS_SQL` から乗務員の
+  絞り込みを外し、**`運行NO` / `車輌名` と `dtako_cars` の JOIN を落とした**もの。
+  ここが速度の支配項だった — 内訳計測で スキャンのみ 0.215 秒 / 現行の形 1.201 秒 /
+  `DATE_FORMAT` を外しても 1.224 秒 / **列と JOIN を落とすと 0.247 秒 (約 5 倍)**。
+  `DATE_FORMAT` はほぼ効いていない。日別サマリはどちらの列も使わないので値は変わらない
+- **`dtako_events` はイベント名で絞る** (`休息` / `休憩` / `運行開始` / `運行終了`)。
+  105,771 行 → 22,092 行 (1/3)。休息と休憩だけで畳めるが、**運行開始・終了も読む** —
+  同日の継ぎ目を「作業」と判定した根拠 (#123) を後から確かめられなくなるため。
+  **`/api/kintai/events` は絞らない** (#116 の「解釈しない読み出し口」を崩さない)
+- **畳む前に `split_by_driver` (純粋関数、`src/kosoku.rs`) で乗務員ごとに分ける。**
+  `daily_summary` は乗務員を知らないので、混ぜたまま渡すと**後から来た始業が前の始業を
+  上書きして人ぶんの拘束が丸ごと落ちる**。`driver_id` が無い / 数でない / 負の行は捨てる
+- **勤務が 1 日も組めなかった乗務員は応答から落とす** (退職者・内勤で応答を膨らませない)。
+  受け手にとって空配列と「居ない」は同じ
+- 応答サイズの見積り: 1 名 1 か月で約 10 KB → 96 名で約 1 MB
 
 ## 給与 (給与大臣) の読み出し — `/api/kyuyo/*`
 

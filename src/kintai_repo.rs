@@ -97,6 +97,28 @@ pub trait KintaiEventsApi: Send + Sync {
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         self.fetch_events_between(&from, &to, driver).await
     }
+
+    /// 任意の期間 `[from, to)` の**全乗務員**の生イベント (Refs #125)。
+    ///
+    /// 日別サマリを全員ぶん組むための読み出し口。1 名ずつ [`fetch_events_between`]
+    /// を 96 回叩くと約 3 秒かかるのを 1 リクエストにまとめる。
+    ///
+    /// [`fetch_events_between`]: KintaiEventsApi::fetch_events_between
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError>;
+
+    /// 対象月 (`YYYY-MM`) の全乗務員の生イベント。[`month_range`] を当てるだけ。
+    async fn fetch_all_events(
+        &self,
+        month: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let (from, to) = month_range(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        self.fetch_all_events_between(&from, &to).await
+    }
 }
 
 pub type DynKintaiEventsRepo = Arc<dyn KintaiEventsApi>;
@@ -113,6 +135,14 @@ impl KintaiEventsApi for DisabledKintaiEventsRepo {
         _from: &str,
         _to: &str,
         _driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        Err(KintaiRepoError::NotConfigured)
+    }
+
+    async fn fetch_all_events_between(
+        &self,
+        _from: &str,
+        _to: &str,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         Err(KintaiRepoError::NotConfigured)
     }
@@ -203,6 +233,62 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
  ORDER BY datetime, source
 "#;
 
+/// 全乗務員ぶんを 1 リクエストで読む (Refs #125)。`EVENTS_SQL` から
+/// **乗務員の絞り込みを外し、`運行NO` と `車輌名` を落とした**もの。
+///
+/// - **`運行NO` / `車輌名` と `dtako_cars` の JOIN を返さない。** 日別サマリ
+///   ([`crate::kosoku::daily_summary`]) はどちらも使っていないので値は変わらないが、
+///   実測ではここが支配的だった — 2026-06 の全乗務員で **1.20 秒 → 0.25 秒 (約 5 倍)**。
+///   22,092 行それぞれで車輌マスタを引き当て、23 桁の `運行NO` を転送していた分。
+///   「どの運行・どの車か」に降りるときは 1 名分の `/api/kintai/events` を叩く
+/// - **`dtako_events` はイベント名で絞る。** 日別サマリが見るのは休息 (勤務の切れ目) と
+///   休憩 (実働から差し引く) だけだが、**運行開始・運行終了も読む** — 同日の運行の継ぎ目を
+///   「作業」と判定した根拠 (#123) を後から確かめられなくなるため。絞ると
+///   `dtako_events` は 105,771 行 → 22,092 行 (1/3)
+/// - **`/api/kintai/events` は絞らない。** あちらは数字がおかしいときに 1 名分の生時系列へ
+///   降りるための口で、種別を絞ると調査ができなくなる (#116 の「解釈しない読み出し口」)
+/// - 2 ブランチに分ける理由・`COALESCE` で 1 本にまとめてはいけない理由は
+///   [`EVENTS_SQL`] と同じ
+const ALL_EVENTS_SQL: &str = r#"
+SELECT DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
+       NULL                                         AS end_datetime,
+       d.id                                         AS driver_id,
+       'timecard'                                   AS source,
+       s.name                                       AS state
+  FROM time_card_dstate d
+  LEFT JOIN time_card_dtako_state s ON s.id = d.state
+ WHERE d.datetime >= :from AND d.datetime < :to
+UNION ALL
+SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'),
+       NULL,
+       t.driver_id,
+       'dtako',
+       COALESCE(t.event_name, s.name)
+  FROM time_card_dtako t
+  LEFT JOIN time_card_dtako_state s ON s.id = t.state
+ WHERE t.datetime >= :from AND t.datetime < :to
+UNION ALL
+SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
+       DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
+       e.`対象乗務員CD`,
+       'dtako_events',
+       e.`イベント名`
+  FROM dtako_events e
+ WHERE e.`開始日時` >= :from AND e.`開始日時` < :to
+   AND e.`イベント名` IN ('休息', '休憩', '運行開始', '運行終了')
+UNION ALL
+SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
+       DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
+       e.`対象乗務員CD`,
+       'dtako_events',
+       e.`イベント名`
+  FROM dtako_events e
+ WHERE e.`終了日時` >= :from AND e.`終了日時` < :to
+   AND e.`開始日時` < :from
+   AND e.`イベント名` IN ('休息', '休憩', '運行開始', '運行終了')
+ ORDER BY driver_id, datetime, source
+"#;
+
 /// DB から取り出した 1 行 (列の順序は `EVENTS_SQL` と 1:1)。
 type EventRow = (
     String,
@@ -225,6 +311,22 @@ fn row_to_json(row: EventRow) -> serde_json::Value {
         "state": state,
         "unko_no": unko_no,
         "vehicle": vehicle,
+    })
+}
+
+/// 全乗務員ぶんの 1 行 (列の順序は `ALL_EVENTS_SQL` と 1:1)。`運行NO` / `車輌名` が無い。
+type AllEventRow = (String, Option<String>, Option<i64>, String, Option<String>);
+
+/// 全乗務員ぶんの行を JSON へ。`unko_no` / `vehicle` は**キーごと出さない** —
+/// 読んでいない列を `null` で埋めると「値が無い」と「読んでいない」が混ざる。
+fn all_row_to_json(row: AllEventRow) -> serde_json::Value {
+    let (datetime, end_datetime, driver_id, source, state) = row;
+    serde_json::json!({
+        "datetime": datetime,
+        "end_datetime": end_datetime,
+        "driver_id": driver_id,
+        "source": source,
+        "state": state,
     })
 }
 
@@ -275,6 +377,29 @@ impl KintaiEventsApi for MariadbKintaiEventsRepo {
             .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
         Ok(rows.into_iter().map(row_to_json).collect())
     }
+
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let rows: Vec<AllEventRow> = conn
+            .exec(
+                ALL_EVENTS_SQL,
+                params! {
+                    "from" => from,
+                    "to" => to,
+                },
+            )
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(all_row_to_json).collect())
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +448,32 @@ mod tests {
         assert!(v["vehicle"].is_null());
     }
 
+    #[test]
+    fn all_row_to_json_omits_unread_columns() {
+        let v = all_row_to_json((
+            "2026-06-02 06:00:00".to_string(),
+            Some("2026-06-02 06:20:00".to_string()),
+            Some(1119),
+            "dtako_events".to_string(),
+            Some("休憩".to_string()),
+        ));
+        assert_eq!(v["driver_id"], 1119);
+        assert_eq!(v["end_datetime"], "2026-06-02 06:20:00");
+        // 読んでいない列はキーごと出さない (`null` にしない)
+        assert!(v.get("unko_no").is_none());
+        assert!(v.get("vehicle").is_none());
+    }
+
+    #[test]
+    fn all_events_sql_drops_the_vehicle_join() {
+        // 1.20 秒 → 0.25 秒 の差はここ。うっかり戻さないよう固定する
+        assert!(!ALL_EVENTS_SQL.contains("dtako_cars"));
+        assert!(!ALL_EVENTS_SQL.contains("運行NO"));
+        // 生イベントの読み出し口 (`/events`) は絞らないまま
+        assert!(EVENTS_SQL.contains("dtako_cars"));
+        assert!(!EVENTS_SQL.contains("イベント名` IN"));
+    }
+
     #[tokio::test]
     async fn disabled_repo_is_not_configured() {
         let err = DisabledKintaiEventsRepo
@@ -331,6 +482,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, KintaiRepoError::NotConfigured));
         assert!(err.to_string().contains("未設定"));
+        let err = DisabledKintaiEventsRepo
+            .fetch_all_events("2026-07")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KintaiRepoError::NotConfigured));
+        // 月が壊れていれば DB へ行く前に落とす
+        let err = DisabledKintaiEventsRepo
+            .fetch_all_events("2026-13")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bad month"));
         assert!(KintaiRepoError::QueryFailed("boom".into())
             .to_string()
             .contains("boom"));
