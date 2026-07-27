@@ -25,7 +25,9 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::restraint_store::{DynRestraintStore, RestraintEntry, RestraintStoreError};
+use crate::restraint_store::{
+    DynRestraintStore, RestraintEntry, RestraintStoreError, RestraintSyncedRow,
+};
 use crate::routes::kintai::is_valid_month;
 
 /// エラーレスポンス本文 (kyuyo と同形)。
@@ -187,6 +189,53 @@ pub async fn put_summaries(
     let saved = entries.len();
     tracing::info!(comp_id = %body.comp_id, source = %body.source, month = %body.month, saved, "restraint summaries pushed");
     Ok(Json(PushResponse { saved, synced_at }))
+}
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/restraint/synced-months?comp=
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct SyncedMonthsQuery {
+    pub comp: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct RestraintSyncedEntry {
+    /// 'theearth' | 'timecard'
+    pub source: String,
+    pub month: String,
+    pub synced_at: String,
+    pub row_count: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct RestraintSyncedResponse {
+    pub entries: Vec<RestraintSyncedEntry>,
+}
+
+/// comp の push 済み (source, 月) 一覧 (Refs nuxt-dtako-admin#460)。消費側
+/// (nuxt-dtako-admin の月タブ) が「高速表示可 (同期済み)」バッジと未同期時の
+/// バックフィル案内を出すためのメタデータのみ。
+pub async fn synced_months(
+    Extension(store): Extension<DynRestraintStore>,
+    Query(params): Query<SyncedMonthsQuery>,
+) -> Result<Json<RestraintSyncedResponse>, ApiError> {
+    if !is_valid_comp(&params.comp) {
+        return Err(err(StatusCode::BAD_REQUEST, "comp が不正です"));
+    }
+    let rows: Vec<RestraintSyncedRow> = store.synced(&params.comp).await.map_err(map_store_err)?;
+    Ok(Json(RestraintSyncedResponse {
+        entries: rows
+            .into_iter()
+            .map(|r| RestraintSyncedEntry {
+                source: r.source,
+                month: r.month,
+                synced_at: r.synced_at,
+                row_count: r.row_count,
+            })
+            .collect(),
+    }))
 }
 
 // ══════════════════════════════════════════════════════════════

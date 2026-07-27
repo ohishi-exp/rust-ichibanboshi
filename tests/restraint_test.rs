@@ -295,6 +295,14 @@ impl RestraintStoreApi for BrokenRestraintStore {
     ) -> Result<RestraintMonth, RestraintStoreError> {
         Err(RestraintStoreError::QueryError("boom".to_string()))
     }
+
+    async fn synced(
+        &self,
+        _comp_id: &str,
+    ) -> Result<Vec<rust_ichibanboshi::restraint_store::RestraintSyncedRow>, RestraintStoreError>
+    {
+        Err(RestraintStoreError::QueryError("boom".to_string()))
+    }
 }
 
 #[tokio::test]
@@ -367,4 +375,75 @@ async fn broken_summary_json_row_is_skipped_not_fatal() {
     let summaries = body["current_theearth"]["summaries"].as_array().unwrap();
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0]["summary"]["driverCd"], "200");
+}
+
+#[tokio::test]
+async fn synced_months_lists_pushed_scopes_per_comp() {
+    let store = memory_store();
+    let app_router = |s: DynRestraintStore| {
+        Router::new()
+            .route(
+                "/api/restraint/summaries",
+                put(routes::restraint::put_summaries),
+            )
+            .route(
+                "/api/restraint/synced-months",
+                get(routes::restraint::synced_months),
+            )
+            .layer(Extension(s))
+    };
+    // comp 27324455 に 2 push、別 comp に 1 push
+    for (comp, source, month) in [
+        ("27324455", "theearth", "2026-06"),
+        ("27324455", "timecard", "2026-06"),
+        ("99999999", "theearth", "2026-06"),
+    ] {
+        let body = serde_json::json!({
+            "comp_id": comp, "source": source, "month": month,
+            "entries": [summary_entry("100", 600)],
+        });
+        let (status, _) = send(
+            app_router(store.clone()),
+            "PUT",
+            "/api/restraint/summaries",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, body) = send(
+        app_router(store.clone()),
+        "GET",
+        "/api/restraint/synced-months?comp=27324455",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2); // 別 comp は混ざらない
+    assert_eq!(entries[0]["source"], "theearth");
+    assert_eq!(entries[0]["month"], "2026-06");
+    assert_eq!(entries[0]["row_count"], 1);
+    assert!(entries[0]["synced_at"].as_str().unwrap().contains("T"));
+    assert_eq!(entries[1]["source"], "timecard");
+
+    // comp 検証 + Disabled 503
+    let (status, _) = send(
+        app_router(store),
+        "GET",
+        "/api/restraint/synced-months?comp=a/b",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let disabled: DynRestraintStore = Arc::new(DisabledRestraintStore);
+    let (status, _) = send(
+        app_router(disabled),
+        "GET",
+        "/api/restraint/synced-months?comp=27324455",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }

@@ -49,6 +49,15 @@ pub struct RestraintEntry {
     pub last_verified_at: Option<String>,
 }
 
+/// sync 済み 1 件 (メタのみ)。
+#[derive(Debug, Clone)]
+pub struct RestraintSyncedRow {
+    pub source: String,
+    pub month: String,
+    pub synced_at: String,
+    pub row_count: i64,
+}
+
 /// 読み出し結果 1 ヶ月分 (source 単位)。
 #[derive(Debug, Clone, Default)]
 pub struct RestraintMonth {
@@ -78,6 +87,10 @@ pub trait RestraintStoreApi: Send + Sync {
         source: &str,
         ym: &str,
     ) -> Result<RestraintMonth, RestraintStoreError>;
+
+    /// comp の sync 済み (source, month) 一覧 (Refs nuxt-dtako-admin#460)。
+    /// 月タブの「高速表示可」バッジ用メタデータのみ。
+    async fn synced(&self, comp_id: &str) -> Result<Vec<RestraintSyncedRow>, RestraintStoreError>;
 }
 
 pub type DynRestraintStore = Arc<dyn RestraintStoreApi>;
@@ -108,6 +121,12 @@ impl RestraintStoreApi for DisabledRestraintStore {
         _source: &str,
         _ym: &str,
     ) -> Result<RestraintMonth, RestraintStoreError> {
+        Err(RestraintStoreError::OpenFailed(
+            "store disabled".to_string(),
+        ))
+    }
+
+    async fn synced(&self, _comp_id: &str) -> Result<Vec<RestraintSyncedRow>, RestraintStoreError> {
         Err(RestraintStoreError::OpenFailed(
             "store disabled".to_string(),
         ))
@@ -300,6 +319,48 @@ impl RestraintStoreApi for RestraintStore {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(q)?;
             Ok(RestraintMonth { entries, synced_at })
+        })
+        .await
+        .map_err(|e| RestraintStoreError::JoinError(e.to_string()))?
+    }
+
+    async fn synced(&self, comp_id: &str) -> Result<Vec<RestraintSyncedRow>, RestraintStoreError> {
+        let prefix = format!("{comp_id}:");
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = futures_lock(&conn);
+            let mut stmt = guard
+                .prepare(
+                    "SELECT scope, synced_at, row_count FROM restraint_sync_state
+                     WHERE scope LIKE ?1 || '%'
+                     ORDER BY scope ASC",
+                )
+                .map_err(q)?;
+            let rows = stmt
+                .query_map(params![prefix], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(q)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(q)?;
+            // scope = '{comp}:{source}:{ym}'。comp_id に ':' は入らない (route 検証済み)
+            Ok(rows
+                .into_iter()
+                .filter_map(|(scope, synced_at, row_count)| {
+                    let rest = scope.strip_prefix(&prefix)?;
+                    let (source, month) = rest.split_once(':')?;
+                    Some(RestraintSyncedRow {
+                        source: source.to_string(),
+                        month: month.to_string(),
+                        synced_at,
+                        row_count,
+                    })
+                })
+                .collect())
         })
         .await
         .map_err(|e| RestraintStoreError::JoinError(e.to_string()))?
