@@ -258,6 +258,38 @@ pub struct Config {
 
     #[serde(default)]
     pub mariadb: MariadbConfig,
+
+    #[serde(default)]
+    pub kosoku: KosokuConfigToml,
+}
+
+/// 拘束時間サマリ (`/api/kintai/kosoku-daily`) の計算パラメータ (Refs #118)。
+///
+/// 既定は就業規則どおり (所定 7.5 時間 / 法定 8 時間 / 休憩は 10 分以上)。
+/// 規則が変わったときに再ビルドせず TOML で追随できるよう外に出してある。
+#[derive(Debug, Clone, Deserialize)]
+pub struct KosokuConfigToml {
+    /// 休憩として数える最小の長さ (分)。
+    #[serde(default = "default_break_threshold_minutes")]
+    pub break_threshold_minutes: i64,
+
+    /// 所定労働時間 (分)。既定 450 = 7.5 時間。
+    #[serde(default = "default_prescribed_minutes")]
+    pub prescribed_minutes: i64,
+
+    /// 法定労働時間 (分)。既定 480 = 8 時間。所定との差が法定内残業 (割増 1.0)。
+    #[serde(default = "default_legal_minutes")]
+    pub legal_minutes: i64,
+}
+
+impl Default for KosokuConfigToml {
+    fn default() -> Self {
+        Self {
+            break_threshold_minutes: default_break_threshold_minutes(),
+            prescribed_minutes: default_prescribed_minutes(),
+            legal_minutes: default_legal_minutes(),
+        }
+    }
 }
 
 fn default_port() -> u16 {
@@ -325,6 +357,20 @@ fn default_mariadb_port() -> u16 {
 
 fn default_mariadb_user() -> String {
     "kintai_reader".to_string()
+}
+
+fn default_break_threshold_minutes() -> i64 {
+    10
+}
+
+fn default_prescribed_minutes() -> i64 {
+    // 所定 7.5 時間
+    450
+}
+
+fn default_legal_minutes() -> i64 {
+    // 法定 8 時間
+    480
 }
 
 impl Default for MariadbConfig {
@@ -456,6 +502,7 @@ impl Config {
             kyuyo: KyuyoConfig::default(),
             restraint: RestraintConfig::default(),
             mariadb: MariadbConfig::default(),
+            kosoku: KosokuConfigToml::default(),
         })
     }
 }

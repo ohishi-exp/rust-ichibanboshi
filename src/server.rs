@@ -83,6 +83,14 @@ pub async fn run(
         Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo)
     };
 
+    // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
+    // 就業規則が変わったら TOML で追随できるよう config から取る。
+    let kosoku_params = Arc::new(crate::kosoku::KosokuParams {
+        break_threshold_minutes: config.kosoku.break_threshold_minutes,
+        prescribed_minutes: config.kosoku.prescribed_minutes,
+        legal_minutes: config.kosoku.legal_minutes,
+    });
+
     // 拘束サマリ store (Refs #106 Phase 3)。open 失敗は Disabled (route が 503) —
     // このストアはキャッシュではなく relay push の一次置き場のため fail-closed
     let restraint_store: crate::restraint_store::DynRestraintStore =
@@ -206,6 +214,7 @@ pub async fn run(
         .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs))
         .route("/kintai/daily", get(routes::kintai::daily))
         .route("/kintai/events", get(routes::kintai::events))
+        .route("/kintai/kosoku-daily", get(routes::kintai::kosoku_daily))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
@@ -247,6 +256,7 @@ pub async fn run(
         .layer(Extension(kyuyo_store))
         .layer(Extension(kintai_store))
         .layer(Extension(kintai_events_repo))
+        .layer(Extension(kosoku_params))
         .layer(Extension(restraint_store));
 
     let addr = config.addr();
