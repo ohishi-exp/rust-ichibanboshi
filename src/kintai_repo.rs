@@ -25,6 +25,23 @@
 //! | `time_card_dtako_state` | `state` → 名称のマスタ |
 //! | `dtako_events` | デジタコ生イベント (運転 / 積み / 降し / 休憩 / 休息)。区間を持つ |
 //! | `dtako_cars` | `車輌CD` → 車番 |
+//!
+//! ## 乗務員は `対象乗務員CD` で引く (`乗務員CD1` ではない)
+//!
+//! `dtako_events` には乗務員の列が 2 つある。**`乗務員CD1` で引くと他人の運行を
+//! 拾う。** 2 名乗務・交替の運行では、運行まるごとが `乗務員CD1` = 別の乗務員の
+//! まま記録される (実測: 運行 26061105351800000039752 の 42 行すべてが
+//! `乗務員CD1=1740` / `対象乗務員CD=1130`)。2026-06 で 1740 の休息・休憩を数えると
+//! `乗務員CD1` では 114 件、`対象乗務員CD` では 83 件 — 31 件は 1130 の分だった。
+//! 引かれた側 (1130) は逆に取りこぼす。
+//!
+//! 速度も段違い。`対象乗務員CD` には `idx_driver_datetime (対象乗務員CD, 開始日時)`
+//! があり covering index が効くが、`乗務員CD1` には索引が無い:
+//!
+//! | 絞り方 | EXPLAIN | 見込み行数 | 実測 |
+//! |---|---|---|---|
+//! | `乗務員CD1` | range / `testin` (開始日時) | 213,884 | 0.202 秒 |
+//! | `対象乗務員CD` | range / `idx_driver_datetime` (covering) | 866 | **0.00042 秒** |
 
 use std::sync::Arc;
 
@@ -162,25 +179,25 @@ SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'),
 UNION ALL
 SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
        DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
-       e.`乗務員CD1`,
+       e.`対象乗務員CD`,
        'dtako_events',
        e.`イベント名`,
        e.`運行NO`,
        c.`車輌名`
   FROM dtako_events e
   LEFT JOIN dtako_cars c ON c.`車輌CD` = e.`車輌CD`
- WHERE e.`乗務員CD1` = :driver AND e.`開始日時` >= :from AND e.`開始日時` < :to
+ WHERE e.`対象乗務員CD` = :driver AND e.`開始日時` >= :from AND e.`開始日時` < :to
 UNION ALL
 SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
        DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
-       e.`乗務員CD1`,
+       e.`対象乗務員CD`,
        'dtako_events',
        e.`イベント名`,
        e.`運行NO`,
        c.`車輌名`
   FROM dtako_events e
   LEFT JOIN dtako_cars c ON c.`車輌CD` = e.`車輌CD`
- WHERE e.`乗務員CD1` = :driver
+ WHERE e.`対象乗務員CD` = :driver
    AND e.`終了日時` >= :from AND e.`終了日時` < :to
    AND e.`開始日時` < :from
  ORDER BY datetime, source
