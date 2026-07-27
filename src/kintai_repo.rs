@@ -60,8 +60,8 @@ impl std::error::Error for KintaiRepoError {}
 pub trait KintaiEventsApi: Send + Sync {
     /// 任意の期間 `[from, to)` × 乗務員CD の生イベントを時刻昇順で返す。
     ///
-    /// 期間の決め方は呼び出し側の担当 — `/events` は [`month_range`]、
-    /// `/kosoku-daily` は前月末の休息まで遡る [`kosoku_range`] を使う。
+    /// 期間の決め方は呼び出し側の担当。区間イベントは重なりで拾うので、
+    /// 期間の前に始まった長い休息もこの範囲で取れる (`EVENTS_SQL` 参照)。
     async fn fetch_events_between(
         &self,
         from: &str,
@@ -76,21 +76,6 @@ pub trait KintaiEventsApi: Send + Sync {
         driver: u64,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         let (from, to) = month_range(month)
-            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
-        self.fetch_events_between(&from, &to, driver).await
-    }
-
-    /// `kosoku-daily` 用。[`kosoku_range`] を当てて**前月末の休息まで遡って**読む。
-    ///
-    /// 期間の組み立てをここに置くのは、route 側に「作れなかった場合」の分岐を
-    /// 残さないため — `is_valid_month` を通った月では必ず作れるので、route に
-    /// 書くと到達しない枝になる。
-    async fn fetch_events_for_kosoku(
-        &self,
-        month: &str,
-        driver: u64,
-    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
-        let (from, to) = kosoku_range(month)
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         self.fetch_events_between(&from, &to, driver).await
     }
@@ -135,27 +120,6 @@ pub fn month_range(month: &str) -> Option<(String, String)> {
     Some((format!("{first} 00:00:00"), format!("{end} 00:00:00")))
 }
 
-/// 勤務を組むために遡る日数。
-///
-/// `kosoku-daily` は「休息の終了 = 始業」で勤務を切るので、月初の勤務を確定するには
-/// **前月末の休息**が要る。実測で最長の休息は 38 時間 (2026-04/1442) だったが、
-/// 連休を挟むともっと長くなるため 1 週間遡る。1 乗務員分のイベントしか読まないので
-/// 範囲を広げる代償は小さい。
-const KOSOKU_LOOKBACK_DAYS: i64 = 7;
-
-/// `kosoku-daily` の取得範囲 `[月初-7日, 翌月+1日)`。
-///
-/// [`month_range`] より**前に広い**のが唯一の違い。月の範囲だけで読むと、月初の
-/// 勤務が前月末の休息を見つけられず静かに欠ける (毎月 1 日目が消える)。
-pub fn kosoku_range(month: &str) -> Option<(String, String)> {
-    let (_, to) = month_range(month)?;
-    let year: i32 = month.get(..4)?.parse().ok()?;
-    let mm: u32 = month.get(5..7)?.parse().ok()?;
-    let first = chrono::NaiveDate::from_ymd_opt(year, mm, 1)?;
-    let from = first.checked_sub_signed(chrono::Duration::days(KOSOKU_LOOKBACK_DAYS))?;
-    Some((format!("{from} 00:00:00"), to))
-}
-
 /// 打刻 (`time_card_dstate`) / 運行の確定イベント (`time_card_dtako`) /
 /// デジタコ生イベント (`dtako_events`) を `UNION ALL` して時刻順に並べる。
 ///
@@ -164,6 +128,11 @@ pub fn kosoku_range(month: &str) -> Option<(String, String)> {
 ///   経路に持ち込まない
 /// - `dtako_events` だけ `end_datetime` を持つ (区間イベントのため)。
 ///   **区間長の判定はしない** — 何分から休憩と数えるかは規則側の話
+/// - 区間イベントは**開始ではなく重なりで絞る** (`開始日時 < to AND 終了日時 >= from`)。
+///   開始で絞ると、月初を跨ぐ長い休息が丸ごと落ちる — `kosoku-daily` は「休息の終了 =
+///   始業」で勤務を切るので、月初の勤務が組めなくなる。車輌故障で 1 週間止まったような
+///   ケースもあるため、遡る日数を決め打ちにする対処では塞げない。`終了日時` が NULL の
+///   行は `開始日時` で代替して従来どおり扱う
 const EVENTS_SQL: &str = r#"
 SELECT DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
        NULL                                         AS end_datetime,
@@ -196,7 +165,9 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
        c.`車輌名`
   FROM dtako_events e
   LEFT JOIN dtako_cars c ON c.`車輌CD` = e.`車輌CD`
- WHERE e.`乗務員CD1` = :driver AND e.`開始日時` >= :from AND e.`開始日時` < :to
+ WHERE e.`乗務員CD1` = :driver
+   AND e.`開始日時` < :to
+   AND COALESCE(e.`終了日時`, e.`開始日時`) >= :from
  ORDER BY datetime, source
 "#;
 
