@@ -184,6 +184,41 @@ impl KyuyoConfig {
     }
 }
 
+/// 社内 MariaDB (勤怠の生イベント) 読み取り configuration (Refs #116)。
+///
+/// 同一ホストの docker `db` コンテナ (172.18.21.35 をマスタにしたレプリカ) を
+/// loopback で読む。CakePHP が `127.0.0.1:120` で同居しているのと同じ 1 hop で、
+/// **DNS も TLS も経路に入らない**。実値は repo に置かず、デプロイ先の
+/// `ichibanboshi.toml` で注入する (`KyuyoConfig` と同じ作法)。未設定なら
+/// `/api/kintai/events` は fail-closed (503)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MariadbConfig {
+    /// MariaDB のホスト。空 = 機能無効。
+    #[serde(default = "default_mariadb_host")]
+    pub host: String,
+
+    #[serde(default = "default_mariadb_port")]
+    pub port: u16,
+
+    /// 読み取り専用ユーザー (SELECT のみを GRANT した専用アカウント)。
+    #[serde(default = "default_mariadb_user")]
+    pub user: String,
+
+    #[serde(default)]
+    pub password: String,
+
+    /// CakePHP が使っている DB 名。空 = 機能無効。
+    #[serde(default)]
+    pub database: String,
+}
+
+impl MariadbConfig {
+    /// 接続設定が揃っているか (揃っていなければ `/api/kintai/events` は 503)。
+    pub fn enabled(&self) -> bool {
+        !self.host.is_empty() && !self.database.is_empty() && !self.password.is_empty()
+    }
+}
+
 /// Runtime configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -220,6 +255,9 @@ pub struct Config {
 
     #[serde(default)]
     pub restraint: RestraintConfig,
+
+    #[serde(default)]
+    pub mariadb: MariadbConfig,
 }
 
 fn default_port() -> u16 {
@@ -274,6 +312,31 @@ fn default_kyuyo_sqlite_path() -> String {
 
 fn default_kyuyo_timeout_secs() -> u64 {
     10
+}
+
+fn default_mariadb_host() -> String {
+    // CakePHP と同居しているホストの docker `db` コンテナ (loopback 1 hop)
+    "127.0.0.1".to_string()
+}
+
+fn default_mariadb_port() -> u16 {
+    3306
+}
+
+fn default_mariadb_user() -> String {
+    "kintai_reader".to_string()
+}
+
+impl Default for MariadbConfig {
+    fn default() -> Self {
+        Self {
+            host: default_mariadb_host(),
+            port: default_mariadb_port(),
+            user: default_mariadb_user(),
+            password: String::new(),
+            database: String::new(),
+        }
+    }
 }
 
 impl Default for KyuyoConfig {
@@ -392,6 +455,7 @@ impl Config {
             raw: RawConfig::default(),
             kyuyo: KyuyoConfig::default(),
             restraint: RestraintConfig::default(),
+            mariadb: MariadbConfig::default(),
         })
     }
 }

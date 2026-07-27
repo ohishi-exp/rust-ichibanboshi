@@ -30,7 +30,8 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
 | `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
-| `src/routes/kintai.rs` | `/api/kintai/daily` (日別サマリ) と `/api/kintai/events` (生の時系列) の中継 (#99 / #114、下記) |
+| `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) と `/api/kintai/events` (MariaDB 直読み) (#99 / #116、下記) |
+| `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116) |
 | `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
 | `src/kyuyo/logic.rs` | 給与の純粋ロジック (項目マッピング・行組み立て)。**coverage 100% 対象** |
 | `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層 |
@@ -48,8 +49,9 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - `/api/kintai/daily?month=YYYY-MM`: 社内 CakePHP (`yhonda-ohishi/nginx`) のタイムカード日別
   データを Cloudflare Worker (nuxt-dtako-admin の dtako-scraper-relay) へ**中継するだけ**。
   詳細は下記「勤怠の中継」節。
-- `/api/kintai/events?month=YYYY-MM&driver=N`: 同 CakePHP の**打刻と運行イベントの生時系列**を
-  中継 (#114、拘束時間の打刻基準化 Phase 1)。`driver` 必須・キャッシュ無し。
+- `/api/kintai/events?month=YYYY-MM&driver=N`: **打刻と運行イベントの生時系列**
+  (#114 / #116、拘束時間の打刻基準化 Phase 1)。ここだけ CakePHP を経由せず
+  **社内 MariaDB を直読み**する。`driver` 必須・キャッシュ無し・未設定は 503。
 - `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
@@ -159,23 +161,37 @@ CakePHP は LAN 内にしか居ないので、**同一ホストで動く本サ�
 - テストは `tests/kintai_test.rs` (wiremock で CakePHP を stub)。`src/routes/kintai.rs` は
   coverage_100 登録済み
 
-### 生イベントの中継 — `/api/kintai/events` (Refs #114)
+### 生イベントの直読み — `/api/kintai/events` (Refs #114 → #116)
 
 拘束時間管理表の残業を**タイムカードの打刻を正として**計算し直すことになり (設計:
 claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各パターン (同日 2 運行・
 打刻と運行のズレ・細切れ休憩・8h 未満の休息) が何件あるかを数えるための読み出し口。
 
-- 上流は `GET /time-card/events-json?month=YYYY-MM&driver=N`。打刻 (`time_card_dstate`、
-  30=始業 / 31=終業) と運行イベント (`time_card_dtako`、`unko_no` 付き) を時刻順に混ぜた生行
-- **`driver` は必須** (省略時 400) — 生イベントは日別サマリより 1 桁多く、全乗務員を返す
-  用途がここには無い。値は数字のみ許可 (そのまま上流 URL に載せるため)
-- **derived store を持たない**。調査用途で頻度が低く常に最新が要るので read-through は
-  付けず、`source` / `synced_at` のメタも足さない (完全な素通し)
+- **ここだけ CakePHP 中継ではなく社内 MariaDB の直読み** (`src/kintai_repo.rs`)。
+  返すのが解釈しない生行なので ORM を挟む意味が薄く、挟めば「CakePHP の解釈」と
+  「本サービスの中継」の 2 段になる。上流に相当エンドポイントも無かった (#116)
+- **`/api/kintai/daily` は CakePHP 中継のまま** — あちらは休日判定・セッション組み立てと
+  いう解釈が上流にあり、直読みで再現すると二重実装になる。混同しないこと
+- 接続は `[mariadb]` (既定 `127.0.0.1:3306`、user `kintai_reader`)。同一ホストの docker
+  `db` コンテナ (172.18.21.35 をマスタにしたレプリカ) へ loopback 1 hop。**password /
+  database はデプロイ先の toml でのみ設定**し、未設定なら 503 fail-closed
+  (`DisabledKintaiEventsRepo` — 空配列を返して「0 件」に見せない)
+- 読むのは 5 テーブル: `time_card_dstate` (打刻 30/31) / `time_card_dtako` (運行の確定
+  イベント 10/11/20、`unko_no` 付き) / `time_card_dtako_state` (名称マスタ) /
+  `dtako_events` (デジタコ生イベント、区間持ち) / `dtako_cars` (車番)。`UNION ALL` して
+  `datetime` 昇順。**SELECT のみを GRANT した専用アカウント**で読む
+- 範囲は `[月初, 翌月+1日)` (`month_range`) — 月で切ると日跨ぎ勤務の終業が消える。
+  上流 `daily-json` の `queryEnd` と同じ考え方
+- 日時は SQL の `DATE_FORMAT` で文字列にして取り出す — driver の時刻型と timezone 解釈を
+  経路に持ち込まない
+- **`driver` は必須** (省略・非数字・負値・桁溢れは 400)。生イベントは日別サマリより
+  1 桁多く、全乗務員を返す用途がここには無い
+- **キャッシュを持たない**。調査用途で頻度が低く常に最新の打刻が要るため
 - 認可は `daily` と同じ CF Access Service Token (edge)。応答は識別情報と時刻・車番だけで
   **金額を含まない**。金額を足すなら `/kyuyo/*` の in-service gate へ移すこと
-- テストは `tests/kintai_events_test.rs`。打刻のみ / 運行のみ / 同日 2 運行 / 日跨ぎ の
-  4 ケースが「解釈されずそのまま通る」ことを固定する (解釈は Phase 2 の
-  `kosoku-daily` 側の担当)
+- テストは `tests/kintai_events_test.rs` — `KintaiEventsApi` の mock を挿して **DB 無し**で
+  回す。打刻のみ / 運行のみ / 同日 2 運行 / 日跨ぎ の 4 ケースが「解釈されずそのまま通る」
+  ことを固定する (解釈は Phase 2 の `kosoku-daily` 側の担当)
 
 ## 給与 (給与大臣) の読み出し — `/api/kyuyo/*`
 
