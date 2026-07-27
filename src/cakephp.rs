@@ -125,6 +125,13 @@ pub struct TimecardDailyResponse {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `/time-card/events-json?month=YYYY-MM&driver=N` のレスポンス (Refs #114)。
+///
+/// 打刻 (`time_card_dstate`) と運行イベント (`time_card_dtako`) を時刻順に混ぜた
+/// **生の時系列**。`rows` + 未知フィールド保持という形は `daily-json` と同じで、
+/// 中継であって解釈者ではないという方針も同じなので型を共有する。
+pub type TimecardEventsResponse = TimecardDailyResponse;
+
 /// CakePHP fetch client。
 ///
 /// `base_url` 空文字なら NotConfigured を返す。
@@ -222,6 +229,29 @@ impl CakephpClient {
             "{}/time-card/daily-json?month={}",
             self.base_url.trim_end_matches('/'),
             urlencode(month)
+        );
+        self.get_json(&url).await
+    }
+
+    /// `/time-card/events-json?month=YYYY-MM&driver=N`
+    ///
+    /// 打刻と運行イベントの生の時系列 (Refs #114)。`driver` は必須 — 生イベントは
+    /// 日別サマリより 1 桁多く、全乗務員を一度に返す用途がここには無い。
+    /// 日別サマリ (`daily-json`) と違い**キャッシュしない** (呼び出しは調査用途で、
+    /// 常に最新の打刻が要る)。
+    pub async fn fetch_timecard_events(
+        &self,
+        month: &str,
+        driver: &str,
+    ) -> Result<TimecardEventsResponse, CakephpError> {
+        if !self.is_enabled() {
+            return Err(CakephpError::NotConfigured);
+        }
+        let url = format!(
+            "{}/time-card/events-json?month={}&driver={}",
+            self.base_url.trim_end_matches('/'),
+            urlencode(month),
+            urlencode(driver)
         );
         self.get_json(&url).await
     }
@@ -359,6 +389,11 @@ mod tests {
         assert!(matches!(err, CakephpError::NotConfigured));
         let err2 = c.fetch_masters("2026-06-29").await.unwrap_err();
         assert!(matches!(err2, CakephpError::NotConfigured));
+        let err3 = c
+            .fetch_timecard_events("2026-06", "1051")
+            .await
+            .unwrap_err();
+        assert!(matches!(err3, CakephpError::NotConfigured));
     }
 
     #[test]

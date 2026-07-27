@@ -193,6 +193,7 @@ pub async fn run(
         )
         .route("/uriage/recalc-jobs", get(routes::uriage::list_recalc_jobs))
         .route("/kintai/daily", get(routes::kintai::daily))
+        .route("/kintai/events", get(routes::kintai::events))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))

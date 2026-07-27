@@ -31,7 +31,7 @@ use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
+use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse, TimecardEventsResponse};
 use crate::kintai_store::DynKintaiStore;
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
@@ -42,6 +42,13 @@ pub struct DailyQuery {
     pub month: Option<String>,
     #[serde(default)]
     pub refresh: Option<String>,
+}
+
+/// `?month=YYYY-MM&driver=1051` (Refs #114)。**両方必須**。
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    pub month: Option<String>,
+    pub driver: Option<String>,
 }
 
 /// 対象月の書式検証。`YYYY-MM` で月は 01-12。
@@ -61,6 +68,15 @@ pub fn is_valid_month(month: &str) -> bool {
     }
     let mm: u32 = month[5..].parse().unwrap_or(0);
     (1..=12).contains(&mm)
+}
+
+/// 乗務員CD の書式検証。**数字のみ**を許す。
+///
+/// 値をそのまま上流 URL のクエリに載せるため、ここで弾いておく方が上流の挙動に
+/// 依存せずに済む (乗務員CD = 一番星 `社員ﾏｽﾀ.社員C` と同一番号体系で、数字以外は
+/// 取らない)。
+pub fn is_valid_driver(driver: &str) -> bool {
+    !driver.is_empty() && driver.as_bytes().iter().all(|b| b.is_ascii_digit())
 }
 
 /// CakePHP のエラーを HTTP ステータスへ写す (uriage の `map_cakephp_err` と同方針)。
@@ -159,6 +175,42 @@ pub async fn daily(
     Ok(Json(with_source_meta(resp, "live", &synced_at)))
 }
 
+/// GET /api/kintai/events?month=YYYY-MM&driver=1051 — 打刻と運行イベントの
+/// **生の時系列**の中継 (Refs #114、拘束時間の打刻基準化 Phase 1)。
+///
+/// 拘束時間管理表の残業を打刻基準で計算し直すにあたり、規則を決める前に実データで
+/// 各パターン (同日 2 運行・打刻と運行のズレ・細切れ休憩 …) が何件あるかを数える
+/// ための読み出し口。`daily` と違い **derived store を持たない** — 調査用途で
+/// 呼び出し頻度が低く、常に最新の打刻が要るため。`source` / `synced_at` のメタも
+/// 足さない (上流応答そのまま)。
+pub async fn events(
+    Query(params): Query<EventsQuery>,
+    Extension(cakephp): Extension<Arc<CakephpClient>>,
+) -> Result<Json<TimecardEventsResponse>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    if !is_valid_month(&month) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください".to_string(),
+        ));
+    }
+    let driver = params.driver.unwrap_or_default();
+    if !is_valid_driver(&driver) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "driver は乗務員CD (数字) で指定してください".to_string(),
+        ));
+    }
+    let resp = cakephp
+        .fetch_timecard_events(&month, &driver)
+        .await
+        .map_err(map_cakephp_err)?;
+    // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
+    let rows = resp.rows.len();
+    tracing::info!(month = %month, driver = %driver, rows, "kintai events relayed");
+    Ok(Json(resp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +231,21 @@ mod tests {
         assert!(!is_valid_month("20a6-06"));
         assert!(!is_valid_month("2026-0a"));
         assert!(!is_valid_month("2026-006"));
+    }
+
+    #[test]
+    fn valid_drivers() {
+        assert!(is_valid_driver("1051"));
+        assert!(is_valid_driver("0"));
+    }
+
+    #[test]
+    fn invalid_drivers() {
+        assert!(!is_valid_driver(""));
+        assert!(!is_valid_driver("10a1"));
+        assert!(!is_valid_driver("１０５１")); // 全角
+        assert!(!is_valid_driver("1051 "));
+        assert!(!is_valid_driver("1051&month=2020-01"));
     }
 
     #[test]
