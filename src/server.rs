@@ -71,6 +71,18 @@ pub async fn run(
         }
     };
 
+    // 勤怠の生イベント読み取り (社内 MariaDB 直読み、Refs #116)。未設定なら
+    // Disabled を挿して `/api/kintai/events` だけ 503 — 空配列を返して「0 件」に
+    // 見せない。pool は lazy なので DB 停止中でも起動は失敗しない
+    let kintai_events_repo: crate::kintai_repo::DynKintaiEventsRepo = if config.mariadb.enabled() {
+        Arc::new(crate::kintai_repo::MariadbKintaiEventsRepo::new(
+            &config.mariadb,
+        ))
+    } else {
+        tracing::info!("mariadb not configured — /api/kintai/events returns 503");
+        Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo)
+    };
+
     // 拘束サマリ store (Refs #106 Phase 3)。open 失敗は Disabled (route が 503) —
     // このストアはキャッシュではなく relay push の一次置き場のため fail-closed
     let restraint_store: crate::restraint_store::DynRestraintStore =
@@ -234,6 +246,7 @@ pub async fn run(
         .layer(Extension(kyuyo_limiter))
         .layer(Extension(kyuyo_store))
         .layer(Extension(kintai_store))
+        .layer(Extension(kintai_events_repo))
         .layer(Extension(restraint_store));
 
     let addr = config.addr();

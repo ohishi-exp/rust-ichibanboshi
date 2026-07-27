@@ -45,6 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 flate2 = "1"
 # Phase 2 fingerprint (raw rows sha256 — recalc skip 判定 + R2 sync 必要性判定)
 sha2 = "0.10"
+mysql_async = { version = "0.37.0", default-features = false, features = ["minimal-rust"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

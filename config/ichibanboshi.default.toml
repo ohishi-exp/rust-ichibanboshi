@@ -36,3 +36,16 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # 空文字で無効 (/api/restraint/* が 503)。relay の resummarize (全月) で再構築できる写し
 # [restraint]
 # sqlite_path = "/opt/ichibanboshi/restraint_local.sqlite"
+
+# 社内 MariaDB (勤怠の生イベント、Refs #116)。未設定なら /api/kintai/events は
+# 503 (fail-closed — 空配列を返して「0 件」に見せない)。
+# 接続先は同一ホストの docker `db` コンテナ (loopback 1 hop)。password / database の
+# 実値は repo に置かず、デプロイ先の ichibanboshi.toml でのみ設定する。
+# 必要な権限は 5 テーブル (time_card_dstate / time_card_dtako / time_card_dtako_state /
+# dtako_events / dtako_cars) の SELECT のみ。
+# [mariadb]
+# host = "127.0.0.1"
+# port = 3306
+# user = "kintai_reader"
+# password = "<kintai_reader パスワード>"
+# database = "<CakePHP の DB 名>"
