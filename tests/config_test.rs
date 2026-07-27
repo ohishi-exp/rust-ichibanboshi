@@ -394,3 +394,38 @@ fn test_mariadb_config_partial_is_disabled() {
         toml::from_str("[mariadb]\nhost = \"\"\npassword = \"s\"\ndatabase = \"d\"\n").unwrap();
     assert!(!config.mariadb.enabled());
 }
+
+#[test]
+fn test_kosoku_config_defaults() {
+    let config: Config = toml::from_str("").unwrap();
+    // 就業規則どおり — 所定 7.5h / 法定 8h / 休憩は 10 分以上 (Refs #118)
+    assert_eq!(config.kosoku.break_threshold_minutes, 10);
+    assert_eq!(config.kosoku.prescribed_minutes, 450);
+    assert_eq!(config.kosoku.legal_minutes, 480);
+}
+
+#[test]
+fn test_kosoku_config_override() {
+    let toml_str = r#"
+[kosoku]
+break_threshold_minutes = 5
+prescribed_minutes = 480
+legal_minutes = 480
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.kosoku.break_threshold_minutes, 5);
+    assert_eq!(config.kosoku.prescribed_minutes, 480);
+    // 所定 = 法定 なら法定内残業は生じない
+    assert_eq!(config.kosoku.legal_minutes, 480);
+}
+
+#[test]
+fn test_kosoku_config_partial_keeps_other_defaults() {
+    let config: Config = toml::from_str("[kosoku]\nbreak_threshold_minutes = 15\n").unwrap();
+    assert_eq!(config.kosoku.break_threshold_minutes, 15);
+    assert_eq!(config.kosoku.prescribed_minutes, 450);
+    assert_eq!(config.kosoku.legal_minutes, 480);
+    // Debug / Clone を通しておく
+    let c = config.kosoku.clone();
+    assert!(format!("{c:?}").contains("15"));
+}

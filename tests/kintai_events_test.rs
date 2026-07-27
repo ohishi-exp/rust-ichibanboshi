@@ -25,7 +25,8 @@ use tower::ServiceExt;
 struct MockEventsRepo {
     rows: Vec<Value>,
     fail: Option<String>,
-    calls: Mutex<Vec<(String, u64)>>,
+    /// 記録するのは `(from, to, driver)` — route が当てた期間まで固定する
+    calls: Mutex<Vec<(String, String, u64)>>,
 }
 
 impl MockEventsRepo {
@@ -48,8 +49,16 @@ impl MockEventsRepo {
 
 #[async_trait]
 impl KintaiEventsApi for MockEventsRepo {
-    async fn fetch_events(&self, month: &str, driver: u64) -> Result<Vec<Value>, KintaiRepoError> {
-        self.calls.lock().unwrap().push((month.to_string(), driver));
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((from.to_string(), to.to_string(), driver));
         match &self.fail {
             Some(m) => Err(KintaiRepoError::QueryFailed(m.clone())),
             None => Ok(self.rows.clone()),
@@ -122,10 +131,15 @@ async fn month_and_driver_reach_the_repo() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // 乗務員CD は整数にしてから渡す (前ゼロは落ちる)
+    // 乗務員CD は整数にしてから渡す (前ゼロは落ちる)。
+    // 期間は month_range — 日跨ぎの終業を拾うため翌月 2 日まで
     assert_eq!(
         *repo.calls.lock().unwrap(),
-        vec![("2026-07".to_string(), 12)]
+        vec![(
+            "2026-07-01 00:00:00".to_string(),
+            "2026-08-02 00:00:00".to_string(),
+            12
+        )]
     );
 }
 

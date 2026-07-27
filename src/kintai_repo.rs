@@ -58,12 +58,42 @@ impl std::error::Error for KintaiRepoError {}
 /// (`DynRepo` と同じ形 — route のテストを DB 無しで回すため)。
 #[async_trait]
 pub trait KintaiEventsApi: Send + Sync {
-    /// 対象月 (`YYYY-MM`) × 乗務員CD の生イベントを時刻昇順で返す。
+    /// 任意の期間 `[from, to)` × 乗務員CD の生イベントを時刻昇順で返す。
+    ///
+    /// 期間の決め方は呼び出し側の担当 — `/events` は [`month_range`]、
+    /// `/kosoku-daily` は前月末の休息まで遡る [`kosoku_range`] を使う。
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError>;
+
+    /// 対象月 (`YYYY-MM`) × 乗務員CD の生イベント。[`month_range`] を当てるだけ。
     async fn fetch_events(
         &self,
         month: &str,
         driver: u64,
-    ) -> Result<Vec<serde_json::Value>, KintaiRepoError>;
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let (from, to) = month_range(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        self.fetch_events_between(&from, &to, driver).await
+    }
+
+    /// `kosoku-daily` 用。[`kosoku_range`] を当てて**前月末の休息まで遡って**読む。
+    ///
+    /// 期間の組み立てをここに置くのは、route 側に「作れなかった場合」の分岐を
+    /// 残さないため — `is_valid_month` を通った月では必ず作れるので、route に
+    /// 書くと到達しない枝になる。
+    async fn fetch_events_for_kosoku(
+        &self,
+        month: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let (from, to) = kosoku_range(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        self.fetch_events_between(&from, &to, driver).await
+    }
 }
 
 pub type DynKintaiEventsRepo = Arc<dyn KintaiEventsApi>;
@@ -75,9 +105,10 @@ pub struct DisabledKintaiEventsRepo;
 
 #[async_trait]
 impl KintaiEventsApi for DisabledKintaiEventsRepo {
-    async fn fetch_events(
+    async fn fetch_events_between(
         &self,
-        _month: &str,
+        _from: &str,
+        _to: &str,
         _driver: u64,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         Err(KintaiRepoError::NotConfigured)
@@ -102,6 +133,27 @@ pub fn month_range(month: &str) -> Option<(String, String)> {
     };
     let end = next_month.succ_opt()?;
     Some((format!("{first} 00:00:00"), format!("{end} 00:00:00")))
+}
+
+/// 勤務を組むために遡る日数。
+///
+/// `kosoku-daily` は「休息の終了 = 始業」で勤務を切るので、月初の勤務を確定するには
+/// **前月末の休息**が要る。実測で最長の休息は 38 時間 (2026-04/1442) だったが、
+/// 連休を挟むともっと長くなるため 1 週間遡る。1 乗務員分のイベントしか読まないので
+/// 範囲を広げる代償は小さい。
+const KOSOKU_LOOKBACK_DAYS: i64 = 7;
+
+/// `kosoku-daily` の取得範囲 `[月初-7日, 翌月+1日)`。
+///
+/// [`month_range`] より**前に広い**のが唯一の違い。月の範囲だけで読むと、月初の
+/// 勤務が前月末の休息を見つけられず静かに欠ける (毎月 1 日目が消える)。
+pub fn kosoku_range(month: &str) -> Option<(String, String)> {
+    let (_, to) = month_range(month)?;
+    let year: i32 = month.get(..4)?.parse().ok()?;
+    let mm: u32 = month.get(5..7)?.parse().ok()?;
+    let first = chrono::NaiveDate::from_ymd_opt(year, mm, 1)?;
+    let from = first.checked_sub_signed(chrono::Duration::days(KOSOKU_LOOKBACK_DAYS))?;
+    Some((format!("{from} 00:00:00"), to))
 }
 
 /// 打刻 (`time_card_dstate`) / 運行の確定イベント (`time_card_dtako`) /
@@ -196,13 +248,12 @@ impl MariadbKintaiEventsRepo {
 
 #[async_trait]
 impl KintaiEventsApi for MariadbKintaiEventsRepo {
-    async fn fetch_events(
+    async fn fetch_events_between(
         &self,
-        month: &str,
+        from: &str,
+        to: &str,
         driver: u64,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
-        let (from, to) = month_range(month)
-            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         let mut conn = self
             .pool
             .get_conn()
