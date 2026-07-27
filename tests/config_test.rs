@@ -349,3 +349,48 @@ fn test_kyuyo_config_partial_is_disabled() {
     let config: Config = toml::from_str("[kyuyo]\nauth_worker_origin = \"https://a\"\n").unwrap();
     assert!(!config.kyuyo.auth_configured());
 }
+
+// ══════════════════════════════════════════════════════════════
+// [mariadb] (勤怠の生イベント直読み、Refs #116)
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_mariadb_config_defaults_fail_closed() {
+    let config: Config = toml::from_str("").unwrap();
+    // 接続先は同一ホストの docker `db` コンテナ (loopback 1 hop)
+    assert_eq!(config.mariadb.host, "127.0.0.1");
+    assert_eq!(config.mariadb.port, 3306);
+    assert_eq!(config.mariadb.user, "kintai_reader");
+    assert!(config.mariadb.password.is_empty());
+    assert!(config.mariadb.database.is_empty());
+    // 未設定は無効 (fail-closed — /api/kintai/events が 503)
+    assert!(!config.mariadb.enabled());
+}
+
+#[test]
+fn test_mariadb_config_enabled() {
+    let toml_str = r#"
+[mariadb]
+host = "127.0.0.1"
+port = 3306
+user = "kintai_reader"
+password = "secret"
+database = "ohishi"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.mariadb.enabled());
+    assert_eq!(config.mariadb.database, "ohishi");
+}
+
+#[test]
+fn test_mariadb_config_partial_is_disabled() {
+    // password 無し / database 無しはいずれも無効
+    let config: Config = toml::from_str("[mariadb]\ndatabase = \"ohishi\"\n").unwrap();
+    assert!(!config.mariadb.enabled());
+    let config: Config = toml::from_str("[mariadb]\npassword = \"secret\"\n").unwrap();
+    assert!(!config.mariadb.enabled());
+    // host を空にすれば明示的に無効化できる
+    let config: Config =
+        toml::from_str("[mariadb]\nhost = \"\"\npassword = \"s\"\ndatabase = \"d\"\n").unwrap();
+    assert!(!config.mariadb.enabled());
+}
