@@ -64,6 +64,15 @@ impl KintaiEventsApi for MockEventsRepo {
             None => Ok(self.rows.clone()),
         }
     }
+
+    /// `/events` は `driver` 必須なので一括読みへは降りない。呼ばれたら失敗させる。
+    async fn fetch_all_events_between(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        panic!("/api/kintai/events は全乗務員を読まない")
+    }
 }
 
 fn app(repo: DynKintaiEventsRepo) -> Router {

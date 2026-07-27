@@ -23,7 +23,10 @@ use tower::ServiceExt;
 struct MockRepo {
     rows: Vec<Value>,
     fail: Option<KintaiRepoError>,
+    /// 1 名分の呼び出し (`from`, `to`, 乗務員CD)
     calls: Mutex<Vec<(String, String, u64)>>,
+    /// 全乗務員の呼び出し (`from`, `to`)
+    all_calls: Mutex<Vec<(String, String)>>,
 }
 
 impl MockRepo {
@@ -32,6 +35,7 @@ impl MockRepo {
             rows,
             fail: None,
             calls: Mutex::new(Vec::new()),
+            all_calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -40,7 +44,16 @@ impl MockRepo {
             rows: Vec::new(),
             fail: Some(e),
             calls: Mutex::new(Vec::new()),
+            all_calls: Mutex::new(Vec::new()),
         })
+    }
+
+    fn result(&self) -> Result<Vec<Value>, KintaiRepoError> {
+        match &self.fail {
+            Some(KintaiRepoError::NotConfigured) => Err(KintaiRepoError::NotConfigured),
+            Some(KintaiRepoError::QueryFailed(m)) => Err(KintaiRepoError::QueryFailed(m.clone())),
+            None => Ok(self.rows.clone()),
+        }
     }
 }
 
@@ -56,11 +69,19 @@ impl KintaiEventsApi for MockRepo {
             .lock()
             .unwrap()
             .push((from.to_string(), to.to_string(), driver));
-        match &self.fail {
-            Some(KintaiRepoError::NotConfigured) => Err(KintaiRepoError::NotConfigured),
-            Some(KintaiRepoError::QueryFailed(m)) => Err(KintaiRepoError::QueryFailed(m.clone())),
-            None => Ok(self.rows.clone()),
-        }
+        self.result()
+    }
+
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        self.all_calls
+            .lock()
+            .unwrap()
+            .push((from.to_string(), to.to_string()));
+        self.result()
     }
 }
 
@@ -328,6 +349,103 @@ async fn over_24h_is_capped_and_flagged() {
     assert_eq!(d["restraint_minutes"], 1440);
 }
 
+// --- driver 省略 = 全乗務員 (Refs #125) ---
+
+/// 乗務員CD 付きの打刻行 (一括読みは `driver_id` を持つ)。
+fn tc_of(driver: i64, datetime: &str, state: &str) -> Value {
+    json!({"datetime": datetime, "end_datetime": null, "driver_id": driver,
+           "source": "timecard", "state": state})
+}
+
+#[tokio::test]
+async fn omitting_driver_returns_every_driver() {
+    let (status, body) = serve(
+        vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1018, "2026-06-02 09:25:00", "始業"),
+            tc_of(1018, "2026-06-02 19:39:00", "終業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["month"], "2026-06");
+    // 1 名指定の形 (`driver` / `days`) は出さない
+    assert!(body.get("driver").is_none());
+    assert!(body.get("days").is_none());
+    let drivers = body["drivers"].as_array().unwrap();
+    assert_eq!(drivers.len(), 2);
+    // 乗務員CD 昇順
+    assert_eq!(drivers[0]["driver"], 1018);
+    assert_eq!(drivers[1]["driver"], 1119);
+    // 乗務員ごとに畳む — 混ぜたまま畳むと 06:00〜19:39 の 1 勤務になる
+    assert_eq!(drivers[0]["days"][0]["restraint_minutes"], 614);
+    assert_eq!(drivers[1]["days"][0]["restraint_minutes"], 720);
+}
+
+#[tokio::test]
+async fn bulk_uses_the_same_month_range_and_reads_once() {
+    let repo = MockRepo::with_rows(vec![]);
+    let (status, _) = call(app(repo.clone()), "/api/kintai/kosoku-daily?month=2026-12").await;
+    assert_eq!(status, StatusCode::OK);
+    // 一括の読みは 1 回だけ (96 名を 1 名ずつ叩かない)
+    assert_eq!(
+        *repo.all_calls.lock().unwrap(),
+        vec![(
+            "2026-12-01 00:00:00".to_string(),
+            "2027-01-02 00:00:00".to_string()
+        )]
+    );
+    assert!(repo.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bulk_drops_drivers_without_any_shift() {
+    // 打刻はあるが終業が無い (勤務が組めない) 乗務員は並べない
+    let (status, body) = serve(
+        vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+            tc_of(1442, "2026-06-02 06:00:00", "始業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let drivers = body["drivers"].as_array().unwrap();
+    assert_eq!(drivers.len(), 1);
+    assert_eq!(drivers[0]["driver"], 1119);
+}
+
+#[tokio::test]
+async fn bulk_with_no_events_is_empty_drivers_not_error() {
+    let (status, body) = serve(vec![], "/api/kintai/kosoku-daily?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drivers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn bulk_failures_map_the_same_way() {
+    let (status, body) = call(
+        app(MockRepo::failing(KintaiRepoError::QueryFailed(
+            "boom".into(),
+        ))),
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(body.contains("boom"));
+
+    let (status, body) = call(
+        app(Arc::new(DisabledKintaiEventsRepo)),
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("未設定"));
+}
+
 // --- 検証 ---
 
 #[tokio::test]
@@ -342,15 +460,16 @@ async fn rejects_bad_month() {
         let (status, body) = call(app(repo.clone()), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
         assert!(body.contains("YYYY-MM"));
-        // 検証で弾いた分は DB を叩かない
+        // 検証で弾いた分は DB を叩かない (1 名分も一括も)
         assert!(repo.calls.lock().unwrap().is_empty());
+        assert!(repo.all_calls.lock().unwrap().is_empty());
     }
 }
 
 #[tokio::test]
 async fn rejects_bad_driver() {
     for uri in [
-        "/api/kintai/kosoku-daily?month=2026-06",
+        // 空は「省略」ではなく不正 — front の入れ忘れで 96 名ぶんを返さない
         "/api/kintai/kosoku-daily?month=2026-06&driver=",
         "/api/kintai/kosoku-daily?month=2026-06&driver=10a1",
         "/api/kintai/kosoku-daily?month=2026-06&driver=-1",
