@@ -1,32 +1,66 @@
-//! /api/kintai/events の中継テスト (Refs #114)。
+//! /api/kintai/events のテスト (Refs #114 / #116)。
 //!
-//! CakePHP は wiremock で stub する (`kintai_test.rs` と同じ方針)。ここでも主眼は
-//! 「素通しであること」— 行を解釈しない・未知フィールドを落とさない。加えて
-//! **`driver` が上流へそのまま渡ること**を固定する (省略時に全乗務員を引いて
-//! しまうと生イベントは桁が 1 つ増える)。
+//! データ源は社内 MariaDB の直読みなので、`KintaiEventsApi` の mock を挿して
+//! **DB 無しで** route の振る舞いを固定する (`DynRepo` / MockRepo と同じ形)。
 //!
-//! データ 4 ケース (打刻のみ / 運行のみ / 同日 2 運行 / 日跨ぎ) は issue #114 の
-//! 受け入れ条件。中継は解釈しないので「行がそのまま通ること」を見るテストになる
-//! — 解釈側の規則は Phase 2 (`kosoku-daily`) の担当。
+//! 主眼は「解釈しないこと」— repo が返した行を並べ替えず・畳まず・欠損を埋めずに
+//! そのまま出すこと。ここが崩れると、Phase 2 で規則を決めるための材料
+//! (同日 2 運行の切れ目、細切れ休憩、日跨ぎの終業) が中継段階で消える。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::{Extension, Router};
-use rust_ichibanboshi::cakephp::CakephpClient;
+use rust_ichibanboshi::kintai_repo::{
+    DisabledKintaiEventsRepo, DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError,
+};
 use rust_ichibanboshi::routes;
+use serde_json::{json, Value};
 use tower::ServiceExt;
-use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn app(base_url: String) -> Router {
+/// 呼び出し引数を記録し、仕込んだ結果を返す mock。
+struct MockEventsRepo {
+    rows: Vec<Value>,
+    fail: Option<String>,
+    calls: Mutex<Vec<(String, u64)>>,
+}
+
+impl MockEventsRepo {
+    fn with_rows(rows: Vec<Value>) -> Arc<Self> {
+        Arc::new(Self {
+            rows,
+            fail: None,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn failing(msg: &str) -> Arc<Self> {
+        Arc::new(Self {
+            rows: Vec::new(),
+            fail: Some(msg.to_string()),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl KintaiEventsApi for MockEventsRepo {
+    async fn fetch_events(&self, month: &str, driver: u64) -> Result<Vec<Value>, KintaiRepoError> {
+        self.calls.lock().unwrap().push((month.to_string(), driver));
+        match &self.fail {
+            Some(m) => Err(KintaiRepoError::QueryFailed(m.clone())),
+            None => Ok(self.rows.clone()),
+        }
+    }
+}
+
+fn app(repo: DynKintaiEventsRepo) -> Router {
     Router::new()
         .route("/api/kintai/events", get(routes::kintai::events))
-        .layer(Extension(Arc::new(
-            CakephpClient::new(base_url, 5).expect("client"),
-        )))
+        .layer(Extension(repo))
 }
 
 async fn call(app: Router, uri: &str) -> (StatusCode, String) {
@@ -41,243 +75,186 @@ async fn call(app: Router, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-/// 上流を stub して `/api/kintai/events` を 1 回叩く。
-async fn relay(body: &str, uri: &str) -> (StatusCode, serde_json::Value) {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/time-card/events-json"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(body))
-        .mount(&server)
-        .await;
-    let (status, body) = call(app(server.uri()), uri).await;
-    let v = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+/// rows を仕込んで 1 回叩き、JSON を返す。
+async fn serve(rows: Vec<Value>, uri: &str) -> (StatusCode, Value) {
+    let (status, body) = call(app(MockEventsRepo::with_rows(rows)), uri).await;
+    let v = serde_json::from_str(&body).unwrap_or(Value::Null);
     (status, v)
 }
 
-/// 打刻 (timecard) と運行 (dtako) が混ざった時系列。未知フィールド付き。
-const MIXED_BODY: &str = r#"{
-  "rows": [
-    {"datetime": "2026-07-23 06:11:45", "driver_id": "1051", "source": "timecard",
-     "state": "始業", "unko_no": null, "vehicle": null},
-    {"datetime": "2026-07-23 06:16:24", "driver_id": "1051", "source": "dtako",
-     "state": "運行開始", "unko_no": "20260723-001", "vehicle": "長崎100か4132",
-     "future_field": {"nested": [1, 2, 3]}},
-    {"datetime": "2026-07-23 18:02:10", "driver_id": "1051", "source": "dtako",
-     "state": "運行終了", "unko_no": "20260723-001", "vehicle": "長崎100か4132"},
-    {"datetime": "2026-07-23 18:20:03", "driver_id": "1051", "source": "timecard",
-     "state": "終業", "unko_no": null, "vehicle": null}
-  ],
-  "generated_at": "2026-07-27T00:00:00+09:00"
-}"#;
+fn timecard(datetime: &str, state: &str) -> Value {
+    json!({"datetime": datetime, "end_datetime": null, "driver_id": 1051,
+           "source": "timecard", "state": state, "unko_no": null, "vehicle": null})
+}
 
-#[tokio::test]
-async fn relays_rows_and_preserves_unknown_fields() {
-    let (status, v) = relay(MIXED_BODY, "/api/kintai/events?month=2026-07&driver=1051").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let rows = v["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 4);
-    // 並び・値をいじらない
-    assert_eq!(rows[0]["state"], "始業");
-    assert_eq!(rows[0]["source"], "timecard");
-    assert_eq!(rows[1]["unko_no"], "20260723-001");
-    assert_eq!(rows[1]["vehicle"], "長崎100か4132");
-    assert_eq!(rows[3]["datetime"], "2026-07-23 18:20:03");
-    // 行の未知フィールドもトップレベルの未知フィールドも落ちない
-    assert_eq!(rows[1]["future_field"]["nested"][2], 3);
-    assert_eq!(v["generated_at"], "2026-07-27T00:00:00+09:00");
-    // daily と違いキャッシュを持たないので source / synced_at のメタは足さない
-    assert!(v.get("source").is_none());
-    assert!(v.get("synced_at").is_none());
+fn dtako(datetime: &str, state: &str, unko_no: &str) -> Value {
+    json!({"datetime": datetime, "end_datetime": null, "driver_id": 1051,
+           "source": "dtako", "state": state, "unko_no": unko_no,
+           "vehicle": "長崎100か4132"})
 }
 
 #[tokio::test]
-async fn driver_and_month_are_forwarded_upstream() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/time-card/events-json"))
-        .and(query_param("month", "2026-07"))
-        .and(query_param("driver", "1051"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"rows":[]}"#))
-        .mount(&server)
-        .await;
+async fn returns_rows_verbatim() {
+    let rows = vec![
+        timecard("2026-07-23 06:11:45", "始業"),
+        dtako("2026-07-23 06:16:24", "運行開始", "20260723-001"),
+        json!({"datetime": "2026-07-23 12:04:00", "end_datetime": "2026-07-23 12:11:00",
+               "driver_id": 1051, "source": "dtako_events", "state": "休憩",
+               "unko_no": "20260723-001", "vehicle": "長崎100か4132"}),
+        timecard("2026-07-23 18:20:03", "終業"),
+    ];
+    let (status, v) = serve(rows.clone(), "/api/kintai/events?month=2026-07&driver=1051").await;
+    assert_eq!(status, StatusCode::OK);
+    // 行をいじらない — 並びも値も repo が返したまま
+    assert_eq!(v["rows"], Value::Array(rows));
+    // 7 分の休憩を「短いから」と落としたり丸めたりしない (閾値は規則側の話)
+    assert_eq!(v["rows"][2]["end_datetime"], "2026-07-23 12:11:00");
+    // 非 ASCII が壊れない
+    assert_eq!(v["rows"][1]["vehicle"], "長崎100か4132");
+}
 
-    // month / driver のどちらかが欠けた URL で上流を叩いていたら mock に当たらず 502
-    let (status, body) = call(
-        app(server.uri()),
-        "/api/kintai/events?month=2026-07&driver=1051",
+#[tokio::test]
+async fn month_and_driver_reach_the_repo() {
+    let repo = MockEventsRepo::with_rows(vec![]);
+    let (status, _) = call(
+        app(repo.clone()),
+        "/api/kintai/events?month=2026-07&driver=0012",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(status, StatusCode::OK);
+    // 乗務員CD は整数にしてから渡す (前ゼロは落ちる)
+    assert_eq!(
+        *repo.calls.lock().unwrap(),
+        vec![("2026-07".to_string(), 12)]
+    );
+}
+
+#[tokio::test]
+async fn empty_rows_is_ok() {
+    let (status, v) = serve(vec![], "/api/kintai/events?month=2026-07&driver=1051").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v["rows"].as_array().unwrap().is_empty());
 }
 
 /// 打刻のみの日 (デジタコに乗らない事務員 / 車に乗らなかった日)
 #[tokio::test]
-async fn timecard_only_day_passes_through() {
-    let body = r#"{"rows":[
-      {"datetime":"2026-07-06 08:02:11","driver_id":"1670","source":"timecard",
-       "state":"始業","unko_no":null,"vehicle":null},
-      {"datetime":"2026-07-06 17:31:45","driver_id":"1670","source":"timecard",
-       "state":"終業","unko_no":null,"vehicle":null}
-    ]}"#;
-    let (status, v) = relay(body, "/api/kintai/events?month=2026-07&driver=1670").await;
+async fn timecard_only_day() {
+    let rows = vec![
+        timecard("2026-07-06 08:02:11", "始業"),
+        timecard("2026-07-06 17:31:45", "終業"),
+    ];
+    let (status, v) = serve(rows, "/api/kintai/events?month=2026-07&driver=1670").await;
     assert_eq!(status, StatusCode::OK);
     let rows = v["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|r| r["source"] == "timecard"));
-    // 打刻が無い項目は null のまま (欠損を 0 や "" に化かさない)
+    // 運行が無い項目は null のまま (欠損を 0 や "" に化かさない)
     assert!(rows[0]["unko_no"].is_null());
 }
 
-/// 運行のみの日 (打刻を忘れて出庫した日) — 中継は補完しない
+/// 運行のみの日 (打刻を忘れて出庫した日) — 打刻を補完しない
 #[tokio::test]
-async fn dtako_only_day_passes_through() {
-    let body = r#"{"rows":[
-      {"datetime":"2026-07-07 05:58:02","driver_id":"1051","source":"dtako",
-       "state":"運行開始","unko_no":"20260707-014","vehicle":"長崎100か4132"},
-      {"datetime":"2026-07-07 19:44:30","driver_id":"1051","source":"dtako",
-       "state":"運行終了","unko_no":"20260707-014","vehicle":"長崎100か4132"}
-    ]}"#;
-    let (status, v) = relay(body, "/api/kintai/events?month=2026-07&driver=1051").await;
+async fn dtako_only_day() {
+    let rows = vec![
+        dtako("2026-07-07 05:58:02", "運行開始", "20260707-014"),
+        dtako("2026-07-07 19:44:30", "運行終了", "20260707-014"),
+    ];
+    let (status, v) = serve(rows, "/api/kintai/events?month=2026-07&driver=1051").await;
     assert_eq!(status, StatusCode::OK);
     let rows = v["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r["source"] == "dtako"));
 }
 
-/// 同日 2 運行 — 運行の切れ目 (休息・終業) も行として素通しする
+/// 同日 2 運行 — 運行の切れ目 (休息) も行として残る
 #[tokio::test]
-async fn two_trips_in_one_day_pass_through() {
-    let body = r#"{"rows":[
-      {"datetime":"2026-07-08 05:30:00","driver_id":"1051","source":"dtako",
-       "state":"運行開始","unko_no":"20260708-001","vehicle":"長崎100か4132"},
-      {"datetime":"2026-07-08 11:10:00","driver_id":"1051","source":"dtako",
-       "state":"運行終了","unko_no":"20260708-001","vehicle":"長崎100か4132"},
-      {"datetime":"2026-07-08 11:20:00","driver_id":"1051","source":"dtako",
-       "state":"休息開始","unko_no":"20260708-001","vehicle":"長崎100か4132"},
-      {"datetime":"2026-07-08 13:00:00","driver_id":"1051","source":"dtako",
-       "state":"休息終了","unko_no":"20260708-002","vehicle":"長崎100か4132"},
-      {"datetime":"2026-07-08 13:05:00","driver_id":"1051","source":"dtako",
-       "state":"運行開始","unko_no":"20260708-002","vehicle":"長崎100か4132"},
-      {"datetime":"2026-07-08 20:15:00","driver_id":"1051","source":"dtako",
-       "state":"運行終了","unko_no":"20260708-002","vehicle":"長崎100か4132"}
-    ]}"#;
-    let (status, v) = relay(body, "/api/kintai/events?month=2026-07&driver=1051").await;
+async fn two_trips_in_one_day() {
+    let rows = vec![
+        dtako("2026-07-08 05:30:00", "運行開始", "20260708-001"),
+        dtako("2026-07-08 11:10:00", "運行終了", "20260708-001"),
+        dtako("2026-07-08 11:20:00", "休息", "20260708-001"),
+        dtako("2026-07-08 13:05:00", "運行開始", "20260708-002"),
+        dtako("2026-07-08 20:15:00", "運行終了", "20260708-002"),
+    ];
+    let (status, v) = serve(rows, "/api/kintai/events?month=2026-07&driver=1051").await;
     assert_eq!(status, StatusCode::OK);
     let rows = v["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 6);
-    // 運行NO が 2 つ現れる = 集約されていない (Phase 2 で数える材料が残っている)
+    assert_eq!(rows.len(), 5);
+    // 運行NO が 2 つ残る = 1 日 1 行に畳んでいない
     assert_eq!(rows[0]["unko_no"], "20260708-001");
-    assert_eq!(rows[4]["unko_no"], "20260708-002");
+    assert_eq!(rows[3]["unko_no"], "20260708-002");
 }
 
-/// 日跨ぎ — 月末に始まって翌月へ出る勤務。中継は日付で切り捨てない
+/// 日跨ぎ — 月末に始まり翌月に終わる勤務。月で切らない
 #[tokio::test]
-async fn overnight_shift_passes_through() {
-    let body = r#"{"rows":[
-      {"datetime":"2026-07-31 21:40:00","driver_id":"1051","source":"timecard",
-       "state":"始業","unko_no":null,"vehicle":null},
-      {"datetime":"2026-07-31 22:05:00","driver_id":"1051","source":"dtako",
-       "state":"運行開始","unko_no":"20260731-020","vehicle":"長崎100か4132"},
-      {"datetime":"2026-08-01 07:12:00","driver_id":"1051","source":"dtako",
-       "state":"運行終了","unko_no":"20260731-020","vehicle":"長崎100か4132"},
-      {"datetime":"2026-08-01 07:30:00","driver_id":"1051","source":"timecard",
-       "state":"終業","unko_no":null,"vehicle":null}
-    ]}"#;
-    let (status, v) = relay(body, "/api/kintai/events?month=2026-07&driver=1051").await;
+async fn overnight_shift() {
+    let rows = vec![
+        timecard("2026-07-31 21:40:00", "始業"),
+        dtako("2026-07-31 22:05:00", "運行開始", "20260731-020"),
+        dtako("2026-08-01 07:12:00", "運行終了", "20260731-020"),
+        timecard("2026-08-01 07:30:00", "終業"),
+    ];
+    let (status, v) = serve(rows, "/api/kintai/events?month=2026-07&driver=1051").await;
     assert_eq!(status, StatusCode::OK);
     let rows = v["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 4);
     // 翌月に出た終業も落ちない (月で切ると拘束の終わりが消える)
+    assert_eq!(rows.len(), 4);
     assert_eq!(rows[3]["datetime"], "2026-08-01 07:30:00");
 }
 
 #[tokio::test]
 async fn month_is_required_and_validated() {
-    // 上流が呼ばれないことを mount 無しの server で担保する
-    let server = MockServer::start().await;
+    // repo が呼ばれないことを failing mock で担保する (呼ばれたら 502 になる)
+    let repo = MockEventsRepo::failing("should not be called");
     for uri in [
         "/api/kintai/events?driver=1051",
         "/api/kintai/events?month=&driver=1051",
         "/api/kintai/events?month=2026-7&driver=1051",
         "/api/kintai/events?month=2026-13&driver=1051",
+        "/api/kintai/events?month=2026/07&driver=1051",
     ] {
-        let (status, body) = call(app(server.uri()), uri).await;
+        let (status, body) = call(app(repo.clone()), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "uri={uri}");
         assert!(body.contains("YYYY-MM"), "uri={uri}");
     }
+    assert!(repo.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn driver_is_required_and_validated() {
-    let server = MockServer::start().await;
+    let repo = MockEventsRepo::failing("should not be called");
     for uri in [
         "/api/kintai/events?month=2026-07",
         "/api/kintai/events?month=2026-07&driver=",
         "/api/kintai/events?month=2026-07&driver=abc",
+        "/api/kintai/events?month=2026-07&driver=-1",
     ] {
-        let (status, body) = call(app(server.uri()), uri).await;
+        let (status, body) = call(app(repo.clone()), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "uri={uri}");
         assert!(body.contains("乗務員CD"), "uri={uri}");
     }
+    assert!(repo.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn base_url_unset_is_503() {
+async fn mariadb_unconfigured_is_503() {
+    // 空配列を返して「0 件」に見せず fail-closed であること
     let (status, body) = call(
-        app(String::new()),
+        app(Arc::new(DisabledKintaiEventsRepo)),
         "/api/kintai/events?month=2026-07&driver=1051",
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(body.contains("base_url"));
+    assert!(body.contains("未設定"));
 }
 
 #[tokio::test]
-async fn upstream_5xx_is_502() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
-
+async fn query_failure_is_502_with_cause() {
     let (status, body) = call(
-        app(server.uri()),
+        app(MockEventsRepo::failing("Connection refused (os error 111)")),
         "/api/kintai/events?month=2026-07&driver=1051",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert!(body.contains("500") && body.contains("boom"));
-}
-
-#[tokio::test]
-async fn upstream_non_json_is_502() {
-    // allowlist (`AppController::addUnauthenticatedActions`) 登録漏れでログイン画面の
-    // HTML が返るケース (yhonda-ohishi/nginx#773 で踏んだ罠)
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string("<!DOCTYPE html><html>login</html>"),
-        )
-        .mount(&server)
-        .await;
-
-    let (status, body) = call(
-        app(server.uri()),
-        "/api/kintai/events?month=2026-07&driver=1051",
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert!(body.contains("parse failed"));
-}
-
-#[tokio::test]
-async fn upstream_unreachable_is_502() {
-    let (status, body) = call(
-        app("http://127.0.0.1:1".to_string()),
-        "/api/kintai/events?month=2026-07&driver=1051",
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert!(body.contains("fetch failed"));
+    // DB 停止の原因が応答に残る (ログにも同じ文字列が出る)
+    assert!(body.contains("Connection refused"));
 }
