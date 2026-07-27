@@ -60,8 +60,9 @@ impl std::error::Error for KintaiRepoError {}
 pub trait KintaiEventsApi: Send + Sync {
     /// 任意の期間 `[from, to)` × 乗務員CD の生イベントを時刻昇順で返す。
     ///
-    /// 期間の決め方は呼び出し側の担当 — `/events` は [`month_range`]、
-    /// `/kosoku-daily` は前月末の休息まで遡る [`kosoku_range`] を使う。
+    /// 期間の決め方は呼び出し側の担当。期間をまたぐ区間イベントは
+    /// `EVENTS_SQL` 側が「期間内に終わる区間」として拾うので、
+    /// 呼び出し側が遡る日数を決め打ちする必要はない。
     async fn fetch_events_between(
         &self,
         from: &str,
@@ -76,21 +77,6 @@ pub trait KintaiEventsApi: Send + Sync {
         driver: u64,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         let (from, to) = month_range(month)
-            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
-        self.fetch_events_between(&from, &to, driver).await
-    }
-
-    /// `kosoku-daily` 用。[`kosoku_range`] を当てて**前月末の休息まで遡って**読む。
-    ///
-    /// 期間の組み立てをここに置くのは、route 側に「作れなかった場合」の分岐を
-    /// 残さないため — `is_valid_month` を通った月では必ず作れるので、route に
-    /// 書くと到達しない枝になる。
-    async fn fetch_events_for_kosoku(
-        &self,
-        month: &str,
-        driver: u64,
-    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
-        let (from, to) = kosoku_range(month)
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         self.fetch_events_between(&from, &to, driver).await
     }
@@ -135,33 +121,6 @@ pub fn month_range(month: &str) -> Option<(String, String)> {
     Some((format!("{first} 00:00:00"), format!("{end} 00:00:00")))
 }
 
-/// 勤務を組むために遡る日数。
-///
-/// **これは暫定策。** 正しくは「区間が期間に重なるか」で絞るべきだが、
-/// `COALESCE(終了日時, 開始日時) >= :from` は索引が効かず、`開始日時` の下限を外すと
-/// 全期間スキャンになる。実機で 0.22 秒だったクエリが 4 分経っても返らなくなったため
-/// #121 を revert した (#122)。車輌故障で 1 週間以上停止した場合はこの窓から外れて
-/// 月初の勤務が欠ける — 索引を足すか、直前の数件だけを別ブランチで拾う形に直すこと。
-///
-/// `kosoku-daily` は「休息の終了 = 始業」で勤務を切るので、月初の勤務を確定するには
-/// **前月末の休息**が要る。実測で最長の休息は 38 時間 (2026-04/1442) だったが、
-/// 連休を挟むともっと長くなるため 1 週間遡る。1 乗務員分のイベントしか読まないので
-/// 範囲を広げる代償は小さい。
-const KOSOKU_LOOKBACK_DAYS: i64 = 7;
-
-/// `kosoku-daily` の取得範囲 `[月初-7日, 翌月+1日)`。
-///
-/// [`month_range`] より**前に広い**のが唯一の違い。月の範囲だけで読むと、月初の
-/// 勤務が前月末の休息を見つけられず静かに欠ける (毎月 1 日目が消える)。
-pub fn kosoku_range(month: &str) -> Option<(String, String)> {
-    let (_, to) = month_range(month)?;
-    let year: i32 = month.get(..4)?.parse().ok()?;
-    let mm: u32 = month.get(5..7)?.parse().ok()?;
-    let first = chrono::NaiveDate::from_ymd_opt(year, mm, 1)?;
-    let from = first.checked_sub_signed(chrono::Duration::days(KOSOKU_LOOKBACK_DAYS))?;
-    Some((format!("{from} 00:00:00"), to))
-}
-
 /// 打刻 (`time_card_dstate`) / 運行の確定イベント (`time_card_dtako`) /
 /// デジタコ生イベント (`dtako_events`) を `UNION ALL` して時刻順に並べる。
 ///
@@ -170,6 +129,14 @@ pub fn kosoku_range(month: &str) -> Option<(String, String)> {
 ///   経路に持ち込まない
 /// - `dtako_events` だけ `end_datetime` を持つ (区間イベントのため)。
 ///   **区間長の判定はしない** — 何分から休憩と数えるかは規則側の話
+/// - `dtako_events` は 2 ブランチに分ける。**期間内に始まる区間**に加えて、
+///   **期間内に終わる区間 (開始は期間より前)** も拾う — `kosoku-daily` は
+///   「休息の終了 = 始業」で勤務を切るので、月をまたぐ休息を落とすと月初の勤務が
+///   組めない。2 つは `開始日時` の条件で排他なので重複しない
+/// - **`COALESCE(終了日時, 開始日時) >= :from` で 1 本にまとめてはいけない。**
+///   関数適用で索引が効かず `type=ALL` の全表走査 (427 万行) になる。実機で
+///   0.2 秒が 4 分超になった (#121 → #122 で revert)。`開始日時` と `終了日時` は
+///   それぞれ索引を持つので、条件を分けて両方に効かせる (各 0.2 秒)
 const EVENTS_SQL: &str = r#"
 SELECT DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
        NULL                                         AS end_datetime,
@@ -203,6 +170,19 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
   FROM dtako_events e
   LEFT JOIN dtako_cars c ON c.`車輌CD` = e.`車輌CD`
  WHERE e.`乗務員CD1` = :driver AND e.`開始日時` >= :from AND e.`開始日時` < :to
+UNION ALL
+SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
+       DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
+       e.`乗務員CD1`,
+       'dtako_events',
+       e.`イベント名`,
+       e.`運行NO`,
+       c.`車輌名`
+  FROM dtako_events e
+  LEFT JOIN dtako_cars c ON c.`車輌CD` = e.`車輌CD`
+ WHERE e.`乗務員CD1` = :driver
+   AND e.`終了日時` >= :from AND e.`終了日時` < :to
+   AND e.`開始日時` < :from
  ORDER BY datetime, source
 "#;
 
