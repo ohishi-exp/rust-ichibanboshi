@@ -34,7 +34,7 @@ use serde::Deserialize;
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
-use crate::kosoku::{daily_summary, KosokuParams};
+use crate::kosoku::{daily_summary, split_by_driver, KosokuParams};
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
 /// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
@@ -46,7 +46,11 @@ pub struct DailyQuery {
     pub refresh: Option<String>,
 }
 
-/// `?month=YYYY-MM&driver=1051` (Refs #114)。**両方必須**。
+/// `?month=YYYY-MM&driver=1051` (Refs #114)。`month` は必須。
+///
+/// `driver` は endpoint で扱いが違う — [`events`] は**必須** (生イベントは日別サマリより
+/// 1 桁多く、全乗務員を返す用途が無い)、[`kosoku_daily`] は**省略可**で省略時は全乗務員
+/// (Refs #125)。
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
     pub month: Option<String>,
@@ -236,7 +240,7 @@ pub async fn events(
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
-/// GET /api/kintai/kosoku-daily?month=YYYY-MM&driver=1051 — **打刻基準の日別サマリ**
+/// GET /api/kintai/kosoku-daily?month=YYYY-MM[&driver=1051] — **打刻基準の日別サマリ**
 /// (Refs #118、拘束時間の打刻基準化 Phase 2)。
 ///
 /// `/events` の生イベントを [`crate::kosoku`] の純粋ロジックで日別に畳んで返す。
@@ -247,6 +251,20 @@ pub async fn events(
 /// 勤務は**始業日**で当月に振り分ける。月初の勤務は前月末に始まった休息の終わりを
 /// 始業とするが、その区間は `EVENTS_SQL` が「期間内に終わる区間」として拾うので、
 /// 範囲は `/events` と同じでよい。
+///
+/// ## `driver` を省略すると全乗務員 (Refs #125)
+///
+/// 画面 (nuxt-dtako-admin のタイムカード表) は全乗務員ぶんが要る。1 名ずつ叩くと
+/// 96 名で約 3 秒かかるので、**省略時は 1 リクエストで全員返す** (実測 0.25 秒)。
+/// 応答の形は指定の有無で変わる:
+///
+/// | 呼び方 | 応答 |
+/// |---|---|
+/// | `driver=1051` | `{month, driver, days}` — **既存の形を変えない** |
+/// | 省略 | `{month, drivers: [{driver, days}]}` |
+///
+/// `driver=` (空) は省略ではなく**不正**として 400 にする — front が値を入れ忘れた
+/// ときに、黙って 96 名ぶん (約 1 MB) を返してしまわないため。
 pub async fn kosoku_daily(
     Query(params): Query<EventsQuery>,
     Extension(repo): Extension<DynKintaiEventsRepo>,
@@ -259,7 +277,10 @@ pub async fn kosoku_daily(
             "month は YYYY-MM で指定してください".to_string(),
         ));
     }
-    let driver = match parse_driver(params.driver.as_deref().unwrap_or_default()) {
+    let Some(raw_driver) = params.driver else {
+        return kosoku_daily_all(&month, repo, &params_cfg).await;
+    };
+    let driver = match parse_driver(&raw_driver) {
         Some(d) => d,
         None => {
             return Err((
@@ -280,6 +301,35 @@ pub async fn kosoku_daily(
         "month": month,
         "driver": driver,
         "days": days,
+    })))
+}
+
+/// `driver` 省略時 — 全乗務員ぶんを 1 リクエストで畳む (Refs #125)。
+///
+/// [`daily_summary`] は乗務員を知らない純粋関数なので、**先に
+/// [`split_by_driver`] で分けてから**乗務員ごとに呼ぶ。混ぜたまま渡すと他人の
+/// 休息で勤務が切れる。
+///
+/// **勤務が 1 日も組めなかった乗務員は落とす。** 期間内に打刻も休息も無い人 (退職者・
+/// 内勤) まで空配列で並べると応答が膨らむだけで、受け手にとって「居ない」と同じ。
+async fn kosoku_daily_all(
+    month: &str,
+    repo: DynKintaiEventsRepo,
+    params_cfg: &KosokuParams,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rows = repo.fetch_all_events(month).await.map_err(map_repo_err)?;
+    let drivers: Vec<serde_json::Value> = split_by_driver(rows)
+        .into_iter()
+        .map(|(driver, rows)| (driver, daily_summary(&rows, month, params_cfg)))
+        .filter(|(_, days)| !days.is_empty())
+        .map(|(driver, days)| serde_json::json!({ "driver": driver, "days": days }))
+        .collect();
+    // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
+    let count = drivers.len();
+    tracing::info!(month = %month, drivers = count, "kintai kosoku-daily built for all drivers");
+    Ok(Json(serde_json::json!({
+        "month": month,
+        "drivers": drivers,
     })))
 }
 
