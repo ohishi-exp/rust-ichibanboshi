@@ -30,8 +30,9 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
 | `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
-| `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) と `/api/kintai/events` (MariaDB 直読み) (#99 / #116、下記) |
+| `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) / `/api/kintai/events` (MariaDB 直読み) / `/api/kintai/kosoku-daily` (日別サマリ) (#99 / #116 / #118、下記) |
 | `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116) |
+| `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
 | `src/kyuyo/logic.rs` | 給与の純粋ロジック (項目マッピング・行組み立て)。**coverage 100% 対象** |
 | `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層 |
@@ -52,6 +53,8 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - `/api/kintai/events?month=YYYY-MM&driver=N`: **打刻と運行イベントの生時系列**
   (#114 / #116、拘束時間の打刻基準化 Phase 1)。ここだけ CakePHP を経由せず
   **社内 MariaDB を直読み**する。`driver` 必須・キャッシュ無し・未設定は 503。
+- `/api/kintai/kosoku-daily?month=YYYY-MM&driver=N`: **打刻基準の日別サマリ** (#118、Phase 2)。
+  `events` の生行を `src/kosoku.rs` の純粋ロジックで畳む。**金額は含めない**。下記「日別サマリ」節。
 - `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
@@ -192,6 +195,33 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
 - テストは `tests/kintai_events_test.rs` — `KintaiEventsApi` の mock を挿して **DB 無し**で
   回す。打刻のみ / 運行のみ / 同日 2 運行 / 日跨ぎ の 4 ケースが「解釈されずそのまま通る」
   ことを固定する (解釈は Phase 2 の `kosoku-daily` 側の担当)
+
+### 打刻基準の日別サマリ — `/api/kintai/kosoku-daily` (Refs #118)
+
+`events` の生行を日別に畳む。**規則は #118 で 4 点とも確定済み** (2026-07-27)。畳み込みは
+`src/kosoku.rs` の純粋関数 `daily_summary(rows, month, params)` にあり、DB も HTTP も
+触らないので実データ無しでテストできる。
+
+- **就業時間**: 打刻 (`始業`/`終業`) があればそれを使い、無ければ**休息イベント**
+  (休息の終了 = 始業、休息の開始 = 終業)。**運行では切らない** — 実測で運行の継ぎ目は
+  4〜112 分 (中央 8 分) しかなく勤務の切れ目ではない。打刻と休息は補完関係
+  (日跨ぎの長距離は打刻が無く休息がある / 日帰りは打刻があり休息が無い)
+- **時間区分**: 所定 7.5h (450 分) / 7.5〜8h は法定内残業 (割増 1.0) / 8h 超が法定時間外 (1.25)
+- **法定休日 = 日曜**。祝日は割増に使わない (所定休日で固有の割増が無い)。祝日は表示用に
+  別 API へ (#119)。賃金側も日曜のみで判定していることを 685 乗務員月で実測確認済み
+- **深夜 (22:00〜05:00) は 所定内/時間外 × 平日/法定休日 の 4 区分**。法定外休日は持たない。
+  法定内残業の深夜は所定内と同じ枠 (どちらも基礎 1.0)。**深夜と時間外深夜は排他**
+- **休憩は閾値 (既定 10 分) 以上のイベントのみ**。拘束からは外さない (実働 = 拘束 − 休憩)
+- **24 時間超の拘束は 24 時間で打ち切り** `over_24h` を立てる。改善基準告示に照らして違反で、
+  正確に積む意味がないため (実測の最長は 38.1 時間)
+- **月境界の罠**: 勤務は**始業日**で当月に振り分ける。月初の勤務は前月末の休息が要るので、
+  範囲は `[月初-7日, 翌月+1日)` (`kosoku_range`)。`month_range` のまま実装すると
+  **毎月 1 日目の勤務が静かに欠ける**
+- パラメータは `[kosoku]` (`break_threshold_minutes` / `prescribed_minutes` / `legal_minutes`)。
+  就業規則が変わったら再ビルドせず toml で追随する
+- 認可は `events` と同じ CF Access Service Token (edge) — **応答に金額を含めない**ため
+- テストは `src/kosoku.rs` の unit test (規則の網羅) と `tests/kosoku_daily_test.rs`
+  (route の配線・検証・失敗の写し方) の 2 段
 
 ## 給与 (給与大臣) の読み出し — `/api/kyuyo/*`
 
