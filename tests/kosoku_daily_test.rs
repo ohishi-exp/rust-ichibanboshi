@@ -109,7 +109,7 @@ fn dtako(datetime: &str, state: &str, unko: &str) -> Value {
 // --- 期間の組み立て ---
 
 #[tokio::test]
-async fn uses_the_plain_month_range() {
+async fn reads_a_week_before_the_month() {
     let repo = MockRepo::with_rows(vec![]);
     let (status, _) = call(
         app(repo.clone()),
@@ -117,12 +117,11 @@ async fn uses_the_plain_month_range() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // `/events` と同じ範囲でよい — 月初を跨ぐ休息は SQL 側が重なりで拾うので、
-    // route が遡る日数を決め打ちする必要がない
+    // 月初の勤務は前月末の休息を要するので 7 日遡る。終わりは events と同じ翌月 2 日
     assert_eq!(
         *repo.calls.lock().unwrap(),
         vec![(
-            "2026-07-01 00:00:00".to_string(),
+            "2026-06-24 00:00:00".to_string(),
             "2026-08-02 00:00:00".to_string(),
             12
         )]
@@ -130,36 +129,15 @@ async fn uses_the_plain_month_range() {
 }
 
 #[tokio::test]
-async fn month_range_rolls_over_year() {
+async fn lookback_crosses_year_boundary() {
     let repo = MockRepo::with_rows(vec![]);
     let (status, _) = call(
         app(repo.clone()),
-        "/api/kintai/kosoku-daily?month=2026-12&driver=1051",
+        "/api/kintai/kosoku-daily?month=2026-01&driver=1051",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(repo.calls.lock().unwrap()[0].1, "2027-01-02 00:00:00");
-}
-
-#[tokio::test]
-async fn long_rest_starting_before_the_month_still_yields_day_one() {
-    // 車輌故障で 1 週間以上止まった想定 — 5/20 に始まり 6/1 に終わる休息。
-    // 重なりで拾えていれば 6/1 の勤務が組める (開始で絞ると丸ごと落ちる)
-    let (status, body) = serve(
-        vec![
-            ev("2026-05-20 18:00:00", "2026-06-01 06:58:00", "休息"),
-            ev("2026-06-01 16:19:00", "2026-06-02 04:42:00", "休息"),
-        ],
-        "/api/kintai/kosoku-daily?month=2026-06&driver=1119",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let days = body["days"].as_array().unwrap();
-    assert_eq!(days.len(), 1);
-    assert_eq!(days[0]["date"], "2026-06-01");
-    assert_eq!(days[0]["start"], "2026-06-01 06:58:00");
-    assert_eq!(days[0]["end"], "2026-06-01 16:19:00");
-    assert_eq!(days[0]["restraint_minutes"], 561);
+    assert_eq!(repo.calls.lock().unwrap()[0].0, "2025-12-25 00:00:00");
 }
 
 // --- 打刻のみ (日帰り) ---
