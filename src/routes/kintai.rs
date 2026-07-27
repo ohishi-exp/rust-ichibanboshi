@@ -244,8 +244,8 @@ pub async fn events(
 /// (edge) のままでよいのはそのため。金額を足すことになったら `/kyuyo/*` と同じ
 /// in-service gate へ移すこと。
 ///
-/// 勤務は**始業日**で当月に振り分ける。月初の勤務は前月末の休息を要するため、
-/// イベントは [`crate::kintai_repo::kosoku_range`] で前に遡って読む。
+/// 勤務は**始業日**で当月に振り分ける。月初の勤務は前月末に始まった休息の終わりを
+/// 始業とするが、区間イベントは重なりで拾うので `/events` と同じ範囲で足りる。
 pub async fn kosoku_daily(
     Query(params): Query<EventsQuery>,
     Extension(repo): Extension<DynKintaiEventsRepo>,
@@ -268,7 +268,7 @@ pub async fn kosoku_daily(
         }
     };
     let rows = repo
-        .fetch_events_for_kosoku(&month, driver)
+        .fetch_events(&month, driver)
         .await
         .map_err(map_repo_err)?;
     let days = daily_summary(&rows, &month, &params_cfg);
