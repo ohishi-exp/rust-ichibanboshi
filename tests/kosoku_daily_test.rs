@@ -401,21 +401,29 @@ async fn bulk_uses_the_same_month_range_and_reads_once() {
 }
 
 #[tokio::test]
-async fn bulk_drops_drivers_without_any_shift() {
-    // 打刻はあるが終業が無い (勤務が組めない) 乗務員は並べない
+async fn bulk_drops_drivers_without_any_shift_or_punch() {
+    // 勤務も打刻も無い乗務員は並べない。**打刻だけの乗務員は並べる** — 対になる終業が
+    // 無い始業も表に出すため (Refs #137)
     let (status, body) = serve(
         vec![
             tc_of(1119, "2026-06-02 06:00:00", "始業"),
             tc_of(1119, "2026-06-02 18:00:00", "終業"),
             tc_of(1442, "2026-06-02 06:00:00", "始業"),
+            json!({"datetime": "2026-06-02 08:00:00", "end_datetime": null, "driver_id": 1500,
+                   "source": "dtako", "state": "運行開始"}),
         ],
         "/api/kintai/kosoku-daily?month=2026-06",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let drivers = body["drivers"].as_array().unwrap();
-    assert_eq!(drivers.len(), 1);
+    assert_eq!(drivers.len(), 2);
     assert_eq!(drivers[0]["driver"], 1119);
+    assert_eq!(drivers[0]["punches"].as_array().unwrap().len(), 2);
+    // 勤務は組めないが打刻はある乗務員
+    assert_eq!(drivers[1]["driver"], 1442);
+    assert_eq!(drivers[1]["days"].as_array().unwrap().len(), 0);
+    assert_eq!(drivers[1]["punches"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

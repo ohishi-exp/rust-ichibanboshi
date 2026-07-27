@@ -290,13 +290,33 @@ fn is_night(t: NaiveDateTime) -> bool {
 
 /// 打刻から勤務を組む。`始業` の後に来る最初の `終業` と対にする。
 ///
-/// 終業が見つからない始業 (月末で切れた等) は捨てる — 終業が無ければ拘束が出せない。
+/// **終業が見つからない始業は、次の休息の開始で終わらせる** (Refs #137)。以前は捨てて
+/// いたが、それだとその日の勤務が 1 本も組まれず、**実働も残業も出ないまま表から消える**
+/// (実測: 乗務員 1021 の 2026-04-17 06:46 の始業は対になる終業が翌月まで無く、17 日の
+/// 行が丸ごと空になっていた)。休息由来の勤務は「休息の終了」からしか始まらないので、
+/// 運行に出た直後の区間はこの手当てが無いと拾えない。
+///
+/// 次の休息も無ければ捨てる — 終わりを決める手がかりが何も無いため。
 fn shifts_from_timecard(events: &[Event]) -> Vec<Shift> {
     let mut out = Vec::new();
     let mut pending: Option<NaiveDateTime> = None;
     for e in events.iter().filter(|e| e.source == "timecard") {
         match e.state.as_str() {
-            "始業" => pending = Some(e.start),
+            "始業" => {
+                // 前の始業が終業を持たないまま次の始業が来たら、前の分を休息で閉じる
+                if let Some(start) = pending.take() {
+                    if let Some(end) = next_rest_start(events, start) {
+                        if end > start {
+                            out.push(Shift {
+                                start,
+                                end,
+                                source: ShiftSource::Timecard,
+                            });
+                        }
+                    }
+                }
+                pending = Some(e.start);
+            }
             "終業" => {
                 if let Some(start) = pending.take() {
                     if e.start > start {
@@ -311,7 +331,29 @@ fn shifts_from_timecard(events: &[Event]) -> Vec<Shift> {
             _ => {}
         }
     }
+    if let Some(start) = pending {
+        if let Some(end) = next_rest_start(events, start) {
+            if end > start {
+                out.push(Shift {
+                    start,
+                    end,
+                    source: ShiftSource::Timecard,
+                });
+            }
+        }
+    }
+    out.sort_by_key(|s| s.start);
     out
+}
+
+/// `after` より後で最初に始まる休息の開始時刻 (Refs #137)。
+fn next_rest_start(events: &[Event], after: NaiveDateTime) -> Option<NaiveDateTime> {
+    events
+        .iter()
+        .filter(|e| e.state == "休息" && e.source == "dtako_events")
+        .map(|e| e.start)
+        .filter(|t| *t > after)
+        .min()
 }
 
 /// 休息イベントから勤務を組む。**休息の終了 = 始業、次の休息の開始 = 終業。**
@@ -656,6 +698,24 @@ pub fn split_by_driver(rows: Vec<serde_json::Value>) -> Vec<(u64, Vec<serde_json
         by_driver.entry(driver).or_default().push(row);
     }
     by_driver.into_iter().collect()
+}
+
+/// 対象月に押された打刻 (`始業` / `終業`) を時刻順にそのまま返す (Refs #137)。
+///
+/// **勤務に紐づけない。** `DaySummary.punches` は勤務を構成した打刻なので、対になる
+/// 終業が無い始業は勤務が組めず落ちる (実測: 乗務員 1021 の 2026-04-17 06:46 の始業は
+/// 対になる終業が翌月まで無く、表から消えていた)。**タイムカードは押された打刻を
+/// そのまま並べるもの**なので、画面にはこちらを渡す。
+pub fn month_punches(rows: &[serde_json::Value], month: &str) -> Vec<Punch> {
+    parse_events(rows)
+        .iter()
+        .filter(|e| e.source == "timecard" && (e.state == "始業" || e.state == "終業"))
+        .map(|e| Punch {
+            at: e.start.format(FMT).to_string(),
+            state: e.state.clone(),
+        })
+        .filter(|p| p.at.starts_with(month))
+        .collect()
 }
 
 /// 生イベント列 → 対象月の日別サマリ。
@@ -1342,6 +1402,64 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert!(days[0].over_24h);
+    }
+
+    // --- 終業の無い始業 / 月の打刻 (Refs #137) ---
+
+    #[test]
+    fn an_unpaired_punch_in_starts_a_shift_that_ends_at_the_next_rest() {
+        // 乗務員 1021 / 2026-04-17 の形 — 始業打刻の相手が翌月まで無く、17 日の行が
+        // 丸ごと空になっていた
+        let rows = vec![
+            tc("2026-06-17 06:46:00", "始業"),
+            ev("2026-06-17 16:00:00", "2026-06-18 05:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-06-17 06:46:00");
+        assert_eq!(days[0].end, "2026-06-17 16:00:00");
+        assert_eq!(days[0].source, ShiftSource::Timecard);
+        assert_eq!(days[0].punches.len(), 1);
+    }
+
+    #[test]
+    fn an_unpaired_punch_in_without_a_rest_is_dropped() {
+        // 終わりを決める手がかりが無ければ従来どおり捨てる
+        let rows = vec![tc("2026-06-17 06:46:00", "始業")];
+        assert!(daily_summary(&rows, "2026-06", &KosokuParams::default()).is_empty());
+    }
+
+    #[test]
+    fn two_punch_ins_in_a_row_close_the_first_at_the_next_rest() {
+        let rows = vec![
+            tc("2026-06-17 06:46:00", "始業"),
+            ev("2026-06-17 16:00:00", "2026-06-18 05:00:00", "休息"),
+            tc("2026-06-18 06:00:00", "始業"),
+            tc("2026-06-18 18:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].end, "2026-06-17 16:00:00");
+        assert_eq!(days[1].start, "2026-06-18 06:00:00");
+        assert_eq!(days[1].end, "2026-06-18 18:00:00");
+    }
+
+    #[test]
+    fn month_punches_returns_every_punch_in_the_month() {
+        // 勤務に紐づかない打刻も返す (対になる終業が無い始業を表から消さない)
+        let rows = vec![
+            tc("2026-06-03 06:33:38", "始業"),
+            tc("2026-06-09 15:16:02", "終業"),
+            tc("2026-06-17 06:46:04", "始業"),
+            tc("2026-07-01 06:10:07", "始業"),
+            dtako("2026-06-05 08:00:00", "運行開始"),
+        ];
+        let p = month_punches(&rows, "2026-06");
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0].at, "2026-06-03 06:33:38");
+        assert_eq!(p[2].at, "2026-06-17 06:46:04");
+        // 打刻以外は入れない / 翌月は入れない
+        assert!(p.iter().all(|x| x.state == "始業" || x.state == "終業"));
     }
 
     // --- 24 時間超は最後の運行終了で終わらせる (Refs #135) ---

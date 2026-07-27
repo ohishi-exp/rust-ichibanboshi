@@ -34,7 +34,7 @@ use serde::Deserialize;
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
-use crate::kosoku::{daily_summary, split_by_driver, KosokuParams};
+use crate::kosoku::{daily_summary, month_punches, split_by_driver, KosokuParams};
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
 /// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
@@ -301,6 +301,7 @@ pub async fn kosoku_daily(
         "month": month,
         "driver": driver,
         "days": days,
+        "punches": month_punches(&rows, &month),
     })))
 }
 
@@ -320,9 +321,16 @@ async fn kosoku_daily_all(
     let rows = repo.fetch_all_events(month).await.map_err(map_repo_err)?;
     let drivers: Vec<serde_json::Value> = split_by_driver(rows)
         .into_iter()
-        .map(|(driver, rows)| (driver, daily_summary(&rows, month, params_cfg)))
-        .filter(|(_, days)| !days.is_empty())
-        .map(|(driver, days)| serde_json::json!({ "driver": driver, "days": days }))
+        .map(|(driver, rows)| {
+            let days = daily_summary(&rows, month, params_cfg);
+            // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
+            let punches = month_punches(&rows, month);
+            (driver, days, punches)
+        })
+        .filter(|(_, days, punches)| !days.is_empty() || !punches.is_empty())
+        .map(|(driver, days, punches)| {
+            serde_json::json!({ "driver": driver, "days": days, "punches": punches })
+        })
         .collect();
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = drivers.len();
