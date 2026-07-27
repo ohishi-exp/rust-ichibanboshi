@@ -373,6 +373,67 @@ fn punches_in(events: &[Event], from: NaiveDateTime, to: NaiveDateTime) -> Vec<P
         .collect()
 }
 
+/// **24 時間を超える打刻の勤務を、中の休息イベントで切り直す** (Refs #133)。
+///
+/// 長距離は打刻が運行 1 本 (数日) をまるごと挟む。実測: 乗務員 1021 は
+/// `2026-04-03 06:33 始業 → 2026-04-09 15:16 終業` の**1 勤務 6 日間**で、24 時間で
+/// 打ち切ると 4/5 以降に配る値が何も無くなる (画面が空欄になる)。
+///
+/// 打刻優先 (#118) は維持したまま、**明らかに包みすぎている勤務だけ**休息で割る。
+/// 社内 CakePHP (`CalDtakoKosoku`) も運行単位に区切ってから暦日へ配っており、
+/// 打刻と運行イベントを同列に扱っていない (2026-07-27 ユーザー指摘)。
+///
+/// - 切るのは **24 時間を超えた勤務だけ**。通常の勤務の中の休息では切らない
+///   (#118 の「運行では切らない」を崩さない)
+/// - 休息は勤務の中に切り詰めてから使う。重なった休息はまとめる
+/// - 割った後も 24 時間を超える区間が残ったら、それは呼び出し側で打ち切られる
+///   (休息を挟まず 24 時間以上走り続けた = 本当に違反の可能性が高い区間)
+fn split_long_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
+    if (shift.end - shift.start).num_minutes() <= MAX_RESTRAINT_MINUTES {
+        return vec![shift.clone()];
+    }
+    let mut rests: Vec<(NaiveDateTime, NaiveDateTime)> = events
+        .iter()
+        .filter(|e| e.state == "休息" && e.source == "dtako_events")
+        .filter_map(|e| e.end.map(|end| (floor_min(e.start), floor_min(end))))
+        .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
+        .filter(|(s, e)| e > s)
+        .collect();
+    rests.sort();
+    let mut merged: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+    for (s, e) in rests {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    let mut out = Vec::new();
+    let mut cur = shift.start;
+    for (s, e) in merged {
+        if s > cur {
+            out.push(Shift {
+                start: cur,
+                end: s,
+                source: shift.source,
+            });
+        }
+        cur = cur.max(e);
+    }
+    if shift.end > cur {
+        out.push(Shift {
+            start: cur,
+            end: shift.end,
+            source: shift.source,
+        });
+    }
+    // 休息が 1 つも無ければ元のまま (打ち切りに任せる)
+    if out.is_empty() {
+        vec![shift.clone()]
+    } else {
+        out
+    }
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -583,6 +644,8 @@ pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) 
             source: s.source,
         })
         .filter(|s| s.end > s.start)
+        // 打刻が数日をまとめて挟んだ勤務は、中の休息で切り直す (Refs #133)
+        .flat_map(|s| split_long_shift(&s, &events))
         .map(|s| summarize(&s, &events, p))
         .filter(|d| d.date.starts_with(month))
         .collect()
@@ -1136,6 +1199,119 @@ mod tests {
         let p = Punch { at: "2026-06-02 09:25:37".into(), state: "始業".into() };
         assert_eq!(p.clone(), p);
         assert!(format!("{p:?}").contains("始業"));
+    }
+
+    // --- 24 時間超の勤務を休息で切り直す (Refs #133) ---
+
+    #[test]
+    fn long_punch_shift_is_split_by_rests() {
+        // 乗務員 1021 / 2026-04 と同じ形 — 打刻が 6 日間を 1 勤務として挟む
+        let rows = vec![
+            tc("2026-06-03 06:33:00", "始業"),
+            ev("2026-06-03 20:00:00", "2026-06-04 06:00:00", "休息"),
+            ev("2026-06-04 21:00:00", "2026-06-05 07:00:00", "休息"),
+            tc("2026-06-05 15:16:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[0].start, "2026-06-03 06:33:00");
+        assert_eq!(days[0].end, "2026-06-03 20:00:00");
+        assert_eq!(days[1].start, "2026-06-04 06:00:00");
+        assert_eq!(days[1].end, "2026-06-04 21:00:00");
+        assert_eq!(days[2].start, "2026-06-05 07:00:00");
+        assert_eq!(days[2].end, "2026-06-05 15:16:00");
+        // 休息で割れたので打ち切りは残らない
+        assert!(days.iter().all(|d| !d.over_24h));
+        // 打刻は端の勤務にだけ付く (中の勤務は休息で切っただけなので打刻が無い)
+        assert_eq!(days[0].punches.len(), 1);
+        assert_eq!(days[0].punches[0].state, "始業");
+        assert!(days[1].punches.is_empty());
+        assert_eq!(days[2].punches[0].state, "終業");
+    }
+
+    #[test]
+    fn splitting_removes_the_24h_cap_where_rests_exist() {
+        let rows = vec![
+            tc("2026-06-03 06:00:00", "始業"),
+            ev("2026-06-03 20:00:00", "2026-06-04 06:00:00", "休息"),
+            tc("2026-06-04 18:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 2);
+        assert!(days.iter().all(|d| !d.over_24h));
+        assert_eq!(days[0].restraint_minutes, 840); // 06:00〜20:00
+        assert_eq!(days[1].restraint_minutes, 720); // 翌 06:00〜18:00
+    }
+
+    #[test]
+    fn a_long_shift_without_rests_is_still_capped() {
+        // 休息を挟まず 24 時間以上 = 切る根拠が無いので従来どおり打ち切る
+        let rows = vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-03 20:08:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert!(days[0].over_24h);
+        assert_eq!(days[0].restraint_minutes, 1440);
+    }
+
+    #[test]
+    fn a_normal_shift_is_not_split_by_a_rest_inside() {
+        // 24 時間以内の勤務は休息があっても切らない (#118 の「運行では切らない」を崩さない)
+        let rows = vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休息"),
+            tc("2026-06-02 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].restraint_minutes, 840);
+    }
+
+    #[test]
+    fn rests_hanging_off_the_edges_are_clipped() {
+        // 勤務の前後にはみ出した休息で先頭・末尾を削らない
+        let rows = vec![
+            tc("2026-06-03 06:00:00", "始業"),
+            ev("2026-06-02 20:00:00", "2026-06-03 07:00:00", "休息"), // 前にはみ出す
+            ev("2026-06-03 22:00:00", "2026-06-04 08:00:00", "休息"),
+            tc("2026-06-04 18:00:00", "終業"), // 全体では 36 時間
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 2);
+        // 06:00〜07:00 は休息に食われる (はみ出した分は勤務の中へ切り詰める)
+        assert_eq!(days[0].start, "2026-06-03 07:00:00");
+        assert_eq!(days[0].end, "2026-06-03 22:00:00");
+        assert_eq!(days[1].start, "2026-06-04 08:00:00");
+        assert_eq!(days[1].end, "2026-06-04 18:00:00");
+    }
+
+    #[test]
+    fn overlapping_rests_are_merged_before_splitting() {
+        let rows = vec![
+            tc("2026-06-03 06:00:00", "始業"),
+            ev("2026-06-04 02:00:00", "2026-06-04 10:00:00", "休息"),
+            ev("2026-06-04 08:00:00", "2026-06-04 12:00:00", "休息"),
+            tc("2026-06-04 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].end, "2026-06-04 02:00:00");
+        assert_eq!(days[1].start, "2026-06-04 12:00:00");
+    }
+
+    #[test]
+    fn a_rest_covering_the_whole_shift_leaves_it_alone() {
+        // 切ると何も残らない場合は元の勤務のまま (打ち切りに任せる)
+        let rows = vec![
+            tc("2026-06-03 06:00:00", "始業"),
+            ev("2026-06-03 06:00:00", "2026-06-05 06:00:00", "休息"),
+            tc("2026-06-05 06:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert!(days[0].over_24h);
     }
 
     // --- 暦日按分の内訳 (Refs #130) ---
