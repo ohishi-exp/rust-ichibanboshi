@@ -141,6 +141,49 @@ pub enum ShiftSource {
     Rest,
 }
 
+/// 日跨ぎ勤務を**暦日で按分**した 1 日分 (Refs #130)。
+///
+/// 現行の拘束時間管理表 (社内 CakePHP) は拘束を暦日へ配っている。勤務を始業日へ丸ごと
+/// 寄せた `DaySummary` とは日別の見え方が変わる (月合計は一致) ため、同じ基準で読める
+/// ように内訳を添える。
+///
+/// **1 日で終わる勤務では空** — その場合は内訳が `DaySummary` そのものになるので、
+/// 応答を膨らませる意味が無い。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DayPart {
+    /// 暦日 (`YYYY-MM-DD`)。
+    pub date: String,
+    /// その日に乗った拘束 (休憩を含む)。
+    pub restraint_minutes: i64,
+    /// その日に乗った実働。
+    pub working_minutes: i64,
+    /// その日に乗った法定時間外。
+    pub overtime_minutes: i64,
+    /// その日に乗った法定休日労働。
+    pub legal_holiday_minutes: i64,
+    /// その日に乗った深夜 (所定内・法定内残業ぶん)。
+    pub night_minutes: i64,
+    /// その日に乗った時間外深夜。
+    pub overtime_night_minutes: i64,
+    /// その日に乗った法定休日の深夜。
+    pub legal_holiday_night_minutes: i64,
+}
+
+impl DayPart {
+    fn new(date: chrono::NaiveDate) -> Self {
+        Self {
+            date: date.format("%Y-%m-%d").to_string(),
+            restraint_minutes: 0,
+            working_minutes: 0,
+            overtime_minutes: 0,
+            legal_holiday_minutes: 0,
+            night_minutes: 0,
+            overtime_night_minutes: 0,
+            legal_holiday_night_minutes: 0,
+        }
+    }
+}
+
 /// 勤務を構成した打刻 1 つ (Refs #128)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Punch {
@@ -168,6 +211,11 @@ pub struct DaySummary {
     ///   落ちる (実測: 乗務員 1194 の 2026-04-01 始業 → 2026-04-03 16:47 終業)
     /// - 休息イベント由来の勤務 (`source: rest`) は空
     pub punches: Vec<Punch>,
+    /// **暦日按分の内訳** (Refs #130)。日跨ぎ勤務だけ入り、1 日で終わる勤務は空。
+    ///
+    /// この行の各分数は勤務を**始業日へ丸ごと寄せた**値。現行の拘束時間管理表は
+    /// 暦日へ配っているので、同じ基準で読みたい消費者はこちらを足し合わせる。
+    pub parts: Vec<DayPart>,
     /// 始業日が日曜か。
     pub is_legal_holiday: bool,
     /// 拘束が 24 時間を超えたため打ち切ったか。**改善基準告示に照らして違反**であり、
@@ -289,6 +337,25 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
         .collect()
 }
 
+/// 区間 `[from, to)` を暦日で切り、日ごとの分数を返す (Refs #130)。
+///
+/// 日跨ぎ勤務の拘束を**暦日で按分**するため。月合計は始業日へ丸ごと寄せた場合と
+/// 一致するが、日別と月境界が変わる。
+fn split_by_date(start: NaiveDateTime, end: NaiveDateTime) -> Vec<(chrono::NaiveDate, i64)> {
+    let mut out = Vec::new();
+    let mut cur = start;
+    while cur < end {
+        // 翌日 0:00 (最終日は勤務の終わり) までがその日の分
+        let next_midnight = (cur.date() + Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .expect("0:00 は常に有効");
+        let bound = next_midnight.min(end);
+        out.push((cur.date(), (bound - cur).num_minutes()));
+        cur = bound;
+    }
+    out
+}
+
 /// 区間 `[from, to]` に入る打刻 (`始業` / `終業`) を時刻順に拾う (Refs #128)。
 ///
 /// **両端を含む** — 勤務の始業・終業そのものを落とさないため。比較は**分に丸めてから**
@@ -405,36 +472,53 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     let mut elapsed = 0i64;
     let (mut statutory, mut within, mut overtime, mut holiday) = (0i64, 0i64, 0i64, 0i64);
     let (mut night, mut ot_night, mut hol_night) = (0i64, 0i64, 0i64);
+    // 暦日按分の内訳 (Refs #130)。1 分ずつ歩くついでにその分が乗る暦日へ振る
+    let mut parts: BTreeMap<chrono::NaiveDate, DayPart> = BTreeMap::new();
 
     for (s, e) in &intervals {
         let mut t = *s;
         while t < *e {
             let n = is_night(t);
+            let part = parts.entry(t.date()).or_insert_with(|| DayPart::new(t.date()));
             if is_legal_holiday {
                 holiday += 1;
+                part.legal_holiday_minutes += 1;
                 if n {
                     hol_night += 1;
+                    part.legal_holiday_night_minutes += 1;
                 }
             } else if elapsed < p.prescribed_minutes {
                 statutory += 1;
                 if n {
                     night += 1;
+                    part.night_minutes += 1;
                 }
             } else if elapsed < p.legal_minutes {
                 within += 1;
                 // 法定内残業は割増 1.0 なので、深夜は所定内と同じ 0.25 上乗せで足りる
                 if n {
                     night += 1;
+                    part.night_minutes += 1;
                 }
             } else {
                 overtime += 1;
+                part.overtime_minutes += 1;
                 if n {
                     ot_night += 1;
+                    part.overtime_night_minutes += 1;
                 }
             }
+            part.working_minutes += 1;
             elapsed += 1;
             t += Duration::minutes(1);
         }
+    }
+    // 拘束は休憩も含む区間なので、実働の歩きとは別に暦日へ切り分ける
+    for (date, minutes) in split_by_date(shift.start, shift.end) {
+        parts
+            .entry(date)
+            .or_insert_with(|| DayPart::new(date))
+            .restraint_minutes += minutes;
     }
 
     DaySummary {
@@ -443,6 +527,12 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         end: shift.end.format(FMT).to_string(),
         source: shift.source,
         punches,
+        // 1 日で終わる勤務は内訳がこの行そのものなので出さない (応答を膨らませない)
+        parts: if parts.len() > 1 {
+            parts.into_values().collect()
+        } else {
+            Vec::new()
+        },
         is_legal_holiday,
         over_24h,
         restraint_minutes: (shift.end - shift.start).num_minutes(),
@@ -1046,6 +1136,122 @@ mod tests {
         let p = Punch { at: "2026-06-02 09:25:37".into(), state: "始業".into() };
         assert_eq!(p.clone(), p);
         assert!(format!("{p:?}").contains("始業"));
+    }
+
+    // --- 暦日按分の内訳 (Refs #130) ---
+
+    #[test]
+    fn parts_split_an_overnight_shift_by_calendar_day() {
+        let rows = vec![
+            tc("2026-06-02 22:00:00", "始業"),
+            tc("2026-06-03 08:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.parts.len(), 2);
+        assert_eq!(d.parts[0].date, "2026-06-02");
+        assert_eq!(d.parts[0].restraint_minutes, 120); // 22:00〜24:00
+        assert_eq!(d.parts[1].date, "2026-06-03");
+        assert_eq!(d.parts[1].restraint_minutes, 480); // 0:00〜8:00
+        // 内訳の合計は行の値と一致する (月合計は寄せ方によらない)
+        assert_eq!(
+            d.parts.iter().map(|p| p.restraint_minutes).sum::<i64>(),
+            d.restraint_minutes
+        );
+        assert_eq!(
+            d.parts.iter().map(|p| p.working_minutes).sum::<i64>(),
+            d.working_minutes
+        );
+        assert_eq!(
+            d.parts.iter().map(|p| p.night_minutes).sum::<i64>(),
+            d.night_minutes
+        );
+    }
+
+    #[test]
+    fn parts_put_night_minutes_on_the_day_they_fall() {
+        let rows = vec![
+            tc("2026-06-02 22:00:00", "始業"),
+            tc("2026-06-03 08:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        // 深夜は 22:00〜24:00 (120 分) と 0:00〜5:00 (300 分)
+        assert_eq!(d.parts[0].night_minutes, 120);
+        assert_eq!(d.parts[1].night_minutes, 300);
+        // 時間外は経過実働 8h 超 = 6/3 06:00 以降なので翌日側にだけ乗る
+        assert_eq!(d.parts[0].overtime_minutes, 0);
+        assert_eq!(d.parts[1].overtime_minutes, 120);
+    }
+
+    #[test]
+    fn parts_are_empty_for_a_same_day_shift() {
+        // 内訳が行そのものになるので出さない (応答を膨らませない)
+        let rows = vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        assert!(daily_summary(&rows, "2026-06", &KosokuParams::default())[0]
+            .parts
+            .is_empty());
+    }
+
+    #[test]
+    fn parts_cover_a_legal_holiday_that_spills_into_monday() {
+        let rows = vec![
+            tc("2026-06-07 20:00:00", "始業"), // 日曜
+            tc("2026-06-08 04:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(d.is_legal_holiday);
+        // 法定休日の判定は勤務単位 (始業日) — 月曜へこぼれた分も法定休日のまま
+        assert_eq!(d.parts[1].legal_holiday_minutes, 240);
+        assert_eq!(d.parts[1].legal_holiday_night_minutes, 240);
+        assert_eq!(
+            d.parts.iter().map(|p| p.legal_holiday_minutes).sum::<i64>(),
+            d.legal_holiday_minutes
+        );
+    }
+
+    #[test]
+    fn parts_split_a_capped_shift_at_the_cut() {
+        // 24 時間で打ち切った勤務は打ち切り後の区間だけを配る
+        let rows = vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-03 20:08:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(d.over_24h);
+        assert_eq!(
+            d.parts.iter().map(|p| p.restraint_minutes).sum::<i64>(),
+            1440
+        );
+        assert_eq!(d.parts.last().unwrap().date, "2026-06-03");
+    }
+
+    #[test]
+    fn split_by_date_cuts_at_midnight() {
+        let v = split_by_date(dt("2026-06-02 22:00:00"), dt("2026-06-04 08:00:00"));
+        assert_eq!(
+            v,
+            vec![
+                (chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(), 120),
+                (chrono::NaiveDate::from_ymd_opt(2026, 6, 3).unwrap(), 1440),
+                (chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap(), 480),
+            ]
+        );
+        // 同じ日で終わる区間は 1 つだけ
+        assert_eq!(
+            split_by_date(dt("2026-06-02 09:00:00"), dt("2026-06-02 18:00:00")).len(),
+            1
+        );
+        // 空区間は何も返さない
+        assert!(split_by_date(dt("2026-06-02 09:00:00"), dt("2026-06-02 09:00:00")).is_empty());
+    }
+
+    #[test]
+    fn day_part_traits_are_wired() {
+        let p = DayPart::new(chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap());
+        assert_eq!(p.clone(), p);
+        assert!(format!("{p:?}").contains("2026-06-02"));
     }
 
     // --- 乗務員ごとの分割 (Refs #125) ---
