@@ -70,6 +70,8 @@
 //! 「期間内に始まる区間」に加えて「期間内に終わる区間」も拾うので、この休息は範囲に入る。
 //! 拾い漏らすと毎月 1 日目の勤務が静かに欠ける。
 
+use std::collections::BTreeMap;
+
 use chrono::{Datelike, Duration, NaiveDateTime, Timelike, Weekday};
 use serde::Serialize;
 
@@ -413,6 +415,25 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         overtime_night_minutes: ot_night,
         legal_holiday_night_minutes: hol_night,
     }
+}
+
+/// 全乗務員ぶんの生イベント列を**乗務員ごとに分ける** (Refs #125)。
+///
+/// [`daily_summary`] は乗務員を知らない — 1 人ぶんのイベント列を前提に休息で勤務を
+/// 切るので、混ざったまま渡すと他人の休息で勤務が切れる。**畳む前にここで分ける。**
+///
+/// - 乗務員CD 昇順で返す (行の並びは入力のまま維持する)
+/// - **`driver_id` が無い / 数でない / 負の行は捨てる。** 誰のものか決められない行を
+///   どこかの乗務員に混ぜると、その人の拘束が静かに伸びる
+pub fn split_by_driver(rows: Vec<serde_json::Value>) -> Vec<(u64, Vec<serde_json::Value>)> {
+    let mut by_driver: BTreeMap<u64, Vec<serde_json::Value>> = BTreeMap::new();
+    for row in rows {
+        let Some(driver) = row.get("driver_id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        by_driver.entry(driver).or_default().push(row);
+    }
+    by_driver.into_iter().collect()
 }
 
 /// 生イベント列 → 対象月の日別サマリ。
@@ -910,6 +931,79 @@ mod tests {
         assert!(d.over_24h);
         assert_eq!(d.break_minutes, 0);
         assert_eq!(d.working_minutes, 1440);
+    }
+
+    // --- 乗務員ごとの分割 (Refs #125) ---
+
+    fn tc_of(driver: i64, datetime: &str, state: &str) -> serde_json::Value {
+        json!({"datetime": datetime, "end_datetime": null, "driver_id": driver,
+               "source": "timecard", "state": state})
+    }
+
+    #[test]
+    fn split_by_driver_groups_and_sorts() {
+        let rows = vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1018, "2026-06-02 09:25:00", "始業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+            tc_of(1018, "2026-06-02 19:39:00", "終業"),
+        ];
+        let split = split_by_driver(rows);
+        assert_eq!(split.len(), 2);
+        // 乗務員CD 昇順
+        assert_eq!(split[0].0, 1018);
+        assert_eq!(split[1].0, 1119);
+        // 行の並びは入力のまま
+        assert_eq!(split[0].1.len(), 2);
+        assert_eq!(split[0].1[0]["datetime"], "2026-06-02 09:25:00");
+        assert_eq!(split[1].1[0]["datetime"], "2026-06-02 06:00:00");
+    }
+
+    #[test]
+    fn split_by_driver_drops_rows_without_a_driver() {
+        // 誰のものか決められない行を混ぜると、その人の拘束が静かに伸びる
+        let rows = vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            json!({"datetime": "2026-06-02 07:00:00", "source": "timecard", "state": "始業"}),
+            json!({"datetime": "2026-06-02 08:00:00", "driver_id": null,
+                   "source": "timecard", "state": "始業"}),
+            json!({"datetime": "2026-06-02 09:00:00", "driver_id": "1119",
+                   "source": "timecard", "state": "始業"}),
+            json!({"datetime": "2026-06-02 10:00:00", "driver_id": -1,
+                   "source": "timecard", "state": "始業"}),
+        ];
+        let split = split_by_driver(rows);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].0, 1119);
+        assert_eq!(split[0].1.len(), 1);
+    }
+
+    #[test]
+    fn split_by_driver_keeps_shifts_apart() {
+        // 混ざったまま畳むと、他人の休息で勤務が切れる
+        let rows = vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1018, "2026-06-02 07:00:00", "始業"),
+            tc_of(1018, "2026-06-02 12:00:00", "終業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+        ];
+        let p = KosokuParams::default();
+        // 分けずに畳むと、後から来た始業が前の始業を上書きし、1119 の 06:00 が消えて
+        // 1018 の 07:00〜12:00 だけが 1 勤務として残る (1119 の拘束が丸ごと落ちる)
+        let mixed = daily_summary(&rows.clone(), "2026-06", &p);
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].restraint_minutes, 300);
+        // 分ければそれぞれの拘束が出る
+        let split = split_by_driver(rows);
+        let d1018 = daily_summary(&split[0].1, "2026-06", &p);
+        let d1119 = daily_summary(&split[1].1, "2026-06", &p);
+        assert_eq!(d1018[0].restraint_minutes, 300);
+        assert_eq!(d1119[0].restraint_minutes, 720);
+    }
+
+    #[test]
+    fn split_by_driver_on_empty_input() {
+        assert!(split_by_driver(Vec::new()).is_empty());
     }
 
     // --- 月境界 ---
