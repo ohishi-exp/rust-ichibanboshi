@@ -231,6 +231,12 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
   各 0.2 秒で済む (#124)
 - パラメータは `[kosoku]` (`break_threshold_minutes` / `prescribed_minutes` / `legal_minutes`)。
   就業規則が変わったら再ビルドせず toml で追随する
+- **`punches` に勤務を構成した打刻をそのまま添える** (#128)。`start`/`end` は勤務としての
+  解釈 (分に丸め・24 時間で打ち切り) が入るが、`punches` は生の打刻 (秒つき)。
+  **打ち切り前の区間から拾う** — 24 時間で切ると切った先の終業打刻が落ちる
+  (実測: 乗務員 1194 の 2026-04-01 始業 → 04-03 16:47 終業)。休息由来の勤務は空。
+  社内タイムカード表 (`TimeCardController::createPdf`) は**打刻を日ごとに並べただけ**で
+  勤務という単位を持たないので、同じ表を作る側にはこの生の時刻が要る
 - 認可は `events` と同じ CF Access Service Token (edge) — **応答に金額を含めない**ため
 - テストは `src/kosoku.rs` の unit test (規則の網羅) と `tests/kosoku_daily_test.rs`
   (route の配線・検証・失敗の写し方) の 2 段
