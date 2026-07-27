@@ -31,7 +31,8 @@ use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse, TimecardEventsResponse};
+use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
+use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
@@ -70,13 +71,15 @@ pub fn is_valid_month(month: &str) -> bool {
     (1..=12).contains(&mm)
 }
 
-/// 乗務員CD の書式検証。**数字のみ**を許す。
+/// 乗務員CD のパース。**数字のみ**を受ける (空・非数字・負値・桁溢れは None)。
 ///
-/// 値をそのまま上流 URL のクエリに載せるため、ここで弾いておく方が上流の挙動に
-/// 依存せずに済む (乗務員CD = 一番星 `社員ﾏｽﾀ.社員C` と同一番号体系で、数字以外は
-/// 取らない)。
-pub fn is_valid_driver(driver: &str) -> bool {
-    !driver.is_empty() && driver.as_bytes().iter().all(|b| b.is_ascii_digit())
+/// 乗務員CD = 一番星 `社員ﾏｽﾀ.社員C` と同一番号体系で、DB 側も整数列なので
+/// ここで整数にしてから渡す — 文字列のままクエリに載せない。
+pub fn parse_driver(driver: &str) -> Option<u64> {
+    if driver.is_empty() || !driver.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    driver.parse::<u64>().ok()
 }
 
 /// CakePHP のエラーを HTTP ステータスへ写す (uriage の `map_cakephp_err` と同方針)。
@@ -175,18 +178,37 @@ pub async fn daily(
     Ok(Json(with_source_meta(resp, "live", &synced_at)))
 }
 
+/// 生イベント読み取りのエラーを HTTP ステータスへ写す。
+///
+/// 未設定は 503 (`base_url` 未設定と同じ fail-closed)、DB 停止・クエリ失敗は 502。
+fn map_repo_err(e: KintaiRepoError) -> (StatusCode, String) {
+    match e {
+        KintaiRepoError::NotConfigured => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MariaDB 接続設定が未設定".to_string(),
+        ),
+        KintaiRepoError::QueryFailed(m) => (
+            StatusCode::BAD_GATEWAY,
+            format!("MariaDB query failed: {m}"),
+        ),
+    }
+}
+
 /// GET /api/kintai/events?month=YYYY-MM&driver=1051 — 打刻と運行イベントの
-/// **生の時系列**の中継 (Refs #114、拘束時間の打刻基準化 Phase 1)。
+/// **生の時系列** (Refs #114 / #116、拘束時間の打刻基準化 Phase 1)。
 ///
 /// 拘束時間管理表の残業を打刻基準で計算し直すにあたり、規則を決める前に実データで
 /// 各パターン (同日 2 運行・打刻と運行のズレ・細切れ休憩 …) が何件あるかを数える
-/// ための読み出し口。`daily` と違い **derived store を持たない** — 調査用途で
-/// 呼び出し頻度が低く、常に最新の打刻が要るため。`source` / `synced_at` のメタも
-/// 足さない (上流応答そのまま)。
+/// ための読み出し口。**解釈しない** — 勤務の切れ目も休憩の閾値もここでは判断せず、
+/// 生行を時刻順に並べて返すだけ。
+///
+/// データ源は社内 MariaDB の直読み (`kintai_repo`)。`daily` (CakePHP 中継 +
+/// derived store) と違い**キャッシュを持たない** — 調査用途で頻度が低く、常に
+/// 最新の打刻が要るため。
 pub async fn events(
     Query(params): Query<EventsQuery>,
-    Extension(cakephp): Extension<Arc<CakephpClient>>,
-) -> Result<Json<TimecardEventsResponse>, (StatusCode, String)> {
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let month = params.month.unwrap_or_default();
     if !is_valid_month(&month) {
         return Err((
@@ -194,21 +216,23 @@ pub async fn events(
             "month は YYYY-MM で指定してください".to_string(),
         ));
     }
-    let driver = params.driver.unwrap_or_default();
-    if !is_valid_driver(&driver) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "driver は乗務員CD (数字) で指定してください".to_string(),
-        ));
-    }
-    let resp = cakephp
-        .fetch_timecard_events(&month, &driver)
+    let driver = match parse_driver(params.driver.as_deref().unwrap_or_default()) {
+        Some(d) => d,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "driver は乗務員CD (数字) で指定してください".to_string(),
+            ))
+        }
+    };
+    let rows = repo
+        .fetch_events(&month, driver)
         .await
-        .map_err(map_cakephp_err)?;
+        .map_err(map_repo_err)?;
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
-    let rows = resp.rows.len();
-    tracing::info!(month = %month, driver = %driver, rows, "kintai events relayed");
-    Ok(Json(resp))
+    let count = rows.len();
+    tracing::info!(month = %month, driver, rows = count, "kintai events read");
+    Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
 #[cfg(test)]
@@ -235,17 +259,31 @@ mod tests {
 
     #[test]
     fn valid_drivers() {
-        assert!(is_valid_driver("1051"));
-        assert!(is_valid_driver("0"));
+        assert_eq!(parse_driver("1051"), Some(1051));
+        assert_eq!(parse_driver("0"), Some(0));
+        assert_eq!(parse_driver("0012"), Some(12));
     }
 
     #[test]
     fn invalid_drivers() {
-        assert!(!is_valid_driver(""));
-        assert!(!is_valid_driver("10a1"));
-        assert!(!is_valid_driver("１０５１")); // 全角
-        assert!(!is_valid_driver("1051 "));
-        assert!(!is_valid_driver("1051&month=2020-01"));
+        assert_eq!(parse_driver(""), None);
+        assert_eq!(parse_driver("10a1"), None);
+        assert_eq!(parse_driver("１０５１"), None); // 全角
+        assert_eq!(parse_driver("1051 "), None);
+        assert_eq!(parse_driver("-1"), None);
+        // u64 桁溢れ (書式は数字でもパースできない)
+        assert_eq!(parse_driver("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn repo_error_mapping() {
+        let (s, m) = map_repo_err(KintaiRepoError::NotConfigured);
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(m.contains("未設定"));
+
+        let (s, m) = map_repo_err(KintaiRepoError::QueryFailed("boom".into()));
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
+        assert!(m.contains("boom"));
     }
 
     #[test]
