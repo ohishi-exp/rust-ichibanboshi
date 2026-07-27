@@ -428,9 +428,39 @@ fn split_long_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     }
     // 休息が 1 つも無ければ元のまま (打ち切りに任せる)
     if out.is_empty() {
-        vec![shift.clone()]
-    } else {
-        out
+        out.push(shift.clone());
+    }
+    // それでも 24 時間を超える区間は**最後の運行終了で終わらせる** (Refs #135)
+    out.into_iter().map(|s| end_at_last_run_end(&s, events)).collect()
+}
+
+/// 24 時間を超えたままの勤務を、**中の最後の `運行終了` で終わらせる** (Refs #135)。
+///
+/// 休息由来の勤務は「次の休息の開始」で終わるが、**運行が終わって帰宅している間は
+/// 休息イベントが出ない**ので勤務が終わらない。実測: 乗務員 1021 は 2026-04-28 08:14 に
+/// 運行終了して帰宅したのに、次の運行 (5/1) まで休息が無く、`04-28 06:47 → 04-29 06:47`
+/// (24 時間打ち切り) になっていた。**運行終了より後は働いていない。**
+///
+/// - **24 時間を超えた勤務だけ**が対象。通常の勤務は運行の継ぎ目で切らない (#123)
+/// - 切るのは**最後の**運行終了。途中の継ぎ目では切らない
+/// - 運行終了が無ければ元のまま (打ち切りに任せる)
+fn end_at_last_run_end(shift: &Shift, events: &[Event]) -> Shift {
+    if (shift.end - shift.start).num_minutes() <= MAX_RESTRAINT_MINUTES {
+        return shift.clone();
+    }
+    let last_run_end = events
+        .iter()
+        .filter(|e| e.state == "運行終了")
+        .map(|e| floor_min(e.start))
+        .filter(|t| *t > shift.start && *t < shift.end)
+        .max();
+    match last_run_end {
+        Some(end) => Shift {
+            start: shift.start,
+            end,
+            source: shift.source,
+        },
+        None => shift.clone(),
     }
 }
 
@@ -1312,6 +1342,65 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert!(days[0].over_24h);
+    }
+
+    // --- 24 時間超は最後の運行終了で終わらせる (Refs #135) ---
+
+    #[test]
+    fn a_rest_shift_ends_at_the_last_run_end() {
+        // 乗務員 1021 / 2026-04-28 の形 — 運行終了して帰宅したが、次の運行まで休息が
+        // 無いので勤務が終わらず 24 時間で打ち切られていた
+        let rows = vec![
+            ev("2026-06-27 16:13:00", "2026-06-28 06:47:00", "休息"),
+            dtako("2026-06-28 08:14:00", "運行終了"),
+            // 次の休息は 3 日後 (その間は帰宅していて休息イベントが出ない)
+            ev("2026-07-01 16:00:00", "2026-07-02 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-06-28 06:47:00");
+        assert_eq!(days[0].end, "2026-06-28 08:14:00");
+        assert!(!days[0].over_24h);
+    }
+
+    #[test]
+    fn only_the_last_run_end_cuts_a_long_shift() {
+        // 途中の継ぎ目では切らない (#123) — 切るのは最後の運行終了だけ
+        let rows = vec![
+            ev("2026-06-27 16:13:00", "2026-06-28 06:47:00", "休息"),
+            dtako("2026-06-28 10:00:00", "運行終了"),
+            dtako("2026-06-28 10:30:00", "運行開始"),
+            dtako("2026-06-29 04:00:00", "運行終了"),
+            ev("2026-07-01 16:00:00", "2026-07-02 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].end, "2026-06-29 04:00:00");
+        assert!(!days[0].over_24h);
+    }
+
+    #[test]
+    fn a_long_shift_without_a_run_end_is_still_capped() {
+        // 運行終了が無ければ切る根拠が無いので従来どおり打ち切る
+        let rows = vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-03 20:08:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert!(days[0].over_24h);
+        assert_eq!(days[0].restraint_minutes, 1440);
+    }
+
+    #[test]
+    fn a_normal_shift_is_not_cut_at_a_run_end() {
+        // 24 時間以内は運行終了で切らない (#123 の「運行では切らない」を崩さない)
+        let rows = vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            dtako("2026-06-02 14:00:00", "運行終了"),
+            tc("2026-06-02 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].end, "2026-06-02 20:00:00");
     }
 
     // --- 暦日按分の内訳 (Refs #130) ---
