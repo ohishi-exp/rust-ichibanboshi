@@ -206,6 +206,10 @@ pub async fn run(
         .route(
             "/restraint/wage-source",
             get(routes::restraint::wage_source),
+        )
+        .route(
+            "/restraint/synced-months",
+            get(routes::restraint::synced_months),
         );
 
     let schema_routes = Router::new()
