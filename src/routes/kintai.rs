@@ -34,6 +34,7 @@ use serde::Deserialize;
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
+use crate::kosoku::{daily_summary, KosokuParams};
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
 /// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
@@ -233,6 +234,52 @@ pub async fn events(
     let count = rows.len();
     tracing::info!(month = %month, driver, rows = count, "kintai events read");
     Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+/// GET /api/kintai/kosoku-daily?month=YYYY-MM&driver=1051 — **打刻基準の日別サマリ**
+/// (Refs #118、拘束時間の打刻基準化 Phase 2)。
+///
+/// `/events` の生イベントを [`crate::kosoku`] の純粋ロジックで日別に畳んで返す。
+/// **応答に金額は含めない** — 認可が `/events` と同じ CF Access Service Token
+/// (edge) のままでよいのはそのため。金額を足すことになったら `/kyuyo/*` と同じ
+/// in-service gate へ移すこと。
+///
+/// 勤務は**始業日**で当月に振り分ける。月初の勤務は前月末の休息を要するため、
+/// イベントは [`crate::kintai_repo::kosoku_range`] で前に遡って読む。
+pub async fn kosoku_daily(
+    Query(params): Query<EventsQuery>,
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+    Extension(params_cfg): Extension<Arc<KosokuParams>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    if !is_valid_month(&month) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください".to_string(),
+        ));
+    }
+    let driver = match parse_driver(params.driver.as_deref().unwrap_or_default()) {
+        Some(d) => d,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "driver は乗務員CD (数字) で指定してください".to_string(),
+            ))
+        }
+    };
+    let rows = repo
+        .fetch_events_for_kosoku(&month, driver)
+        .await
+        .map_err(map_repo_err)?;
+    let days = daily_summary(&rows, &month, &params_cfg);
+    // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
+    let count = days.len();
+    tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
+    Ok(Json(serde_json::json!({
+        "month": month,
+        "driver": driver,
+        "days": days,
+    })))
 }
 
 #[cfg(test)]
