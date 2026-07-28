@@ -629,7 +629,31 @@ fn unpunched_ops_shift(
     } else {
         first
     };
-    let end = bound.min(latest);
+    // 終わりは**運行が窓の中で終わったかどうか**で決める。「最後のイベントの終わり」
+    // (latest) は全乗務員経路では使えない — `ALL_EVENTS_SQL` は応答を抑えるため
+    // イベント名を 休息/休憩/運行開始/運行終了 に絞っており、休息まで続く運転・実車
+    // イベントが見えず、途中の休憩の終わりで切れてしまう (実測 1072 立山 03-25:
+    // 1 名指定は 660、全乗務員は 553 と**同じ日の値が経路で割れた**)。
+    // 運行開始・運行終了の点イベントはどちらの SQL にもあるので、これで判定する。
+    let last_run_start = ops
+        .iter()
+        .filter(|e| e.state == "運行開始")
+        .map(|e| e.start)
+        .max();
+    let last_run_end = ops
+        .iter()
+        .filter(|e| e.state == "運行終了")
+        .map(|e| e.start)
+        .max();
+    let end = match (last_run_start, last_run_end) {
+        // 最後の運行が窓の中で終わっている → そこまで (1541 の 17:14)
+        (Some(s), Some(e)) if e >= s => e,
+        (None, Some(e)) => e,
+        // 運行が休息まで続いている → 次の休息 (=bound) まで (1072 03-25 / 1130)
+        (Some(_), _) => bound,
+        // 運行の点イベントが無い (休憩だけ等) → 従来どおり最後のイベントまで
+        (None, None) => bound.min(latest),
+    };
     (end > start).then_some(Shift {
         start,
         end,
