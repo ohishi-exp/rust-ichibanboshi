@@ -215,6 +215,7 @@ pub async fn run(
         .route("/kintai/daily", get(routes::kintai::daily))
         .route("/kintai/events", get(routes::kintai::events))
         .route("/kintai/kosoku-daily", get(routes::kintai::kosoku_daily))
+        .route("/kintai/pdf-json", get(routes::kintai::pdf_json))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
