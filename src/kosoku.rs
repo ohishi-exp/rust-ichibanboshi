@@ -505,25 +505,24 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
         .filter(|(s, e)| e > s)
         .collect();
     rests.sort();
-    let mut out: Vec<Shift> = rests
-        .windows(2)
-        .filter(|w| w[1].0 > w[0].1)
-        .map(|w| Shift {
-            start: w[0].1,
-            end: w[1].0,
-            source: ShiftSource::Rest,
-        })
-        .collect();
-    if let Some(last) = rests.last() {
-        if let Some(end) = next_punch_out(events, last.1) {
-            out.push(Shift {
-                start: last.1,
+    rests
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            // 次の休息と終業打刻の**早い方**で閉じる
+            let end = match (rests.get(i + 1).map(|n| n.0), next_punch_out(events, r.1)) {
+                (Some(rest), Some(punch)) => rest.min(punch),
+                (Some(rest), None) => rest,
+                (None, Some(punch)) => punch,
+                (None, None) => return None,
+            };
+            (end > r.1).then_some(Shift {
+                start: r.1,
                 end,
                 source: ShiftSource::Rest,
-            });
-        }
-    }
-    out
+            })
+        })
+        .collect()
 }
 
 /// **全列が同じ行を落とす** (Refs ohishi-exp/nuxt-dtako-admin#501)。
@@ -2389,6 +2388,30 @@ mod tests {
         let parts = &days[0].parts;
         assert_eq!(parts[0].restraint_minutes, 388);
         assert_eq!(parts[1].restraint_minutes, 357);
+    }
+
+    #[test]
+    fn a_rest_shift_ends_at_the_punch_out_not_a_far_away_next_rest() {
+        // 1526 陣内 / 2026-03-02 の実形。次の休息は 4 日先 (次の運行) で、その間に
+        // 終業打刻がある。**早い方で閉じる**。次の休息まで伸ばすと 24 時間超の勤務に
+        // なり、後続の打刻由来の勤務と重なって `merge_shifts` に丸ごと捨てられる —
+        // 本番で 745 分が消えていた原因がこれ
+        let rows = vec![
+            ev("2026-03-02 04:54:00", "2026-03-02 17:32:00", "休息"),
+            tc("2026-03-03 05:57:00", "終業"),
+            ev("2026-03-06 22:00:00", "2026-03-07 06:00:00", "休息"),
+            tc("2026-03-06 06:30:00", "始業"),
+            tc("2026-03-06 20:35:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        let d = days
+            .iter()
+            .find(|d| d.start.contains("03-02 17:32"))
+            .unwrap();
+        assert_eq!(d.end, "2026-03-03 05:57:00");
+        assert_eq!(d.restraint_minutes, 745);
+        // 03-06 の打刻由来の勤務は残る (休息由来に食われない)
+        assert!(days.iter().any(|d| d.source == ShiftSource::Timecard));
     }
 
     #[test]
