@@ -760,6 +760,29 @@ async fn compare_view_omits_a_zero_rest_deduction() {
     assert!(body["days"][0].get("rest_minus_minutes").is_none());
 }
 
+#[tokio::test]
+async fn compare_view_keeps_a_non_zero_run_gap() {
+    // 運行の継ぎ目のある日だけ run_gap_minutes を載せる (Refs rust-ichibanboshi#170)。
+    // 継ぎ目が日を跨げば内訳 (parts) にも載る
+    let (status, body) = serve(
+        vec![
+            ev("2026-06-01 06:00:00", "2026-06-02 20:00:00", "休息"),
+            dtako("2026-06-02 23:00:00", "運行終了", "u1"),
+            dtako("2026-06-03 01:00:00", "運行開始", "u2"),
+            ev("2026-06-03 10:00:00", "2026-06-04 04:00:00", "休息"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    assert_eq!(d["run_gap_minutes"], 120);
+    assert_eq!(d["parts"][0]["run_gap_minutes"], 60);
+    assert_eq!(d["parts"][1]["run_gap_minutes"], 60);
+    // 継ぎ目の無い翌勤務には付かない (0 を全日ぶら下げない)
+    assert!(body["days"][1].get("run_gap_minutes").is_none());
+}
+
 // --- 全列同一の行の検知 (Refs nuxt-dtako-admin#501) ---
 
 #[tokio::test]
