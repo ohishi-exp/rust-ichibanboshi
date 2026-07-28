@@ -629,7 +629,31 @@ fn unpunched_ops_shift(
     } else {
         first
     };
-    let end = bound.min(latest);
+    // 終わりは**運行が窓の中で終わったかどうか**で決める。「最後のイベントの終わり」
+    // (latest) は全乗務員経路では使えない — `ALL_EVENTS_SQL` は応答を抑えるため
+    // イベント名を 休息/休憩/運行開始/運行終了 に絞っており、休息まで続く運転・実車
+    // イベントが見えず、途中の休憩の終わりで切れてしまう (実測 1072 立山 03-25:
+    // 1 名指定は 660、全乗務員は 553 と**同じ日の値が経路で割れた**)。
+    // 運行開始・運行終了の点イベントはどちらの SQL にもあるので、これで判定する。
+    let last_run_start = ops
+        .iter()
+        .filter(|e| e.state == "運行開始")
+        .map(|e| e.start)
+        .max();
+    let last_run_end = ops
+        .iter()
+        .filter(|e| e.state == "運行終了")
+        .map(|e| e.start)
+        .max();
+    let end = match (last_run_start, last_run_end) {
+        // 最後の運行が窓の中で終わっている → そこまで (1541 の 17:14)
+        (Some(s), Some(e)) if e >= s => e,
+        (None, Some(e)) => e,
+        // 運行が休息まで続いている → 次の休息 (=bound) まで (1072 03-25 / 1130)
+        (Some(_), _) => bound,
+        // 運行の点イベントが無い (休憩だけ等) → 従来どおり最後のイベントまで
+        (None, None) => bound.min(latest),
+    };
     (end > start).then_some(Shift {
         start,
         end,
@@ -2608,6 +2632,27 @@ mod tests {
         assert_eq!(afternoon.end, "2026-03-14 17:14:00");
         assert_eq!(afternoon.restraint_minutes, 281);
         assert!(days.iter().any(|d| d.start == "2026-03-14 06:06:00"));
+    }
+
+    #[test]
+    fn a_run_ending_in_the_window_without_a_start_ends_the_shift_there() {
+        // 窓の中に運行終了だけがある形 (運行開始は終業打刻より前)。
+        // 終わりはその運行終了 — 全乗務員 SQL でも運行の点イベントは見える
+        let rows = vec![
+            ev("2026-03-02 04:00:00", "2026-03-02 05:00:00", "休息"),
+            tc("2026-03-02 06:00:00", "終業"),
+            ev("2026-03-02 06:30:00", "2026-03-02 08:00:00", "運転"),
+            dtako("2026-03-02 08:00:00", "運行終了"),
+            ev("2026-03-02 22:00:00", "2026-03-03 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        let picked = days
+            .iter()
+            .find(|d| d.end == "2026-03-02 08:00:00")
+            .unwrap();
+        // 孤立終業 + 同じ暦日 → 終業打刻から始まる
+        assert_eq!(picked.start, "2026-03-02 06:00:00");
+        assert_eq!(picked.restraint_minutes, 120);
     }
 
     #[test]
