@@ -226,6 +226,12 @@ pub struct DaySummary {
     pub restraint_minutes: i64,
     /// 閾値以上の休憩の合計。
     pub break_minutes: i64,
+    /// **休憩イベントが無かったので固定の 60 分を当てた**か (2026-07-28)。
+    ///
+    /// デジタコを積んでいない社員 (事務員・構内) は運行イベントが出ないため、
+    /// 実測の休憩が 1 つも無い。画面に「引いた」と分かる印を出すためのフラグで、
+    /// 長距離のように休憩イベントがある勤務では false。
+    pub fixed_break: bool,
     /// 実働 = 拘束 − 休憩。
     pub working_minutes: i64,
 
@@ -557,6 +563,52 @@ fn split_by_run_gaps(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     out
 }
 
+/// 休憩イベントが 1 つも無い勤務に当てる休憩 (分)。
+///
+/// **デジタコを積んでいない社員 (事務員・構内) は運行イベントが出ない**ので、
+/// 休憩イベントだけを数えると実働 = 拘束になってしまう (実測: 乗務員 1111 浦山純成 /
+/// 2026-04 は全日 休憩 0 分・9h01m 拘束がそのまま実働)。社内 CakePHP のタイムカードは
+/// 12:00-13:00 の 60 分を必ず控除しており、そちらに合わせる。
+///
+/// **夜勤も 1 時間引く** (2026-07-28 ユーザー決定)。昼をまたがない勤務でも休憩は取る。
+/// 長距離は休憩イベントが出るので、こちらは当たらない (実働・休憩ベースのまま)。
+const FIXED_BREAK_MINUTES: i64 = 60;
+
+/// 勤務の中にデジタコ由来のイベント (運行・区間) があるか。
+///
+/// 無ければ**打刻だけで組んだ勤務** = デジタコを積んでいない社員。
+fn has_dtako_events(events: &[Event], shift: &Shift) -> bool {
+    events.iter().any(|e| {
+        e.source != "timecard" && {
+            let t = floor_min(e.start);
+            t >= shift.start && t <= shift.end
+        }
+    })
+}
+
+/// 休憩イベントが無い勤務に置く休憩の区間。
+///
+/// **位置を決めないと深夜・時間外・暦日按分に配れない**ので、
+///
+/// 1. 12:00-13:00 が勤務にすっぽり入るならそこ (日勤 = 昼休憩そのもの)
+/// 2. 入らないなら勤務の**中央**に 60 分 (夜勤・早朝勤務)
+///
+/// 拘束が 60 分以下の勤務には置かない (引くと実働が 0 以下になる)。
+fn fixed_break_interval(shift: &Shift) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let total = (shift.end - shift.start).num_minutes();
+    if total <= FIXED_BREAK_MINUTES {
+        return None;
+    }
+    let lunch_start = shift.start.date().and_hms_opt(12, 0, 0)?;
+    let lunch_end = lunch_start + Duration::minutes(FIXED_BREAK_MINUTES);
+    if lunch_start >= shift.start && lunch_end <= shift.end {
+        return Some((lunch_start, lunch_end));
+    }
+    let offset = (total - FIXED_BREAK_MINUTES) / 2;
+    let start = shift.start + Duration::minutes(offset);
+    Some((start, start + Duration::minutes(FIXED_BREAK_MINUTES)))
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -648,7 +700,19 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         },
         source: shift.source,
     };
-    let breaks = breaks_in(events, shift, p.break_threshold_minutes);
+    let mut breaks = breaks_in(events, shift, p.break_threshold_minutes);
+    // 休憩イベントが 1 つも無い勤務 (= デジタコを積んでいない社員) は固定の 60 分を引く
+    // **デジタコが乗らない社員 (打刻だけ) は固定の 60 分を引く** (2026-07-28 決定)。
+    // 運行イベントが 1 つも無い勤務が対象 — 実測: 乗務員 1111 浦山純成 / 2026-04 は
+    // 月の全イベントが 始業/終業 の打刻だけで、休憩が 0 分・実働 = 拘束になっていた。
+    // **デジタコが乗る乗務員は対象外** — あちらは休憩イベントが実測なので、それが
+    // 0 分の勤務は本当に休んでいない (長距離は実働・休憩ベースのまま、ユーザー決定)
+    let mut fixed_break = breaks.is_empty() && !has_dtako_events(events, shift);
+    if fixed_break {
+        breaks.extend(fixed_break_interval(shift));
+        // 拘束が 60 分以下で置けなかった時は立てない (引いていないので)
+        fixed_break = !breaks.is_empty();
+    }
     let break_minutes: i64 = breaks.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let intervals = working_intervals(shift, &breaks);
     let is_legal_holiday = shift.start.weekday() == Weekday::Sun;
@@ -719,6 +783,7 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         },
         is_legal_holiday,
         over_24h,
+        fixed_break,
         restraint_minutes: (shift.end - shift.start).num_minutes(),
         break_minutes,
         working_minutes: elapsed,
@@ -907,6 +972,8 @@ mod tests {
     fn short_shift_has_no_overtime() {
         let rows = vec![
             tc("2026-06-02 09:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-02 09:30:00", "運行開始"),
             tc("2026-06-02 15:00:00", "終業"), // 360 分
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
@@ -1052,6 +1119,8 @@ mod tests {
         // 2026-06-07 は日曜
         let rows = vec![
             tc("2026-06-07 08:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-07 08:30:00", "運行開始"),
             tc("2026-06-07 20:00:00", "終業"), // 720 分
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
@@ -1067,6 +1136,8 @@ mod tests {
         // 日曜 21:00〜翌 02:00 → 深夜は 22:00〜02:00 の 240 分
         let rows = vec![
             tc("2026-06-07 21:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-07 21:30:00", "運行開始"),
             tc("2026-06-08 02:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
@@ -1086,6 +1157,8 @@ mod tests {
         //   実働 480〜720   = 02:00〜06:00 … うち深夜 02:00〜05:00 = 180 分 → overtime_night
         let rows = vec![
             tc("2026-06-08 18:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-08 18:30:00", "運行開始"),
             tc("2026-06-09 06:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
@@ -1142,6 +1215,8 @@ mod tests {
     fn break_outside_shift_is_clipped_away() {
         let rows = vec![
             tc("2026-06-02 09:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-02 09:30:00", "運行開始"),
             ev("2026-06-02 07:00:00", "2026-06-02 08:00:00", "休憩"), // 勤務前
             ev("2026-06-02 19:00:00", "2026-06-02 20:00:00", "休憩"), // 勤務後
             tc("2026-06-02 18:00:00", "終業"),
@@ -1259,6 +1334,8 @@ mod tests {
         // 打ち切り後 (翌日 10:00) の休憩は勤務外なので引かない
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-02 06:30:00", "運行開始"),
             ev("2026-06-03 10:00:00", "2026-06-03 11:00:00", "休憩"),
             tc("2026-06-03 20:08:00", "終業"),
         ];
@@ -1548,6 +1625,77 @@ mod tests {
         assert!(!days[0].over_24h);
     }
 
+    // --- 打刻だけの勤務は固定の 60 分を引く (2026-07-28) ---
+
+    #[test]
+    fn a_timecard_only_shift_gets_a_fixed_lunch_break() {
+        // 乗務員 1111 浦山純成 / 2026-04 の形 — 月の全イベントが 始業/終業 の打刻だけ。
+        // 休憩イベントが無いので実働 = 拘束 になっていた
+        let rows = vec![
+            tc("2026-06-02 09:54:00", "始業"),
+            tc("2026-06-02 18:55:00", "終業"), // 541 分
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(d.fixed_break);
+        assert_eq!(d.break_minutes, 60);
+        assert_eq!(d.working_minutes, 481);
+    }
+
+    #[test]
+    fn a_fixed_break_sits_at_noon_when_the_shift_covers_it() {
+        // 12:00-13:00 がすっぽり入る勤務は昼休憩そのもの — 深夜にも時間外にも回さない
+        let rows = vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 60);
+        // 09:00-12:00 と 13:00-18:00 の 480 分。8 時間ちょうどなので時間外は出ない
+        assert_eq!(d.working_minutes, 480);
+        assert_eq!(d.overtime_minutes, 0);
+    }
+
+    #[test]
+    fn a_night_shift_also_gets_an_hour_even_without_noon() {
+        // 夜勤も 1 時間休憩あり (ユーザー決定)。昼をまたがないので勤務の中央に置く
+        let rows = vec![
+            tc("2026-06-02 19:00:00", "始業"),
+            tc("2026-06-03 05:00:00", "終業"), // 600 分
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(d.fixed_break);
+        assert_eq!(d.break_minutes, 60);
+        assert_eq!(d.working_minutes, 540);
+    }
+
+    #[test]
+    fn a_driver_shift_without_break_events_keeps_working_equal_to_restraint() {
+        // 長距離は実働・休憩ベースのまま (ユーザー決定) — 運行イベントがあれば
+        // 休憩 0 分は「本当に休んでいない」なので固定休憩を入れない
+        let rows = vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            dtako("2026-06-02 09:30:00", "運行開始"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(!d.fixed_break);
+        assert_eq!(d.break_minutes, 0);
+        assert_eq!(d.working_minutes, 540);
+    }
+
+    #[test]
+    fn a_shift_shorter_than_the_fixed_break_keeps_all_of_it() {
+        // 60 分以下の勤務に 60 分を引いたら実働が 0 以下になる — 置かない
+        let rows = vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            tc("2026-06-02 09:40:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert!(!d.fixed_break);
+        assert_eq!(d.break_minutes, 0);
+        assert_eq!(d.working_minutes, 40);
+    }
+
     #[test]
     fn a_long_shift_splits_at_every_long_run_gap() {
         // 乗務員 1108 / 2026-04 の形 — 帰宅を挟んで運行が 3 本続く。最後の運行終了
@@ -1628,6 +1776,8 @@ mod tests {
     fn parts_split_an_overnight_shift_by_calendar_day() {
         let rows = vec![
             tc("2026-06-02 22:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-02 22:30:00", "運行開始"),
             tc("2026-06-03 08:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
@@ -1655,6 +1805,8 @@ mod tests {
     fn parts_put_night_minutes_on_the_day_they_fall() {
         let rows = vec![
             tc("2026-06-02 22:00:00", "始業"),
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-02 22:30:00", "運行開始"),
             tc("2026-06-03 08:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
@@ -1682,6 +1834,8 @@ mod tests {
     fn parts_cover_a_legal_holiday_that_spills_into_monday() {
         let rows = vec![
             tc("2026-06-07 20:00:00", "始業"), // 日曜
+            // デジタコが乗る乗務員の勤務 (これが無いと打刻だけとみなされ固定休憩 60 分が入る)
+            dtako("2026-06-07 20:30:00", "運行開始"),
             tc("2026-06-08 04:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
