@@ -36,7 +36,7 @@ use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
 use crate::kosoku::{
     apply_ferry_minus, daily_summary, drop_duplicate_rows, ferry_minus_by_date, month_punches,
-    split_by_driver, split_ferry_by_driver, KosokuParams,
+    split_by_driver, split_ferry_by_driver, DayPart, DaySummary, KosokuParams, ShiftSource,
 };
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
@@ -58,7 +58,9 @@ pub struct DailyQuery {
 pub struct EventsQuery {
     pub month: Option<String>,
     pub driver: Option<String>,
-    /// `view=compare` で**突合に要る項目だけ**返す (Refs #157)。省略で従来どおり全項目。
+    /// `view=compare` で**突合に要る項目だけ** (Refs #157)、`view=timecard` で
+    /// **画面のタイムカード表に要る項目だけ** (Refs #164) 返す。省略・未知の値は
+    /// 従来どおり全項目。
     pub view: Option<String>,
 }
 
@@ -74,7 +76,7 @@ pub struct EventsQuery {
 ///
 /// **キー名は元のまま**にする。短縮すると消費側 (relay / kyuyo-mcp) のパーサを
 /// 2 通り持つことになり、削れるのは数 % しかない。
-fn compare_days(days: &[crate::kosoku::DaySummary]) -> Vec<serde_json::Value> {
+fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
     days.iter()
         .map(|d| {
             let parts: Vec<serde_json::Value> = d
@@ -111,9 +113,123 @@ fn compare_days(days: &[crate::kosoku::DaySummary]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// `view=compare` か。未知の値は**従来どおり**扱う (壊さない方に倒す)。
-fn is_compare_view(view: Option<&str>) -> bool {
-    view == Some("compare")
+/// 画面のタイムカード表用に日別を絞る (Refs #164)。
+///
+/// [`compare_days`] (突合用) と同じ発想の**画面経路**版。全項目だと全乗務員で
+/// 月 ~1.7 MB あり、それが社内から Cloudflare Tunnel を通って毎回出ていく
+/// (方針は「圧縮より先にデータを減らす」— #156 revert 時のユーザー決定)。
+///
+/// 消費側は 2 つ — nuxt-dtako-admin front の `app/utils/kosoku-daily.ts`
+/// (`toKosokuDay`) と relay の `workers/dtako-scraper-relay/src/kosoku-daily.ts`
+/// (`parseKosokuDaily`)。残す/落とすはどちらの実コードにも合わせてある:
+///
+/// - **常に残す**: `date` / `start` / `end` — 消費側はどれかが欠けた日を捨てる
+/// - **既定と違うときだけ載せる**: `source` は `rest` のみ (消費側は `=== 'rest'`
+///   判定)、`is_legal_holiday` / `over_24h` は `true` のみ (`=== true` 判定)、
+///   分数は非 0 のみ (欠けは 0 に落ちる)
+/// - `punches` (勤務の中の打刻 = 表の出勤/退社列の原本) と `parts` (暦日按分)
+///   は**空でなければ**残す。part 側も `date` + 非 0 分数だけ
+/// - **落とす**: `rest_minus_minutes` (compare の診断専用で画面は読まない)
+///
+/// **キー名は元のまま** (compare_days と同じ理由 — 消費側のパーサを 2 通りに
+/// しない)。
+fn timecard_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
+    days.iter()
+        .map(|d| {
+            let mut o = serde_json::json!({
+                "date": d.date,
+                "start": d.start,
+                "end": d.end,
+            });
+            // 消費側は `=== 'rest'` で見るので、既定の `timecard` は書かない
+            if d.source == ShiftSource::Rest {
+                o["source"] = serde_json::json!(d.source);
+            }
+            // `=== true` 判定なので false は書かない
+            if d.is_legal_holiday {
+                o["is_legal_holiday"] = serde_json::json!(true);
+            }
+            if d.over_24h {
+                o["over_24h"] = serde_json::json!(true);
+            }
+            // **0 は載せない** (Refs #157 と同じ規則)。日別 13 個の分数の過半は 0 で、
+            // 消費側は欠けを 0 として読む
+            for (key, v) in [
+                ("restraint_minutes", d.restraint_minutes),
+                ("break_minutes", d.break_minutes),
+                ("working_minutes", d.working_minutes),
+                ("statutory_minutes", d.statutory_minutes),
+                (
+                    "within_statutory_overtime_minutes",
+                    d.within_statutory_overtime_minutes,
+                ),
+                ("overtime_minutes", d.overtime_minutes),
+                ("legal_holiday_minutes", d.legal_holiday_minutes),
+                ("night_minutes", d.night_minutes),
+                ("overtime_night_minutes", d.overtime_night_minutes),
+                ("legal_holiday_night_minutes", d.legal_holiday_night_minutes),
+                ("ferry_minus_minutes", d.ferry_minus_minutes),
+            ] {
+                if v != 0 {
+                    o[key] = serde_json::json!(v);
+                }
+            }
+            // 休息由来の勤務は空 — 空配列を全日ぶら下げない
+            if !d.punches.is_empty() {
+                o["punches"] = serde_json::json!(d.punches);
+            }
+            // 1 日で終わる勤務は空 (元の応答と同じ規則)
+            if !d.parts.is_empty() {
+                o["parts"] = serde_json::Value::Array(timecard_parts(&d.parts));
+            }
+            o
+        })
+        .collect()
+}
+
+/// [`timecard_days`] の暦日按分 — `date` + 非 0 分数だけ (Refs #164)。
+fn timecard_parts(parts: &[DayPart]) -> Vec<serde_json::Value> {
+    parts
+        .iter()
+        .map(|p| {
+            let mut o = serde_json::json!({ "date": p.date });
+            for (key, v) in [
+                ("restraint_minutes", p.restraint_minutes),
+                ("working_minutes", p.working_minutes),
+                ("overtime_minutes", p.overtime_minutes),
+                ("legal_holiday_minutes", p.legal_holiday_minutes),
+                ("night_minutes", p.night_minutes),
+                ("overtime_night_minutes", p.overtime_night_minutes),
+                ("legal_holiday_night_minutes", p.legal_holiday_night_minutes),
+                ("ferry_minus_minutes", p.ferry_minus_minutes),
+            ] {
+                if v != 0 {
+                    o[key] = serde_json::json!(v);
+                }
+            }
+            o
+        })
+        .collect()
+}
+
+/// 応答の絞り方。**未知の値は [`Full`](ResponseView::Full)** — 綴り間違いで黙って
+/// 情報が減らないように、従来どおり全項目へ倒す (壊さない方に倒す)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseView {
+    /// 従来どおり全項目。
+    Full,
+    /// 突合に要る項目だけ (Refs #157)。
+    Compare,
+    /// 画面のタイムカード表に要る項目だけ (Refs #164)。
+    Timecard,
+}
+
+fn parse_view(view: Option<&str>) -> ResponseView {
+    match view {
+        Some("compare") => ResponseView::Compare,
+        Some("timecard") => ResponseView::Timecard,
+        _ => ResponseView::Full,
+    }
 }
 
 /// 対象月の書式検証。`YYYY-MM` で月は 01-12。
@@ -386,7 +502,7 @@ pub async fn kosoku_daily(
             &month,
             repo,
             &params_cfg,
-            is_compare_view(params.view.as_deref()),
+            parse_view(params.view.as_deref()),
         )
         .await;
     };
@@ -417,26 +533,34 @@ pub async fn kosoku_daily(
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = days.len();
     tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
-    if is_compare_view(params.view.as_deref()) {
-        // 突合は打刻を見ない
-        let mut o = serde_json::json!({
+    match parse_view(params.view.as_deref()) {
+        ResponseView::Compare => {
+            // 突合は打刻を見ない
+            let mut o = serde_json::json!({
+                "month": month,
+                "driver": driver,
+                "days": compare_days(&days),
+            });
+            // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
+            if !duplicate_rows.is_empty() {
+                o["duplicate_rows"] = serde_json::json!(duplicate_rows);
+            }
+            Ok(Json(o))
+        }
+        // 画面は月全打刻 (`punches`) も `duplicate_rows` 診断も読まない (Refs #164)
+        ResponseView::Timecard => Ok(Json(serde_json::json!({
             "month": month,
             "driver": driver,
-            "days": compare_days(&days),
-        });
-        // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
-        if !duplicate_rows.is_empty() {
-            o["duplicate_rows"] = serde_json::json!(duplicate_rows);
-        }
-        return Ok(Json(o));
+            "days": timecard_days(&days),
+        }))),
+        ResponseView::Full => Ok(Json(serde_json::json!({
+            "month": month,
+            "driver": driver,
+            "days": days,
+            "duplicate_rows": duplicate_rows,
+            "punches": month_punches(&rows, &month),
+        }))),
     }
-    Ok(Json(serde_json::json!({
-        "month": month,
-        "driver": driver,
-        "days": days,
-        "duplicate_rows": duplicate_rows,
-        "punches": month_punches(&rows, &month),
-    })))
 }
 
 /// `driver` 省略時 — 全乗務員ぶんを 1 リクエストで畳む (Refs #125)。
@@ -451,7 +575,7 @@ async fn kosoku_daily_all(
     month: &str,
     repo: DynKintaiEventsRepo,
     params_cfg: &KosokuParams,
-    compare_view: bool,
+    view: ResponseView,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let rows = repo.fetch_all_events(month).await.map_err(map_repo_err)?;
     // 全乗務員ぶんを 1 回で引いて乗務員ごとに分ける (Refs #146)。取れなければ空 =
@@ -478,7 +602,13 @@ async fn kosoku_daily_all(
         })
         .filter(|(_, days, punches, _)| !days.is_empty() || !punches.is_empty())
         .map(|(driver, days, punches, duplicate_rows)| {
-            let mut o = if compare_view {
+            // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
+            // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
+            // `duplicate_rows` 診断も画面は読まない
+            if view == ResponseView::Timecard {
+                return serde_json::json!({ "driver": driver, "days": timecard_days(&days) });
+            }
+            let mut o = if view == ResponseView::Compare {
                 // 突合は打刻を見ない。日別も要る項目だけに絞る (Refs #157)
                 serde_json::json!({ "driver": driver, "days": compare_days(&days) })
             } else {
@@ -538,6 +668,16 @@ mod tests {
         assert_eq!(parse_driver("-1"), None);
         // u64 桁溢れ (書式は数字でもパースできない)
         assert_eq!(parse_driver("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn view_parsing() {
+        assert_eq!(parse_view(None), ResponseView::Full);
+        assert_eq!(parse_view(Some("compare")), ResponseView::Compare);
+        assert_eq!(parse_view(Some("timecard")), ResponseView::Timecard);
+        // 未知の値は全項目へ倒す (壊さない方に倒す)
+        assert_eq!(parse_view(Some("full")), ResponseView::Full);
+        assert_eq!(parse_view(Some("")), ResponseView::Full);
     }
 
     #[test]
