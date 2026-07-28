@@ -242,6 +242,8 @@ pub struct DayPart {
     /// こちらの拘束には**入っていない** (足しても引いてもいない)。紙との差の原因を
     /// 説明するためだけに載せる。詳細は [`ferry_minus_by_date`]。
     pub ferry_minus_minutes: i64,
+    /// この暦日に乗った**運行の継ぎ目** ([`DaySummary::run_gap_minutes`])。
+    pub run_gap_minutes: i64,
 }
 
 impl DayPart {
@@ -256,6 +258,7 @@ impl DayPart {
             overtime_night_minutes: 0,
             legal_holiday_night_minutes: 0,
             ferry_minus_minutes: 0,
+            run_gap_minutes: 0,
         }
     }
 }
@@ -334,6 +337,17 @@ pub struct DaySummary {
     ///
     /// こちらの拘束には入っていない。詳細は [`ferry_minus_by_date`]。
     pub ferry_minus_minutes: i64,
+    /// **運行の継ぎ目** — 勤務の中の 運行終了 → 次の運行開始 の空きの合計 (分)
+    /// (ユーザー決定 2026-07-29、Refs ohishi-exp/nuxt-dtako-admin#501)。
+    ///
+    /// 紙のタイムカード表は運行単位のスパン (dtk) を暦日で合算するため、運行と
+    /// 運行の間の短い空き (荷降ろし後の待機など。実測 数分〜100 分弱) を拘束に
+    /// 入れない。こちらは #123 の決定どおり同じ勤務の続きとして**入れる**。
+    /// 拘束の値は変えず、突合が差を cause `run-gap` として説明するために実額を
+    /// 添える。8 時間以上の空きはそもそも勤務が割れる ([`split_by_run_gaps`]) ので
+    /// ここには出ない。勤務の端の空き (打刻 ↔ 運行) は紙も TC_DC で数えるので
+    /// 含めない — 中の継ぎ目だけ。
+    pub run_gap_minutes: i64,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -920,6 +934,36 @@ fn split_by_run_gaps(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     out
 }
 
+/// 勤務の中の**運行の継ぎ目** (運行終了 → 次の運行開始) を拾う
+/// (Refs ohishi-exp/nuxt-dtako-admin#501、[`DaySummary::run_gap_minutes`])。
+///
+/// - 連続する運行終了は**最初の**終了から数える — 間に運行は無いので、次の
+///   運行開始までの空白すべてが継ぎ目
+/// - 運行終了の相手が勤務内に無ければ数えない (帰宅・勤務の端)
+/// - 幽霊運行 (数秒の 開始→終了) は継ぎ目を 2 つに割るだけで、合計はほぼ変わらない
+fn run_gap_spans(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let mut points: Vec<(NaiveDateTime, bool)> = events
+        .iter()
+        .filter(|e| e.state == "運行終了" || e.state == "運行開始")
+        .map(|e| (floor_min(e.start), e.state == "運行終了"))
+        .filter(|(t, _)| *t >= shift.start && *t <= shift.end)
+        .collect();
+    points.sort();
+    let mut out = Vec::new();
+    let mut open: Option<NaiveDateTime> = None;
+    for (t, is_end) in points {
+        if is_end {
+            // 最初の運行終了を保持する (連続する終了で上書きしない)
+            open.get_or_insert(t);
+        } else if let Some(s) = open.take() {
+            if t > s {
+                out.push((s, t));
+            }
+        }
+    }
+    merge_intervals(out)
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -1146,6 +1190,9 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     // 休息の中に入った休憩は二重に引かない (昼休憩の窓が休息に丸ごと重なる場合など)
     let breaks = subtract_intervals(&breaks, &rests);
     let break_minutes: i64 = breaks.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
+    // 運行の継ぎ目 (紙が拘束に入れない分)。休息と重なる分は拘束から外れているので除く
+    let run_gaps = subtract_intervals(&run_gap_spans(events, shift), &rests);
+    let run_gap_minutes: i64 = run_gaps.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let intervals = subtract_intervals(&restraint, &breaks);
     let is_legal_holiday = shift.start.weekday() == Weekday::Sun;
 
@@ -1205,11 +1252,22 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
                 .restraint_minutes += minutes;
         }
     }
+    // 継ぎ目も暦日へ配る — 突合は暦日単位なので、日跨ぎの継ぎ目を始業日に寄せると
+    // 残差の説明が別の日に付いてしまう
+    for (s, e) in &run_gaps {
+        for (date, minutes) in split_by_date(*s, *e) {
+            parts
+                .entry(date)
+                .or_insert_with(|| DayPart::new(date))
+                .run_gap_minutes += minutes;
+        }
+    }
 
     DaySummary {
         // フェリー控除は勤務の計算に混ぜない。日別サマリを組み終えてから
         // `apply_ferry_minus` で暦日ごとに載せる (Refs #146)
         ferry_minus_minutes: 0,
+        run_gap_minutes,
         date: shift.start.format("%Y-%m-%d").to_string(),
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
@@ -3140,6 +3198,59 @@ mod tests {
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].start, "2026-06-02 04:42:00");
         assert_eq!(days[0].end, "2026-06-02 16:18:00");
+    }
+
+    #[test]
+    fn run_gap_minutes_counts_seams_between_runs() {
+        // 乗務員 1731 / 2026-03-16 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 紙は運行単位のスパンを合算するので 12:17→12:40 の継ぎ目 23 分が入らない。
+        // 幽霊運行 (12:18 の 開始→終了) は継ぎ目を 2 つに割るだけ
+        let rows = vec![
+            ev("2026-06-15 11:17:00", "2026-06-16 08:35:00", "休息"),
+            dtako("2026-06-16 12:17:00", "運行終了"),
+            dtako("2026-06-16 12:18:00", "運行開始"),
+            dtako("2026-06-16 12:18:00", "運行終了"),
+            dtako("2026-06-16 12:40:00", "運行開始"),
+            ev("2026-06-16 19:46:00", "2026-06-17 06:22:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let d = days.iter().find(|d| d.date == "2026-06-16").unwrap();
+        // 拘束は変えない (#123 のとおり継ぎ目も勤務の続き)
+        assert_eq!(d.restraint_minutes, 671);
+        assert_eq!(d.run_gap_minutes, 23);
+    }
+
+    #[test]
+    fn run_gap_ignores_a_run_end_without_a_next_start() {
+        // 帰宅 (運行終了のあと勤務内に運行開始が無い) は継ぎ目ではない
+        let rows = vec![
+            ev("2026-06-15 20:00:00", "2026-06-16 05:26:00", "休息"),
+            dtako("2026-06-16 11:51:00", "運行終了"),
+            ev("2026-06-16 13:19:00", "2026-06-17 03:17:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let d = days.iter().find(|d| d.date == "2026-06-16").unwrap();
+        assert_eq!(d.run_gap_minutes, 0);
+    }
+
+    #[test]
+    fn run_gap_crossing_midnight_lands_on_each_day() {
+        // 日跨ぎの継ぎ目は暦日へ配る — 突合は暦日単位
+        let rows = vec![
+            ev("2026-06-15 06:00:00", "2026-06-16 20:00:00", "休息"),
+            dtako("2026-06-16 23:00:00", "運行終了"),
+            dtako("2026-06-17 01:00:00", "運行開始"),
+            ev("2026-06-17 10:00:00", "2026-06-18 04:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let d = days.iter().find(|d| d.date == "2026-06-16").unwrap();
+        assert_eq!(d.run_gap_minutes, 120);
+        let by_date: Vec<_> = d
+            .parts
+            .iter()
+            .map(|p| (p.date.as_str(), p.run_gap_minutes))
+            .collect();
+        assert_eq!(by_date, vec![("2026-06-16", 60), ("2026-06-17", 60)]);
     }
 
     #[test]
