@@ -119,6 +119,33 @@ pub trait KintaiEventsApi: Send + Sync {
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         self.fetch_all_events_between(&from, &to).await
     }
+
+    /// 対象月の**フェリー区間** (Refs #146、yhonda-ohishi/nginx#788 からの引き継ぎ)。
+    ///
+    /// 紙のタイムカード表が拘束から引いている「同日フェリー控除」を再現するための
+    /// 読み出し口。**控除は紙の側の誤り**で、こちらの拘束には影響させない — 突合で
+    /// 差の原因を説明するためだけに使う。
+    ///
+    /// `driver` を省略すると全乗務員。範囲は**その月ちょうど** `[月初, 翌月初)` で、
+    /// イベント側の `[月初, 翌月+1日)` とは違う — 上流の条件
+    /// (`$fr->開始日時 >= $date_f && < $date_next`) をそのまま写すため。
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError>;
+
+    /// 対象月 (`YYYY-MM`) のフェリー区間。範囲はその月ちょうど。
+    async fn fetch_ferry(
+        &self,
+        month: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let (from, to) = exact_month_range(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        self.fetch_ferry_between(&from, &to, driver).await
+    }
 }
 
 pub type DynKintaiEventsRepo = Arc<dyn KintaiEventsApi>;
@@ -146,6 +173,15 @@ impl KintaiEventsApi for DisabledKintaiEventsRepo {
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         Err(KintaiRepoError::NotConfigured)
     }
+
+    async fn fetch_ferry_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        Err(KintaiRepoError::NotConfigured)
+    }
 }
 
 /// 対象月の取得範囲 `[月初, 翌月+1日)` を `YYYY-MM-DD HH:MM:SS` で返す。
@@ -155,6 +191,26 @@ impl KintaiEventsApi for DisabledKintaiEventsRepo {
 /// が `queryEnd = nextMonth + 1day` にしているのと同じ考え方)。
 ///
 /// `month` は呼び出し側 (`is_valid_month`) で検証済みの `YYYY-MM` 前提。
+/// 対象月**ちょうど**の範囲 `[月初, 翌月初)`。
+///
+/// [`month_range`] が翌月 2 日まで広げるのは日跨ぎ勤務の終わりを拾うためだが、
+/// フェリー控除は上流が `開始日時 >= $date_f && < $date_next` で切っている。
+/// **紙と同じ数字を出すのが目的**なので、そちらに合わせる。
+pub fn exact_month_range(month: &str) -> Option<(String, String)> {
+    let year: i32 = month.get(..4)?.parse().ok()?;
+    let mm: u32 = month.get(5..7)?.parse().ok()?;
+    let first = chrono::NaiveDate::from_ymd_opt(year, mm, 1)?;
+    let next = if mm == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, mm + 1, 1)?
+    };
+    Some((
+        format!("{} 00:00:00", first.format("%Y-%m-%d")),
+        format!("{} 00:00:00", next.format("%Y-%m-%d")),
+    ))
+}
+
 pub fn month_range(month: &str) -> Option<(String, String)> {
     let year: i32 = month.get(..4)?.parse().ok()?;
     let mm: u32 = month.get(5..7)?.parse().ok()?;
@@ -289,6 +345,44 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
  ORDER BY driver_id, datetime, source
 "#;
 
+/// フェリー区間 (Refs #146)。
+///
+/// - **`dtako_ferry_rows` は 3 列しか読めない** (`運行NO` / `開始日時` / `終了日時`)。
+///   このテーブルは `標準料金` / `契約料金` を持つので、`kintai_reader` には列単位で
+///   GRANT してある。列を足すときは GRANT の追加が要る
+/// - 乗務員は `dtako_rows.対象乗務員CD` から取る。**`dtako_ferry_rows.乗務員CD1` は
+///   使わない** — 2 名乗務では運行まるごとが別の乗務員のまま記録される (`EVENTS_SQL`
+///   と同じ理由)
+/// - 突合の鍵は `運行NO`。上流は `substr($dtako_row->運行NO, 0, 22) . "1"` で引いて
+///   いるので、`CONCAT(LEFT(r.運行NO, 22), '1')` で同じものを作る
+/// - 運行側も月で絞る。上流は当月に出庫 **または** 帰庫した運行だけを回しているので、
+///   その条件も写す (ferry の月内条件だけだと、月をまたいだ運行のフェリーを拾って
+///   紙と数字がずれる)
+/// - `:driver` が NULL なら全乗務員 (`fetch_ferry_between` の `driver: None`)
+const FERRY_SQL: &str = r#"
+SELECT DATE_FORMAT(f.`開始日時`, '%Y-%m-%d %H:%i:%s') AS start_datetime,
+       DATE_FORMAT(f.`終了日時`, '%Y-%m-%d %H:%i:%s') AS end_datetime,
+       r.`対象乗務員CD`                               AS driver_id
+  FROM dtako_ferry_rows f
+  JOIN dtako_rows r ON f.`運行NO` = CONCAT(LEFT(r.`運行NO`, 22), '1')
+ WHERE f.`開始日時` >= :from AND f.`開始日時` < :to
+   AND (:driver IS NULL OR r.`対象乗務員CD` = :driver)
+   AND (   (r.`帰庫日時` >= :from AND r.`帰庫日時` < :to)
+        OR (r.`出庫日時` >= :from AND r.`出庫日時` < :to) )
+ ORDER BY r.`対象乗務員CD`, f.`開始日時`
+"#;
+
+/// `FERRY_SQL` の 1 行。
+type FerryRow = (String, String, Option<i64>);
+
+fn ferry_row_to_json(r: FerryRow) -> serde_json::Value {
+    serde_json::json!({
+        "start_datetime": r.0,
+        "end_datetime": r.1,
+        "driver_id": r.2,
+    })
+}
+
 /// DB から取り出した 1 行 (列の順序は `EVENTS_SQL` と 1:1)。
 type EventRow = (
     String,
@@ -353,6 +447,31 @@ impl MariadbKintaiEventsRepo {
 
 #[async_trait]
 impl KintaiEventsApi for MariadbKintaiEventsRepo {
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let rows: Vec<FerryRow> = conn
+            .exec(
+                FERRY_SQL,
+                params! {
+                    "from" => from,
+                    "to" => to,
+                    "driver" => driver,
+                },
+            )
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(ferry_row_to_json).collect())
+    }
+
     async fn fetch_events_between(
         &self,
         from: &str,
