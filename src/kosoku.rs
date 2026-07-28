@@ -56,6 +56,13 @@
 //! 閾値 (既定 10 分) 以上の `休憩` イベントだけを数える。**拘束からは外さない** —
 //! 拘束 = 終業 − 始業、実働 = 拘束 − 休憩。
 //!
+//! **運行に出ていない勤務は昼休憩 (12:00-13:00) を引く** (ユーザー決定 2026-07-28)。
+//! 休憩イベントはデジタコにしか残らないので、事務・作業・整備、および乗務員が構内
+//! 作業だけした日は休憩が 1 分も出ず、実働 = 拘束 になっていた (実測 2026-04: 事務
+//! 1065 は 23 日すべて休憩 0 で拘束 293.8h = 実働 293.8h、一方 乗務 1021 は 26 日で
+//! 休憩 63.1h)。運行中かどうかは [`has_operation`] が判定し、**イベント由来の休憩と
+//! 昼休憩は排他** — 運行中の日に昼休憩を足すと昼を二重に引く。
+//!
 //! ### 24 時間を超える拘束
 //!
 //! たまに日付を跨いで 24 時間以上続く運行がある (実測では最長 38.1 時間)。**例外的な
@@ -82,6 +89,11 @@ const FMT: &str = "%Y-%m-%d %H:%M:%S";
 const NIGHT_FROM_HOUR: u32 = 22;
 /// 深夜の終了時 (この時未満)。
 const NIGHT_TO_HOUR: u32 = 5;
+
+/// 昼休憩の開始時 / 終了時。**運行に出ていない勤務だけ**この窓を休憩として引く
+/// ([`has_operation`] / [`lunch_windows`])。
+const LUNCH_FROM_HOUR: u32 = 12;
+const LUNCH_TO_HOUR: u32 = 13;
 
 /// 1 勤務の拘束の上限 (分)。これを超えたら**打ち切る**。
 ///
@@ -589,7 +601,7 @@ fn breaks_in(
     shift: &Shift,
     threshold: i64,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
-    let mut out: Vec<(NaiveDateTime, NaiveDateTime)> = events
+    let out: Vec<(NaiveDateTime, NaiveDateTime)> = events
         .iter()
         .filter(|e| e.state == "休憩")
         .filter_map(|e| e.end.map(|end| (floor_min(e.start), floor_min(end))))
@@ -597,16 +609,71 @@ fn breaks_in(
         .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
         .filter(|(s, e)| e > s)
         .collect();
-    out.sort();
-    // 重なった休憩をまとめる (重複して引かないため)
+    merge_intervals(out)
+}
+
+/// 時刻順に並べて重なりをまとめる (重複して引かないため)。
+fn merge_intervals(
+    mut v: Vec<(NaiveDateTime, NaiveDateTime)>,
+) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    v.sort();
     let mut merged: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
-    for (s, e) in out {
+    for (s, e) in v {
         match merged.last_mut() {
             Some(last) if s <= last.1 => last.1 = last.1.max(e),
             _ => merged.push((s, e)),
         }
     }
     merged
+}
+
+/// この勤務が**運行**か (デジタコに運行のイベントが残っているか、ユーザー決定 2026-07-28)。
+///
+/// 運行中なら休憩はイベントから出せる (運転を止めた時間がそのまま記録されている)。
+/// 運行に出ていない勤務 — 事務・作業・整備、および乗務員が構内作業だけした日 — は
+/// デジタコに何も残らないので、イベントからは休憩が 1 分も出ず**実働 = 拘束**に
+/// なっていた。そういう日は昼休憩を引く ([`lunch_windows`])。
+///
+/// - **`休息` は運行の証拠にしない** — 休息は勤務の**外側**の境界であって
+///   ([`shifts_from_rest`])、その勤務中に運行したことを意味しない
+/// - 打刻 (`timecard`) も証拠にしない — 打刻は事務員にもある
+/// - 点イベント (`dtako` の 運行開始 / 運行終了) は区間を持たないので、勤務に
+///   含まれるかどうかで見る
+fn has_operation(events: &[Event], shift: &Shift) -> bool {
+    events
+        .iter()
+        .filter(|e| e.source != "timecard" && e.state != "休息")
+        .any(|e| match e.end {
+            Some(end) => overlaps((e.start, end), (shift.start, shift.end)),
+            None => e.start >= shift.start && e.start <= shift.end,
+        })
+}
+
+/// 勤務が跨ぐ暦日ごとの昼休憩の窓 (12:00-13:00) を、勤務内へ切り詰めて返す。
+///
+/// 窓は消費側 (`nuxt-dtako-admin` の `timecard-summary.ts`) が打刻から実働を出す
+/// ときに使っているものと同じ — 同じ人の同じ日が、経路によって違う実働になるのを
+/// 防ぐ。勤務は 24 時間で打ち切られているので、跨ぐ暦日は最大 2 日。
+fn lunch_windows(shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let mut out = Vec::new();
+    let mut day = shift.start.date();
+    let last = shift.end.date();
+    while day <= last {
+        let from = day
+            .and_hms_opt(LUNCH_FROM_HOUR, 0, 0)
+            .expect("12:00 は常に有効");
+        let to = day
+            .and_hms_opt(LUNCH_TO_HOUR, 0, 0)
+            .expect("13:00 は常に有効");
+        // 勤務の外へはみ出す分は落とす (昼をまたがない勤務は 1 件も出ない)
+        let s = from.max(shift.start);
+        let e = to.min(shift.end);
+        if e > s {
+            out.push((s, e));
+        }
+        day += Duration::days(1);
+    }
+    out
 }
 
 /// 拘束区間から休憩を差し引いて、実働区間の列を返す。
@@ -648,7 +715,16 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         },
         source: shift.source,
     };
-    let breaks = breaks_in(events, shift, p.break_threshold_minutes);
+    // 運行に出ていない勤務は昼休憩を引く (ユーザー決定 2026-07-28)。運行中なら
+    // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
+    let breaks = if has_operation(events, shift) {
+        breaks_in(events, shift, p.break_threshold_minutes)
+    } else {
+        // **運行に出ていない勤務にはデジタコの休憩イベントも無い** — 休憩イベントは
+        // 運行に紐づいて記録されるので、勤務に重なる休憩が 1 件でもあれば
+        // `has_operation` が true になりこちらへは来ない。足し合わせは起きえない
+        lunch_windows(shift)
+    };
     let break_minutes: i64 = breaks.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let intervals = working_intervals(shift, &breaks);
     let is_legal_holiday = shift.start.weekday() == Weekday::Sun;
@@ -910,7 +986,8 @@ mod tests {
             tc("2026-06-02 15:00:00", "終業"), // 360 分
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
-        assert_eq!(d.statutory_minutes, 360);
+        // 運行に出ていない勤務なので昼休憩 60 分が引かれる (360 - 60)
+        assert_eq!(d.statutory_minutes, 300);
         assert_eq!(d.within_statutory_overtime_minutes, 0);
         assert_eq!(d.overtime_minutes, 0);
     }
@@ -1056,7 +1133,8 @@ mod tests {
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.is_legal_holiday);
-        assert_eq!(d.legal_holiday_minutes, 720);
+        // 運行に出ていない勤務なので昼休憩 60 分が引かれる (720 - 60)
+        assert_eq!(d.legal_holiday_minutes, 660);
         assert_eq!(d.statutory_minutes, 0);
         assert_eq!(d.within_statutory_overtime_minutes, 0);
         assert_eq!(d.overtime_minutes, 0);
@@ -1147,7 +1225,126 @@ mod tests {
             tc("2026-06-02 18:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        // 勤務外の 2 件はどちらも落ちている — 残っているのは昼休憩の 60 分だけ
+        // (落ちていなければ 120 分が上乗せされる)
+        assert_eq!(d.break_minutes, 60);
+        assert_eq!(d.working_minutes, 540 - 60);
+    }
+
+    // --- 運行に出ていない勤務の昼休憩 (ユーザー決定 2026-07-28) ---
+
+    #[test]
+    fn shift_without_operation_gets_lunch_break() {
+        // 事務員の 1 日。デジタコには何も残らないので、休憩イベントは 1 件も無い
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"), // 600 分
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 60);
+        assert_eq!(d.working_minutes, 540);
+        // 拘束は昼休憩を引く前のまま (拘束 = 終業 − 始業)
+        assert_eq!(d.restraint_minutes, 600);
+    }
+
+    #[test]
+    fn shift_with_operation_keeps_event_breaks_only() {
+        // 運行に出ている日は昼休憩を足さない (デジタコの休憩イベントが正)
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            ev("2026-06-02 09:00:00", "2026-06-02 17:00:00", "運転"),
+            ev("2026-06-02 15:00:00", "2026-06-02 15:30:00", "休憩"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 30);
+        assert_eq!(d.working_minutes, 570);
+    }
+
+    #[test]
+    fn operation_without_any_break_event_still_gets_no_lunch() {
+        // 運行に出ていれば、休憩イベントが 0 件でも昼休憩は足さない
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            ev("2026-06-02 09:00:00", "2026-06-02 17:00:00", "運転"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert_eq!(d.break_minutes, 0);
+        assert_eq!(d.working_minutes, 600);
+    }
+
+    #[test]
+    fn point_operation_event_inside_shift_counts_as_operation() {
+        // 運行開始 / 運行終了 (`dtako`) は区間を持たない点イベント
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            dtako("2026-06-02 09:00:00", "運行開始"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 0);
+    }
+
+    #[test]
+    fn point_operation_event_outside_shift_is_not_operation() {
+        // 勤務の外にある運行イベントはこの勤務の証拠にならない
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            dtako("2026-06-02 20:00:00", "運行開始"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 60);
+    }
+
+    #[test]
+    fn rest_event_alone_is_not_operation() {
+        // 休息は勤務の**外側**の境界なので、運行した証拠にはしない。
+        // 06/02 06:00 に終わる休息 → 始業、06/03 06:00 に始まる休息 → 終業
+        let rows = vec![
+            ev("2026-06-01 20:00:00", "2026-06-02 06:00:00", "休息"),
+            ev("2026-06-03 06:00:00", "2026-06-03 16:00:00", "休息"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.source, ShiftSource::Rest);
+        // 入るのは 6/2 の昼だけ — 6/3 の昼は終業 (06:00) より後なので切り落とされる
+        assert_eq!(d.break_minutes, 60);
+    }
+
+    #[test]
+    fn lunch_is_clipped_to_the_shift() {
+        // 12:30 始業 → 入るのは 12:30-13:00 の 30 分だけ
+        let rows = vec![
+            tc("2026-06-02 12:30:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 30);
+    }
+
+    #[test]
+    fn shift_not_covering_noon_has_no_lunch() {
+        let rows = vec![
+            tc("2026-06-02 13:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 0);
+        assert_eq!(d.working_minutes, 300);
+    }
+
+    #[test]
+    fn break_event_alone_counts_as_operation_so_no_lunch_is_added() {
+        // 休憩イベントは運行に紐づいて記録される = その勤務は運行に出ている。
+        // 昼と重なっていても足し合わせない (12:00-13:30 の 90 分にはならない)
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            ev("2026-06-02 12:30:00", "2026-06-02 13:30:00", "休憩"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 60);
         assert_eq!(d.working_minutes, 540);
     }
 
@@ -1264,8 +1461,10 @@ mod tests {
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.over_24h);
-        assert_eq!(d.break_minutes, 0);
-        assert_eq!(d.working_minutes, 1440);
+        // 打ち切り後の休憩は落ちている — 残っているのは打ち切り前に入る 6/2 の
+        // 昼休憩だけ (6/3 の昼は 06:00 打ち切りより後なので入らない)
+        assert_eq!(d.break_minutes, 60);
+        assert_eq!(d.working_minutes, 1440 - 60);
     }
 
     // --- 勤務を構成した打刻 (Refs #128) ---
