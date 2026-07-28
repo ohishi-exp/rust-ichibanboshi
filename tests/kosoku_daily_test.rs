@@ -760,6 +760,79 @@ async fn compare_view_omits_a_zero_rest_deduction() {
     assert!(body["days"][0].get("rest_minus_minutes").is_none());
 }
 
+// --- 全列同一の行の検知 (Refs nuxt-dtako-admin#501) ---
+
+#[tokio::test]
+async fn duplicate_rows_are_reported_per_calendar_day() {
+    // 取り込みが 2 回走った形。落とした件数を暦日ごとに返す (紙は二重計上する)
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            ev("2026-06-02 10:00:00", "2026-06-02 11:00:00", "休憩"),
+            ev("2026-06-02 10:00:00", "2026-06-02 11:00:00", "休憩"),
+            tc("2026-06-02 20:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["duplicate_rows"]["2026-06-02"], 1);
+    // 落としたので休憩は 1 回だけ引かれる
+    assert_eq!(body["days"][0]["break_minutes"], 60);
+}
+
+#[tokio::test]
+async fn compare_view_reports_duplicate_rows_too() {
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            ev("2026-06-02 10:00:00", "2026-06-02 11:00:00", "休憩"),
+            ev("2026-06-02 10:00:00", "2026-06-02 11:00:00", "休憩"),
+            tc("2026-06-02 20:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["duplicate_rows"]["2026-06-02"], 1);
+}
+
+#[tokio::test]
+async fn compare_view_omits_duplicate_rows_when_there_are_none() {
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("duplicate_rows").is_none());
+}
+
+#[tokio::test]
+async fn duplicate_rows_are_reported_for_all_drivers_too() {
+    let (status, body) = serve(
+        vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+            tc_of(1018, "2026-06-02 09:00:00", "始業"),
+            tc_of(1018, "2026-06-02 17:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let drivers = body["drivers"].as_array().unwrap();
+    let a = drivers.iter().find(|d| d["driver"] == 1119).unwrap();
+    let b = drivers.iter().find(|d| d["driver"] == 1018).unwrap();
+    assert_eq!(a["duplicate_rows"]["2026-06-02"], 1);
+    // 重複の無い乗務員には付けない
+    assert!(b.get("duplicate_rows").is_none());
+}
+
 #[tokio::test]
 async fn compare_view_keeps_parts_for_the_calendar_split() {
     // 日跨ぎ勤務は暦日按分に parts が要る。ただし日付と拘束だけ
