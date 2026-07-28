@@ -1,4 +1,5 @@
-use rust_ichibanboshi::config::{AppArgs, Config};
+use rust_ichibanboshi::config::{AppArgs, Config, RestraintRoundingToml};
+use rust_ichibanboshi::kosoku::RestraintRounding;
 use std::io::Write;
 
 /// exe 隣接 `ichibanboshi.toml` を書くテストと、default locations を読むテストの
@@ -428,4 +429,71 @@ fn test_kosoku_config_partial_keeps_other_defaults() {
     // Debug / Clone を通しておく
     let c = config.kosoku.clone();
     assert!(format!("{c:?}").contains("15"));
+}
+
+#[test]
+fn test_restraint_rounding_defaults_to_the_paper_rule() {
+    // 既定は紙のタイムカード表と同じ「経過時間を切り捨て」(Refs #149)
+    let config: Config = toml::from_str("").unwrap();
+    assert_eq!(
+        config.kosoku.restraint_rounding,
+        RestraintRoundingToml::TruncateElapsed
+    );
+    assert_eq!(
+        RestraintRounding::from(config.kosoku.restraint_rounding),
+        RestraintRounding::TruncateElapsed
+    );
+}
+
+#[test]
+fn test_restraint_rounding_can_go_back_to_floor_endpoints() {
+    // 従来の丸めに TOML だけで戻せる (再デプロイのみ、コード変更不要)
+    let config: Config = toml::from_str(
+        "[kosoku]
+restraint_rounding = \"floor_endpoints\"
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.kosoku.restraint_rounding,
+        RestraintRoundingToml::FloorEndpoints
+    );
+    assert_eq!(
+        RestraintRounding::from(config.kosoku.restraint_rounding),
+        RestraintRounding::FloorEndpoints
+    );
+    // 他の値は既定のまま
+    assert_eq!(config.kosoku.break_threshold_minutes, 10);
+}
+
+#[test]
+fn test_restraint_rounding_accepts_the_explicit_default() {
+    let config: Config = toml::from_str(
+        "[kosoku]
+restraint_rounding = \"truncate_elapsed\"
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.kosoku.restraint_rounding,
+        RestraintRoundingToml::TruncateElapsed
+    );
+    // Debug / Clone / Copy を通しておく
+    let c = config.kosoku.restraint_rounding;
+    assert!(format!("{c:?}").contains("TruncateElapsed"));
+}
+
+#[test]
+fn test_restraint_rounding_rejects_an_unknown_value() {
+    // 綴り間違いを黙って既定に落とさない (丸めは金額に効くので fail-loud)
+    let err = toml::from_str::<Config>(
+        "[kosoku]
+restraint_rounding = \"nearest\"
+",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "unexpected error: {err}"
+    );
 }
