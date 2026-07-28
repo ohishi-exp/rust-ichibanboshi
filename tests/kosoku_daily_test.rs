@@ -373,7 +373,7 @@ async fn sunday_is_legal_holiday() {
 }
 
 #[tokio::test]
-async fn over_24h_is_capped_and_flagged() {
+async fn over_24h_is_flagged_but_not_capped() {
     let (status, body) = serve(
         vec![
             tc("2026-06-02 06:00:00", "始業"),
@@ -385,7 +385,8 @@ async fn over_24h_is_capped_and_flagged() {
     assert_eq!(status, StatusCode::OK);
     let d = &body["days"][0];
     assert_eq!(d["over_24h"], true);
-    assert_eq!(d["restraint_minutes"], 1440);
+    // **打ち切らない** (Refs #152) — 旗は立てるが値は実測のまま
+    assert_eq!(d["restraint_minutes"], 2288);
 }
 
 // --- driver 省略 = 全乗務員 (Refs #125) ---
