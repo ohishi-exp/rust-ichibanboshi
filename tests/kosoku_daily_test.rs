@@ -291,8 +291,9 @@ async fn overnight_shift_is_filed_under_start_date() {
     assert_eq!(days.len(), 1);
     assert_eq!(days[0]["date"], "2026-06-30");
     assert_eq!(days[0]["restraint_minutes"], 600);
-    // 深夜 22:00〜05:00 の 420 分
-    assert_eq!(days[0]["night_minutes"], 420);
+    // 昼の窓に掛からない勤務なので、休憩 60 分がまん中 (02:30-03:30、深夜帯) に入る。
+    // 深夜は 22:00〜05:00 の 420 分から休憩ぶんを引いた 360 分
+    assert_eq!(days[0]["night_minutes"], 360);
 }
 
 #[tokio::test]
