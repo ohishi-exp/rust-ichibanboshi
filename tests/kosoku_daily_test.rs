@@ -720,10 +720,7 @@ async fn compare_view_returns_only_what_the_diff_needs() {
     assert_eq!(status, StatusCode::OK);
     let d = &body["days"][0];
     let keys: Vec<&str> = d.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    assert_eq!(
-        keys,
-        vec!["date", "ferry_minus_minutes", "restraint_minutes"]
-    );
+    assert_eq!(keys, vec!["date", "restraint_minutes"]);
     assert_eq!(d["restraint_minutes"], 540);
     // 打刻は突合で使わないので付けない
     assert!(body.get("punches").is_none());
@@ -791,10 +788,7 @@ async fn compare_view_drops_punches_for_all_drivers_too() {
         .keys()
         .map(|k| k.as_str())
         .collect();
-    assert_eq!(
-        keys,
-        vec!["date", "ferry_minus_minutes", "restraint_minutes"]
-    );
+    assert_eq!(keys, vec!["date", "restraint_minutes"]);
 }
 
 #[tokio::test]
@@ -810,4 +804,28 @@ async fn an_unknown_view_falls_back_to_the_full_shape() {
     .await;
     assert!(body.get("punches").is_some());
     assert!(body["days"][0].get("working_minutes").is_some());
+}
+
+#[tokio::test]
+async fn compare_view_keeps_a_non_zero_ferry_deduction() {
+    // 控除がある日だけ ferry_minus_minutes を載せる (Refs #157)
+    let repo = MockRepo::with_ferry(
+        vec![
+            tc_of(1726, "2026-06-02 09:00:00", "始業"),
+            tc_of(1726, "2026-06-02 18:00:00", "終業"),
+        ],
+        vec![ferry_row(
+            "2026-06-02 10:00:00",
+            "2026-06-02 11:18:56",
+            1726,
+        )],
+    );
+    let (status, body) = call(
+        app(repo),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1726&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &serde_json::from_str::<Value>(&body).unwrap()["days"][0];
+    assert!(d["ferry_minus_minutes"].as_i64().unwrap() > 0);
 }
