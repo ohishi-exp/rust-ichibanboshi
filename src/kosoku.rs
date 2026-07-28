@@ -536,11 +536,7 @@ fn rest_spans(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     // (2026-01〜07 で 72 時間超が 20 件、大半は連休)。中に別の休息を含むかどうかが、
     // 張り付きと本物の連休を分ける。
     let spans = rests.clone();
-    rests.retain(|r| {
-        !spans
-            .iter()
-            .any(|o| o != r && o.0 >= r.0 && o.1 <= r.1)
-    });
+    rests.retain(|r| !spans.iter().any(|o| o != r && o.0 >= r.0 && o.1 <= r.1));
     for r in rests.iter_mut() {
         let clip = events
             .iter()
