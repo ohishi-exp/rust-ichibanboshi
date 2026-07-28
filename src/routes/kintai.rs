@@ -183,6 +183,51 @@ pub async fn daily(
     Ok(Json(with_source_meta(resp, "live", &synced_at)))
 }
 
+/// GET /api/kintai/pdf-json?month=YYYY-MM[&driver=1021] — タイムカード表 **PDF 相当**
+/// の中継 (Refs #143、yhonda-ohishi/nginx#782、ohishi-exp/nuxt-dtako-admin#492)。
+///
+/// 用途は dtako-admin のタイムカード表と社内 CakePHP の PDF の **1 vs 1 突合**、
+/// および MCP での全乗務員一括チェック。[`daily`] (打刻セッション) とはデータが違い、
+/// 拘束 (`time_card_kosoku` の日別合計・type 別内訳)・休暇区分・月次集計欄を持つ。
+///
+/// **キャッシュを持たない** — 突合は「いま上流が何を出しているか」を見るのが目的で、
+/// derived store を挟むと nginx 側の修正が反映されたかどうかが分からなくなる。
+///
+/// `driver` の扱いは [`kosoku_daily`] と揃える — **省略で全乗務員**、`driver=` (空) は
+/// 省略ではなく不正として 400。
+pub async fn pdf_json(
+    Query(params): Query<EventsQuery>,
+    Extension(cakephp): Extension<Arc<CakephpClient>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    if !is_valid_month(&month) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください".to_string(),
+        ));
+    }
+    let driver = match params.driver {
+        None => None,
+        Some(raw) => match parse_driver(&raw) {
+            Some(d) => Some(d),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "driver は乗務員CD (数字) で指定してください".to_string(),
+                ))
+            }
+        },
+    };
+    let resp = cakephp
+        .fetch_timecard_pdf_json(&month, driver)
+        .await
+        .map_err(map_cakephp_err)?;
+    // 値は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
+    let all = driver.is_none();
+    tracing::info!(month = %month, all, "kintai pdf-json relayed");
+    Ok(Json(resp))
+}
+
 /// 生イベント読み取りのエラーを HTTP ステータスへ写す。
 ///
 /// 未設定は 503 (`base_url` 未設定と同じ fail-closed)、DB 停止・クエリ失敗は 502。

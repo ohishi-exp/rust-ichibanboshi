@@ -226,6 +226,40 @@ impl CakephpClient {
         self.get_json(&url).await
     }
 
+    /// `/time-card/pdf-json?month=YYYY-MM[&driver_id=1021]`
+    /// (Refs #143、yhonda-ohishi/nginx#782)
+    ///
+    /// タイムカード表 **PDF (`TimeCardController::createPdf`) が出す数字**の JSON 版。
+    /// [`fetch_timecard_daily`](Self::fetch_timecard_daily) (打刻セッション) とは別物で、
+    /// 拘束 (`time_card_kosoku` の日別合計・type 別内訳)・休暇区分・月次集計欄を持つ。
+    /// dtako-admin のタイムカード表と 1 vs 1 で突き合わせるための読み出し口。
+    ///
+    /// **`driver_id` 省略で全乗務員。** MCP の一括チェックが月 1 リクエストで済むよう
+    /// 上流がそう作られている。
+    ///
+    /// 応答は [`serde_json::Value`] のまま返す — 上流の形が確定しておらず、かつ
+    /// このサービスは中継であって解釈者ではないため、型を持たない。
+    pub async fn fetch_timecard_pdf_json(
+        &self,
+        month: &str,
+        driver: Option<u64>,
+    ) -> Result<serde_json::Value, CakephpError> {
+        if !self.is_enabled() {
+            return Err(CakephpError::NotConfigured);
+        }
+        let base = self.base_url.trim_end_matches('/');
+        let url = match driver {
+            Some(d) => format!(
+                "{}/time-card/pdf-json?month={}&driver_id={}",
+                base,
+                urlencode(month),
+                d
+            ),
+            None => format!("{}/time-card/pdf-json?month={}", base, urlencode(month)),
+        };
+        self.get_json(&url).await
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, CakephpError> {
         let res = self
             .client
@@ -359,6 +393,11 @@ mod tests {
         assert!(matches!(err, CakephpError::NotConfigured));
         let err2 = c.fetch_masters("2026-06-29").await.unwrap_err();
         assert!(matches!(err2, CakephpError::NotConfigured));
+        let err3 = c
+            .fetch_timecard_pdf_json("2026-04", Some(1021))
+            .await
+            .unwrap_err();
+        assert!(matches!(err3, CakephpError::NotConfigured));
     }
 
     #[test]
