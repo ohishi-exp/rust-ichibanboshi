@@ -58,6 +58,52 @@ pub struct DailyQuery {
 pub struct EventsQuery {
     pub month: Option<String>,
     pub driver: Option<String>,
+    /// `view=compare` で**突合に要る項目だけ**返す (Refs #157)。省略で従来どおり全項目。
+    pub view: Option<String>,
+}
+
+/// 突合用に日別を絞る (Refs #157)。
+///
+/// 全項目だと 1 日 516 B・19 キーあり、2026-05 の全乗務員で **1.71 MB**。突合
+/// (`timecard-compare` / `get_timecard_diff`) が使うのは**日付・拘束・フェリー控除**と、
+/// 暦日按分のための `parts` の日付・拘束だけで、残り 15 キーは受け取って捨てられていた。
+/// 絞ると **108 KB (16 分の 1)**。
+///
+/// この経路は社内から Cloudflare Tunnel を通って出ていくので、応答サイズがそのまま
+/// 応答時間になる (実測: DB 0.48 秒 / rust 0.46 秒 なのにブラウザで 14〜57 秒)。
+///
+/// **キー名は元のまま**にする。短縮すると消費側 (relay / kyuyo-mcp) のパーサを
+/// 2 通り持つことになり、削れるのは数 % しかない。
+fn compare_days(days: &[crate::kosoku::DaySummary]) -> Vec<serde_json::Value> {
+    days.iter()
+        .map(|d| {
+            let parts: Vec<serde_json::Value> = d
+                .parts
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "date": p.date,
+                        "restraint_minutes": p.restraint_minutes,
+                    })
+                })
+                .collect();
+            let mut o = serde_json::json!({
+                "date": d.date,
+                "restraint_minutes": d.restraint_minutes,
+                "ferry_minus_minutes": d.ferry_minus_minutes,
+            });
+            // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
+            if !parts.is_empty() {
+                o["parts"] = serde_json::Value::Array(parts);
+            }
+            o
+        })
+        .collect()
+}
+
+/// `view=compare` か。未知の値は**従来どおり**扱う (壊さない方に倒す)。
+fn is_compare_view(view: Option<&str>) -> bool {
+    view == Some("compare")
 }
 
 /// 対象月の書式検証。`YYYY-MM` で月は 01-12。
@@ -326,7 +372,13 @@ pub async fn kosoku_daily(
         ));
     }
     let Some(raw_driver) = params.driver else {
-        return kosoku_daily_all(&month, repo, &params_cfg).await;
+        return kosoku_daily_all(
+            &month,
+            repo,
+            &params_cfg,
+            is_compare_view(params.view.as_deref()),
+        )
+        .await;
     };
     let driver = match parse_driver(&raw_driver) {
         Some(d) => d,
@@ -353,6 +405,14 @@ pub async fn kosoku_daily(
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = days.len();
     tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
+    if is_compare_view(params.view.as_deref()) {
+        // 突合は打刻を見ない
+        return Ok(Json(serde_json::json!({
+            "month": month,
+            "driver": driver,
+            "days": compare_days(&days),
+        })));
+    }
     Ok(Json(serde_json::json!({
         "month": month,
         "driver": driver,
@@ -373,6 +433,7 @@ async fn kosoku_daily_all(
     month: &str,
     repo: DynKintaiEventsRepo,
     params_cfg: &KosokuParams,
+    compare_view: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let rows = repo.fetch_all_events(month).await.map_err(map_repo_err)?;
     // 全乗務員ぶんを 1 回で引いて乗務員ごとに分ける (Refs #146)。取れなければ空 =
@@ -397,7 +458,12 @@ async fn kosoku_daily_all(
         })
         .filter(|(_, days, punches)| !days.is_empty() || !punches.is_empty())
         .map(|(driver, days, punches)| {
-            serde_json::json!({ "driver": driver, "days": days, "punches": punches })
+            if compare_view {
+                // 突合は打刻を見ない。日別も要る項目だけに絞る (Refs #157)
+                serde_json::json!({ "driver": driver, "days": compare_days(&days) })
+            } else {
+                serde_json::json!({ "driver": driver, "days": days, "punches": punches })
+            }
         })
         .collect();
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない

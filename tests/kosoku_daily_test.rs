@@ -703,3 +703,111 @@ async fn kosoku_daily_survives_a_ferry_failure() {
         assert!(body.contains("\"restraint_minutes\":540"), "{uri}");
     }
 }
+
+// --- view=compare (Refs #157) ---
+
+#[tokio::test]
+async fn compare_view_returns_only_what_the_diff_needs() {
+    // 突合が使うのは日付・拘束・フェリー控除だけ。19 キーのうち 16 キーは捨てられていた
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    let keys: Vec<&str> = d.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["date", "ferry_minus_minutes", "restraint_minutes"]
+    );
+    assert_eq!(d["restraint_minutes"], 540);
+    // 打刻は突合で使わないので付けない
+    assert!(body.get("punches").is_none());
+}
+
+#[tokio::test]
+async fn compare_view_keeps_parts_for_the_calendar_split() {
+    // 日跨ぎ勤務は暦日按分に parts が要る。ただし日付と拘束だけ
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 20:00:00", "始業"),
+            tc("2026-06-03 04:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parts = body["days"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    let keys: Vec<&str> = parts[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(keys, vec!["date", "restraint_minutes"]);
+}
+
+#[tokio::test]
+async fn compare_view_omits_parts_for_a_single_day_shift() {
+    // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
+    let (_, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert!(body["days"][0].get("parts").is_none());
+}
+
+#[tokio::test]
+async fn compare_view_drops_punches_for_all_drivers_too() {
+    // 全乗務員の経路は driver_id で分けるので、行に乗務員CD が要る
+    let with_driver = |dt: &str, st: &str| {
+        let mut v = tc(dt, st);
+        v["driver_id"] = json!(1442);
+        v
+    };
+    let (status, body) = serve(
+        vec![
+            with_driver("2026-06-02 06:00:00", "始業"),
+            with_driver("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d0 = &body["drivers"][0];
+    assert!(d0.get("punches").is_none());
+    let keys: Vec<&str> = d0["days"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["date", "ferry_minus_minutes", "restraint_minutes"]
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_view_falls_back_to_the_full_shape() {
+    // 綴り間違いで黙って情報が減らないように、既定 (全項目) へ倒す
+    let (_, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=full",
+    )
+    .await;
+    assert!(body.get("punches").is_some());
+    assert!(body["days"][0].get("working_minutes").is_some());
+}
