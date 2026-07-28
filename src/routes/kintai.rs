@@ -83,10 +83,14 @@ fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
                 .parts
                 .iter()
                 .map(|p| {
-                    serde_json::json!({
+                    let mut o = serde_json::json!({
                         "date": p.date,
                         "restraint_minutes": p.restraint_minutes,
-                    })
+                    });
+                    if p.run_gap_minutes != 0 {
+                        o["run_gap_minutes"] = serde_json::json!(p.run_gap_minutes);
+                    }
+                    o
                 })
                 .collect();
             let mut o = serde_json::json!({
@@ -103,6 +107,10 @@ fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
             // 「この日は休息を何分外したか」が無いと残差の説明が付かない
             if d.rest_minus_minutes != 0 {
                 o["rest_minus_minutes"] = serde_json::json!(d.rest_minus_minutes);
+            }
+            // 運行の継ぎ目 (cause "run-gap" の実額) も 0 は載せない
+            if d.run_gap_minutes != 0 {
+                o["run_gap_minutes"] = serde_json::json!(d.run_gap_minutes);
             }
             // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
             if !parts.is_empty() {
