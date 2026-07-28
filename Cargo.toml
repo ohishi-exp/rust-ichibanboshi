@@ -20,7 +20,7 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
 bb8 = "0.8"
 bb8-tiberius = "0.15"
