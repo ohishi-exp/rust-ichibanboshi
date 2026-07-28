@@ -472,38 +472,89 @@ fn split_long_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     if out.is_empty() {
         out.push(shift.clone());
     }
-    // それでも 24 時間を超える区間は**最後の運行終了で終わらせる** (Refs #135)
-    out.into_iter().map(|s| end_at_last_run_end(&s, events)).collect()
+    out.into_iter()
+        // 休息が記録されていない帰宅は「運行終了 → 次の運行開始」の空きで割る (Refs #135)
+        .flat_map(|s| split_by_run_gaps(&s, events))
+        .collect()
 }
 
-/// 24 時間を超えたままの勤務を、**中の最後の `運行終了` で終わらせる** (Refs #135)。
+/// 休息と見なす「運行終了 → 次の運行開始」の空き (分)。
 ///
-/// 休息由来の勤務は「次の休息の開始」で終わるが、**運行が終わって帰宅している間は
-/// 休息イベントが出ない**ので勤務が終わらない。実測: 乗務員 1021 は 2026-04-28 08:14 に
-/// 運行終了して帰宅したのに、次の運行 (5/1) まで休息が無く、`04-28 06:47 → 04-29 06:47`
-/// (24 時間打ち切り) になっていた。**運行終了より後は働いていない。**
+/// 改善基準告示の休息期間 (継続 8 時間以上) に合わせる。実測 (96 名 / 2026-06) では
+/// **同日の運行の継ぎ目は 4〜112 分 (中央 8 分)** しかないので、この閾値なら
+/// 「荷を降ろして次の伝票を積んで出るだけ」の継ぎ目 (#123) を割ることはない。
+const RUN_GAP_REST_MINUTES: i64 = 8 * 60;
+
+/// 24 時間を超えたままの勤務を、**運行終了 → 次の運行開始 の長い空きで割る** (Refs #135)。
+///
+/// [`end_at_last_run_end`] は**最後の**運行終了しか見ないので、帰宅を挟んで運行が
+/// 何本も続く勤務では効かない。実測: 乗務員 1108 / 2026-04 は
+///
+/// ```text
+/// 04-11 03:11  休息終了 (= 始業)
+/// 04-11 09:28  運行終了      ← ここで帰宅
+/// 04-13 07:31  運行開始      ← 46 時間空く
+/// 04-13 12:10  運行終了
+/// 04-14 07:13  運行開始      ← 19 時間空く
+/// 04-14 10:48  終業打刻      (= 勤務の終わり)
+/// ```
+///
+/// で、最後の運行終了 (04-13 12:10) で切っても 2 日超が残り、24 時間打ち切りに
+/// 戻っていた (2026-07-28 ユーザー指摘「11 土 … 退社不明 (拘束 24 時間で打ち切り)」)。
 ///
 /// - **24 時間を超えた勤務だけ**が対象。通常の勤務は運行の継ぎ目で切らない (#123)
-/// - 切るのは**最後の**運行終了。途中の継ぎ目では切らない
-/// - 運行終了が無ければ元のまま (打ち切りに任せる)
-fn end_at_last_run_end(shift: &Shift, events: &[Event]) -> Shift {
+/// - 割るのは空きが [`RUN_GAP_REST_MINUTES`] 以上の所だけ
+/// - 運行終了の後に運行開始が無ければ、そこで勤務を終える (帰宅したまま = #135 の形)
+fn split_by_run_gaps(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     if (shift.end - shift.start).num_minutes() <= MAX_RESTRAINT_MINUTES {
-        return shift.clone();
+        return vec![shift.clone()];
     }
-    let last_run_end = events
+    let inside = |t: &NaiveDateTime| *t > shift.start && *t < shift.end;
+    let mut run_ends: Vec<NaiveDateTime> = events
         .iter()
         .filter(|e| e.state == "運行終了")
         .map(|e| floor_min(e.start))
-        .filter(|t| *t > shift.start && *t < shift.end)
-        .max();
-    match last_run_end {
-        Some(end) => Shift {
-            start: shift.start,
+        .filter(inside)
+        .collect();
+    run_ends.sort();
+    let mut run_starts: Vec<NaiveDateTime> = events
+        .iter()
+        .filter(|e| e.state == "運行開始")
+        .map(|e| floor_min(e.start))
+        .filter(inside)
+        .collect();
+    run_starts.sort();
+
+    let mut out = Vec::new();
+    let mut cur = shift.start;
+    for end in run_ends {
+        if end <= cur {
+            continue;
+        }
+        let next_start = run_starts.iter().copied().find(|s| *s > end);
+        let gap = next_start.unwrap_or(shift.end) - end;
+        if gap.num_minutes() < RUN_GAP_REST_MINUTES {
+            continue;
+        }
+        out.push(Shift {
+            start: cur,
             end,
             source: shift.source,
-        },
-        None => shift.clone(),
+        });
+        match next_start {
+            Some(s) => cur = s,
+            // 次の運行が無い = 帰宅したまま。残りは勤務ではない
+            None => return out,
+        }
     }
+    if shift.end > cur {
+        out.push(Shift {
+            start: cur,
+            end: shift.end,
+            source: shift.source,
+        });
+    }
+    out
 }
 
 /// 2 つの区間が重なるか。
@@ -1495,6 +1546,56 @@ mod tests {
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].end, "2026-06-29 04:00:00");
         assert!(!days[0].over_24h);
+    }
+
+    #[test]
+    fn a_long_shift_splits_at_every_long_run_gap() {
+        // 乗務員 1108 / 2026-04 の形 — 帰宅を挟んで運行が 3 本続く。最後の運行終了
+        // (= 6/14 10:48) で切るだけでは 3 日超が残り、24 時間打ち切りに戻っていた
+        let rows = vec![
+            ev("2026-06-10 20:00:00", "2026-06-11 03:11:00", "休息"),
+            dtako("2026-06-11 09:28:00", "運行終了"),
+            // 同じ帰宅の中にもう 1 本運行終了があっても、割る所は増えない
+            dtako("2026-06-11 10:00:00", "運行終了"),
+            dtako("2026-06-13 07:31:00", "運行開始"),
+            dtako("2026-06-13 12:10:00", "運行終了"),
+            dtako("2026-06-14 07:13:00", "運行開始"),
+            dtako("2026-06-14 10:48:00", "運行終了"),
+            ev("2026-06-16 19:05:00", "2026-06-17 06:13:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(
+            days.iter()
+                .map(|d| (d.start.as_str(), d.end.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-06-11 03:11:00", "2026-06-11 09:28:00"),
+                ("2026-06-13 07:31:00", "2026-06-13 12:10:00"),
+                // 最後の運行終了より後は帰宅している — 次の休息までは勤務にしない
+                ("2026-06-14 07:13:00", "2026-06-14 10:48:00"),
+            ],
+        );
+        assert!(days.iter().all(|d| !d.over_24h));
+        assert_eq!(days[0].restraint_minutes, 6 * 60 + 17);
+    }
+
+    #[test]
+    fn a_long_shift_is_not_split_at_a_short_run_gap() {
+        // 継ぎ目 (実測 4〜112 分) では割らない — 8 時間未満は同じ勤務の続き (#123)
+        let rows = vec![
+            ev("2026-06-10 20:00:00", "2026-06-11 03:00:00", "休息"),
+            dtako("2026-06-11 12:00:00", "運行終了"),
+            dtako("2026-06-11 19:00:00", "運行開始"), // 7 時間空き = 閾値未満
+            dtako("2026-06-12 20:00:00", "運行終了"),
+            ev("2026-06-14 19:00:00", "2026-06-15 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-06-11 03:00:00");
+        // 割る根拠が無いまま 24 時間を超えたので、従来どおり打ち切って旗を立てる
+        // (7 時間しか空けずに 41 時間続けた = 改善基準告示に照らして本当に違反)
+        assert_eq!(days[0].end, "2026-06-12 03:00:00");
+        assert!(days[0].over_24h);
     }
 
     #[test]
