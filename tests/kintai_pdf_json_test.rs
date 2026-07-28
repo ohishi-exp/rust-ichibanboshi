@@ -88,6 +88,8 @@ async fn relays_verbatim_and_preserves_unknown_fields() {
         .and(path("/time-card/pdf-json"))
         .and(query_param("month", "2026-04"))
         .and(query_param("driver_id", "1021"))
+        // 再計算 = 本番の time_card_kosoku への書き込みを起こさせない (nginx#786)
+        .and(query_param("recalc", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM_BODY))
         .mount(&server)
         .await;
@@ -118,6 +120,7 @@ async fn driver_omitted_fetches_all_drivers() {
         .and(path("/time-card/pdf-json"))
         .and(query_param("month", "2026-04"))
         .and(query_param_is_missing("driver_id"))
+        .and(query_param("recalc", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM_BODY))
         .mount(&server)
         .await;
@@ -126,6 +129,28 @@ async fn driver_omitted_fetches_all_drivers() {
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["drivers"].as_array().unwrap().len(), 1);
+}
+
+/// 突合は**読み取り口**。上流は既定 (`recalc=1`) だと拘束時間を再計算して
+/// `time_card_kosoku` を書き換えるので、呼び出し側の付け忘れが起きない位置で固定する。
+#[tokio::test]
+async fn always_sends_recalc_zero_so_upstream_never_writes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/time-card/pdf-json"))
+        .and(query_param("recalc", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UPSTREAM_BODY))
+        .mount(&server)
+        .await;
+
+    // 1 名指定・省略のどちらでも付く (1 名は上流の既定ゲートで必ず再計算が走る形だった)
+    for uri in [
+        "/api/kintai/pdf-json?month=2026-04&driver=1021",
+        "/api/kintai/pdf-json?month=2026-04",
+    ] {
+        let (status, _) = call(app(server.uri()), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
 }
 
 #[tokio::test]
