@@ -71,10 +71,10 @@
 //!
 //! ### 24 時間を超える拘束
 //!
-//! たまに日付を跨いで 24 時間以上続く運行がある (実測では最長 38.1 時間)。**例外的な
-//! 外れ値**であり、24 時間超の拘束は改善基準告示に照らして明確な違反なので、正確に
-//! 積み上げる意味がない。**24 時間で打ち切り** [`DaySummary::over_24h`] を立てて
-//! 遵守チェックに回す。
+//! たまに日付を跨いで 24 時間以上続く運行がある (実測では最長 39.2 時間)。以前は
+//! 24 時間で打ち切っていたが、**打ち切らない** (Refs #152)。帰宅日が混ざったのでは
+//! なく実在する長時間拘束だと実測で確かめたうえ、打ち切ると改善基準違反がその分だけ
+//! 小さく見えるため。[`DaySummary::over_24h`] を立てて遵守チェックに回す。
 //!
 //! ## 月境界
 //!
@@ -120,7 +120,8 @@ const OFF_HOURS_BREAK_MIN_RESTRAINT_MINUTES: i64 = 6 * 60;
 /// たまに日付を跨いで 24 時間以上続く運行がある (実測では最長 2288 分 = 38.1 時間、
 /// 2026-04 の乗務員 1442)。**例外的な外れ値**であり、24 時間を超える拘束は
 /// 改善基準告示に照らして明確な違反なので、正確に積み上げる意味がない。
-/// 24 時間で切って [`DaySummary::over_24h`] を立て、遵守チェックに回す。
+/// これを超えた勤務は [`DaySummary::over_24h`] を立てて遵守チェックに回す。
+/// **値は打ち切らない** — 打ち切ると違反がその分だけ小さく見える (Refs #152)。
 const MAX_RESTRAINT_MINUTES: i64 = 24 * 60;
 
 /// 勤務の**秒の落とし方**。紙のタイムカード表 (社内 CakePHP) との突合で 1 分ずれる
@@ -280,7 +281,8 @@ pub struct DaySummary {
     /// 始業日が日曜か。
     pub is_legal_holiday: bool,
     /// 拘束が 24 時間を超えたため打ち切ったか。**改善基準告示に照らして違反**であり、
-    /// 遵守チェックで拾うべき行。`true` のとき `restraint_minutes` は 1440 で頭打ち。
+    /// 拘束が 24 時間を超えた勤務。**値は頭打ちにしない** — 遵守チェックで拾う目印
+    /// であって、上限ではない (Refs #152)。
     pub over_24h: bool,
 
     /// 拘束 = 終業 − 始業。
@@ -771,7 +773,7 @@ fn off_hours_break(shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
 ///
 /// 窓は消費側 (`nuxt-dtako-admin` の `timecard-summary.ts`) が打刻から実働を出す
 /// ときに使っているものと同じ — 同じ人の同じ日が、経路によって違う実働になるのを
-/// 防ぐ。勤務は 24 時間で打ち切られているので、跨ぐ暦日は最大 2 日。
+/// 防ぐ。勤務は 24 時間を超えることがあるので、跨ぐ暦日は 3 日以上になりうる。
 fn lunch_windows(shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     let mut out = Vec::new();
     let mut day = shift.start.date();
@@ -827,16 +829,12 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         punch_window_end(shift, p.restraint_rounding),
     );
     // 24 時間を超える拘束はここで打ち切る (法令違反なので積み上げる意味がない)
+    // **打ち切らない** (Refs #152)。24 時間を超えた勤務は、帰宅日の混入ではなく
+    // 実在する長時間拘束だと実測で確かめた (乗務員 1674 / 2026-04-07 01:08 →
+    // 04-08 16:22 = 39.2 時間。中の休憩は最長 152 分、運行の空きは 36 分、打刻なし)。
+    // 1440 で頭打ちにすると**改善基準違反をその分だけ小さく見せる**ので、実測のまま
+    // 出して `over_24h` で目立たせる。
     let over_24h = (shift.end - shift.start).num_minutes() > MAX_RESTRAINT_MINUTES;
-    let shift = &Shift {
-        start: shift.start,
-        end: if over_24h {
-            shift.start + Duration::minutes(MAX_RESTRAINT_MINUTES)
-        } else {
-            shift.end
-        },
-        source: shift.source,
-    };
     // 運行に出ていない勤務は昼休憩を引く (ユーザー決定 2026-07-28)。運行中なら
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
     let breaks = if has_operation(events, shift) {
@@ -1883,17 +1881,17 @@ mod tests {
     // --- 24 時間超の打ち切り ---
 
     #[test]
-    fn restraint_over_24h_is_capped_and_flagged() {
-        // 実測の外れ値と同じ長さ (2288 分 = 38.1 時間) を与える
+    fn restraint_over_24h_is_kept_and_flagged() {
+        // 実測の外れ値と同じ長さ (2288 分 = 38.1 時間) を与える。**打ち切らない**
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
             tc("2026-06-03 20:08:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.over_24h);
-        assert_eq!(d.restraint_minutes, 1440);
-        assert_eq!(d.end, "2026-06-03 06:00:00");
-        // 打ち切った後も内訳の合計は実働に一致する
+        assert_eq!(d.restraint_minutes, 2288);
+        assert_eq!(d.end, "2026-06-03 20:08:00");
+        // 内訳の合計は実働に一致する
         assert_eq!(
             d.working_minutes,
             d.statutory_minutes
@@ -1915,8 +1913,9 @@ mod tests {
     }
 
     #[test]
-    fn breaks_after_the_cut_are_not_counted() {
-        // 打ち切り後 (翌日 10:00) の休憩は勤務外なので引かない
+    fn breaks_in_an_over_24h_shift_are_counted() {
+        // 以前は 24 時間で打ち切っていたので翌日 10:00 の休憩が勤務外になっていた。
+        // 打ち切らなくなったので**勤務の中の休憩として数える**
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
             ev("2026-06-03 10:00:00", "2026-06-03 11:00:00", "休憩"),
@@ -1924,10 +1923,10 @@ mod tests {
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.over_24h);
-        // 打ち切り後の休憩は落ちている — 残っているのは打ち切り前に入る 6/2 の
-        // 昼休憩だけ (6/3 の昼は 06:00 打ち切りより後なので入らない)
+        // 6/3 10:00-11:00 の休憩 (60 分) + 6/2 と 6/3 の昼休憩は入らない
+        // (休憩イベントが 1 件でもある勤務は運行扱いで昼休憩を入れない)
         assert_eq!(d.break_minutes, 60);
-        assert_eq!(d.working_minutes, 1440 - 60);
+        assert_eq!(d.working_minutes, 2288 - 60);
     }
 
     // --- 秒の落とし方 (Refs ohishi-exp/nuxt-dtako-admin#501) ---
@@ -2035,18 +2034,18 @@ mod tests {
     }
 
     #[test]
-    fn punches_survive_the_24h_cap() {
+    fn punches_survive_an_over_24h_shift() {
         // 乗務員 1194 / 2026-04 と同じ形 — 打刻が運行 1 本 (2 晩) を挟み 43 時間になる。
-        // 拘束は 24 時間で打ち切るが、**切った先にある終業打刻を落とさない**
+        // 拘束は 43 時間のまま出し、終業打刻も落とさない
         let rows = vec![
             tc("2026-06-01 21:31:32", "始業"),
             tc("2026-06-03 16:47:04", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.over_24h);
-        assert_eq!(d.restraint_minutes, 1440);
-        // end は打ち切り後 (実在しない時刻)
-        assert_eq!(d.end, "2026-06-02 21:31:00");
+        assert_eq!(d.restraint_minutes, 2595);
+        // 秒は経過時間の切り捨て (#149) — 終業の秒 04 < 始業の秒 32 なので 1 分手前
+        assert_eq!(d.end, "2026-06-03 16:46:00");
         // 打刻は実際の終業まで残る
         assert_eq!(d.punches.len(), 2);
         assert_eq!(d.punches[1].at, "2026-06-03 16:47:04");
@@ -2133,8 +2132,35 @@ mod tests {
     }
 
     #[test]
-    fn a_long_shift_without_rests_is_still_capped() {
-        // 休息を挟まず 24 時間以上 = 切る根拠が無いので従来どおり打ち切る
+    fn a_39h_shift_with_only_short_breaks_is_reported_in_full() {
+        // 乗務員 1674 / 2026-04-07 01:08 → 04-08 16:22 と同じ形 (Refs #152)。
+        // 打刻なし・休息は両端だけ・中の休憩は最長 152 分・運行の空きは 36 分。
+        // 切る根拠がどこにも無く、**本物の 39.2 時間拘束**だった
+        let rows = vec![
+            ev("2026-06-06 19:00:00", "2026-06-07 01:08:00", "休息"),
+            ev("2026-06-07 06:21:00", "2026-06-07 08:53:00", "休憩"), // 152 分
+            dtako("2026-06-08 07:49:00", "運行終了"),
+            dtako("2026-06-08 08:25:00", "運行開始"), // 36 分 = 閾値未満
+            ev("2026-06-08 16:22:00", "2026-06-09 02:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        let d = &days[0];
+        assert!(d.over_24h);
+        // 01:08 → 16:22 = 2354 分。1440 に丸めない
+        assert_eq!(d.restraint_minutes, 2354);
+        assert_eq!(d.end, "2026-06-08 16:22:00");
+        // 3 暦日に配られる (打ち切っていたら 6/9 が出ない)
+        assert_eq!(d.parts.len(), 2);
+        assert_eq!(
+            d.parts.iter().map(|p| p.restraint_minutes).sum::<i64>(),
+            2354
+        );
+    }
+
+    #[test]
+    fn a_long_shift_without_rests_keeps_its_real_length() {
+        // 休息を挟まず 24 時間以上 = 切る根拠が無い。**実測のまま出して旗を立てる**
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
             tc("2026-06-03 20:08:00", "終業"),
@@ -2142,7 +2168,7 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert!(days[0].over_24h);
-        assert_eq!(days[0].restraint_minutes, 1440);
+        assert_eq!(days[0].restraint_minutes, 2288);
     }
 
     #[test]
@@ -2340,22 +2366,23 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].start, "2026-06-11 03:00:00");
-        // 割る根拠が無いまま 24 時間を超えたので、従来どおり打ち切って旗を立てる
-        // (7 時間しか空けずに 41 時間続けた = 改善基準告示に照らして本当に違反)
-        assert_eq!(days[0].end, "2026-06-12 03:00:00");
+        // 割る根拠が無いまま 24 時間を超えた = 7 時間しか空けずに続けた本物の違反。
+        // 打ち切らないので、勤務は**最後の運行終了**まで伸びる (その先に運行開始が
+        // 無いので `split_by_run_gaps` がそこで閉じる)
+        assert_eq!(days[0].end, "2026-06-12 20:00:00");
         assert!(days[0].over_24h);
     }
 
     #[test]
-    fn a_long_shift_without_a_run_end_is_still_capped() {
-        // 運行終了が無ければ切る根拠が無いので従来どおり打ち切る
+    fn a_long_shift_without_a_run_end_keeps_its_real_length() {
+        // 運行終了が無ければ切る根拠が無い。それでも打ち切らない
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
             tc("2026-06-03 20:08:00", "終業"),
         ];
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert!(days[0].over_24h);
-        assert_eq!(days[0].restraint_minutes, 1440);
+        assert_eq!(days[0].restraint_minutes, 2288);
     }
 
     #[test]
@@ -2447,8 +2474,8 @@ mod tests {
     }
 
     #[test]
-    fn parts_split_a_capped_shift_at_the_cut() {
-        // 24 時間で打ち切った勤務は打ち切り後の区間だけを配る
+    fn parts_cover_the_whole_over_24h_shift() {
+        // 24 時間超の勤務も、暦日の内訳は全区間ぶん配る (打ち切らないので端が欠けない)
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
             tc("2026-06-03 20:08:00", "終業"),
@@ -2457,7 +2484,7 @@ mod tests {
         assert!(d.over_24h);
         assert_eq!(
             d.parts.iter().map(|p| p.restraint_minutes).sum::<i64>(),
-            1440
+            2288
         );
         assert_eq!(d.parts.last().unwrap().date, "2026-06-03");
     }
