@@ -83,7 +83,7 @@
 //! 「期間内に始まる区間」に加えて「期間内に終わる区間」も拾うので、この休息は範囲に入る。
 //! 拾い漏らすと毎月 1 日目の勤務が静かに欠ける。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{Datelike, Duration, NaiveDateTime, Timelike, Weekday};
 use serde::Serialize;
@@ -911,8 +911,17 @@ pub fn month_punches(rows: &[serde_json::Value], month: &str) -> Vec<Punch> {
 ///
 /// 上流の条件をそのまま写す:
 ///
-/// - **同日で始まって同日で終わるフェリーだけ**。日跨ぎは上流の分岐が
-///   `$d_time_2->d = 0` (代入。`==` の書き損じ) で常に false になり一度も走らない
+/// - **同日で始まって同日で終わるフェリーだけ**。
+///
+///   日跨ぎのフェリーは**珍しくない** — 2025-11〜2026-06 の実データで
+///   同日 662 件 / **日跨ぎ 526 件 (44%)**、最長 24 時間。上流にも日跨ぎ用の分岐が
+///   あり、開始日と終了日へ割る作りになっている (`_make_kosoku_time` の
+///   「フェリーの日付が異なる」ブロック)。
+///
+///   ただしその分岐は `$d_time_2->d = 0` (代入。`==` の書き損じ) で条件が常に false
+///   になり、**一度も走っていない**。しかも仮に `==` へ直しても条件は
+///   `h < 4 && d == 0` = 「総時間 4 時間未満」なので、**実データの日跨ぎ 526 件は
+///   4 時間未満が 0 件**で 1 件も該当しない。よって同日のみで紙と一致する
 /// - **4 時間未満**だけ (`$d_time_1->h < 4`)。`h` は `DateInterval` の時コンポーネント
 ///   なので、同日前提では「総時間 < 4h」と同じ
 /// - 控除額は `h * 60 + i` = **秒を切り捨てた総分**
@@ -964,18 +973,34 @@ pub fn split_ferry_by_driver(
 /// 日跨ぎ勤務は `parts` の暦日へ、1 日で終わる勤務は勤務の日へ。**勤務の無い暦日の
 /// 控除は載らない** — フェリーは運行に紐づき、運行があれば勤務も立つので実データでは
 /// 起きない想定だが、起きても静かに落ちるだけで拘束の数字は動かない。
+///
+/// ## 同じ暦日に複数の勤務があっても 1 回だけ載せる
+///
+/// **控除は暦日に対する値**で、勤務に対する値ではない。ところが**フェリー自体が
+/// 休息イベントなので勤務が割れる** — 実データ (1726 / 2026-03-14) は 4 時間近い
+/// フェリーが 2 本あるせいで 1 日が 4 勤務 (拘束 1 / 16 / 82 / 222 分) になる。
+/// 日付が一致する勤務すべてに載せると、消費側が暦日で合算したときに
+/// 433 分が 4 回足されて 1732 分になる。**最初の 1 つにだけ載せる。**
 pub fn apply_ferry_minus(days: &mut [DaySummary], ferry: &BTreeMap<String, i64>) {
     if ferry.is_empty() {
         return;
     }
+    // 既に載せた暦日。勤務は時刻順なので「最初の勤務が持つ」で決まる
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    let mut take = |date: &str| -> i64 {
+        match ferry.get(date) {
+            Some(&m) if used.insert(date.to_string()) => m,
+            _ => 0,
+        }
+    };
     for day in days.iter_mut() {
         if day.parts.is_empty() {
-            day.ferry_minus_minutes = ferry.get(&day.date).copied().unwrap_or(0);
+            day.ferry_minus_minutes = take(&day.date);
             continue;
         }
         let mut total = 0;
         for part in day.parts.iter_mut() {
-            part.ferry_minus_minutes = ferry.get(&part.date).copied().unwrap_or(0);
+            part.ferry_minus_minutes = take(&part.date);
             total += part.ferry_minus_minutes;
         }
         day.ferry_minus_minutes = total;
@@ -1050,7 +1075,9 @@ mod tests {
 
     #[test]
     fn ferry_crossing_midnight_is_not_deducted() {
-        // 上流の日跨ぎ分岐は `$d_time_2->d = 0` (代入) で常に false → 一度も走らない
+        // 日跨ぎは実データで 44% (526/1188、2025-11〜2026-06) と珍しくないが、
+        // 上流の日跨ぎ分岐は `$d_time_2->d = 0` (代入) で常に false → 一度も走らない。
+        // 直しても条件は総時間 4 時間未満で、日跨ぎのうち 4 時間未満は実データ 0 件
         assert!(
             ferry_minus_by_date(&[ferry("2026-03-14 23:00:00", "2026-03-15 01:00:00")]).is_empty()
         );
@@ -1124,6 +1151,33 @@ mod tests {
         assert_eq!(days[0].parts[1].ferry_minus_minutes, 45);
         // 勤務の値は内訳の合計
         assert_eq!(days[0].ferry_minus_minutes, 75);
+    }
+
+    #[test]
+    fn apply_ferry_minus_counts_a_calendar_day_once_even_with_several_shifts() {
+        // 実データ (1726 / 2026-03-14) の形: 打刻が無く、**フェリー自体が休息イベント**
+        // なので勤務が休息のたびに割れる (実測 4 勤務・拘束 1 / 16 / 82 / 222 分)。
+        // 日付の一致する勤務すべてに載せると、消費側の暦日合算で 433 が 4 回足される
+        let rows = vec![
+            ev("2026-06-02 05:00:00", "2026-06-02 06:00:00", "休息"),
+            ev("2026-06-02 07:00:00", "2026-06-02 10:40:00", "休息"),
+            ev("2026-06-02 12:00:00", "2026-06-02 15:30:00", "休息"),
+            ev("2026-06-02 18:00:00", "2026-06-02 19:00:00", "休息"),
+        ];
+        let mut days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert!(days.len() > 1, "休息で勤務が割れる前提のテスト");
+        let ferry = ferry_minus_by_date(&[
+            ferry("2026-06-02 07:00:00", "2026-06-02 10:40:00"),
+            ferry("2026-06-02 12:00:00", "2026-06-02 15:30:00"),
+        ]);
+        assert_eq!(ferry.get("2026-06-02"), Some(&430));
+        apply_ferry_minus(&mut days, &ferry);
+        // 暦日の合計は 1 回ぶん
+        let total: i64 = days.iter().map(|d| d.ferry_minus_minutes).sum();
+        assert_eq!(total, 430);
+        // 最初の勤務が持つ
+        assert_eq!(days[0].ferry_minus_minutes, 430);
+        assert!(days[1..].iter().all(|d| d.ferry_minus_minutes == 0));
     }
 
     #[test]
