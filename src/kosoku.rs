@@ -2635,6 +2635,27 @@ mod tests {
     }
 
     #[test]
+    fn a_run_ending_in_the_window_without_a_start_ends_the_shift_there() {
+        // 窓の中に運行終了だけがある形 (運行開始は終業打刻より前)。
+        // 終わりはその運行終了 — 全乗務員 SQL でも運行の点イベントは見える
+        let rows = vec![
+            ev("2026-03-02 04:00:00", "2026-03-02 05:00:00", "休息"),
+            tc("2026-03-02 06:00:00", "終業"),
+            ev("2026-03-02 06:30:00", "2026-03-02 08:00:00", "運転"),
+            dtako("2026-03-02 08:00:00", "運行終了"),
+            ev("2026-03-02 22:00:00", "2026-03-03 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        let picked = days
+            .iter()
+            .find(|d| d.end == "2026-03-02 08:00:00")
+            .unwrap();
+        // 孤立終業 + 同じ暦日 → 終業打刻から始まる
+        assert_eq!(picked.start, "2026-03-02 06:00:00");
+        assert_eq!(picked.restraint_minutes, 120);
+    }
+
+    #[test]
     fn unpunched_ops_stop_at_the_next_punch_in() {
         // 次の始業打刻から先は打刻由来の勤務の領分 — 拾うと二重になる。
         // 始業のあとの運行しか無ければ、拾う勤務は生まれない
