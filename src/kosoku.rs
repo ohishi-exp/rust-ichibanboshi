@@ -199,6 +199,11 @@ pub struct DayPart {
     pub overtime_night_minutes: i64,
     /// その日に乗った法定休日の深夜。
     pub legal_holiday_night_minutes: i64,
+    /// **紙のタイムカード表がこの暦日から引いている同日フェリー控除** (Refs #146)。
+    ///
+    /// こちらの拘束には**入っていない** (足しても引いてもいない)。紙との差の原因を
+    /// 説明するためだけに載せる。詳細は [`ferry_minus_by_date`]。
+    pub ferry_minus_minutes: i64,
 }
 
 impl DayPart {
@@ -212,6 +217,7 @@ impl DayPart {
             night_minutes: 0,
             overtime_night_minutes: 0,
             legal_holiday_night_minutes: 0,
+            ferry_minus_minutes: 0,
         }
     }
 }
@@ -276,6 +282,11 @@ pub struct DaySummary {
     pub overtime_night_minutes: i64,
     /// 法定休日に重なる深夜。
     pub legal_holiday_night_minutes: i64,
+    /// **紙のタイムカード表がこの勤務の暦日から引いている同日フェリー控除の合計**
+    /// (Refs #146)。日跨ぎ勤務は `parts` の合計と一致する。
+    ///
+    /// こちらの拘束には入っていない。詳細は [`ferry_minus_by_date`]。
+    pub ferry_minus_minutes: i64,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -826,6 +837,9 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     }
 
     DaySummary {
+        // フェリー控除は勤務の計算に混ぜない。日別サマリを組み終えてから
+        // `apply_ferry_minus` で暦日ごとに載せる (Refs #146)
+        ferry_minus_minutes: 0,
         date: shift.start.format("%Y-%m-%d").to_string(),
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
@@ -889,6 +903,85 @@ pub fn month_punches(rows: &[serde_json::Value], month: &str) -> Vec<Punch> {
         .collect()
 }
 
+/// フェリー区間 → **暦日ごとの控除額** (分)。上流 `_make_kosoku_time` の再現
+/// (Refs #146、yhonda-ohishi/nginx#788 の引き継ぎ)。
+///
+/// 紙のタイムカード表は同日フェリーぶんを拘束から引いており、それが突合の差の
+/// 原因になっている。**こちらの拘束はこの値を使わない** — 差の説明のために出すだけ。
+///
+/// 上流の条件をそのまま写す:
+///
+/// - **同日で始まって同日で終わるフェリーだけ**。日跨ぎは上流の分岐が
+///   `$d_time_2->d = 0` (代入。`==` の書き損じ) で常に false になり一度も走らない
+/// - **4 時間未満**だけ (`$d_time_1->h < 4`)。`h` は `DateInterval` の時コンポーネント
+///   なので、同日前提では「総時間 < 4h」と同じ
+/// - 控除額は `h * 60 + i` = **秒を切り捨てた総分**
+///
+/// 月の絞り込みは呼び出し側 (`fetch_ferry` が `[月初, 翌月初)` で引く)。
+pub fn ferry_minus_by_date(rows: &[serde_json::Value]) -> BTreeMap<String, i64> {
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    for row in rows {
+        let (Some(s), Some(e)) = (
+            row.get("start_datetime").and_then(|v| v.as_str()),
+            row.get("end_datetime").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            NaiveDateTime::parse_from_str(s, FMT),
+            NaiveDateTime::parse_from_str(e, FMT),
+        ) else {
+            continue;
+        };
+        if start.date() != end.date() {
+            continue;
+        }
+        let secs = (end - start).num_seconds();
+        if !(0..4 * 3600).contains(&secs) {
+            continue;
+        }
+        *out.entry(start.format("%Y-%m-%d").to_string()).or_insert(0) += secs / 60;
+    }
+    out
+}
+
+/// フェリー区間を乗務員CD ごとに分ける (全乗務員ぶんを 1 回で引いたとき用)。
+pub fn split_ferry_by_driver(
+    rows: Vec<serde_json::Value>,
+) -> BTreeMap<u64, Vec<serde_json::Value>> {
+    let mut out: BTreeMap<u64, Vec<serde_json::Value>> = BTreeMap::new();
+    for row in rows {
+        let Some(driver) = row.get("driver_id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        out.entry(driver).or_default().push(row);
+    }
+    out
+}
+
+/// 日別サマリへ暦日ごとのフェリー控除を載せる。
+///
+/// 日跨ぎ勤務は `parts` の暦日へ、1 日で終わる勤務は勤務の日へ。**勤務の無い暦日の
+/// 控除は載らない** — フェリーは運行に紐づき、運行があれば勤務も立つので実データでは
+/// 起きない想定だが、起きても静かに落ちるだけで拘束の数字は動かない。
+pub fn apply_ferry_minus(days: &mut [DaySummary], ferry: &BTreeMap<String, i64>) {
+    if ferry.is_empty() {
+        return;
+    }
+    for day in days.iter_mut() {
+        if day.parts.is_empty() {
+            day.ferry_minus_minutes = ferry.get(&day.date).copied().unwrap_or(0);
+            continue;
+        }
+        let mut total = 0;
+        for part in day.parts.iter_mut() {
+            part.ferry_minus_minutes = ferry.get(&part.date).copied().unwrap_or(0);
+            total += part.ferry_minus_minutes;
+        }
+        day.ferry_minus_minutes = total;
+    }
+}
+
 /// 生イベント列 → 対象月の日別サマリ。
 ///
 /// `month` (`YYYY-MM`) は**始業日**で絞る。前後にはみ出した勤務は落ちる/入る:
@@ -916,6 +1009,139 @@ pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn ferry(start: &str, end: &str) -> serde_json::Value {
+        json!({"start_datetime": start, "end_datetime": end, "driver_id": 1726})
+    }
+
+    // ---- フェリー控除 (Refs #146) ----
+    //
+    // 紙のタイムカード表を再現するだけの値。**拘束の計算には入れない**。
+
+    #[test]
+    fn ferry_same_day_under_4h_is_deducted() {
+        // 実データ: 1726 / 2026-03-21 は 78 分 (16:18:41 → 17:36:56)
+        let m = ferry_minus_by_date(&[ferry("2026-03-21 16:18:41", "2026-03-21 17:36:56")]);
+        assert_eq!(m.get("2026-03-21"), Some(&78));
+    }
+
+    #[test]
+    fn ferry_same_day_sums_and_can_exceed_the_day_total() {
+        // 実データ: 1726 / 2026-03-14 は 2 本で 433 分。積算 321 分を食い破って -112 になる
+        let m = ferry_minus_by_date(&[
+            ferry("2026-03-14 07:38:40", "2026-03-14 11:22:33"),
+            ferry("2026-03-14 16:31:06", "2026-03-14 20:01:24"),
+        ]);
+        assert_eq!(m.get("2026-03-14"), Some(&433));
+    }
+
+    #[test]
+    fn ferry_4h_or_longer_is_not_deducted() {
+        // 上流の `$d_time_1->h < 4`。4 時間ちょうどは対象外
+        assert!(
+            ferry_minus_by_date(&[ferry("2026-03-14 00:00:00", "2026-03-14 04:00:00")]).is_empty()
+        );
+        assert_eq!(
+            ferry_minus_by_date(&[ferry("2026-03-14 00:00:00", "2026-03-14 03:59:59")])
+                .get("2026-03-14"),
+            Some(&239),
+        );
+    }
+
+    #[test]
+    fn ferry_crossing_midnight_is_not_deducted() {
+        // 上流の日跨ぎ分岐は `$d_time_2->d = 0` (代入) で常に false → 一度も走らない
+        assert!(
+            ferry_minus_by_date(&[ferry("2026-03-14 23:00:00", "2026-03-15 01:00:00")]).is_empty()
+        );
+    }
+
+    #[test]
+    fn ferry_seconds_are_truncated_not_rounded() {
+        // `h * 60 + i` = 秒を切り捨てた総分
+        assert_eq!(
+            ferry_minus_by_date(&[ferry("2026-03-14 10:00:00", "2026-03-14 10:01:59")])
+                .get("2026-03-14"),
+            Some(&1),
+        );
+    }
+
+    #[test]
+    fn ferry_broken_rows_are_dropped() {
+        let rows = vec![
+            json!({"end_datetime": "2026-03-14 11:00:00"}),
+            json!({"start_datetime": "2026-03-14 10:00:00"}),
+            json!({"start_datetime": "x", "end_datetime": "2026-03-14 11:00:00"}),
+            json!({"start_datetime": "2026-03-14 10:00:00", "end_datetime": "y"}),
+            // 終わりが始まりより前 (負) — 引かない
+            ferry("2026-03-14 11:00:00", "2026-03-14 10:00:00"),
+        ];
+        assert!(ferry_minus_by_date(&rows).is_empty());
+    }
+
+    #[test]
+    fn ferry_splits_by_driver_and_drops_rows_without_one() {
+        let rows = vec![
+            json!({"start_datetime": "2026-03-14 10:00:00", "end_datetime": "2026-03-14 11:00:00", "driver_id": 1726}),
+            json!({"start_datetime": "2026-03-15 10:00:00", "end_datetime": "2026-03-15 11:00:00", "driver_id": 1726}),
+            json!({"start_datetime": "2026-03-14 10:00:00", "end_datetime": "2026-03-14 11:00:00", "driver_id": 1021}),
+            json!({"start_datetime": "2026-03-14 10:00:00", "end_datetime": "2026-03-14 11:00:00"}),
+        ];
+        let by = split_ferry_by_driver(rows);
+        assert_eq!(by.len(), 2);
+        assert_eq!(by[&1726].len(), 2);
+        assert_eq!(by[&1021].len(), 1);
+    }
+
+    #[test]
+    fn apply_ferry_minus_puts_it_on_the_calendar_day() {
+        let rows = vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let mut days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert!(days[0].parts.is_empty());
+        let ferry = ferry_minus_by_date(&[ferry("2026-06-02 10:00:00", "2026-06-02 11:00:00")]);
+        apply_ferry_minus(&mut days, &ferry);
+        assert_eq!(days[0].ferry_minus_minutes, 60);
+        // **拘束は動かない** — 控除は紙の側の話
+        assert_eq!(days[0].restraint_minutes, 540);
+    }
+
+    #[test]
+    fn apply_ferry_minus_splits_across_parts_of_an_overnight_shift() {
+        let rows = vec![
+            tc("2026-06-02 22:00:00", "始業"),
+            tc("2026-06-03 08:00:00", "終業"),
+        ];
+        let mut days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].parts.len(), 2);
+        let mut ferry = BTreeMap::new();
+        ferry.insert("2026-06-02".to_string(), 30);
+        ferry.insert("2026-06-03".to_string(), 45);
+        apply_ferry_minus(&mut days, &ferry);
+        assert_eq!(days[0].parts[0].ferry_minus_minutes, 30);
+        assert_eq!(days[0].parts[1].ferry_minus_minutes, 45);
+        // 勤務の値は内訳の合計
+        assert_eq!(days[0].ferry_minus_minutes, 75);
+    }
+
+    #[test]
+    fn apply_ferry_minus_leaves_zero_when_there_is_none() {
+        let rows = vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ];
+        let mut days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        // 空なら何も触らない (早期 return)
+        apply_ferry_minus(&mut days, &BTreeMap::new());
+        assert_eq!(days[0].ferry_minus_minutes, 0);
+        // 別の日の控除しか無ければ 0 のまま
+        let mut other = BTreeMap::new();
+        other.insert("2026-06-09".to_string(), 60);
+        apply_ferry_minus(&mut days, &other);
+        assert_eq!(days[0].ferry_minus_minutes, 0);
+    }
 
     fn dt(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, FMT).unwrap()
