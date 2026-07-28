@@ -54,7 +54,21 @@
 //! ### 休憩
 //!
 //! 閾値 (既定 10 分) 以上の `休憩` イベントだけを数える。**拘束からは外さない** —
-//! 拘束 = 終業 − 始業、実働 = 拘束 − 休憩。
+//! 拘束 = 終業 − 始業 − 中の休息、実働 = 拘束 − 休憩。
+//!
+//! ### 勤務の中に残った休息
+//!
+//! 休息は勤務の境界だが ([`shifts_from_rest`])、**打刻優先** (#118) の勤務では中に
+//! 残る。休憩として数えられないので、外さないと**実働として払う**ことになる。
+//! **拘束からも実働からも外す** (ユーザー決定 2026-07-28、
+//! Refs ohishi-exp/nuxt-dtako-admin#501)。外した分は
+//! [`DaySummary::rest_minus_minutes`] に出す。
+//!
+//! 実測 (1194 陣野 / 2026-03) は夜勤 11 日すべてで 6〜7 時間の休息が勤務の中にあり、
+//! 03-11 は 拘束 18h09m / 休憩 1h39m (= 休憩イベント 63 + 36 分ちょうど) / 実働
+//! 16h30m で、402 分の休息がまるごと実働に入っていた。紙のタイムカード表 (社内
+//! CakePHP) は同じ 402 分を引いて 684 分にしており、11 日ぶんの残差 (-4464 分) は
+//! 休息の暦日按分と **合計 -15 分** まで一致する。
 //!
 //! **運行に出ていない勤務は昼休憩 (12:00-13:00) を引く** (ユーザー決定 2026-07-28)。
 //! 休憩イベントはデジタコにしか残らないので、事務・作業・整備、および乗務員が構内
@@ -285,12 +299,20 @@ pub struct DaySummary {
     /// であって、上限ではない (Refs #152)。
     pub over_24h: bool,
 
-    /// 拘束 = 終業 − 始業。
+    /// 拘束 = 終業 − 始業 − 中の休息 ([`rest_minus_minutes`](Self::rest_minus_minutes))。
     pub restraint_minutes: i64,
     /// 閾値以上の休憩の合計。
     pub break_minutes: i64,
     /// 実働 = 拘束 − 休憩。
     pub working_minutes: i64,
+    /// **勤務の中にあった休息の合計** (ユーザー決定 2026-07-28、Refs
+    /// ohishi-exp/nuxt-dtako-admin#501)。拘束からも実働からも**外してある**。
+    ///
+    /// 休息は勤務の境界に使う ([`shifts_from_rest`]) が、打刻優先の勤務では中に
+    /// 残ることがある。実測 (1194 陣野 / 2026-03) は夜勤 11 日すべてで 6〜7 時間の
+    /// 休息が勤務の中にあり、休憩として数えないまま実働に入っていた
+    /// (03-11: 拘束 18h09m / 休憩 1h39m / 実働 16h30m のうち 402 分が休息)。
+    pub rest_minus_minutes: i64,
 
     /// 所定内 (0〜所定)。法定休日は 0。
     pub statutory_minutes: i64,
@@ -796,23 +818,52 @@ fn lunch_windows(shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     out
 }
 
-/// 拘束区間から休憩を差し引いて、実働区間の列を返す。
-fn working_intervals(
-    shift: &Shift,
-    breaks: &[(NaiveDateTime, NaiveDateTime)],
+/// `base` の各区間から `cut` を差し引く。`cut` は時刻順・重なり無しであること
+/// ([`merge_intervals`] を通したもの)。
+fn subtract_intervals(
+    base: &[(NaiveDateTime, NaiveDateTime)],
+    cut: &[(NaiveDateTime, NaiveDateTime)],
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     let mut out = Vec::new();
-    let mut cur = shift.start;
-    for (s, e) in breaks {
-        if *s > cur {
-            out.push((cur, *s));
+    for (bs, be) in base {
+        let mut cur = *bs;
+        for (s, e) in cut {
+            if *e <= cur || *s >= *be {
+                continue;
+            }
+            if *s > cur {
+                out.push((cur, *s));
+            }
+            cur = cur.max(*e);
         }
-        cur = cur.max(*e);
-    }
-    if shift.end > cur {
-        out.push((cur, shift.end));
+        if *be > cur {
+            out.push((cur, *be));
+        }
     }
     out
+}
+
+/// 勤務に重なる**休息**区間を、勤務内へ切り詰めて返す (ユーザー決定 2026-07-28)。
+///
+/// 区間を持つ `dtako_events` 由来の `休息` だけを使う — `dtako` 側は点イベントで
+/// 長さを持たない ([`shifts_from_rest`] と同じ理由)。
+///
+/// 休息は本来なら勤務の境界になる ([`shifts_from_rest`]) が、**打刻優先** (#118) の
+/// 勤務では中に残る。休憩には数えられないので、外さないと**実働として払う**ことに
+/// なる (実測 1194 陣野 / 2026-03-11: 402 分の休息が実働 16h30m の中にあった)。
+/// 紙のタイムカード表 (社内 CakePHP) も同じだけ引いている。
+///
+/// **閾値は設けない** — 休憩イベント ([`breaks_in`]) と違い、休息はデジタコが
+/// 「運行を終えて休んだ」と判定した区間そのものなので、短くても休憩ではない。
+fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let out: Vec<(NaiveDateTime, NaiveDateTime)> = events
+        .iter()
+        .filter(|e| e.state == "休息" && e.source == "dtako_events")
+        .filter_map(|e| e.end.map(|end| (floor_min(e.start), floor_min(end))))
+        .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
+        .filter(|(s, e)| e > s)
+        .collect();
+    merge_intervals(out)
 }
 
 /// 勤務 1 回を日別サマリへ畳む。
@@ -834,7 +885,20 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     // 04-08 16:22 = 39.2 時間。中の休憩は最長 152 分、運行の空きは 36 分、打刻なし)。
     // 1440 で頭打ちにすると**改善基準違反をその分だけ小さく見せる**ので、実測のまま
     // 出して `over_24h` で目立たせる。
-    let over_24h = (shift.end - shift.start).num_minutes() > MAX_RESTRAINT_MINUTES;
+    // 勤務の中に残った休息は拘束からも実働からも外す (ユーザー決定 2026-07-28)。
+    // 拘束の実体はここから下の `restraint` — 以降は「終業 − 始業」を直接使わない
+    let rests = rests_in(events, shift);
+    let restraint = subtract_intervals(&[(shift.start, shift.end)], &rests);
+    // **外して何も残らないなら外さない** ([`split_long_shift`] の打ち切りと同じ扱い)。
+    // 勤務を丸ごと覆う休息はデータの壊れ方であって「拘束 0 の出勤日」ではない
+    let (rests, restraint) = if restraint.is_empty() {
+        (Vec::new(), vec![(shift.start, shift.end)])
+    } else {
+        (rests, restraint)
+    };
+    let restraint_minutes: i64 = restraint.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
+    let rest_minus_minutes: i64 = rests.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
+    let over_24h = restraint_minutes > MAX_RESTRAINT_MINUTES;
     // 運行に出ていない勤務は昼休憩を引く (ユーザー決定 2026-07-28)。運行中なら
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
     let breaks = if has_operation(events, shift) {
@@ -851,8 +915,10 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
             lunch
         }
     };
+    // 休息の中に入った休憩は二重に引かない (昼休憩の窓が休息に丸ごと重なる場合など)
+    let breaks = subtract_intervals(&breaks, &rests);
     let break_minutes: i64 = breaks.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
-    let intervals = working_intervals(shift, &breaks);
+    let intervals = subtract_intervals(&restraint, &breaks);
     let is_legal_holiday = shift.start.weekday() == Weekday::Sun;
 
     let mut elapsed = 0i64;
@@ -901,12 +967,15 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
             t += Duration::minutes(1);
         }
     }
-    // 拘束は休憩も含む区間なので、実働の歩きとは別に暦日へ切り分ける
-    for (date, minutes) in split_by_date(shift.start, shift.end) {
-        parts
-            .entry(date)
-            .or_insert_with(|| DayPart::new(date))
-            .restraint_minutes += minutes;
+    // 拘束は休憩も含む区間なので、実働の歩きとは別に暦日へ切り分ける。
+    // **休息を抜いた区間ごとに**配る — 勤務の端から端で配ると外したはずの休息が戻る
+    for (s, e) in &restraint {
+        for (date, minutes) in split_by_date(*s, *e) {
+            parts
+                .entry(date)
+                .or_insert_with(|| DayPart::new(date))
+                .restraint_minutes += minutes;
+        }
     }
 
     DaySummary {
@@ -926,9 +995,10 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         },
         is_legal_holiday,
         over_24h,
-        restraint_minutes: (shift.end - shift.start).num_minutes(),
+        restraint_minutes,
         break_minutes,
         working_minutes: elapsed,
+        rest_minus_minutes,
         statutory_minutes: statutory,
         within_statutory_overtime_minutes: within,
         overtime_minutes: overtime,
@@ -2173,7 +2243,8 @@ mod tests {
 
     #[test]
     fn a_normal_shift_is_not_split_by_a_rest_inside() {
-        // 24 時間以内の勤務は休息があっても切らない (#118 の「運行では切らない」を崩さない)
+        // 24 時間以内の勤務は休息があっても**切らない** (#118 の「運行では切らない」を
+        // 崩さない)。ただし休息そのものは拘束から外す (2026-07-28)
         let rows = vec![
             tc("2026-06-02 06:00:00", "始業"),
             ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休息"),
@@ -2181,7 +2252,8 @@ mod tests {
         ];
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
-        assert_eq!(days[0].restraint_minutes, 840);
+        assert_eq!(days[0].restraint_minutes, 780); // 840 − 休息 60
+        assert_eq!(days[0].rest_minus_minutes, 60);
     }
 
     #[test]
@@ -2227,6 +2299,81 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert!(days[0].over_24h);
+        // 外して何も残らないので外さない (拘束 0 の出勤日にはしない)
+        assert_eq!(days[0].restraint_minutes, 2880);
+        assert_eq!(days[0].rest_minus_minutes, 0);
+    }
+
+    // --- 勤務の中に残った休息を外す (ユーザー決定 2026-07-28、Refs nuxt-dtako-admin#501) ---
+
+    #[test]
+    fn a_rest_inside_a_night_shift_leaves_restraint_working_and_night() {
+        // 乗務員 1194 陣野 / 2026-03-11 そのもの。紙は 684 分、こちらは 1089 分だった
+        let rows = vec![
+            tc("2026-03-10 22:43:00", "始業"),
+            ev("2026-03-11 00:42:00", "2026-03-11 07:24:00", "休息"), // 402 分
+            ev("2026-03-11 07:26:00", "2026-03-11 08:29:00", "休憩"), // 63 分
+            ev("2026-03-11 10:33:00", "2026-03-11 11:09:00", "休憩"), // 36 分
+            tc("2026-03-11 16:52:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        let d = &days[0];
+        assert_eq!(d.rest_minus_minutes, 402);
+        assert_eq!(d.restraint_minutes, 687); // 1089 − 402
+        assert_eq!(d.break_minutes, 99); // 休憩イベント 63 + 36 のまま
+        assert_eq!(d.working_minutes, 588); // 拘束 − 休憩
+        assert_eq!(d.restraint_minutes, d.working_minutes + d.break_minutes);
+        // 深夜も休息のぶんだけ減る (22:43→24:00 の 77 分 + 00:00→00:42 の 42 分)
+        assert_eq!(d.night_minutes + d.overtime_night_minutes, 119);
+    }
+
+    #[test]
+    fn a_rest_is_taken_off_each_calendar_day_it_covers() {
+        // 暦日按分の内訳からも外れる — 勤務の端から端で配ると休息が戻ってしまう
+        let rows = vec![
+            tc("2026-03-10 22:43:00", "始業"),
+            ev("2026-03-11 00:42:00", "2026-03-11 07:24:00", "休息"),
+            ev("2026-03-11 07:26:00", "2026-03-11 08:29:00", "休憩"),
+            tc("2026-03-11 16:52:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        let parts = &days[0].parts;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].restraint_minutes, 77); // 03-10 22:43→24:00
+        assert_eq!(parts[1].restraint_minutes, 610); // 03-11 00:00→00:42 + 07:24→16:52
+        let total: i64 = parts.iter().map(|p| p.restraint_minutes).sum();
+        assert_eq!(total, days[0].restraint_minutes);
+    }
+
+    #[test]
+    fn a_break_inside_a_rest_is_not_deducted_twice() {
+        // 休息の中に休憩が入っていても、引くのは休息の 1 回だけ
+        let rows = vec![
+            tc("2026-03-02 06:00:00", "始業"),
+            ev("2026-03-02 10:00:00", "2026-03-02 14:00:00", "休息"), // 240 分
+            ev("2026-03-02 12:00:00", "2026-03-02 13:00:00", "休憩"), // 休息の中
+            tc("2026-03-02 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        assert_eq!(days[0].rest_minus_minutes, 240);
+        assert_eq!(days[0].restraint_minutes, 600); // 840 − 240
+        assert_eq!(days[0].break_minutes, 0);
+        assert_eq!(days[0].working_minutes, 600);
+    }
+
+    #[test]
+    fn a_point_rest_without_a_span_is_not_deducted() {
+        // `dtako` 側の休息は点イベントで長さを持たない — 引く根拠が無い
+        let rows = vec![
+            tc("2026-03-02 06:00:00", "始業"),
+            dtako("2026-03-02 12:00:00", "休息"),
+            ev("2026-03-02 09:00:00", "2026-03-02 09:30:00", "運転"),
+            tc("2026-03-02 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        assert_eq!(days[0].rest_minus_minutes, 0);
+        assert_eq!(days[0].restraint_minutes, 840);
     }
 
     // --- 終業の無い始業 / 月の打刻 (Refs #137) ---
