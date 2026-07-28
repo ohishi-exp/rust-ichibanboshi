@@ -244,6 +244,8 @@ pub struct DayPart {
     pub ferry_minus_minutes: i64,
     /// この暦日に乗った**運行の継ぎ目** ([`DaySummary::run_gap_minutes`])。
     pub run_gap_minutes: i64,
+    /// この暦日に乗った**日跨ぎ終業の尻尾** ([`DaySummary::punch_tail_minutes`])。
+    pub punch_tail_minutes: i64,
 }
 
 impl DayPart {
@@ -259,6 +261,7 @@ impl DayPart {
             legal_holiday_night_minutes: 0,
             ferry_minus_minutes: 0,
             run_gap_minutes: 0,
+            punch_tail_minutes: 0,
         }
     }
 }
@@ -348,6 +351,16 @@ pub struct DaySummary {
     /// ここには出ない。勤務の端の空き (打刻 ↔ 運行) は紙も TC_DC で数えるので
     /// 含めない — 中の継ぎ目だけ。
     pub run_gap_minutes: i64,
+    /// **日跨ぎ終業の尻尾** — 最後のデジタコイベント → 終業打刻 (分)
+    /// (Refs ohishi-exp/nuxt-dtako-admin#501)。
+    ///
+    /// 紙のタイムカード表は暦日ごとに「最初のイベント → 最後のイベント」で数える
+    /// ため、終業打刻が**翌暦日**へ落ちる (0 時過ぎの打刻) と、最後のデジタコ
+    /// イベントから終業までの尻尾を数えない。こちらは打刻まで数える。
+    /// 実測 (1708 松江 03-13): 運行終了 21:28 → 終業 翌 00:00:02 の 151 分。
+    /// 同日の終業なら紙も TC_DC で数えるので対象外 — 打刻が暦日を跨ぐときだけ。
+    /// 休息と重なる分は除く。拘束は変えない (説明用の実額)。
+    pub punch_tail_minutes: i64,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -964,6 +977,30 @@ fn run_gap_spans(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDa
     merge_intervals(out)
 }
 
+/// **日跨ぎ終業の尻尾** — 最後のデジタコイベントから勤務の終わりまで
+/// ([`DaySummary::punch_tail_minutes`]、Refs ohishi-exp/nuxt-dtako-admin#501)。
+///
+/// 対象は「勤務を閉じた終業打刻が、最後のデジタコイベントより**後の暦日**にある」
+/// 勤務だけ。同日の終業なら紙も TC_DC (打刻↔運行の隙間) で数えるので尻尾は出ない。
+/// 勤務の終わりは丸め ([`RestraintRounding::TruncateElapsed`]) で終業打刻より最大
+/// 1 分手前に来るので、打刻は [`punch_window_end`] と同じく 1 分足して探す。
+fn punch_tail_span(events: &[Event], shift: &Shift) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let last_ev = events
+        .iter()
+        .filter(|e| e.source != "timecard")
+        .map(|e| floor_min(e.end.unwrap_or(e.start)))
+        .filter(|t| *t > shift.start && *t < shift.end)
+        .max()?;
+    let closing_punch = events
+        .iter()
+        .filter(|e| e.source == "timecard" && e.state == "終業")
+        .map(|e| e.start)
+        .find(|t| {
+            floor_min(*t) >= shift.end && floor_min(*t) <= shift.end + Duration::minutes(1)
+        })?;
+    (closing_punch.date() > last_ev.date()).then_some((last_ev, shift.end))
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -1193,6 +1230,17 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     // 運行の継ぎ目 (紙が拘束に入れない分)。休息と重なる分は拘束から外れているので除く
     let run_gaps = subtract_intervals(&run_gap_spans(events, shift), &rests);
     let run_gap_minutes: i64 = run_gaps.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
+    // 日跨ぎ終業の尻尾 (紙が数えない分)。休息と重なる分は拘束から外れているので除く
+    let punch_tails = subtract_intervals(
+        &punch_tail_span(events, shift)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        &rests,
+    );
+    let punch_tail_minutes: i64 = punch_tails
+        .iter()
+        .map(|(s, e)| (*e - *s).num_minutes())
+        .sum();
     let intervals = subtract_intervals(&restraint, &breaks);
     let is_legal_holiday = shift.start.weekday() == Weekday::Sun;
 
@@ -1262,12 +1310,21 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
                 .run_gap_minutes += minutes;
         }
     }
+    for (s, e) in &punch_tails {
+        for (date, minutes) in split_by_date(*s, *e) {
+            parts
+                .entry(date)
+                .or_insert_with(|| DayPart::new(date))
+                .punch_tail_minutes += minutes;
+        }
+    }
 
     DaySummary {
         // フェリー控除は勤務の計算に混ぜない。日別サマリを組み終えてから
         // `apply_ferry_minus` で暦日ごとに載せる (Refs #146)
         ferry_minus_minutes: 0,
         run_gap_minutes,
+        punch_tail_minutes,
         date: shift.start.format("%Y-%m-%d").to_string(),
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
@@ -3251,6 +3308,48 @@ mod tests {
             .map(|p| (p.date.as_str(), p.run_gap_minutes))
             .collect();
         assert_eq!(by_date, vec![("2026-06-16", 60), ("2026-06-17", 60)]);
+    }
+
+    #[test]
+    fn punch_tail_counts_when_the_closing_punch_is_on_the_next_day() {
+        // 乗務員 1708 松江 / 2026-03-13 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 運行終了 21:28 のあと終業打刻が翌 00:00:02 — 紙は暦日ごとに最後のイベント
+        // までしか数えないので、21:28→24:00 の尻尾 152 分が落ちる
+        let rows = vec![
+            tc("2026-06-13 06:11:00", "始業"),
+            dtako("2026-06-13 06:49:00", "運行開始"),
+            dtako("2026-06-13 21:28:00", "運行終了"),
+            tc("2026-06-14 00:00:02", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let d = days.iter().find(|d| d.date == "2026-06-13").unwrap();
+        assert_eq!(d.punch_tail_minutes, 152);
+        // 拘束は変えない
+        assert_eq!(d.restraint_minutes, 1069);
+    }
+
+    #[test]
+    fn punch_tail_is_zero_for_a_same_day_closing_punch() {
+        // 同日の終業なら紙も TC_DC (打刻↔運行の隙間) で数える — 尻尾ではない
+        let rows = vec![
+            tc("2026-06-13 06:11:00", "始業"),
+            dtako("2026-06-13 06:49:00", "運行開始"),
+            dtako("2026-06-13 21:28:00", "運行終了"),
+            tc("2026-06-13 23:10:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].punch_tail_minutes, 0);
+    }
+
+    #[test]
+    fn punch_tail_is_zero_without_dtako_events() {
+        // 事務員 (デジタコ無し) の日跨ぎ打刻は紙も対で按分する — 尻尾は出ない
+        let rows = vec![
+            tc("2026-06-13 08:00:00", "始業"),
+            tc("2026-06-14 00:30:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].punch_tail_minutes, 0);
     }
 
     #[test]
