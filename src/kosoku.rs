@@ -63,6 +63,12 @@
 //! 休憩 63.1h)。運行中かどうかは [`has_operation`] が判定し、**イベント由来の休憩と
 //! 昼休憩は排他** — 運行中の日に昼休憩を足すと昼を二重に引く。
 //!
+//! **昼の窓に 1 分も掛からない勤務は、拘束が 6 時間を超えていれば 1 時間を勤務の
+//! まん中に置く** ([`off_hours_break`]、ユーザー指示 2026-07-28)。昼休憩は時計の窓
+//! なので夜勤には当たらず、作業員 1196 の 23:45 → 08:00 の夜勤 18 日が全日 休憩 0
+//! (拘束 149.9h = 実働) のまま残っていた。6 時間以下を除くのは 19:00 → 00:00 の
+//! 5 時間勤務 (事務 1706 / 1707) や 3 時間勤務 (1573) に 1 時間を引かないため。
+//!
 //! ### 24 時間を超える拘束
 //!
 //! たまに日付を跨いで 24 時間以上続く運行がある (実測では最長 38.1 時間)。**例外的な
@@ -94,6 +100,20 @@ const NIGHT_TO_HOUR: u32 = 5;
 /// ([`has_operation`] / [`lunch_windows`])。
 const LUNCH_FROM_HOUR: u32 = 12;
 const LUNCH_TO_HOUR: u32 = 13;
+
+/// 昼の窓に 1 分も掛からない勤務 (夜勤・夕方だけ等) に入れる休憩 (分)。
+///
+/// 昼休憩の窓は時計で決めているので、夜勤にはそもそも当たらない。実測 2026-04 の
+/// 作業員 1196 は 23:45 → 08:00 の夜勤 18 日が全日 休憩 0 (拘束 149.9h = 実働) の
+/// まま残っていた。**1 時間引く** (ユーザー指示 2026-07-28)。
+const OFF_HOURS_BREAK_MINUTES: i64 = 60;
+
+/// 昼の窓に掛からない勤務へ休憩を入れる下限の拘束 (分)。**これ以下は入れない。**
+///
+/// 労基法 34 条が休憩を義務づける最初の閾値 (6 時間超) に合わせる。実測では
+/// 19:00 → 00:00 の 5 時間勤務 (事務 1706 / 1707) や 07:00 → 10:00 の 3 時間勤務
+/// (1573) があり、これらに 1 時間を引くのは実態にも法にも合わない。
+const OFF_HOURS_BREAK_MIN_RESTRAINT_MINUTES: i64 = 6 * 60;
 
 /// 1 勤務の拘束の上限 (分)。これを超えたら**打ち切る**。
 ///
@@ -649,6 +669,24 @@ fn has_operation(events: &[Event], shift: &Shift) -> bool {
         })
 }
 
+/// 昼の窓に 1 分も掛からない勤務へ入れる休憩 (ユーザー指示 2026-07-28)。
+///
+/// 昼休憩は時計の窓なので夜勤には当たらない ([`lunch_windows`])。拘束が
+/// [`OFF_HOURS_BREAK_MIN_RESTRAINT_MINUTES`] を超える勤務にだけ
+/// [`OFF_HOURS_BREAK_MINUTES`] を入れる。
+///
+/// **置く場所は勤務のまん中。** 夜勤は時計の窓で決められず、端に寄せると深夜
+/// (22:00-05:00) の内訳が寄せ方しだいで動いてしまう。まん中なら実際に休憩を取る
+/// 時間帯に最も近く、恣意的な偏りも入らない。
+fn off_hours_break(shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let restraint = (shift.end - shift.start).num_minutes();
+    if restraint <= OFF_HOURS_BREAK_MIN_RESTRAINT_MINUTES {
+        return Vec::new();
+    }
+    let start = shift.start + Duration::minutes((restraint - OFF_HOURS_BREAK_MINUTES) / 2);
+    vec![(start, start + Duration::minutes(OFF_HOURS_BREAK_MINUTES))]
+}
+
 /// 勤務が跨ぐ暦日ごとの昼休憩の窓 (12:00-13:00) を、勤務内へ切り詰めて返す。
 ///
 /// 窓は消費側 (`nuxt-dtako-admin` の `timecard-summary.ts`) が打刻から実働を出す
@@ -723,7 +761,13 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         // **運行に出ていない勤務にはデジタコの休憩イベントも無い** — 休憩イベントは
         // 運行に紐づいて記録されるので、勤務に重なる休憩が 1 件でもあれば
         // `has_operation` が true になりこちらへは来ない。足し合わせは起きえない
-        lunch_windows(shift)
+        let lunch = lunch_windows(shift);
+        // 夜勤のように昼の窓へ 1 分も掛からない勤務は、時計の窓では休憩を置けない
+        if lunch.is_empty() {
+            off_hours_break(shift)
+        } else {
+            lunch
+        }
     };
     let break_minutes: i64 = breaks.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let intervals = working_intervals(shift, &breaks);
@@ -1158,21 +1202,23 @@ mod tests {
 
     #[test]
     fn night_splits_between_statutory_and_overtime() {
-        // 月曜 18:00〜翌 06:00 = 720 分、休憩なし
-        //   実働 0〜450 分  = 18:00〜01:30 … うち深夜 22:00〜01:30 = 210 分 → night
-        //   実働 450〜480   = 01:30〜02:00 … 全部深夜 30 分         → night (法定内残業)
-        //   実働 480〜720   = 02:00〜06:00 … うち深夜 02:00〜05:00 = 180 分 → overtime_night
+        // 月曜 18:00〜翌 06:00 = 拘束 720 分。昼の窓に掛からないので休憩 60 分が
+        // まん中 (23:30-00:30、深夜帯) に入り、実働は 660 分
+        //   実働 0〜450 分  = 18:00〜23:30 + 00:30〜02:30 … うち深夜 210 分 → night
+        //   実働 450〜480   = 02:30〜03:00 … 全部深夜 30 分            → night (法定内残業)
+        //   実働 480〜660   = 03:00〜06:00 … うち深夜 03:00〜05:00 = 120 分 → overtime_night
         let rows = vec![
             tc("2026-06-08 18:00:00", "始業"),
             tc("2026-06-09 06:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
-        assert_eq!(d.working_minutes, 720);
+        assert_eq!(d.working_minutes, 660);
         assert_eq!(d.night_minutes, 240);
-        assert_eq!(d.overtime_night_minutes, 180);
+        assert_eq!(d.overtime_night_minutes, 120);
         assert_eq!(d.legal_holiday_night_minutes, 0);
-        // 深夜と時間外深夜は排他 — 合計が実際の深夜帯 (22:00〜05:00 = 420 分) に一致
-        assert_eq!(d.night_minutes + d.overtime_night_minutes, 420);
+        // 深夜と時間外深夜は排他 — 合計は深夜帯 (22:00〜05:00 = 420 分) から
+        // 深夜に入った休憩 60 分を引いた 360 分
+        assert_eq!(d.night_minutes + d.overtime_night_minutes, 360);
     }
 
     // --- 休憩 ---
@@ -1325,6 +1371,7 @@ mod tests {
 
     #[test]
     fn shift_not_covering_noon_has_no_lunch() {
+        // 5 時間なので夜勤側の 1 時間も入らない (6 時間以下)
         let rows = vec![
             tc("2026-06-02 13:00:00", "始業"),
             tc("2026-06-02 18:00:00", "終業"),
@@ -1332,6 +1379,71 @@ mod tests {
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert_eq!(d.break_minutes, 0);
         assert_eq!(d.working_minutes, 300);
+    }
+
+    // --- 昼の窓に掛からない勤務の休憩 (ユーザー指示 2026-07-28) ---
+
+    #[test]
+    fn night_shift_gets_one_hour_in_the_middle() {
+        // 実測の作業員 1196 と同じ形 (23:45 → 翌 08:00 = 495 分)。
+        // まん中 = 始業 + (495 - 60) / 2 = +217 分 → 03:22-04:22
+        let rows = vec![
+            tc("2026-06-02 23:45:00", "始業"),
+            tc("2026-06-03 08:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 495);
+        assert_eq!(d.break_minutes, 60);
+        assert_eq!(d.working_minutes, 435);
+        // 休憩は 03:22-04:22 = すべて深夜帯なので、深夜がそのぶん減る。
+        // 深夜は 23:45-05:00 の 315 分から 60 分引いた 255 分
+        assert_eq!(d.night_minutes, 255);
+    }
+
+    #[test]
+    fn evening_shift_of_six_hours_or_less_gets_no_break() {
+        // 事務 1706 / 1707 と同じ形 (19:00 → 翌 00:00 = 5 時間)
+        let rows = vec![
+            tc("2026-06-02 19:00:00", "始業"),
+            tc("2026-06-03 00:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 0);
+        assert_eq!(d.working_minutes, 300);
+    }
+
+    #[test]
+    fn exactly_six_hours_off_hours_gets_no_break() {
+        // 境界: 6 時間ちょうどは「6 時間超」ではないので入れない
+        let rows = vec![
+            tc("2026-06-02 18:00:00", "始業"),
+            tc("2026-06-03 00:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 0);
+    }
+
+    #[test]
+    fn one_minute_over_six_hours_off_hours_gets_the_break() {
+        let rows = vec![
+            tc("2026-06-02 17:59:00", "始業"),
+            tc("2026-06-03 00:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 60);
+    }
+
+    #[test]
+    fn night_shift_on_an_operation_day_keeps_event_breaks() {
+        // 運行に出ている夜勤には入れない (デジタコの休憩イベントが正)
+        let rows = vec![
+            tc("2026-06-02 23:45:00", "始業"),
+            ev("2026-06-03 00:30:00", "2026-06-03 07:00:00", "運転"),
+            tc("2026-06-03 08:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 0);
+        assert_eq!(d.working_minutes, 495);
     }
 
     #[test]
@@ -1857,12 +1969,13 @@ mod tests {
             tc("2026-06-03 08:00:00", "終業"),
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
-        // 深夜は 22:00〜24:00 (120 分) と 0:00〜5:00 (300 分)
+        // 拘束 600 分。昼の窓に掛からないので休憩 60 分がまん中 (02:30-03:30) に入る
+        // 深夜は 22:00〜24:00 (120 分) と 0:00〜5:00 の 300 分 − 休憩 60 分 = 240 分
         assert_eq!(d.parts[0].night_minutes, 120);
-        assert_eq!(d.parts[1].night_minutes, 300);
-        // 時間外は経過実働 8h 超 = 6/3 06:00 以降なので翌日側にだけ乗る
+        assert_eq!(d.parts[1].night_minutes, 240);
+        // 時間外は経過実働 8h 超 = 6/3 07:00 以降なので翌日側にだけ乗る
         assert_eq!(d.parts[0].overtime_minutes, 0);
-        assert_eq!(d.parts[1].overtime_minutes, 120);
+        assert_eq!(d.parts[1].overtime_minutes, 60);
     }
 
     #[test]
@@ -1885,9 +1998,11 @@ mod tests {
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.is_legal_holiday);
+        // 拘束 480 分。昼の窓に掛からないので休憩 60 分がまん中 (23:30-00:30) に入り、
+        // 月曜側の実働は 00:30〜04:00 の 210 分 (すべて深夜帯)
         // 法定休日の判定は勤務単位 (始業日) — 月曜へこぼれた分も法定休日のまま
-        assert_eq!(d.parts[1].legal_holiday_minutes, 240);
-        assert_eq!(d.parts[1].legal_holiday_night_minutes, 240);
+        assert_eq!(d.parts[1].legal_holiday_minutes, 210);
+        assert_eq!(d.parts[1].legal_holiday_night_minutes, 210);
         assert_eq!(
             d.parts.iter().map(|p| p.legal_holiday_minutes).sum::<i64>(),
             d.legal_holiday_minutes
