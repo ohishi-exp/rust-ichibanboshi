@@ -22,29 +22,49 @@ use tower::ServiceExt;
 
 struct MockRepo {
     rows: Vec<Value>,
+    /// フェリー区間 (Refs #146)
+    ferry: Vec<Value>,
     fail: Option<KintaiRepoError>,
     /// 1 名分の呼び出し (`from`, `to`, 乗務員CD)
     calls: Mutex<Vec<(String, String, u64)>>,
     /// 全乗務員の呼び出し (`from`, `to`)
     all_calls: Mutex<Vec<(String, String)>>,
+    /// フェリーの呼び出し (`from`, `to`, 乗務員CD)
+    ferry_calls: Mutex<Vec<(String, String, Option<u64>)>>,
 }
 
 impl MockRepo {
     fn with_rows(rows: Vec<Value>) -> Arc<Self> {
         Arc::new(Self {
             rows,
+            ferry: Vec::new(),
             fail: None,
             calls: Mutex::new(Vec::new()),
             all_calls: Mutex::new(Vec::new()),
+            ferry_calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// フェリー区間つき (Refs #146)。控除は拘束に混ぜないことを見るため。
+    fn with_ferry(rows: Vec<Value>, ferry: Vec<Value>) -> Arc<Self> {
+        Arc::new(Self {
+            rows,
+            ferry,
+            fail: None,
+            calls: Mutex::new(Vec::new()),
+            all_calls: Mutex::new(Vec::new()),
+            ferry_calls: Mutex::new(Vec::new()),
         })
     }
 
     fn failing(e: KintaiRepoError) -> Arc<Self> {
         Arc::new(Self {
             rows: Vec::new(),
+            ferry: Vec::new(),
             fail: Some(e),
             calls: Mutex::new(Vec::new()),
             all_calls: Mutex::new(Vec::new()),
+            ferry_calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -82,6 +102,23 @@ impl KintaiEventsApi for MockRepo {
             .unwrap()
             .push((from.to_string(), to.to_string()));
         self.result()
+    }
+
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        self.ferry_calls
+            .lock()
+            .unwrap()
+            .push((from.to_string(), to.to_string(), driver));
+        match &self.fail {
+            Some(KintaiRepoError::NotConfigured) => Err(KintaiRepoError::NotConfigured),
+            Some(KintaiRepoError::QueryFailed(m)) => Err(KintaiRepoError::QueryFailed(m.clone())),
+            None => Ok(self.ferry.clone()),
+        }
     }
 }
 
@@ -535,4 +572,133 @@ async fn no_events_is_empty_days_not_error() {
     let (status, body) = serve(vec![], "/api/kintai/kosoku-daily?month=2026-06&driver=1051").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["days"].as_array().unwrap().len(), 0);
+}
+
+// ---- フェリー控除 (Refs #146) ----
+//
+// 紙のタイムカード表が拘束から引いている分。**こちらの拘束には入れない** — 突合で
+// 差の原因を説明するためだけに載せる。取れなくても日別サマリは返す。
+
+fn ferry_row(start: &str, end: &str, driver: u64) -> Value {
+    serde_json::json!({"start_datetime": start, "end_datetime": end, "driver_id": driver})
+}
+
+#[tokio::test]
+async fn kosoku_daily_puts_ferry_minus_on_the_day_without_touching_restraint() {
+    let repo = MockRepo::with_ferry(
+        vec![
+            tc_of(1726, "2026-06-02 09:00:00", "始業"),
+            tc_of(1726, "2026-06-02 18:00:00", "終業"),
+        ],
+        vec![ferry_row(
+            "2026-06-02 10:00:00",
+            "2026-06-02 11:18:56",
+            1726,
+        )],
+    );
+    let (status, body) = call(
+        app(repo.clone()),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1726",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let day = &v["days"][0];
+    assert_eq!(day["ferry_minus_minutes"], 78);
+    // 拘束は控除の影響を受けない
+    assert_eq!(day["restraint_minutes"], 540);
+
+    // フェリーは**その月ちょうど**で引く (イベント側の翌月+1日とは違う)
+    let calls = repo.ferry_calls.lock().unwrap();
+    assert_eq!(
+        calls[0],
+        (
+            "2026-06-01 00:00:00".to_string(),
+            "2026-07-01 00:00:00".to_string(),
+            Some(1726)
+        )
+    );
+}
+
+#[tokio::test]
+async fn kosoku_daily_all_drivers_splits_ferry_per_driver() {
+    let repo = MockRepo::with_ferry(
+        vec![
+            tc_of(1726, "2026-06-02 09:00:00", "始業"),
+            tc_of(1726, "2026-06-02 18:00:00", "終業"),
+            tc_of(1021, "2026-06-02 09:00:00", "始業"),
+            tc_of(1021, "2026-06-02 18:00:00", "終業"),
+        ],
+        vec![
+            ferry_row("2026-06-02 10:00:00", "2026-06-02 11:00:00", 1726),
+            ferry_row("2026-06-02 10:00:00", "2026-06-02 10:30:00", 1021),
+        ],
+    );
+    let (status, body) = call(app(repo.clone()), "/api/kintai/kosoku-daily?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let of = |cd: u64| -> i64 {
+        v["drivers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["driver"] == cd)
+            .unwrap()["days"][0]["ferry_minus_minutes"]
+            .as_i64()
+            .unwrap()
+    };
+    // 他人の控除を混ぜない
+    assert_eq!(of(1726), 60);
+    assert_eq!(of(1021), 30);
+    // 全乗務員は 1 回で引く (driver 指定なし)
+    let calls = repo.ferry_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2, None);
+}
+
+#[tokio::test]
+async fn kosoku_daily_survives_a_ferry_failure() {
+    // フェリーは突合の付帯情報。取れなくても日別サマリは返す (控除 0)
+    struct FerryFails(Vec<Value>);
+    #[async_trait]
+    impl KintaiEventsApi for FerryFails {
+        async fn fetch_events_between(
+            &self,
+            _from: &str,
+            _to: &str,
+            _driver: u64,
+        ) -> Result<Vec<Value>, KintaiRepoError> {
+            Ok(self.0.clone())
+        }
+        async fn fetch_all_events_between(
+            &self,
+            _from: &str,
+            _to: &str,
+        ) -> Result<Vec<Value>, KintaiRepoError> {
+            Ok(self.0.clone())
+        }
+        async fn fetch_ferry_between(
+            &self,
+            _from: &str,
+            _to: &str,
+            _driver: Option<u64>,
+        ) -> Result<Vec<Value>, KintaiRepoError> {
+            Err(KintaiRepoError::QueryFailed("ferry table gone".into()))
+        }
+    }
+    let rows = vec![
+        tc_of(1726, "2026-06-02 09:00:00", "始業"),
+        tc_of(1726, "2026-06-02 18:00:00", "終業"),
+    ];
+    let repo: DynKintaiEventsRepo = Arc::new(FerryFails(rows));
+
+    for uri in [
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1726",
+        "/api/kintai/kosoku-daily?month=2026-06",
+    ] {
+        let (status, body) = call(app(repo.clone()), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(body.contains("\"ferry_minus_minutes\":0"), "{uri}");
+        assert!(body.contains("\"restraint_minutes\":540"), "{uri}");
+    }
 }
