@@ -35,8 +35,8 @@ use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
 use crate::kosoku::{
-    apply_ferry_minus, daily_summary, ferry_minus_by_date, month_punches, split_by_driver,
-    split_ferry_by_driver, KosokuParams,
+    apply_ferry_minus, daily_summary, drop_duplicate_rows, ferry_minus_by_date, month_punches,
+    split_by_driver, split_ferry_by_driver, KosokuParams,
 };
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
@@ -403,6 +403,8 @@ pub async fn kosoku_daily(
         .fetch_events(&month, driver)
         .await
         .map_err(map_repo_err)?;
+    // 取り込みが 2 回走ると全列同一の行が入る。**紙は二重計上する**ので件数を返す
+    let (rows, duplicate_rows) = drop_duplicate_rows(rows);
     let mut days = daily_summary(&rows, &month, &params_cfg);
     // 紙のタイムカード表がこの月に引いているフェリー控除を載せる (Refs #146)。
     // **拘束の計算には入れない** — 突合で差の原因を説明するためだけ。
@@ -417,16 +419,22 @@ pub async fn kosoku_daily(
     tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
     if is_compare_view(params.view.as_deref()) {
         // 突合は打刻を見ない
-        return Ok(Json(serde_json::json!({
+        let mut o = serde_json::json!({
             "month": month,
             "driver": driver,
             "days": compare_days(&days),
-        })));
+        });
+        // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
+        if !duplicate_rows.is_empty() {
+            o["duplicate_rows"] = serde_json::json!(duplicate_rows);
+        }
+        return Ok(Json(o));
     }
     Ok(Json(serde_json::json!({
         "month": month,
         "driver": driver,
         "days": days,
+        "duplicate_rows": duplicate_rows,
         "punches": month_punches(&rows, &month),
     })))
 }
@@ -458,22 +466,29 @@ async fn kosoku_daily_all(
     let drivers: Vec<serde_json::Value> = split_by_driver(rows)
         .into_iter()
         .map(|(driver, rows)| {
+            // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
+            let (rows, duplicate_rows) = drop_duplicate_rows(rows);
             let mut days = daily_summary(&rows, month, params_cfg);
             if let Some(ferry) = ferry_by_driver.get(&driver) {
                 apply_ferry_minus(&mut days, &ferry_minus_by_date(ferry));
             }
             // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
             let punches = month_punches(&rows, month);
-            (driver, days, punches)
+            (driver, days, punches, duplicate_rows)
         })
-        .filter(|(_, days, punches)| !days.is_empty() || !punches.is_empty())
-        .map(|(driver, days, punches)| {
-            if compare_view {
+        .filter(|(_, days, punches, _)| !days.is_empty() || !punches.is_empty())
+        .map(|(driver, days, punches, duplicate_rows)| {
+            let mut o = if compare_view {
                 // 突合は打刻を見ない。日別も要る項目だけに絞る (Refs #157)
                 serde_json::json!({ "driver": driver, "days": compare_days(&days) })
             } else {
                 serde_json::json!({ "driver": driver, "days": days, "punches": punches })
+            };
+            // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
+            if !duplicate_rows.is_empty() {
+                o["duplicate_rows"] = serde_json::json!(duplicate_rows);
             }
+            o
         })
         .collect();
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
