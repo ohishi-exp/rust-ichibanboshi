@@ -412,6 +412,16 @@ fn is_night(t: NaiveDateTime) -> bool {
 /// 行が丸ごと空になっていた)。休息由来の勤務は「休息の終了」からしか始まらないので、
 /// 運行に出た直後の区間はこの手当てが無いと拾えない。
 ///
+/// **ただし次の始業打刻が先に来るなら、そこで閉じる** (Refs ohishi-exp/nuxt-dtako-admin#501)。
+/// 次の休息まで伸ばすと、次の始業から始まる勤務と**重なった 2 本**ができる —
+/// [`merge_shifts`] は打刻×休息の重なりしか見ないので、打刻どうしの重なりは
+/// そのまま二重計上になる。実測 (乗務員 1072 立山 / 2026-03): 始業 03-14 06:46 は
+/// 対の終業が無く、次の休息は**次の始業 03-16 06:41 より後**の 03-16 20:17。
+/// 休息で閉じると 03-14 06:46→03-16 20:17 の勤務が
+/// [`split_by_run_gaps`] を経て 03-16 07:19→20:17 (777 分) の欠片を残し、
+/// 始業 03-16 06:41→20:17 (816 分) と併存して 03-16 が 1593 分 (暦日 1440 分超)
+/// になっていた (紙は 815)。
+///
 /// 次の休息も無ければ捨てる — 終わりを決める手がかりが何も無いため。
 fn shifts_from_timecard(events: &[Event]) -> Vec<Shift> {
     let mut out = Vec::new();
@@ -419,9 +429,10 @@ fn shifts_from_timecard(events: &[Event]) -> Vec<Shift> {
     for e in events.iter().filter(|e| e.source == "timecard") {
         match e.state.as_str() {
             "始業" => {
-                // 前の始業が終業を持たないまま次の始業が来たら、前の分を休息で閉じる
+                // 前の始業が終業を持たないまま次の始業が来たら、前の分を
+                // 次の休息と**この始業の早い方**で閉じる
                 if let Some(start) = pending.take() {
-                    if let Some(end) = next_rest_start(events, start) {
+                    if let Some(end) = next_rest_start(events, start).map(|r| r.min(e.start)) {
                         if end > start {
                             out.push(Shift {
                                 start,
@@ -2954,6 +2965,35 @@ mod tests {
         assert_eq!(days[0].end, "2026-06-17 16:00:00");
         assert_eq!(days[1].start, "2026-06-18 06:00:00");
         assert_eq!(days[1].end, "2026-06-18 18:00:00");
+    }
+
+    #[test]
+    fn an_unpaired_punch_in_closes_at_the_next_punch_in_when_it_is_before_the_rest() {
+        // 乗務員 1072 立山 / 2026-03-14〜16 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 始業 14 日 06:46 は対の終業が無く、次の休息は**次の始業 16 日 06:41 より後**の
+        // 16 日 20:17。休息で閉じると 14 日 06:46→16 日 20:17 の勤務が run-gap 分割を
+        // 経て 16 日 07:19→20:17 (777 分) の欠片を残し、始業 16 日 06:41→20:17
+        // (816 分) と併存して 16 日が 1593 分 (暦日 1440 分超) に二重計上されていた
+        let rows = vec![
+            ev("2026-06-13 17:27:00", "2026-06-14 08:37:00", "休息"),
+            tc("2026-06-14 06:46:00", "始業"),
+            dtako("2026-06-14 09:45:00", "運行終了"),
+            // 15 日は丸ごと休み (イベント無し)
+            tc("2026-06-16 06:41:00", "始業"),
+            dtako("2026-06-16 07:19:00", "運行開始"),
+            ev("2026-06-16 20:17:00", "2026-06-17 03:18:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let d16: Vec<_> = days.iter().filter(|d| d.date == "2026-06-16").collect();
+        assert_eq!(d16.len(), 1, "16 日の行は 1 本だけ: {days:?}");
+        assert_eq!(d16[0].start, "2026-06-16 06:41:00");
+        assert_eq!(d16[0].end, "2026-06-16 20:17:00");
+        // 14 日は休息明け→運行終了 (帰宅) で閉じたまま
+        let d14: Vec<_> = days.iter().filter(|d| d.date == "2026-06-14").collect();
+        assert_eq!(d14.len(), 1);
+        assert_eq!(d14[0].end, "2026-06-14 09:45:00");
+        // 休みの 15 日に欠片を落とさない
+        assert!(days.iter().all(|d| d.date != "2026-06-15"), "{days:?}");
     }
 
     #[test]
