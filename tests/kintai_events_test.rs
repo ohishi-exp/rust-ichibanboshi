@@ -73,6 +73,16 @@ impl KintaiEventsApi for MockEventsRepo {
     ) -> Result<Vec<Value>, KintaiRepoError> {
         panic!("/api/kintai/events は全乗務員を読まない")
     }
+
+    async fn fetch_ferry_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        // /events はフェリーを使わない (Refs #146 は kosoku-daily だけ)
+        Ok(Vec::new())
+    }
 }
 
 fn app(repo: DynKintaiEventsRepo) -> Router {

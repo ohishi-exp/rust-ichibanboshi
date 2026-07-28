@@ -34,7 +34,10 @@ use serde::Deserialize;
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
-use crate::kosoku::{daily_summary, month_punches, split_by_driver, KosokuParams};
+use crate::kosoku::{
+    apply_ferry_minus, daily_summary, ferry_minus_by_date, month_punches, split_by_driver,
+    split_ferry_by_driver, KosokuParams,
+};
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
 /// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
@@ -338,7 +341,15 @@ pub async fn kosoku_daily(
         .fetch_events(&month, driver)
         .await
         .map_err(map_repo_err)?;
-    let days = daily_summary(&rows, &month, &params_cfg);
+    let mut days = daily_summary(&rows, &month, &params_cfg);
+    // 紙のタイムカード表がこの月に引いているフェリー控除を載せる (Refs #146)。
+    // **拘束の計算には入れない** — 突合で差の原因を説明するためだけ。
+    // 取れなくても日別サマリは返す (控除が 0 になるだけ) — 突合の付帯情報のために
+    // 本体を落とさない
+    match repo.fetch_ferry(&month, Some(driver)).await {
+        Ok(ferry) => apply_ferry_minus(&mut days, &ferry_minus_by_date(&ferry)),
+        Err(e) => tracing::warn!("ferry fetch failed — ferry_minus stays 0: {e}"),
+    }
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = days.len();
     tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
@@ -364,10 +375,22 @@ async fn kosoku_daily_all(
     params_cfg: &KosokuParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let rows = repo.fetch_all_events(month).await.map_err(map_repo_err)?;
+    // 全乗務員ぶんを 1 回で引いて乗務員ごとに分ける (Refs #146)。取れなければ空 =
+    // 控除 0 で続ける — 突合の付帯情報のために日別サマリを落とさない
+    let ferry_by_driver = match repo.fetch_ferry(month, None).await {
+        Ok(rows) => split_ferry_by_driver(rows),
+        Err(e) => {
+            tracing::warn!("ferry fetch failed — ferry_minus stays 0: {e}");
+            Default::default()
+        }
+    };
     let drivers: Vec<serde_json::Value> = split_by_driver(rows)
         .into_iter()
         .map(|(driver, rows)| {
-            let days = daily_summary(&rows, month, params_cfg);
+            let mut days = daily_summary(&rows, month, params_cfg);
+            if let Some(ferry) = ferry_by_driver.get(&driver) {
+                apply_ferry_minus(&mut days, &ferry_minus_by_date(ferry));
+            }
             // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
             let punches = month_punches(&rows, month);
             (driver, days, punches)
