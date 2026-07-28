@@ -90,8 +90,13 @@ fn compare_days(days: &[crate::kosoku::DaySummary]) -> Vec<serde_json::Value> {
             let mut o = serde_json::json!({
                 "date": d.date,
                 "restraint_minutes": d.restraint_minutes,
-                "ferry_minus_minutes": d.ferry_minus_minutes,
             });
+            // **0 は載せない** (Refs #157)。フェリー控除がある日は月に数十日しか無いのに
+            // `"ferry_minus_minutes":0,` が全日に付くと 3,128 日で約 75 KB (応答の 29%)
+            // を食う。消費側は欠けを 0 として読む
+            if d.ferry_minus_minutes != 0 {
+                o["ferry_minus_minutes"] = serde_json::json!(d.ferry_minus_minutes);
+            }
             // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
             if !parts.is_empty() {
                 o["parts"] = serde_json::Value::Array(parts);
