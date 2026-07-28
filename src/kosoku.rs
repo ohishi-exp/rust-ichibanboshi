@@ -472,10 +472,31 @@ fn next_rest_start(events: &[Event], after: NaiveDateTime) -> Option<NaiveDateTi
         .min()
 }
 
+/// `after` より後で最初の**終業打刻** (Refs ohishi-exp/nuxt-dtako-admin#501)。
+fn next_punch_out(events: &[Event], after: NaiveDateTime) -> Option<NaiveDateTime> {
+    events
+        .iter()
+        .filter(|e| e.source == "timecard" && e.state == "終業")
+        .map(|e| e.start)
+        .filter(|t| *t > after)
+        .min()
+}
+
 /// 休息イベントから勤務を組む。**休息の終了 = 始業、次の休息の開始 = 終業。**
 ///
 /// 区間を持つ `dtako_events` 由来の `休息` だけを使う (`dtako` 側は開始・終了が
 /// 別行の点イベントで、対にする根拠が無い)。
+///
+/// **最後の休息は終業打刻で閉じる** (Refs ohishi-exp/nuxt-dtako-admin#501)。
+/// 次の休息が無いと対が作れず、その勤務が**丸ごと落ちて**いた。終業打刻の相手の
+/// 始業が無ければ [`shifts_from_timecard`] も捨てるので、両方から漏れる。
+/// #137 で入れた「終業の無い始業は次の休息で終わらせる」の裏返し。
+///
+/// 実測 (乗務員 1526 陣内 / 2026-03): 758 分の休息が明けた 03-02 17:32 から
+/// 03-03 05:57 の終業打刻までの **745 分が欠けていた** (紙との差 03-02 +388 /
+/// 03-03 は行ごと無し 356 = 暦日按分そのもの)。
+///
+/// 運行終了では閉じない — 打刻の無い日を運行で代替するかは別の判断 (型D)。
 fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
     let mut rests: Vec<(NaiveDateTime, NaiveDateTime)> = events
         .iter()
@@ -484,7 +505,7 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
         .filter(|(s, e)| e > s)
         .collect();
     rests.sort();
-    rests
+    let mut out: Vec<Shift> = rests
         .windows(2)
         .filter(|w| w[1].0 > w[0].1)
         .map(|w| Shift {
@@ -492,7 +513,53 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
             end: w[1].0,
             source: ShiftSource::Rest,
         })
-        .collect()
+        .collect();
+    if let Some(last) = rests.last() {
+        if let Some(end) = next_punch_out(events, last.1) {
+            out.push(Shift {
+                start: last.1,
+                end,
+                source: ShiftSource::Rest,
+            });
+        }
+    }
+    out
+}
+
+/// **全列が同じ行を落とす** (Refs ohishi-exp/nuxt-dtako-admin#501)。
+///
+/// デジタコの取り込みが 2 回走ると、`dtako_events` に**同じ運行NO・同じ車輌・
+/// 同じ読取日で全列同一の行**が入る (実測 1732 / 2026-07-16: id 32553689〜691 と
+/// 32553773〜775 の 2 ブロック)。こちらの計算は元から重複に強い
+/// ([`merge_intervals`] / [`shifts_from_rest`] の `windows(2)`) が、**紙の
+/// タイムカード表は二重計上して拘束が 2 倍になる**ので、落とした件数を暦日ごとに
+/// 返して突合で気付けるようにする。
+///
+/// 読み出し SQL は `id` を選んでいないので、**残った列が全部同じ = 区別する
+/// 情報が無い** = 重複と断じてよい。
+pub fn drop_duplicate_rows(
+    rows: Vec<serde_json::Value>,
+) -> (Vec<serde_json::Value>, BTreeMap<String, i64>) {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut dropped: BTreeMap<String, i64> = BTreeMap::new();
+    let kept = rows
+        .into_iter()
+        .filter(|r| {
+            if seen.insert(r.to_string()) {
+                return true;
+            }
+            let date = r
+                .get("datetime")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .chars()
+                .take(10)
+                .collect::<String>();
+            *dropped.entry(date).or_insert(0) += 1;
+            false
+        })
+        .collect();
+    (kept, dropped)
 }
 
 /// 区間 `[from, to)` を暦日で切り、日ごとの分数を返す (Refs #130)。
@@ -2302,6 +2369,81 @@ mod tests {
         // 外して何も残らないので外さない (拘束 0 の出勤日にはしない)
         assert_eq!(days[0].restraint_minutes, 2880);
         assert_eq!(days[0].rest_minus_minutes, 0);
+    }
+
+    // --- 最後の休息を終業打刻で閉じる (Refs nuxt-dtako-admin#501) ---
+
+    #[test]
+    fn the_last_rest_is_closed_by_a_punch_out() {
+        // 乗務員 1526 陣内 / 2026-03-02 の形。次の休息が無いので勤務ごと落ちていた
+        let rows = vec![
+            ev("2026-03-02 04:54:00", "2026-03-02 17:32:00", "休息"),
+            tc("2026-03-03 05:57:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-03-02 17:32:00");
+        assert_eq!(days[0].end, "2026-03-03 05:57:00");
+        assert_eq!(days[0].restraint_minutes, 745);
+        // 暦日按分は 03-02 が 388 分・03-03 が 357 分 (紙との残差そのもの)
+        let parts = &days[0].parts;
+        assert_eq!(parts[0].restraint_minutes, 388);
+        assert_eq!(parts[1].restraint_minutes, 357);
+    }
+
+    #[test]
+    fn the_last_rest_stays_dropped_without_a_punch_out() {
+        // 終業打刻が無ければ従来どおり捨てる — 運行終了では閉じない (型D は別判断)
+        let rows = vec![
+            ev("2026-03-02 04:54:00", "2026-03-02 17:32:00", "休息"),
+            dtako("2026-03-03 05:49:00", "運行終了"),
+        ];
+        assert!(daily_summary(&rows, "2026-03", &KosokuParams::default()).is_empty());
+    }
+
+    #[test]
+    fn a_punch_out_before_the_last_rest_does_not_close_it() {
+        // 休息より前の終業打刻では閉じない (負の勤務を作らない)
+        let rows = vec![
+            tc("2026-03-02 03:00:00", "終業"),
+            ev("2026-03-02 04:54:00", "2026-03-02 17:32:00", "休息"),
+        ];
+        assert!(daily_summary(&rows, "2026-03", &KosokuParams::default()).is_empty());
+    }
+
+    // --- 全列同一の行を落とす (Refs nuxt-dtako-admin#501) ---
+
+    #[test]
+    fn duplicate_rows_are_dropped_and_counted_by_date() {
+        // 取り込みが 2 回走った形 (実測 1732 / 2026-07-16)
+        let rows = vec![
+            ev("2026-07-16 04:04:36", "2026-07-16 04:58:24", "一般道空車"),
+            ev("2026-07-16 04:04:36", "2026-07-16 04:58:24", "一般道空車"),
+            tc("2026-07-17 06:00:00", "始業"),
+        ];
+        let (kept, dropped) = drop_duplicate_rows(rows);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(dropped.get("2026-07-16"), Some(&1));
+        assert_eq!(dropped.len(), 1);
+    }
+
+    #[test]
+    fn rows_that_differ_anywhere_are_kept() {
+        // 同じ時刻・同じイベントでも運行NO が違えば別物 (実測 1526 の ...011 / ...012)
+        let a = serde_json::json!({"datetime": "2026-03-01 00:49:24", "end_datetime": null,
+            "source": "dtako", "state": "休息", "unko_no": "26022506251200000023011"});
+        let b = serde_json::json!({"datetime": "2026-03-01 00:49:24", "end_datetime": null,
+            "source": "dtako", "state": "休息", "unko_no": "26022506251200000023012"});
+        let (kept, dropped) = drop_duplicate_rows(vec![a, b]);
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn dropping_duplicates_on_an_empty_list() {
+        let (kept, dropped) = drop_duplicate_rows(Vec::new());
+        assert!(kept.is_empty());
+        assert!(dropped.is_empty());
     }
 
     // --- 勤務の中に残った休息を外す (ユーザー決定 2026-07-28、Refs nuxt-dtako-admin#501) ---
