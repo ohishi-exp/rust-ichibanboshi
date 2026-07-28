@@ -329,7 +329,8 @@ async fn sunday_is_legal_holiday() {
     assert_eq!(status, StatusCode::OK);
     let d = &body["days"][0];
     assert_eq!(d["is_legal_holiday"], true);
-    assert_eq!(d["legal_holiday_minutes"], 720);
+    // 運行に出ていない勤務なので昼休憩 60 分が引かれる (720 - 60)
+    assert_eq!(d["legal_holiday_minutes"], 660);
     assert_eq!(d["overtime_minutes"], 0);
 }
 
