@@ -811,6 +811,23 @@ async fn compare_view_keeps_ferry_on_parts_of_an_overnight_shift() {
     assert!(d["parts"][1].get("ferry_minus_minutes").is_none());
 }
 
+#[tokio::test]
+async fn compare_view_keeps_a_non_zero_punch_tail() {
+    // 日跨ぎ終業の尻尾 (Refs #501、1708 松江 03-13 の形)。0 の日には載せない
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-13 06:11:00", "始業"),
+            dtako("2026-06-13 06:49:00", "運行開始", "u1"),
+            dtako("2026-06-13 21:28:00", "運行終了", "u1"),
+            tc("2026-06-14 00:00:02", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1708&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["days"][0]["punch_tail_minutes"], 152);
+}
+
 // --- 全列同一の行の検知 (Refs nuxt-dtako-admin#501) ---
 
 #[tokio::test]
