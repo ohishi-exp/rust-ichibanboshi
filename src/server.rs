@@ -89,6 +89,7 @@ pub async fn run(
         break_threshold_minutes: config.kosoku.break_threshold_minutes,
         prescribed_minutes: config.kosoku.prescribed_minutes,
         legal_minutes: config.kosoku.legal_minutes,
+        restraint_rounding: config.kosoku.restraint_rounding.into(),
     });
 
     // 拘束サマリ store (Refs #106 Phase 3)。open 失敗は Disabled (route が 503) —

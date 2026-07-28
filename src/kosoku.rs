@@ -123,6 +123,26 @@ const OFF_HOURS_BREAK_MIN_RESTRAINT_MINUTES: i64 = 6 * 60;
 /// 24 時間で切って [`DaySummary::over_24h`] を立て、遵守チェックに回す。
 const MAX_RESTRAINT_MINUTES: i64 = 24 * 60;
 
+/// 勤務の**秒の落とし方**。紙のタイムカード表 (社内 CakePHP) との突合で 1 分ずれる
+/// 原因がここだったので、あとで戻せるよう設定にした (Refs ohishi-exp/nuxt-dtako-admin#501)。
+///
+/// 実測 (2026-03、129 名): 両方に居る乗務員の暦日 467 日のうち **204 日が 1〜2 分差**で、
+/// その大半がこの違いによるもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestraintRounding {
+    /// **紙と同じ**: 経過時間を切り捨てる。`floor(end - start)`。
+    ///
+    /// nginx 側は `date_diff()` の `->h * 60 + ->i` で**差の秒を捨てて**いる
+    /// (`TimeCardKosokuController::_make_tc_to_tc`)。始業 09:00:30 / 終業 17:00:20 なら
+    /// 経過 7:59:50 → **479 分**。
+    TruncateElapsed,
+    /// 従来: 両端をそれぞれ分に切り捨ててから引く。`floor(end) - floor(start)`。
+    ///
+    /// 同じ例で 09:00 → 17:00 の **480 分**。終業の秒が始業の秒より小さいとき、
+    /// [`RestraintRounding::TruncateElapsed`] より 1 分**大きく**なる。
+    FloorEndpoints,
+}
+
 /// 日別サマリの計算パラメータ。
 #[derive(Debug, Clone, Copy)]
 pub struct KosokuParams {
@@ -132,6 +152,8 @@ pub struct KosokuParams {
     pub prescribed_minutes: i64,
     /// 法定労働時間 (分)。既定 480 = 8 時間。`prescribed_minutes` との差が法定内残業。
     pub legal_minutes: i64,
+    /// 秒の落とし方。既定は紙に合わせた [`RestraintRounding::TruncateElapsed`]。
+    pub restraint_rounding: RestraintRounding,
 }
 
 impl Default for KosokuParams {
@@ -140,6 +162,7 @@ impl Default for KosokuParams {
             break_threshold_minutes: 10,
             prescribed_minutes: 450,
             legal_minutes: 480,
+            restraint_rounding: RestraintRounding::TruncateElapsed,
         }
     }
 }
@@ -325,6 +348,32 @@ fn floor_min(dt: NaiveDateTime) -> NaiveDateTime {
     dt - Duration::seconds(dt.second() as i64) - Duration::nanoseconds(dt.nanosecond() as i64)
 }
 
+/// 勤務の両端を**分に揃える**。中の区間 (休憩・運行・深夜) はすべて分単位で扱うので、
+/// ここで境界を確定させてから畳む。
+///
+/// 始業は常に切り捨てる。終業の置き方だけが [`RestraintRounding`] で変わる:
+///
+/// - [`RestraintRounding::TruncateElapsed`] — 始業から**経過の切り捨てぶんだけ**進めた
+///   時刻に置く。拘束が `floor(end - start)` になり紙と一致する
+/// - [`RestraintRounding::FloorEndpoints`] — 終業も単に切り捨てる (従来)
+///
+/// どちらでも終業は分の境界に乗るので、下流の区間計算は変わらない。**拘束・実働が
+/// 最大 1 分小さくなるだけ**で、`拘束 = 実働 + 休憩` の関係も崩れない。
+fn align_shift(s: &Shift, rounding: RestraintRounding) -> Shift {
+    let start = floor_min(s.start);
+    let end = match rounding {
+        RestraintRounding::TruncateElapsed => {
+            start + Duration::minutes((s.end - s.start).num_minutes())
+        }
+        RestraintRounding::FloorEndpoints => floor_min(s.end),
+    };
+    Shift {
+        start,
+        end,
+        source: s.source,
+    }
+}
+
 /// 深夜帯 (22:00〜05:00) か。
 fn is_night(t: NaiveDateTime) -> bool {
     let h = t.hour();
@@ -446,6 +495,26 @@ fn split_by_date(start: NaiveDateTime, end: NaiveDateTime) -> Vec<(chrono::Naive
 /// **両端を含む** — 勤務の始業・終業そのものを落とさないため。比較は**分に丸めてから**
 /// 行う: 勤務の端は秒を切り捨ててあるので、`16:47:04` の終業打刻を `16:47:00` の
 /// 終業と比べると範囲外になって落ちる。
+///
+/// 呼び出し側は [`RestraintRounding::TruncateElapsed`] で**削った 1 分を足し戻して**
+/// 渡すこと ([`punch_window_end`])。削るのは拘束の数え方の話で、その 1 分に乗っている
+/// 終業打刻は依然この勤務のものだから。
+/// 打刻を拾うときの終端。
+///
+/// [`RestraintRounding::TruncateElapsed`] は経過の端数を落とすので、勤務の `end` が
+/// 終業打刻より最大 1 分手前に来る。そのまま [`punches_in`] に渡すと**終業打刻が
+/// 落ちる** (実測: 始業 09:25:37 / 終業 19:39:04 の勤務で終業が消えた)。削った 1 分を
+/// 足し戻して拾う。
+///
+/// 足すのは 1 分だけなので、無関係な打刻を巻き込むことはない — その 1 分は
+/// 元々この勤務の中にあった時間そのもの。
+fn punch_window_end(shift: &Shift, rounding: RestraintRounding) -> NaiveDateTime {
+    match rounding {
+        RestraintRounding::TruncateElapsed => shift.end + Duration::minutes(1),
+        RestraintRounding::FloorEndpoints => shift.end,
+    }
+}
+
 fn punches_in(events: &[Event], from: NaiveDateTime, to: NaiveDateTime) -> Vec<Punch> {
     events
         .iter()
@@ -752,7 +821,11 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     // **打刻は打ち切り前の区間から拾う** — 24 時間で切ると、切った先にある終業打刻
     // (実測: 乗務員 1194 の 2026-04-03 16:47) が落ちる。拘束の値は打ち切ったままでよいが、
     // 打刻カードとして出す側にはその時刻が要る (Refs #128)
-    let punches = punches_in(events, shift.start, shift.end);
+    let punches = punches_in(
+        events,
+        shift.start,
+        punch_window_end(shift, p.restraint_rounding),
+    );
     // 24 時間を超える拘束はここで打ち切る (法令違反なので積み上げる意味がない)
     let over_24h = (shift.end - shift.start).num_minutes() > MAX_RESTRAINT_MINUTES;
     let shift = &Shift {
@@ -794,7 +867,9 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         let mut t = *s;
         while t < *e {
             let n = is_night(t);
-            let part = parts.entry(t.date()).or_insert_with(|| DayPart::new(t.date()));
+            let part = parts
+                .entry(t.date())
+                .or_insert_with(|| DayPart::new(t.date()));
             if is_legal_holiday {
                 holiday += 1;
                 part.legal_holiday_minutes += 1;
@@ -1017,11 +1092,7 @@ pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) 
     let shifts = merge_shifts(shifts_from_timecard(&events), shifts_from_rest(&events));
     shifts
         .iter()
-        .map(|s| Shift {
-            start: floor_min(s.start),
-            end: floor_min(s.end),
-            source: s.source,
-        })
+        .map(|s| align_shift(s, p.restraint_rounding))
         .filter(|s| s.end > s.start)
         // 打刻が数日をまとめて挟んだ勤務は、中の休息で切り直す (Refs #133)
         .flat_map(|s| split_long_shift(&s, &events))
@@ -1859,6 +1930,83 @@ mod tests {
         assert_eq!(d.working_minutes, 1440 - 60);
     }
 
+    // --- 秒の落とし方 (Refs ohishi-exp/nuxt-dtako-admin#501) ---
+
+    #[test]
+    fn truncate_elapsed_matches_the_paper_timecard() {
+        // 始業 09:00:30 / 終業 17:00:20 → 経過 7:59:50。
+        // 紙 (nginx `date_diff()->h*60 + ->i`) は秒を捨てて 479 分
+        let rows = vec![
+            tc("2026-06-02 09:00:30", "始業"),
+            tc("2026-06-02 17:00:20", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 479);
+    }
+
+    #[test]
+    fn floor_endpoints_keeps_the_old_number() {
+        // 同じ入力を従来の丸めで引くと 09:00 → 17:00 の 480 分。
+        // **1 分大きい** — これが紙との差の正体だった
+        let rows = vec![
+            tc("2026-06-02 09:00:30", "始業"),
+            tc("2026-06-02 17:00:20", "終業"),
+        ];
+        let p = KosokuParams {
+            restraint_rounding: RestraintRounding::FloorEndpoints,
+            ..KosokuParams::default()
+        };
+        let d = &daily_summary(&rows, "2026-06", &p)[0];
+        assert_eq!(d.restraint_minutes, 480);
+    }
+
+    #[test]
+    fn truncate_elapsed_changes_nothing_when_seconds_do_not_wrap() {
+        // 終業の秒 >= 始業の秒 なら両者は一致する。ずれるのは繰り下がるときだけ
+        let rows = vec![
+            tc("2026-06-02 09:00:10", "始業"),
+            tc("2026-06-02 17:00:40", "終業"),
+        ];
+        let trunc = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        let p = KosokuParams {
+            restraint_rounding: RestraintRounding::FloorEndpoints,
+            ..KosokuParams::default()
+        };
+        let floor = &daily_summary(&rows, "2026-06", &p)[0];
+        assert_eq!(trunc.restraint_minutes, 480);
+        assert_eq!(floor.restraint_minutes, 480);
+    }
+
+    #[test]
+    fn truncate_elapsed_keeps_restraint_equal_to_working_plus_break() {
+        // 1 分削っても `拘束 = 実働 + 休憩` は崩さない (削るのは終業側なので実働が吸う)
+        let rows = vec![
+            tc("2026-06-02 09:00:30", "始業"),
+            ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休憩"),
+            tc("2026-06-02 17:00:20", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, d.working_minutes + d.break_minutes);
+        assert_eq!(d.restraint_minutes, 479);
+    }
+
+    #[test]
+    fn truncate_elapsed_still_keeps_the_closing_punch() {
+        // 削った 1 分の上に終業打刻が乗っていても落とさない (punch_window_end)
+        let rows = vec![
+            tc("2026-06-02 09:25:37", "始業"),
+            tc("2026-06-02 19:39:04", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.end, "2026-06-02 19:38:00");
+        assert_eq!(
+            d.punches.len(),
+            2,
+            "終業打刻が勤務の end より後になっても拾う"
+        );
+        assert_eq!(d.punches[1].state, "終業");
+    }
+
     // --- 勤務を構成した打刻 (Refs #128) ---
 
     #[test]
@@ -1872,8 +2020,14 @@ mod tests {
         assert_eq!(
             d.punches,
             vec![
-                Punch { at: "2026-06-02 09:25:37".into(), state: "始業".into() },
-                Punch { at: "2026-06-02 19:39:04".into(), state: "終業".into() },
+                Punch {
+                    at: "2026-06-02 09:25:37".into(),
+                    state: "始業".into()
+                },
+                Punch {
+                    at: "2026-06-02 19:39:04".into(),
+                    state: "終業".into()
+                },
             ]
         );
         // 勤務としての解釈 (分に丸め) は start / end のまま
@@ -1928,7 +2082,10 @@ mod tests {
 
     #[test]
     fn punch_traits_are_wired() {
-        let p = Punch { at: "2026-06-02 09:25:37".into(), state: "始業".into() };
+        let p = Punch {
+            at: "2026-06-02 09:25:37".into(),
+            state: "始業".into(),
+        };
         assert_eq!(p.clone(), p);
         assert!(format!("{p:?}").contains("始業"));
     }
@@ -2227,7 +2384,7 @@ mod tests {
         assert_eq!(d.parts[0].restraint_minutes, 120); // 22:00〜24:00
         assert_eq!(d.parts[1].date, "2026-06-03");
         assert_eq!(d.parts[1].restraint_minutes, 480); // 0:00〜8:00
-        // 内訳の合計は行の値と一致する (月合計は寄せ方によらない)
+                                                       // 内訳の合計は行の値と一致する (月合計は寄せ方によらない)
         assert_eq!(
             d.parts.iter().map(|p| p.restraint_minutes).sum::<i64>(),
             d.restraint_minutes
