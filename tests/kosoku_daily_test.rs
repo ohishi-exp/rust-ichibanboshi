@@ -727,6 +727,40 @@ async fn compare_view_returns_only_what_the_diff_needs() {
 }
 
 #[tokio::test]
+async fn compare_view_keeps_a_non_zero_rest_deduction() {
+    // 休息を外した日だけ rest_minus_minutes を載せる (Refs nuxt-dtako-admin#501)。
+    // 拘束は既に外した後の値なので、残差の説明にはこの内訳が要る
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            ev("2026-06-02 10:00:00", "2026-06-02 12:00:00", "休息"),
+            tc("2026-06-02 20:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    assert_eq!(d["rest_minus_minutes"], 120);
+    assert_eq!(d["restraint_minutes"], 720); // 840 − 120
+}
+
+#[tokio::test]
+async fn compare_view_omits_a_zero_rest_deduction() {
+    // 休息の無い日に `"rest_minus_minutes":0` を全日ぶら下げない (Refs #157 と同じ規則)
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["days"][0].get("rest_minus_minutes").is_none());
+}
+
+#[tokio::test]
 async fn compare_view_keeps_parts_for_the_calendar_split() {
     // 日跨ぎ勤務は暦日按分に parts が要る。ただし日付と拘束だけ
     let (status, body) = serve(

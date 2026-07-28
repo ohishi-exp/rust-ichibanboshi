@@ -97,6 +97,11 @@ fn compare_days(days: &[crate::kosoku::DaySummary]) -> Vec<serde_json::Value> {
             if d.ferry_minus_minutes != 0 {
                 o["ferry_minus_minutes"] = serde_json::json!(d.ferry_minus_minutes);
             }
+            // 休息控除も同じ扱い。拘束からは既に外してあるので突合の値は動かないが、
+            // 「この日は休息を何分外したか」が無いと残差の説明が付かない
+            if d.rest_minus_minutes != 0 {
+                o["rest_minus_minutes"] = serde_json::json!(d.rest_minus_minutes);
+            }
             // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
             if !parts.is_empty() {
                 o["parts"] = serde_json::Value::Array(parts);
