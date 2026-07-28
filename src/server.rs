@@ -5,7 +5,6 @@ use axum::{
     Extension, Router,
 };
 use tokio_util::sync::CancellationToken;
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -247,14 +246,6 @@ pub async fn run(
         .nest("/api", api_routes)
         .nest("/api", schema_routes)
         .layer(cors)
-        // **応答を圧縮する** (Refs #154)。この API は Cloudflare Tunnel 越しに社内から
-        // 出ていくので、圧縮しないと上りの帯域がそのまま応答時間になる。
-        //
-        // 実測 (2026-07-28、`/api/kintai/kosoku-daily?month=2026-05`):
-        // DB 0.48 秒 / rust 本体 0.46 秒 なのに**ブラウザでは 14〜57 秒**だった。
-        // 応答が 1.7 MB 非圧縮で、CF がエッジで 128 KB に圧縮していた = 遅い区間
-        // (社内 → CF) だけが 1.7 MB を運んでいた。
-        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(Extension(repo))
         .layer(Extension(local_store))
