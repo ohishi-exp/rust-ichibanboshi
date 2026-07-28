@@ -913,6 +913,206 @@ async fn an_unknown_view_falls_back_to_the_full_shape() {
     assert!(body["days"][0].get("working_minutes").is_some());
 }
 
+// --- view=timecard (Refs #164) ---
+//
+// 画面のタイムカード表用。消費側 (nuxt-dtako-admin front の `toKosokuDay` / relay の
+// `parseKosokuDaily`) は date/start/end のどれかが欠けた日を捨て、数値の欠けを 0、
+// `source` を `=== 'rest'`、旗を `=== true` で読む — その読み方に合わせて既定値を
+// 省略する。
+
+#[tokio::test]
+async fn timecard_view_keeps_date_start_end_and_omits_defaults() {
+    // 所定 (7.5h) ちょうどで収まる平日 — 分数の過半が 0 の、いちばん普通の日
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 09:00:00", "始業"),
+            tc("2026-06-02 17:30:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1018&view=timecard",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["month"], "2026-06");
+    assert_eq!(body["driver"], 1018);
+    let d = &body["days"][0];
+    // 消費側が行を捨てないための必須 3 つ
+    assert_eq!(d["date"], "2026-06-02");
+    assert_eq!(d["start"], "2026-06-02 09:00:00");
+    assert_eq!(d["end"], "2026-06-02 17:30:00");
+    // 非 0 の分数は残る
+    assert_eq!(d["restraint_minutes"], 510);
+    assert_eq!(d["break_minutes"], 60);
+    assert_eq!(d["working_minutes"], 450);
+    assert_eq!(d["statutory_minutes"], 450);
+    // 0 の分数・既定値の旗・既定の source は書かない (消費側が 0 / false /
+    // 'timecard' に落とす)
+    for key in [
+        "within_statutory_overtime_minutes",
+        "overtime_minutes",
+        "legal_holiday_minutes",
+        "night_minutes",
+        "overtime_night_minutes",
+        "legal_holiday_night_minutes",
+        "ferry_minus_minutes",
+        "source",
+        "is_legal_holiday",
+        "over_24h",
+        // compare の診断専用 — 画面は読まない
+        "rest_minus_minutes",
+    ] {
+        assert!(d.get(key).is_none(), "{key} should be omitted");
+    }
+    // 打刻は表の出勤/退社列の原本なので残す
+    assert_eq!(d["punches"].as_array().unwrap().len(), 2);
+    assert_eq!(d["punches"][0]["at"], "2026-06-02 09:00:00");
+    assert_eq!(d["punches"][0]["state"], "始業");
+    // 1 日で終わる勤務に parts は無い
+    assert!(d.get("parts").is_none());
+    // 月全打刻 (`month_punches`) は days[].punches と重複するので載せない
+    assert!(body.get("punches").is_none());
+    assert!(body.get("duplicate_rows").is_none());
+}
+
+#[tokio::test]
+async fn timecard_view_keeps_a_rest_source() {
+    // 休息由来の勤務だけ source を書く (消費側は `=== 'rest'` 判定)
+    let (status, body) = serve(
+        vec![
+            ev("2026-06-01 16:19:00", "2026-06-02 04:42:00", "休息"),
+            ev("2026-06-02 16:18:00", "2026-06-03 06:01:00", "休息"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1119&view=timecard",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    assert_eq!(d["source"], "rest");
+    // 休息由来は打刻を持たない — 空配列をぶら下げない
+    assert!(d.get("punches").is_none());
+}
+
+#[tokio::test]
+async fn timecard_view_keeps_true_flags_and_parts() {
+    // 日曜始まりの 24 時間超 — 旗 2 つと暦日按分が同時に出る形
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-07 06:00:00", "始業"), // 日曜
+            tc("2026-06-08 08:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=timecard",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    assert_eq!(d["is_legal_holiday"], true);
+    assert_eq!(d["over_24h"], true);
+    // 日跨ぎなので暦日按分が付く。part も date + 非 0 分数だけ
+    let parts = d["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["date"], "2026-06-07");
+    assert!(parts[0]["restraint_minutes"].as_i64().unwrap() > 0);
+    // 日曜 (法定休日) の part に時間外は無い
+    assert!(parts[0].get("overtime_minutes").is_none());
+    assert!(parts[0].get("ferry_minus_minutes").is_none());
+}
+
+#[tokio::test]
+async fn timecard_view_keeps_a_non_zero_ferry_deduction() {
+    let repo = MockRepo::with_ferry(
+        vec![
+            tc_of(1726, "2026-06-02 09:00:00", "始業"),
+            tc_of(1726, "2026-06-02 18:00:00", "終業"),
+        ],
+        vec![ferry_row(
+            "2026-06-02 10:00:00",
+            "2026-06-02 11:18:56",
+            1726,
+        )],
+    );
+    let (status, body) = call(
+        app(repo),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1726&view=timecard",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &serde_json::from_str::<Value>(&body).unwrap()["days"][0];
+    assert_eq!(d["ferry_minus_minutes"], 78);
+}
+
+#[tokio::test]
+async fn timecard_view_drops_driver_level_punches_for_all_drivers() {
+    // 一括応答の drivers[].punches (月全打刻) は消費側のどちらも読まない (Refs #164)。
+    // days[].punches と重複しているだけなので落とす。duplicate_rows 診断も落とす
+    let (status, body) = serve(
+        vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1119, "2026-06-02 06:00:00", "始業"), // 全列同一 = 取り込み二重
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&view=timecard",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d0 = &body["drivers"][0];
+    assert_eq!(d0["driver"], 1119);
+    assert!(d0.get("punches").is_none());
+    assert!(d0.get("duplicate_rows").is_none());
+    // 日別の打刻 (表の原本) は残る
+    let day = &d0["days"][0];
+    assert_eq!(day["punches"].as_array().unwrap().len(), 2);
+    assert_eq!(day["restraint_minutes"], 720);
+}
+
+#[tokio::test]
+async fn timecard_view_is_smaller_than_the_full_shape() {
+    // 同じデータを全項目と timecard で serialize してバイト数が減っていることを見る。
+    // 実データの実測 (month=2026-05) はデプロイ後に行う
+    let rows = vec![
+        tc_of(1119, "2026-06-02 09:00:00", "始業"),
+        tc_of(1119, "2026-06-02 18:00:00", "終業"),
+        tc_of(1442, "2026-06-07 06:00:00", "始業"), // 日曜跨ぎ (parts あり)
+        tc_of(1442, "2026-06-08 08:00:00", "終業"),
+    ];
+    let (_, full) = call(
+        app(MockRepo::with_rows(rows.clone())),
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    let (_, timecard) = call(
+        app(MockRepo::with_rows(rows)),
+        "/api/kintai/kosoku-daily?month=2026-06&view=timecard",
+    )
+    .await;
+    println!(
+        "full={} bytes / timecard={} bytes ({}%)",
+        full.len(),
+        timecard.len(),
+        timecard.len() * 100 / full.len()
+    );
+    assert!(
+        timecard.len() < full.len(),
+        "timecard ({}) should be smaller than full ({})",
+        timecard.len(),
+        full.len()
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_view_falls_back_to_the_full_shape_for_all_drivers_too() {
+    let (_, body) = serve(
+        vec![
+            tc_of(1119, "2026-06-02 09:00:00", "始業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&view=timecards",
+    )
+    .await;
+    let d0 = &body["drivers"][0];
+    // 綴り間違いは全項目のまま — 黙って情報が減らない
+    assert!(d0.get("punches").is_some());
+    assert!(d0["days"][0].get("working_minutes").is_some());
+}
+
 #[tokio::test]
 async fn compare_view_keeps_a_non_zero_ferry_deduction() {
     // 控除がある日だけ ferry_minus_minutes を載せる (Refs #157)
