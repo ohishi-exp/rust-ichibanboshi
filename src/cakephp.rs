@@ -237,6 +237,20 @@ impl CakephpClient {
     /// **`driver_id` 省略で全乗務員。** MCP の一括チェックが月 1 リクエストで済むよう
     /// 上流がそう作られている。
     ///
+    /// ## `recalc=0` を必ず付ける (yhonda-ohishi/nginx#786)
+    ///
+    /// 上流は既定 (`recalc=1`) だと拘束時間を**再計算し、値が変われば
+    /// `time_card_kosoku` を DELETE + INSERT する**。この endpoint は突合のための
+    /// **読み取り口**なので、叩くたびに本番データが書き換わってよいはずがない。
+    /// パラメータで選ばせず、ここで固定する — 呼び出し側 (relay / MCP) が付け忘れる
+    /// 余地を残さないため。
+    ///
+    /// 副次的に速い。実測 (2026-04 / 乗務員 1379): **4.18 秒 → 0.31 秒**。
+    /// 全乗務員では上流計測で実行時間の約 65% が再計算だった。
+    ///
+    /// 読むのは保存済みの値になるが、突合の相手は**紙のタイムカード表 = 保存済みの値**
+    /// なのでこちらが正しい。再計算が要るなら PDF を出す本来の経路で行う。
+    ///
     /// 応答は [`serde_json::Value`] のまま返す — 上流の形が確定しておらず、かつ
     /// このサービスは中継であって解釈者ではないため、型を持たない。
     pub async fn fetch_timecard_pdf_json(
@@ -250,12 +264,16 @@ impl CakephpClient {
         let base = self.base_url.trim_end_matches('/');
         let url = match driver {
             Some(d) => format!(
-                "{}/time-card/pdf-json?month={}&driver_id={}",
+                "{}/time-card/pdf-json?month={}&driver_id={}&recalc=0",
                 base,
                 urlencode(month),
                 d
             ),
-            None => format!("{}/time-card/pdf-json?month={}", base, urlencode(month)),
+            None => format!(
+                "{}/time-card/pdf-json?month={}&recalc=0",
+                base,
+                urlencode(month)
+            ),
         };
         self.get_json(&url).await
     }
