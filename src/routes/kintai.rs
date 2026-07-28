@@ -90,6 +90,14 @@ fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
                     if p.run_gap_minutes != 0 {
                         o["run_gap_minutes"] = serde_json::json!(p.run_gap_minutes);
                     }
+                    // 日跨ぎ勤務のフェリー控除は**内訳側が正** — 突合 (relay の
+                    // kosokuPartsByDate) は parts がある勤務を parts だけで暦日合算
+                    // するので、ここに載せないと控除が丸ごと落ちて unknown になる
+                    // (実測 1714 井上: 単日勤務の 03-08 だけ ferry が付き、日跨ぎの
+                    // 03-05/06/15/22/29 は 71〜75 分がそのまま残差になっていた)
+                    if p.ferry_minus_minutes != 0 {
+                        o["ferry_minus_minutes"] = serde_json::json!(p.ferry_minus_minutes);
+                    }
                     o
                 })
                 .collect();

@@ -783,6 +783,34 @@ async fn compare_view_keeps_a_non_zero_run_gap() {
     assert!(body["days"][1].get("run_gap_minutes").is_none());
 }
 
+#[tokio::test]
+async fn compare_view_keeps_ferry_on_parts_of_an_overnight_shift() {
+    // 日跨ぎ勤務のフェリー控除は parts 側が正 — 突合は parts だけで暦日合算する
+    // (実測 1714 井上 03-15: 14:12→翌00:49 の勤務でフェリー 75 分が落ちていた)
+    let rows = vec![
+        tc_of(1714, "2026-06-15 14:12:00", "始業"),
+        tc_of(1714, "2026-06-16 00:49:00", "終業"),
+    ];
+    let ferry = vec![json!({
+        "start_datetime": "2026-06-15 17:34:00",
+        "end_datetime": "2026-06-15 18:49:00",
+        "driver_id": 1714,
+    })];
+    let (status, body) = call(
+        app(MockRepo::with_ferry(rows, ferry)),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1714&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let d = &body["days"][0];
+    assert_eq!(d["ferry_minus_minutes"], 75);
+    assert_eq!(d["parts"][0]["date"], "2026-06-15");
+    assert_eq!(d["parts"][0]["ferry_minus_minutes"], 75);
+    // 控除の無い翌日の内訳には付かない
+    assert!(d["parts"][1].get("ferry_minus_minutes").is_none());
+}
+
 // --- 全列同一の行の検知 (Refs nuxt-dtako-admin#501) ---
 
 #[tokio::test]
