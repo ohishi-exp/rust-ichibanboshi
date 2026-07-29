@@ -487,9 +487,29 @@ fn shifts_from_timecard(events: &[Event]) -> Vec<Shift> {
         match e.state.as_str() {
             "始業" => {
                 // 前の始業が終業を持たないまま次の始業が来たら、前の分を
-                // 次の休息と**この始業の早い方**で閉じる
+                // 次の休息と**この始業の早い方**で閉じる。休息イベントが 1 本も
+                // 無い乗務員 (毎日帰宅・フェリー通勤等) でも次の始業では閉じる —
+                // 実測 (1029 冨田 03-12): 始業 00:12 の対が無く休息も無いため
+                // 1 日が丸ごと消えていた (紙 676)
                 if let Some(start) = pending.take() {
-                    if let Some(end) = next_rest_start(events, start).map(|r| r.min(e.start)) {
+                    let bound = next_rest_start(events, start).map_or(e.start, |r| r.min(e.start));
+                    // 「次の始業」で閉じた (= 実際の終業が無いまま次の日が始まった)
+                    // ときは**末尾の運行終了まで縮める** — 帰宅後の空白は勤務ではない。
+                    // 運行終了が無ければ、運行が続いている証拠があるときだけ残す
+                    // (事務員の打刻忘れで丸一日を作らない)
+                    let end = if bound == e.start {
+                        trailing_run_end(events, start, bound).or_else(|| {
+                            let probe = Shift {
+                                start,
+                                end: bound,
+                                source: ShiftSource::Timecard,
+                            };
+                            has_operation(events, &probe).then_some(bound)
+                        })
+                    } else {
+                        Some(bound)
+                    };
+                    if let Some(end) = end {
                         if end > start {
                             out.push(Shift {
                                 start,
@@ -528,6 +548,28 @@ fn shifts_from_timecard(events: &[Event]) -> Vec<Shift> {
     }
     out.sort_by_key(|s| s.start);
     out
+}
+
+/// 区間 `(start, bound]` の**末尾の運行終了** (その後 `bound` までに運行開始が無い
+/// ときだけ)。対の無い始業を次の始業で閉じるとき、帰宅後の空白を落とすのに使う
+/// (Refs ohishi-exp/nuxt-dtako-admin#501)。
+fn trailing_run_end(
+    events: &[Event],
+    start: NaiveDateTime,
+    bound: NaiveDateTime,
+) -> Option<NaiveDateTime> {
+    let last_end = events
+        .iter()
+        .filter(|e| e.state == "運行終了")
+        .map(|e| floor_min(e.start))
+        .filter(|t| *t > start && *t <= bound)
+        .max()?;
+    let resumed = events
+        .iter()
+        .filter(|e| e.state == "運行開始")
+        .map(|e| floor_min(e.start))
+        .any(|t| t > last_end && t < bound);
+    (!resumed).then_some(last_end)
 }
 
 /// `after` より後で最初に始まる休息の開始時刻 (Refs #137)。
@@ -3256,6 +3298,58 @@ mod tests {
         assert_eq!(d14[0].end, "2026-06-14 09:45:00");
         // 休みの 15 日に欠片を落とさない
         assert!(days.iter().all(|d| d.date != "2026-06-15"), "{days:?}");
+    }
+
+    #[test]
+    fn an_unpaired_punch_in_without_rests_closes_at_the_trailing_run_end() {
+        // 乗務員 1029 冨田 / 2026-03-12 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 毎日帰宅する乗務員は休息イベントが 1 本も無く、対の無い始業の日が
+        // 丸ごと消えていた。次の始業で閉じ、末尾の運行終了 (帰宅) まで縮める
+        let rows = vec![
+            tc("2026-06-12 00:12:00", "始業"),
+            dtako("2026-06-12 00:16:00", "運行開始"),
+            dtako("2026-06-12 12:44:00", "運行終了"),
+            tc("2026-06-13 00:11:00", "始業"),
+            tc("2026-06-13 14:18:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(
+            days.iter()
+                .map(|d| (d.start.as_str(), d.end.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-06-12 00:12:00", "2026-06-12 12:44:00"),
+                ("2026-06-13 00:11:00", "2026-06-13 14:18:00"),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_unpaired_punch_in_without_rests_or_operations_is_dropped() {
+        // 事務員の打刻忘れ: 休息も運行も無ければ従来どおり捨てる (丸一日を作らない)
+        let rows = vec![
+            tc("2026-06-12 08:00:00", "始業"),
+            tc("2026-06-13 08:00:00", "始業"),
+            tc("2026-06-13 17:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].date, "2026-06-13");
+    }
+
+    #[test]
+    fn an_unpaired_punch_in_with_a_continuing_run_keeps_the_punch_in_bound() {
+        // 運行終了が無い (運行が次の始業を跨いで続く) なら次の始業まで —
+        // 連続運行の途中で打刻を忘れた形
+        let rows = vec![
+            tc("2026-06-12 06:00:00", "始業"),
+            dtako("2026-06-12 06:30:00", "運行開始"),
+            tc("2026-06-13 06:00:00", "始業"),
+            tc("2026-06-13 17:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].start, "2026-06-12 06:00:00");
+        assert_eq!(days[0].end, "2026-06-13 06:00:00");
     }
 
     #[test]
