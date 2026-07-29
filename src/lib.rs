@@ -5,6 +5,7 @@ pub mod db;
 pub mod kintai_repo;
 pub mod kintai_store;
 pub mod kosoku;
+pub mod kosoku_paper;
 pub mod kyuyo;
 pub mod repo;
 pub mod restraint_store;

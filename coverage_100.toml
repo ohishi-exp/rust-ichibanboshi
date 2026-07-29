@@ -17,6 +17,9 @@ path = "src/config.rs"
 path = "src/kosoku.rs"
 
 [[files]]
+path = "src/kosoku_paper.rs"
+
+[[files]]
 path = "src/kyuyo/introspect.rs"
 
 [[files]]

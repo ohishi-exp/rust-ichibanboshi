@@ -720,7 +720,10 @@ async fn compare_view_returns_only_what_the_diff_needs() {
     assert_eq!(status, StatusCode::OK);
     let d = &body["days"][0];
     let keys: Vec<&str> = d.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    assert_eq!(keys, vec!["date", "lunch_overlap_minutes", "restraint_minutes"]);
+    assert_eq!(
+        keys,
+        vec!["date", "lunch_overlap_minutes", "restraint_minutes"]
+    );
     assert_eq!(d["restraint_minutes"], 540);
     // 打刻は突合で使わないので付けない
     assert!(body.get("punches").is_none());
@@ -1026,7 +1029,50 @@ async fn compare_view_drops_punches_for_all_drivers_too() {
         .keys()
         .map(|k| k.as_str())
         .collect();
-    assert_eq!(keys, vec!["date", "lunch_overlap_minutes", "restraint_minutes"]);
+    assert_eq!(
+        keys,
+        vec!["date", "lunch_overlap_minutes", "restraint_minutes"]
+    );
+}
+
+#[tokio::test]
+async fn compare_view_carries_the_paper_drift() {
+    // 運行の無い対はこちらが昼休を休憩として数え (拘束 540)、紙は拘束から引く (480)。
+    // その差 60 が紙の再現値との drift として乗る (Refs nuxt-dtako-admin#501)。
+    // 単一乗務員と全乗務員の両経路で同じ値になること
+    let with_driver = |dt: &str, st: &str| {
+        let mut v = tc(dt, st);
+        v["driver_id"] = json!(1442);
+        v
+    };
+    let rows = vec![
+        with_driver("2026-06-02 06:00:00", "始業"),
+        with_driver("2026-06-02 15:00:00", "終業"),
+    ];
+    let (status, body) = serve(
+        rows.clone(),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["paper_drift_by_date"]["2026-06-02"], 60);
+    let (status, body) = serve(rows, "/api/kintai/kosoku-daily?month=2026-06&view=compare").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drivers"][0]["paper_drift_by_date"]["2026-06-02"], 60);
+}
+
+#[tokio::test]
+async fn full_view_does_not_carry_the_paper_drift() {
+    // 突合しか使わないので compare 以外には載せない (#157 の絞りと同じ方針)
+    let (_, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 15:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442",
+    )
+    .await;
+    assert!(body.get("paper_drift_by_date").is_none());
 }
 
 #[tokio::test]
