@@ -263,6 +263,45 @@ pub fn minus_unko_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMap<S
     out
 }
 
+/// 継ぎ目の対 (`運行終了 → 運行開始`) が**深夜を跨ぐ**ときの暦日配分の差を日別に返す
+/// (`YYYY-MM-DD → 分`、Refs #182 / nuxt-dtako-admin#546)。正 = 紙がその日に多く載せている。
+///
+/// 紙は対を**丸ごと運行開始の日**へ載せる ([`tc_dc_daily`] の「同日の縛りが無い」)。
+/// こちらは暦日で割るので、0 時より前の分だけ前日へ回る — 同じ時間の置き場所が
+/// 違うだけで、月合計は変わらない。
+///
+/// 実測 1536 谷川 / 2026-06-10 23:51:55 → 06-11 07:03:07 (車両の乗り換え): 紙は 431 分を
+/// 全部 06-11 へ、こちらは 06-10 に 8 分 + 06-11 に 423 分。06-11 の差 +8 がこれ。
+///
+/// [`paper_outside_by_date`] の深夜跨ぎ処理 (#190) は**勤務の外**に残った継ぎ目だけが
+/// 対象なので、継ぎ目がこちらの拘束の**中**にあるこの形は拾えない。
+pub fn gap_midnight_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMap<String, i64> {
+    use chrono::Timelike as _;
+    let events = parse_events(rows);
+    let stream = tc_stream(&events, month);
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    for w in stream.windows(2) {
+        let (t, nt) = (&w[0], &w[1]);
+        if t.st != "運行終了" || nt.st != "運行開始" || nt.at <= t.at {
+            continue;
+        }
+        let (d, h) = interval_d_h(t.at, nt.at);
+        // 紙が数える窓に入っていて、かつ深夜を跨ぐ対だけ (跨がなければ置き場所は同じ)
+        if !(d < 1 && h < 12) || t.at.date() == nt.at.date() {
+            continue;
+        }
+        // こちらの配分 ([`add_paper_segment`] の運行の外の枝と同じ): 前半は経過床、
+        // 後半は終端の時刻の分。紙はその合計を丸ごと運行開始の日へ
+        let before = elapsed_min(t.at, midnight_after(t.at));
+        let after = i64::from(nt.at.hour() * 60 + nt.at.minute());
+        *out.entry(t.at.format("%Y-%m-%d").to_string()).or_default() -= before;
+        *out.entry(nt.at.format("%Y-%m-%d").to_string()).or_default() +=
+            elapsed_min(t.at, nt.at) - after;
+    }
+    out.retain(|date, m| *m != 0 && date.starts_with(month));
+    out
+}
+
 /// こちらの日別値 (暦日按分後) と紙の再現値の差 (`ours − paper`) を日別に返す。
 /// **両方に値がある日だけ**、差が 0 でない日だけ載せる — 突合 (relay) が cause
 /// `rounding` の実額として使う。正 = こちらが大きい (紙が小さく数えている)。
@@ -724,6 +763,35 @@ mod tests {
         // 実額として出すのも TC_DC が値を持つ日だけ — 引かれていない分を突合の
         // cause 候補に出すと過剰説明になる
         assert!(minus_unko_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn gap_midnight_moves_the_pre_midnight_part_to_the_run_start_day() {
+        // 1536 谷川 / 2026-06-10 23:51:55 → 06-11 07:03:07 の形 (車両の乗り換え)。
+        // 紙は対 431 分を丸ごと 06-11 へ、こちらは 06-10 に 8 分 + 06-11 に 423 分
+        let rows = vec![
+            dtako("2026-03-10 23:51:55", "運行終了"),
+            dtako("2026-03-11 07:03:07", "運行開始"),
+        ];
+        let got = gap_midnight_by_date(&rows, "2026-03");
+        assert_eq!(got.get("2026-03-10"), Some(&-8));
+        assert_eq!(got.get("2026-03-11"), Some(&8));
+    }
+
+    #[test]
+    fn gap_midnight_ignores_same_day_and_out_of_window_pairs() {
+        // 深夜を跨がない対は置き場所が同じ — 差は出ない
+        let same_day = vec![
+            dtako("2026-03-10 08:00:20", "運行終了"),
+            dtako("2026-03-10 09:30:40", "運行開始"),
+        ];
+        assert!(gap_midnight_by_date(&same_day, "2026-03").is_empty());
+        // 窓 (d < 1 && h < 12) の外は紙が数えないので対象外
+        let wide = vec![
+            dtako("2026-03-10 22:00:00", "運行終了"),
+            dtako("2026-03-11 20:00:00", "運行開始"),
+        ];
+        assert!(gap_midnight_by_date(&wide, "2026-03").is_empty());
     }
 
     #[test]
