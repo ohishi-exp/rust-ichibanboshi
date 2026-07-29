@@ -96,6 +96,9 @@ fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
                     if p.punch_head_minutes != 0 {
                         o["punch_head_minutes"] = serde_json::json!(p.punch_head_minutes);
                     }
+                    if p.run_head_minutes != 0 {
+                        o["run_head_minutes"] = serde_json::json!(p.run_head_minutes);
+                    }
                     // 日跨ぎ勤務のフェリー控除は**内訳側が正** — 突合 (relay の
                     // kosokuPartsByDate) は parts がある勤務を parts だけで暦日合算
                     // するので、ここに載せないと控除が丸ごと落ちて unknown になる
@@ -133,6 +136,10 @@ fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
             // 日跨ぎ始業の頭 (cause "punch-head" の実額) も同じ規則
             if d.punch_head_minutes != 0 {
                 o["punch_head_minutes"] = serde_json::json!(d.punch_head_minutes);
+            }
+            // 始業前の運行の頭 (cause "run-head" の実額、紙が大きくなる向き) も同じ規則
+            if d.run_head_minutes != 0 {
+                o["run_head_minutes"] = serde_json::json!(d.run_head_minutes);
             }
             // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
             if !parts.is_empty() {
