@@ -341,9 +341,13 @@ nuxt-dtako-admin の relay (dtako-scraper-relay) が上流応答キャッシュ 
   本番実測)。binlog 検査で応答が読む 6 列への in-place UPDATE がゼロ件と確認済み
   という運用実態が前提 — 6 列を UPDATE する運用が始まったら CRC に戻すこと
   (`src/kintai_version.rs` モジュール docs の「例外」参照)
-- **BUILD_SHA と `KosokuParams` (Debug 表現) も畳む** — デプロイ (計算ロジック) や
-  TOML (丸め・閾値) の変更でもキャッシュを無効化するため。デプロイごとに全月
-  refetch になるのは仕様 (正しさ優先)
+- **`KINTAI_OUTPUT_SHA` と `KosokuParams` (Debug 表現) も畳む** — 計算ロジックや
+  TOML (丸め・閾値) の変更でもキャッシュを無効化するため。`KINTAI_OUTPUT_SHA` は
+  `build.rs` が `src/kosoku*` / `src/kintai*` / `src/routes/kintai*` を glob して
+  作る内容ハッシュで、**リポジトリ全体の `BUILD_SHA` ではない** (Refs #191) — 全体だと
+  ETC・日報など kintai と無関係なデプロイでも relay の上流キャッシュが全月飛んでいた。
+  対象ファイルが消えたら**ビルドが落ちる** (`KINTAI_OUTPUT_REQUIRED`)。接頭辞の外に
+  出力ロジックを新設したら build.rs の glob を同じ PR で足すこと (取りこぼし =「古い値」)
 - 覆えないもの: dailyJson の国民の祝日 (外部 API `holidays-jp.github.io`、DB に無い)
 - **GRANT 前提**: `kintai_reader` に `daily_report_other_detail` / `drivers` /
   `offices` / `time_card_non_legal_holiday` の SELECT が要る。無ければ **502
