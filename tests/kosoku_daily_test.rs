@@ -720,7 +720,7 @@ async fn compare_view_returns_only_what_the_diff_needs() {
     assert_eq!(status, StatusCode::OK);
     let d = &body["days"][0];
     let keys: Vec<&str> = d.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    assert_eq!(keys, vec!["date", "restraint_minutes"]);
+    assert_eq!(keys, vec!["date", "lunch_overlap_minutes", "restraint_minutes"]);
     assert_eq!(d["restraint_minutes"], 540);
     // 打刻は突合で使わないので付けない
     assert!(body.get("punches").is_none());
@@ -872,6 +872,25 @@ async fn compare_view_keeps_a_non_zero_run_head() {
     assert_eq!(d["parts"][1]["run_head_minutes"], 5);
 }
 
+#[tokio::test]
+async fn compare_view_keeps_a_non_zero_lunch_overlap() {
+    // 昼休の窓との重なり (Refs #501、1714 井上 03-04 の形)。日跨ぎの対は
+    // 両日の窓が内訳 (parts) に配られる。0 の日には載せない
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-04 08:00:00", "始業"),
+            tc("2026-06-05 17:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1714&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    assert_eq!(d["lunch_overlap_minutes"], 120);
+    assert_eq!(d["parts"][0]["lunch_overlap_minutes"], 60);
+    assert_eq!(d["parts"][1]["lunch_overlap_minutes"], 60);
+}
+
 // --- 全列同一の行の検知 (Refs nuxt-dtako-admin#501) ---
 
 #[tokio::test]
@@ -947,7 +966,7 @@ async fn duplicate_rows_are_reported_for_all_drivers_too() {
 
 #[tokio::test]
 async fn compare_view_keeps_parts_for_the_calendar_split() {
-    // 日跨ぎ勤務は暦日按分に parts が要る。ただし日付と拘束だけ
+    // 日跨ぎ勤務は暦日按分に parts が要る。ただし日付と拘束だけ (夜勤 = 昼窓なし)
     let (status, body) = serve(
         vec![
             tc("2026-06-02 20:00:00", "始業"),
@@ -1007,7 +1026,7 @@ async fn compare_view_drops_punches_for_all_drivers_too() {
         .keys()
         .map(|k| k.as_str())
         .collect();
-    assert_eq!(keys, vec!["date", "restraint_minutes"]);
+    assert_eq!(keys, vec!["date", "lunch_overlap_minutes", "restraint_minutes"]);
 }
 
 #[tokio::test]
