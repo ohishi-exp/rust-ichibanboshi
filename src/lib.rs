@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod kintai_repo;
 pub mod kintai_store;
+pub mod kintai_version;
 pub mod kosoku;
 pub mod kosoku_paper;
 pub mod kyuyo;

@@ -32,6 +32,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
 | `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) / `/api/kintai/events` (MariaDB 直読み) / `/api/kintai/kosoku-daily` (日別サマリ、`driver` 省略で全乗務員) (#99 / #116 / #118 / #125、下記) |
 | `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116)。1 名分の `EVENTS_SQL` と全乗務員の `ALL_EVENTS_SQL` (#125) |
+| `src/kintai_version.rs` + `src/routes/kintai_version.rs` | `/api/kintai/version` 月別バージョン (ETag) — `daily`/`kosoku-daily` の全ソーステーブル (11 個) の COUNT+CRC32 マーカーを `VERSION_SQL` 1 本で取り sha256 に畳む (#184、下記) |
 | `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/kosoku_paper.rs` | 紙のタイムカード表 (社内 CakePHP) の日別拘束の**再現** — 突合の cause `rounding` 用の `paper_drift_by_date` を `kosoku-daily?view=compare` に載せる (nuxt-dtako-admin#501)。**coverage 100% 対象** |
 | `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
@@ -57,6 +58,8 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - `/api/kintai/kosoku-daily?month=YYYY-MM[&driver=N]`: **打刻基準の日別サマリ** (#118、Phase 2)。
   `events` の生行を `src/kosoku.rs` の純粋ロジックで畳む。**金額は含めない**。
   **`driver` 省略で全乗務員** (#125、`{month, drivers:[{driver, days}]}`)。下記「日別サマリ」節。
+- `/api/kintai/version?month=YYYY-MM`: **月別バージョン (ETag)** (#184)。relay の条件付き
+  再検証キャッシュ用。下記「月別バージョン」節。
 - `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
@@ -309,6 +312,35 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
 - **勤務が 1 日も組めなかった乗務員は応答から落とす** (退職者・内勤で応答を膨らませない)。
   受け手にとって空配列と「居ない」は同じ
 - 応答サイズの見積り: 1 名 1 か月で約 10 KB → 96 名で約 1 MB
+
+### 月別バージョン (ETag) — `/api/kintai/version` (Refs #184)
+
+nuxt-dtako-admin の relay (dtako-scraper-relay) が上流応答キャッシュ (DO SQLite) の
+**条件付き再検証**に使う数十バイトの読み出し口。鮮度要件は「古い値は一切返さない」。
+
+- 応答: `{"month":"YYYY-MM","etag":"…"}` + 同じ値を `ETag` ヘッダに。etag は
+  **HTTP の quoted ETag そのもの** (`"…"` 込み) — relay は文字列比較だけ
+- **唯一の危険点はソーステーブルの列挙漏れ** — `kosoku-daily` (MariaDB 直読み:
+  `time_card_dstate` / `time_card_dtako` / `time_card_dtako_state` / `dtako_events` /
+  `dtako_cars` / `dtako_ferry_rows` / `dtako_rows`) と `daily` (CakePHP `dailyJson` の
+  読む `time_card_dstate` / `daily_report_other_detail` / `drivers` / `offices` /
+  `time_card_non_legal_holiday`) の **11 テーブル**を `VERSION_SQL` (UNION ALL 1 本)
+  で覆う。`src/kintai_version.rs` の unit test が全テーブルの在席を固定している
+- マーカーは **COUNT + `SUM(CRC32(読む列))`** — `dtako_*` 系に modified 列が無いため
+  `MAX(updated_at)` 方式は使えない。範囲・列はデータクエリの**上位集合** (広い分は
+  無駄な再取得で済むが、狭いと「古い値」事故)。`dtako_events` は `EVENTS_SQL` と同じ
+  2 ブランチ (`COALESCE` 1 本化は全表走査 #121→#122)
+- **BUILD_SHA と `KosokuParams` (Debug 表現) も畳む** — デプロイ (計算ロジック) や
+  TOML (丸め・閾値) の変更でもキャッシュを無効化するため。デプロイごとに全月
+  refetch になるのは仕様 (正しさ優先)
+- 覆えないもの: dailyJson の国民の祝日 (外部 API `holidays-jp.github.io`、DB に無い)
+- **GRANT 前提**: `kintai_reader` に `daily_report_other_detail` / `drivers` /
+  `offices` / `time_card_non_legal_holiday` の SELECT が要る。無ければ **502
+  fail-closed** — 一部テーブル抜きの etag へは縮退しない (列挙漏れと同じ事故になる)
+- 認可・パラメータは `kosoku-daily` に揃える (CF Access Service Token / `month` 必須)。
+  `driver` は取らない — キャッシュ鍵は月単位
+- テストは `src/kintai_version.rs` の unit test (畳み込み・SQL guard) と
+  `tests/kintai_version_test.rs` (route の配線、mock で DB 無し) の 2 段
 
 ## 給与 (給与大臣) の読み出し — `/api/kyuyo/*`
 
