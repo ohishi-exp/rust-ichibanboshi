@@ -17,7 +17,7 @@
 //! | `time_card_dstate` | 両方 | 月 (`month_range`) | `EVENTS_SQL` / dailyJson の打刻 30/31 |
 //! | `time_card_dtako` | kosoku-daily | 月 (`month_range`) | `EVENTS_SQL` 2 本目 |
 //! | `time_card_dtako_state` | kosoku-daily | 全体 (マスタ) | `EVENTS_SQL` の JOIN |
-//! | `dtako_events` | kosoku-daily | 月 (2 ブランチ) | `EVENTS_SQL` 3/4 本目 |
+//! | `dtako_events` | kosoku-daily | 前月初〜 (下記) | `EVENTS_SQL` 3/4 本目 |
 //! | `dtako_cars` | kosoku-daily | 全体 (マスタ) | `EVENTS_SQL` の JOIN (`車輌名`) |
 //! | `dtako_ferry_rows` | kosoku-daily | 月 (`exact_month_range`) | `FERRY_SQL` |
 //! | `dtako_rows` | kosoku-daily | 月 (出庫 or 帰庫) | `FERRY_SQL` の JOIN |
@@ -40,6 +40,27 @@
 //! いずれも) が必ずどちらかを動かす。範囲・列はデータクエリの**上位集合**に
 //! 揃える (広すぎる分は「無駄な再取得」で済むが、狭いと「古い値」になる)。
 //! コストはデータクエリ自身と同程度の index range scan で、転送が無い分軽い。
+//!
+//! ## 例外: `dtako_events` は COUNT + MAX(id) (index-only)
+//!
+//! `dtako_events` だけは 428 万行 / 約 2GB で、CRC 方式 (行本体のランダム読み) は
+//! DB のバッファプール (128MB、変更不可) が冷えていると **7〜24 秒**かかることを
+//! 本番で実測した (2026-07-29)。そこでこのテーブルのみ、`開始日時` インデックスの
+//! オンリースキャンで済む `COUNT(*)` + `MAX(id)` に置き換える (冷えた月でも実測
+//! 0.64 秒)。
+//!
+//! **前提となる運用実態 (binlog 検証 2026-07-29)**: 直近 7 日の binlog 全書き込み
+//! 約 30 万件を検査した結果、UPDATE 296,824 件のうち `EVENTS_SQL` が読む 6 列
+//! (`開始日時`/`終了日時`/`対象乗務員CD`/`イベント名`/`運行NO`/`車輌CD`) を SET
+//! するものは **0 件** (SET されるのは `得意先`・`kosoku_o15_time`・`旅費id`・
+//! `非表示` 等、応答が読まない列だけ)。DELETE 4,321 件は COUNT が、INSERT は
+//! COUNT/MAX(id) が検知する。REPLACE は 0 件。つまり 6 列は「挿入時確定・以後
+//! 不変」— **もし将来 `イベント名` 等を in-place UPDATE する運用が始まると
+//! 検知漏れ (古い値) になる**ので、その場合はこのブランチを CRC に戻すこと。
+//!
+//! 範囲は `[前月初, 翌月+1日)` に広げる — 月 M の応答は「前月に開始して M 月に
+//! 終わる区間」(`EVENTS_SQL` 第 4 ブランチ) を含むため、前月分の増減も月 M の
+//! マーカーを動かす必要がある (上位集合原則)。
 //!
 //! ## 追加 GRANT が要る (デプロイ前提条件)
 //!
@@ -67,7 +88,8 @@ pub struct SourceMarker {
     pub source: String,
     /// 対象範囲の行数
     pub count: String,
-    /// 対象範囲・対象列の CRC32 の和 (0 行なら "0")
+    /// 対象範囲の内容指紋。ほとんどのテーブルは対象列の CRC32 の和、
+    /// `dtako_events` のみ `MAX(id)` (モジュール docs の「例外」参照)。0 行なら "0"
     pub fingerprint: String,
 }
 
@@ -97,9 +119,11 @@ impl KintaiVersionApi for DisabledKintaiVersionRepo {
 ///   列は、対応するデータクエリ (`EVENTS_SQL` / `ALL_EVENTS_SQL` / `FERRY_SQL` /
 ///   dailyJson) が読むものの**上位集合**に揃える。絞り (dailyJson の state 30/31 等)
 ///   は掛けない — 広い分は安全側
-/// - `dtako_events` は `EVENTS_SQL` と同じ **2 ブランチ** (期間内に始まる区間 +
-///   期間内に終わる区間)。`COALESCE` で 1 本にまとめると索引が効かず全表走査に
-///   なる (#121 → #122 の実害) のも同じ
+/// - `dtako_events` は CRC を使わない (モジュール docs の「例外」参照)。
+///   `開始日時 >= :efrom` (前月初) の 1 ブランチで `EVENTS_SQL` の 2 ブランチ両方の
+///   行集合を覆う — 第 4 ブランチの「前月開始・当月終了」行も `開始日時` は前月
+///   範囲内にあるため。`COUNT(*)` + `MAX(e.id)` は `開始日時` インデックス
+///   (id を含む) のオンリースキャンで、行本体を読まない (EXPLAIN: `Using index`)
 /// - `dtako_ferry_rows` は `kintai_reader` に**列単位 GRANT** (`運行NO` / `開始日時` /
 ///   `終了日時` のみ)。`COUNT(*)` ではなく `COUNT(f.``開始日時``)` を使い、他の列
 ///   (`標準料金` 等) には一切触らない
@@ -130,25 +154,9 @@ SELECT 'time_card_dtako_state',
 UNION ALL
 SELECT 'dtako_events',
        CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(ev.fp), 0) AS CHAR)
-  FROM (
-    SELECT CRC32(CONCAT_WS('|',
-               e.`対象乗務員CD`,
-               DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
-               DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
-               e.`イベント名`, e.`運行NO`, e.`車輌CD`)) AS fp
-      FROM dtako_events e
-     WHERE e.`開始日時` >= :from AND e.`開始日時` < :to
-    UNION ALL
-    SELECT CRC32(CONCAT_WS('|',
-               e.`対象乗務員CD`,
-               DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
-               DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
-               e.`イベント名`, e.`運行NO`, e.`車輌CD`))
-      FROM dtako_events e
-     WHERE e.`終了日時` >= :from AND e.`終了日時` < :to
-       AND e.`開始日時` < :from
-  ) ev
+       CAST(IFNULL(MAX(e.id), 0) AS CHAR)
+  FROM dtako_events e
+ WHERE e.`開始日時` >= :efrom AND e.`開始日時` < :to
 UNION ALL
 SELECT 'dtako_cars',
        CAST(COUNT(*) AS CHAR),
@@ -202,6 +210,20 @@ SELECT 'time_card_non_legal_holiday',
 /// `VERSION_SQL` の 1 行 (source, cnt, fp — 全列 CHAR)。
 type MarkerRow = (String, String, String);
 
+/// 前月初 (`YYYY-MM-01 00:00:00`) — `dtako_events` マーカーの `:efrom`。
+/// 月 M の応答に含まれる「前月開始・M 月終了」行 (`EVENTS_SQL` 第 4 ブランチ) を
+/// 覆うため、範囲を前月へ 1 ヶ月広げる。
+fn prev_month_start(month: &str) -> Option<String> {
+    let year: i32 = month.get(..4)?.parse().ok()?;
+    let mm: u32 = month.get(5..7)?.parse().ok()?;
+    let prev = if mm == 1 {
+        chrono::NaiveDate::from_ymd_opt(year - 1, 12, 1)?
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, mm - 1, 1)?
+    };
+    Some(format!("{prev} 00:00:00"))
+}
+
 /// MariaDB 実装。`MariadbKintaiEventsRepo` と同じく pool は lazy —
 /// DB 停止中でも起動は失敗せず、実際に読むときに 502。
 pub struct MariadbKintaiVersionRepo {
@@ -232,6 +254,8 @@ impl KintaiVersionApi for MariadbKintaiVersionRepo {
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         let (mfrom, mto) = exact_month_range(month)
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        let efrom = prev_month_start(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         let mut conn = self
             .pool
             .get_conn()
@@ -245,6 +269,7 @@ impl KintaiVersionApi for MariadbKintaiVersionRepo {
                     "to" => &to,
                     "mfrom" => &mfrom,
                     "mto" => &mto,
+                    "efrom" => &efrom,
                 },
             )
             .await
@@ -327,13 +352,39 @@ mod tests {
         }
     }
 
-    /// `dtako_events` は `EVENTS_SQL` と同じ 2 ブランチ。`COALESCE` で 1 本に
-    /// まとめると全表走査 (#121 → #122 の実害)。
+    /// `dtako_events` は index-only の COUNT + MAX(id) 1 ブランチ (モジュール docs
+    /// の「例外」)。行本体を読む CRC を復活させると冷えた DB で 7〜24 秒に戻り、
+    /// `COALESCE` で `終了日時` を混ぜると全表走査 (#121 → #122 の実害)。
     #[test]
-    fn version_sql_keeps_two_branch_dtako_events() {
-        assert_eq!(VERSION_SQL.matches("FROM dtako_events").count(), 2);
-        assert!(VERSION_SQL.contains("`開始日時` < :from"));
+    fn version_sql_keeps_index_only_dtako_events() {
+        assert_eq!(VERSION_SQL.matches("FROM dtako_events").count(), 1);
+        // 範囲は前月初 (:efrom) から — EVENTS_SQL 第 4 ブランチの
+        // 「前月開始・当月終了」行を覆う
+        assert!(VERSION_SQL.contains("`開始日時` >= :efrom"));
+        assert!(VERSION_SQL.contains("MAX(e.id)"));
         assert!(!VERSION_SQL.contains("COALESCE(`終了日時`"));
+        // events ブランチに CRC が無いこと (CRC32 は他テーブル用に残る)
+        let events_branch = VERSION_SQL
+            .split("'dtako_events'")
+            .nth(1)
+            .unwrap()
+            .split("UNION ALL")
+            .next()
+            .unwrap();
+        assert!(!events_branch.contains("CRC32"));
+    }
+
+    #[test]
+    fn prev_month_start_handles_year_boundary() {
+        assert_eq!(
+            prev_month_start("2026-07").as_deref(),
+            Some("2026-06-01 00:00:00")
+        );
+        assert_eq!(
+            prev_month_start("2026-01").as_deref(),
+            Some("2025-12-01 00:00:00")
+        );
+        assert_eq!(prev_month_start("bad"), None);
     }
 
     /// `dtako_ferry_rows` は列単位 GRANT (`運行NO`/`開始日時`/`終了日時` のみ)。
