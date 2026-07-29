@@ -239,6 +239,30 @@ pub fn paper_daily_minutes(rows: &[serde_json::Value], month: &str) -> BTreeMap<
     out
 }
 
+/// 紙が日計から引く `運行開始 → 始業` (`_make_minus_unko_day`) を日別に返す
+/// (`YYYY-MM-DD → 分`、Refs #182 / nuxt-dtako-admin#546)。
+///
+/// 打刻より先に運行を始めた日、紙はその頭を**引く**のでこちらより小さくなる。
+/// [`paper_daily_minutes`] の中では既に効いているが、突合の cause 候補としては
+/// **実額が要る** — これが無いと `ours-outside` などと組み合わせられず、複合の日が
+/// drift (cause `rounding`) の受け皿へ落ちる (実測 1729 / 2026-01-09 の −15 =
+/// ours-outside 6 + minus_unko 9)。
+///
+/// 紙と同じく **TC_DC が値を持つ日だけ**返す — 紙が着地しない日は引かれないので、
+/// 実額として出すと過剰説明になる。
+pub fn minus_unko_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMap<String, i64> {
+    let events = parse_events(rows);
+    let stream = tc_stream(&events, month);
+    let (tc_dc, minus_unko) = tc_dc_daily(&stream);
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    for (day, minutes) in minus_unko {
+        if minutes != 0 && tc_dc.contains_key(&day) {
+            out.insert(format!("{month}-{day:02}"), minutes);
+        }
+    }
+    out
+}
+
 /// こちらの日別値 (暦日按分後) と紙の再現値の差 (`ours − paper`) を日別に返す。
 /// **両方に値がある日だけ**、差が 0 でない日だけ載せる — 突合 (relay) が cause
 /// `rounding` の実額として使う。正 = こちらが大きい (紙が小さく数えている)。
@@ -697,6 +721,32 @@ mod tests {
         ];
         let paper = paper_daily_minutes(&rows, "2026-03");
         assert_eq!(paper.get("2026-03-04"), Some(&63));
+        // 実額として出すのも TC_DC が値を持つ日だけ — 引かれていない分を突合の
+        // cause 候補に出すと過剰説明になる
+        assert!(minus_unko_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn minus_unko_by_date_reports_the_run_head_the_paper_subtracts() {
+        // 1729 石坂 2026-01-09 の形。運行開始 → 始業 の 9 分 23 秒を紙は日計から
+        // 引く。TC_DC は 運行終了 → 終業 で値を持つので着地する
+        let rows = vec![
+            dtako("2026-03-04 05:50:04", "運行開始"),
+            tc("2026-03-04 05:59:27", "始業"),
+            ev("2026-03-04 06:05:45", "2026-03-04 18:43:06", "運転"),
+            dtako("2026-03-04 18:43:06", "運行終了"),
+            tc("2026-03-04 18:54:02", "終業"),
+        ];
+        assert_eq!(
+            minus_unko_by_date(&rows, "2026-03").get("2026-03-04"),
+            Some(&9)
+        );
+        // 紙の値もその分だけ小さい: デジタコ 758 (06:05 → 18:43 の端点床) +
+        // 尻尾 10 (運行終了 → 終業) − 9。実測 1729 / 2026-01-09 の nginx 値と同じ
+        assert_eq!(
+            paper_daily_minutes(&rows, "2026-03").get("2026-03-04"),
+            Some(&759)
+        );
     }
 
     #[test]
