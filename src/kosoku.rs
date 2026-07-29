@@ -250,6 +250,8 @@ pub struct DayPart {
     pub punch_head_minutes: i64,
     /// この暦日に乗った**始業前の運行の頭** ([`DaySummary::run_head_minutes`])。
     pub run_head_minutes: i64,
+    /// この暦日に乗った**昼休の窓との重なり** ([`DaySummary::lunch_overlap_minutes`])。
+    pub lunch_overlap_minutes: i64,
 }
 
 impl DayPart {
@@ -268,6 +270,7 @@ impl DayPart {
             punch_tail_minutes: 0,
             punch_head_minutes: 0,
             run_head_minutes: 0,
+            lunch_overlap_minutes: 0,
         }
     }
 }
@@ -391,6 +394,17 @@ pub struct DaySummary {
     /// **紙が大きくなる向き**の実額 (他の実額と逆) — 突合は cause `run-head` として
     /// 負の説明に使う。拘束は変えない。
     pub run_head_minutes: i64,
+    /// **昼休の窓 (12:00-13:00) との重なり** (分、Refs ohishi-exp/nuxt-dtako-admin#501)。
+    ///
+    /// 紙のタイムカード表は運行を挟まない打刻の対から**昼休の窓と重なった分**を
+    /// 拘束から引く (`_make_tc_to_tc`)。一律 60 分ではない — 終業が窓の中に落ちる
+    /// 対は重なりだけ引かれる。実測 (1714 井上 03-04): 対 07:18→12:20 は
+    /// 12:00→12:20 の 20 分だけ引かれ、紙の TC_DC 309 = 281 + 夕方 28 と一致。
+    ///
+    /// 値は自前の昼休憩 ([`lunch_windows`]) と同じ窓の重なり — こちらは休憩として
+    /// 数え、紙は拘束から引く。運行のある勤務 ([`has_operation`]) は 0。
+    /// 突合が cause `lunch` の実額として使う。拘束は変えない。
+    pub lunch_overlap_minutes: i64,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -1354,7 +1368,8 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
     let over_24h = restraint_minutes > MAX_RESTRAINT_MINUTES;
     // 運行に出ていない勤務は昼休憩を引く (ユーザー決定 2026-07-28)。運行中なら
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
-    let breaks = if has_operation(events, shift) {
+    let has_op = has_operation(events, shift);
+    let breaks = if has_op {
         breaks_in(events, shift, p.break_threshold_minutes)
     } else {
         // **運行に出ていない勤務にはデジタコの休憩イベントも無い** — 休憩イベントは
@@ -1389,6 +1404,16 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         &rests,
     );
     let punch_head_minutes: i64 = punch_heads
+        .iter()
+        .map(|(s, e)| (*e - *s).num_minutes())
+        .sum();
+    // 昼休の窓との重なり (紙が引く側の実額)。運行のある勤務は紙も引かない
+    let lunch_overlaps = if has_op {
+        Vec::new()
+    } else {
+        subtract_intervals(&lunch_windows(shift), &rests)
+    };
+    let lunch_overlap_minutes: i64 = lunch_overlaps
         .iter()
         .map(|(s, e)| (*e - *s).num_minutes())
         .sum();
@@ -1493,6 +1518,14 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
                 .run_head_minutes += minutes;
         }
     }
+    for (s, e) in &lunch_overlaps {
+        for (date, minutes) in split_by_date(*s, *e) {
+            parts
+                .entry(date)
+                .or_insert_with(|| DayPart::new(date))
+                .lunch_overlap_minutes += minutes;
+        }
+    }
 
     DaySummary {
         // フェリー控除は勤務の計算に混ぜない。日別サマリを組み終えてから
@@ -1502,6 +1535,7 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         punch_tail_minutes,
         punch_head_minutes,
         run_head_minutes,
+        lunch_overlap_minutes,
         date: shift.start.format("%Y-%m-%d").to_string(),
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
@@ -3693,6 +3727,42 @@ mod tests {
         ];
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days[0].run_head_minutes, 0);
+    }
+
+    #[test]
+    fn lunch_overlap_counts_the_window_overlap_not_a_flat_hour() {
+        // 乗務員 1714 井上 / 2026-03-04 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 終業 12:20 が昼休の窓の中に落ちる対は、紙は 12:00→12:20 の 20 分だけ引く
+        let rows = vec![
+            tc("2026-06-04 07:18:00", "始業"),
+            tc("2026-06-04 12:20:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].lunch_overlap_minutes, 20);
+        // 拘束は変えない (こちらは休憩として数えるだけ)
+        assert_eq!(days[0].restraint_minutes, 302);
+    }
+
+    #[test]
+    fn lunch_overlap_is_the_full_hour_for_a_normal_office_day() {
+        let rows = vec![
+            tc("2026-06-04 08:00:00", "始業"),
+            tc("2026-06-04 17:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].lunch_overlap_minutes, 60);
+    }
+
+    #[test]
+    fn lunch_overlap_is_zero_for_a_shift_with_operations() {
+        // 運行のある勤務は紙も昼休を引かない (休憩はイベントから出る)
+        let rows = vec![
+            tc("2026-06-04 08:00:00", "始業"),
+            dtako("2026-06-04 09:00:00", "運行開始"),
+            tc("2026-06-04 17:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].lunch_overlap_minutes, 0);
     }
 
     #[test]
