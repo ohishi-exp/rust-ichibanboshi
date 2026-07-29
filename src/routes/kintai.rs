@@ -477,6 +477,14 @@ pub(crate) fn map_repo_err(e: KintaiRepoError) -> (StatusCode, String) {
 /// データ源は社内 MariaDB の直読み (`kintai_repo`)。`daily` (CakePHP 中継 +
 /// derived store) と違い**キャッシュを持たない** — 調査用途で頻度が低く、常に
 /// 最新の打刻が要るため。
+/// `EVENTS_SQL` / `ALL_EVENTS_SQL` 系 (kosoku 計算) の同時実行キャップ。
+///
+/// 殺到すると MariaDB (HDD + 128MB pool) を食い合って全員が数分待ちの convoy に
+/// なる (2026-07-29 実害 — `MARIADB_SESSION_SETUP` の docs 参照)。4 は通常運用
+/// (画面 1 つが当月+前月の 2 本) の余裕をみた値。超過分は待たされるだけで
+/// 落ちない — `max_statement_time=60` と併せて、待ち行列は最長でも数分で捌ける。
+static KOSOKU_DB_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 pub async fn events(
     Query(params): Query<EventsQuery>,
     Extension(repo): Extension<DynKintaiEventsRepo>,
@@ -488,6 +496,7 @@ pub async fn events(
             "month は YYYY-MM で指定してください".to_string(),
         ));
     }
+    let _permit = KOSOKU_DB_PERMITS.acquire().await.expect("semaphore open");
     let driver = match parse_driver(params.driver.as_deref().unwrap_or_default()) {
         Some(d) => d,
         None => {
@@ -544,6 +553,8 @@ pub async fn kosoku_daily(
             "month は YYYY-MM で指定してください".to_string(),
         ));
     }
+    // DB 読みと kosoku 計算全体をキャップ内で行う (convoy 防止)
+    let _permit = KOSOKU_DB_PERMITS.acquire().await.expect("semaphore open");
     let Some(raw_driver) = params.driver else {
         return kosoku_daily_all(
             &month,
@@ -696,7 +707,15 @@ async fn kosoku_daily_all(
                 .unwrap_or_default();
             // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
             let punches = month_punches(&rows, month);
-            (driver, days, punches, duplicate_rows, drift, ferry_map, outside)
+            (
+                driver,
+                days,
+                punches,
+                duplicate_rows,
+                drift,
+                ferry_map,
+                outside,
+            )
         })
         .filter(|(_, days, punches, _, _, _, _)| !days.is_empty() || !punches.is_empty())
         .map(

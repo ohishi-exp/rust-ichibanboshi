@@ -431,6 +431,16 @@ pub struct MariadbKintaiEventsRepo {
     pool: Pool,
 }
 
+/// MariaDB セッションの初期化文 (`OptsBuilder::setup` — pool が接続を使い回す際の
+/// `COM_RESET_CONNECTION` 後にも再適用される)。
+///
+/// クライアント (relay/ブラウザ) が約 100 秒で切断しても**サーバー側では SELECT が
+/// 走り続け**、リロード・月切替のたびに積み上がって HDD を食い合う convoy になる
+/// (2026-07-29 実害: kintai_reader のクエリが 10 本超 × 最長 582 秒滞留、全リクエストが
+/// 数分待ちに)。`max_statement_time` はこのセッションの 60 秒超のステートメントを
+/// MariaDB が自動 abort する — **サーバー設定 (my.cnf) は触らない** (セッション変数)。
+pub(crate) const MARIADB_SESSION_SETUP: &str = "SET SESSION max_statement_time=60";
+
 impl MariadbKintaiEventsRepo {
     /// config から接続 pool を組む。**接続はここでは張らない** (mysql_async の
     /// pool は lazy) ので、DB 停止中でも起動は失敗しない — 実際に読むときに 502。
@@ -440,7 +450,8 @@ impl MariadbKintaiEventsRepo {
             .tcp_port(cfg.port)
             .user(Some(cfg.user.clone()))
             .pass(Some(cfg.password.clone()))
-            .db_name(Some(cfg.database.clone()));
+            .db_name(Some(cfg.database.clone()))
+            .setup(vec![MARIADB_SESSION_SETUP.to_string()]);
         Self {
             pool: Pool::new(opts),
         }
