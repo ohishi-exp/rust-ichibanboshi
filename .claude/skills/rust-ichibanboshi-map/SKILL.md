@@ -33,6 +33,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) / `/api/kintai/events` (MariaDB 直読み) / `/api/kintai/kosoku-daily` (日別サマリ、`driver` 省略で全乗務員) (#99 / #116 / #118 / #125、下記) |
 | `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116)。1 名分の `EVENTS_SQL` と全乗務員の `ALL_EVENTS_SQL` (#125) |
 | `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
+| `src/kosoku_paper.rs` | 紙のタイムカード表 (社内 CakePHP) の日別拘束の**再現** — 突合の cause `rounding` 用の `paper_drift_by_date` を `kosoku-daily?view=compare` に載せる (nuxt-dtako-admin#501)。**coverage 100% 対象** |
 | `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
 | `src/kyuyo/logic.rs` | 給与の純粋ロジック (項目マッピング・行組み立て)。**coverage 100% 対象** |
 | `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層 |
