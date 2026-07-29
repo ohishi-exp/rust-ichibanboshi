@@ -451,7 +451,7 @@ pub fn parse_events(rows: &[serde_json::Value]) -> Vec<Event> {
 }
 
 /// 秒を切り捨てて分に丸める。拘束・実働は分単位で出すので、境界も分に揃える。
-fn floor_min(dt: NaiveDateTime) -> NaiveDateTime {
+pub(crate) fn floor_min(dt: NaiveDateTime) -> NaiveDateTime {
     // 秒とナノ秒を 0 にするだけなので、範囲外にはならない
     dt - Duration::seconds(dt.second() as i64) - Duration::nanoseconds(dt.nanosecond() as i64)
 }
@@ -728,7 +728,9 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
                     end: pin,
                     source: ShiftSource::Rest,
                 };
-                if has_operation(events, &probe) {
+                // 始端と同時刻の点イベント (運行終了) は証拠にしない — それだけを
+                // 根拠に何も無い休日が勤務になる (1418 の 41 時間、Refs #182)
+                if has_operation_strictly_after_start(events, &probe) {
                     end = pin;
                 } else {
                     // 捨てるのはこの勤務だけ — 後段の「打刻の無い運行」拾いは生かす
@@ -1259,6 +1261,25 @@ fn has_operation(events: &[Event], shift: &Shift) -> bool {
         })
 }
 
+/// [`has_operation`] の**始端の点イベントを証拠にしない**版 (Refs #182 フォローアップ)。
+///
+/// 休息明けの欠片を残すかの判定 ([`shifts_from_rest`]) で使う。休息の終わりと
+/// **同時刻**の点イベント (運行終了) は「運行がそこで終わった」印であって、その先に
+/// 勤務が続く証拠ではない。実測 (1418 岩永 / 2026-01-22): 休息の終わり = 運行終了
+/// 13:57:35 の点だけを証拠に、次の始業 (01-24 07:05) までの **41 時間 (イベント皆無の
+/// 休日) が勤務 2467 分**になり、01-22〜24 の拘束と over_24h を偽って膨らませていた。
+///
+/// 区間イベントは同時刻開始でも中身がその先へ続くので、従来どおり証拠に数える。
+fn has_operation_strictly_after_start(events: &[Event], shift: &Shift) -> bool {
+    events
+        .iter()
+        .filter(|e| e.source != "timecard" && e.state != "休息")
+        .any(|e| match e.end {
+            Some(end) => overlaps((e.start, end), (shift.start, shift.end)),
+            None => e.start > shift.start && e.start <= shift.end,
+        })
+}
+
 /// 昼の窓に 1 分も掛からない勤務へ入れる休憩 (ユーザー指示 2026-07-28)。
 ///
 /// 昼休憩は時計の窓なので夜勤には当たらない ([`lunch_windows`])。拘束が
@@ -1306,7 +1327,7 @@ fn lunch_windows(shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
 
 /// `base` の各区間から `cut` を差し引く。`cut` は時刻順・重なり無しであること
 /// ([`merge_intervals`] を通したもの)。
-fn subtract_intervals(
+pub(crate) fn subtract_intervals(
     base: &[(NaiveDateTime, NaiveDateTime)],
     cut: &[(NaiveDateTime, NaiveDateTime)],
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
@@ -1890,6 +1911,30 @@ pub fn apply_ferry_minus(days: &mut [DaySummary], ferry: &BTreeMap<String, i64>)
         }
         day.ferry_minus_minutes = total;
     }
+}
+
+/// 勤務が**覆っている**区間 (分に揃えた span、Refs #182 フォローアップ)。
+///
+/// 紙が勤務の外で数えている分 ([`crate::kosoku_paper::paper_outside_by_date`]) を
+/// 測るときの「外」の定義に使う。**始業前の運行の頭 ([`run_head_span`]) も覆いに
+/// 足す** — あちらは cause `run-head` の領分で、外に残すと二重説明になる。
+pub(crate) fn shift_cover(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let shifts = merge_shifts(shifts_from_timecard(events), shifts_from_rest(events));
+    let mut cover: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+    for s in &shifts {
+        let aligned = Shift {
+            start: floor_min(s.start),
+            end: floor_min(s.end),
+            source: s.source,
+        };
+        if aligned.end > aligned.start {
+            cover.push((aligned.start, aligned.end));
+        }
+        if let Some(span) = run_head_span(events, &aligned) {
+            cover.push(span);
+        }
+    }
+    merge_intervals(cover)
 }
 
 /// 生イベント列 → 対象月の日別サマリ。
@@ -4025,6 +4070,43 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].start, "2026-06-14 06:05:00");
+    }
+
+    #[test]
+    fn a_rest_shift_with_only_the_boundary_run_end_is_dropped() {
+        // 1418 岩永 / 2026-01-22 の形 (Refs #182)。休息の終わりと同時刻の運行終了
+        // (点) しか無く、次の始業まで丸 2 日イベントが無い — その点を証拠に勤務を
+        // 残すと、何も無い休日が丸ごと拘束になる (実測 2467 分 + 偽の over_24h)
+        let rows = vec![
+            tc("2026-06-10 05:45:00", "始業"),
+            ev("2026-06-10 10:55:00", "2026-06-10 13:57:00", "休息"),
+            tc("2026-06-10 10:58:00", "終業"),
+            dtako("2026-06-10 13:57:00", "運行終了"),
+            tc("2026-06-12 07:05:00", "始業"),
+            tc("2026-06-12 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(
+            days.iter().map(|d| d.date.as_str()).collect::<Vec<_>>(),
+            vec!["2026-06-10", "2026-06-12"],
+        );
+        assert!(days.iter().all(|d| !d.over_24h));
+    }
+
+    #[test]
+    fn a_rest_shift_with_an_interval_event_from_its_start_is_kept() {
+        // 休息の終わりと**同時刻に始まる区間イベント**は中身がその先へ続く証拠 —
+        // 点イベント (運行終了) と違って従来どおり残す (Refs #182)
+        let rows = vec![
+            ev("2026-06-13 20:00:00", "2026-06-14 06:00:00", "休息"),
+            ev("2026-06-14 06:00:00", "2026-06-14 06:40:00", "運転"),
+            tc("2026-06-14 06:50:00", "始業"),
+            tc("2026-06-14 15:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].start, "2026-06-14 06:00:00");
+        assert_eq!(days[0].end, "2026-06-14 06:50:00");
+        assert_eq!(days[1].start, "2026-06-14 06:50:00");
     }
 
     #[test]

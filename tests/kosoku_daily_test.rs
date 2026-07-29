@@ -1115,6 +1115,36 @@ async fn compare_view_carries_the_paper_drift() {
 }
 
 #[tokio::test]
+async fn compare_view_carries_the_paper_outside_map() {
+    // 終業打刻の後の構内ミニ運行 (1018 金原 2026-03-03 の形、Refs #182) は紙だけが
+    // 数える — その実額 (digi 1 分 + 継ぎ目 5 分) を `paper_outside_by_date` として
+    // 載せる。単一乗務員と全乗務員の両経路で同じ値になること
+    let with_driver = |mut v: serde_json::Value| {
+        v["driver_id"] = json!(1018);
+        v
+    };
+    let rows = vec![
+        with_driver(tc("2026-06-02 09:23:49", "始業")),
+        with_driver(tc("2026-06-02 20:25:27", "終業")),
+        with_driver(dtako("2026-06-02 20:36:57", "運行開始", "u1")),
+        with_driver(ev("2026-06-02 20:36:57", "2026-06-02 20:37:15", "運転")),
+        with_driver(dtako("2026-06-02 20:37:15", "運行終了", "u1")),
+        with_driver(dtako("2026-06-02 20:42:29", "運行開始", "u2")),
+        with_driver(dtako("2026-06-02 20:42:56", "運行終了", "u2")),
+    ];
+    let (status, body) = serve(
+        rows.clone(),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1018&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["paper_outside_by_date"]["2026-06-02"], 6);
+    let (status, body) = serve(rows, "/api/kintai/kosoku-daily?month=2026-06&view=compare").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drivers"][0]["paper_outside_by_date"]["2026-06-02"], 6);
+}
+
+#[tokio::test]
 async fn paper_drift_counts_duplicate_rows_the_way_the_paper_does() {
     // 取り込み 2 回で全列同一の行が入ると**紙は二重計上する** (実測 1339 渡邊
     // 2026-04-04)。再現は重複除去の**前**の行で計算しないと drift が 0 になり
