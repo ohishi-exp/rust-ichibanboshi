@@ -335,8 +335,12 @@ nuxt-dtako-admin の relay (dtako-scraper-relay) が上流応答キャッシュ 
   で覆う。`src/kintai_version.rs` の unit test が全テーブルの在席を固定している
 - マーカーは **COUNT + `SUM(CRC32(読む列))`** — `dtako_*` 系に modified 列が無いため
   `MAX(updated_at)` 方式は使えない。範囲・列はデータクエリの**上位集合** (広い分は
-  無駄な再取得で済むが、狭いと「古い値」事故)。`dtako_events` は `EVENTS_SQL` と同じ
-  2 ブランチ (`COALESCE` 1 本化は全表走査 #121→#122)
+  無駄な再取得で済むが、狭いと「古い値」事故)
+- **例外: `dtako_events` だけ COUNT + `MAX(id)` (index-only、範囲は前月初〜)** —
+  428万行/2GB で CRC (行読み) は DB バッファ冷え時に 7〜24 秒かかった (2026-07-29
+  本番実測)。binlog 検査で応答が読む 6 列への in-place UPDATE がゼロ件と確認済み
+  という運用実態が前提 — 6 列を UPDATE する運用が始まったら CRC に戻すこと
+  (`src/kintai_version.rs` モジュール docs の「例外」参照)
 - **BUILD_SHA と `KosokuParams` (Debug 表現) も畳む** — デプロイ (計算ロジック) や
   TOML (丸め・閾値) の変更でもキャッシュを無効化するため。デプロイごとに全月
   refetch になるのは仕様 (正しさ優先)
