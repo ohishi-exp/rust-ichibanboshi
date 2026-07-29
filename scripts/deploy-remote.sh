@@ -71,10 +71,19 @@ sleep 6
 echo "=== Health check (localhost:$HEALTH_PORT/health) ==="
 # remote の localhost に対して health を叩く。body + HTTP code を一括取得し、
 # HTTP 200 以外は loud fail。body は build 情報 ({"status","commit","built_at"})。
-HEALTH_RESP="$(ssh "${SSH_OPTS[@]}" "$TARGET" \
-  "curl -s -w '\n%{http_code}' --max-time 10 http://localhost:$HEALTH_PORT/health || true")"
-HTTP_CODE="$(printf '%s' "$HEALTH_RESP" | tail -n1)"
-HEALTH_BODY="$(printf '%s' "$HEALTH_RESP" | sed '$d')"
+# 起動は 20 秒超かかることがある (kyuyo SQL Server pool 初期化だけで 13 秒の実測、
+# 2026-07-29 に一発チェックで race って赤になった) ので、最長 60 秒までポーリング。
+HTTP_CODE=""
+HEALTH_BODY=""
+for _i in $(seq 1 12); do
+  HEALTH_RESP="$(ssh "${SSH_OPTS[@]}" "$TARGET" \
+    "curl -s -w '\n%{http_code}' --max-time 10 http://localhost:$HEALTH_PORT/health || true")"
+  HTTP_CODE="$(printf '%s' "$HEALTH_RESP" | tail -n1)"
+  HEALTH_BODY="$(printf '%s' "$HEALTH_RESP" | sed '$d')"
+  if [[ "$HTTP_CODE" == "200" ]]; then break; fi
+  echo "health not ready yet (got ${HTTP_CODE:-<none>}) — retrying in 5s"
+  sleep 5
+done
 
 echo "health HTTP code: ${HTTP_CODE:-<none>}"
 echo "health body: ${HEALTH_BODY:-<none>}"
