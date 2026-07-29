@@ -354,8 +354,18 @@ pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMa
         if span.1 <= span.0 {
             continue;
         }
+        // 紙はこの対を**丸ごと運行開始の日**に載せる ([`tc_dc_daily`] の
+        // 「同日の縛りが無い」)。暦日で割ると深夜を跨ぐ対の説明が前日と当日に
+        // 散って一致しなくなる (実測 1634 / 2026-01-04: 583 分の対が 202+380 に
+        // 割れていた) — 外に残った分をまとめて運行開始の日へ
+        let mut gap_outside = 0i64;
         for (s, x) in subtract_intervals(&[span], &cover) {
-            add_span(&mut out, s, x);
+            gap_outside += (x - s).num_seconds() / 60;
+        }
+        if gap_outside > 0 {
+            *out
+                .entry(nt.at.format("%Y-%m-%d").to_string())
+                .or_default() += gap_outside;
         }
     }
     // 紙の**二重計上** (`time_card_dtako` の運行行が欠けた日、Refs #182 フォローアップ)。
@@ -831,6 +841,27 @@ mod tests {
     }
 
     #[test]
+    fn a_midnight_crossing_gap_pair_lands_wholly_on_the_run_start_day() {
+        // 1634 中山 2026-01-04 の形 (Refs #182)。紙は 運行終了 → 運行開始 の対を
+        // **丸ごと運行開始の日**に載せる ([`tc_dc_daily`] の「同日の縛りが無い」)。
+        // 暦日で割ると説明が前日と当日に散って一致しない
+        let rows = vec![
+            ev("2026-03-02 10:00:00", "2026-03-03 10:00:00", "休息"),
+            dtako("2026-03-03 10:00:00", "運行開始"),
+            ev("2026-03-03 10:00:00", "2026-03-03 20:14:00", "運転"),
+            dtako("2026-03-03 20:14:00", "運行終了"),
+            dtako("2026-03-04 06:00:00", "運行開始"),
+            ev("2026-03-04 06:00:00", "2026-03-04 20:00:00", "運転"),
+            dtako("2026-03-04 20:00:00", "運行終了"),
+            ev("2026-03-04 20:00:00", "2026-03-05 07:00:00", "休息"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 20:14 → 翌 06:00 の 586 分が丸ごと 03-04 へ (03-03 には載らない)
+        assert_eq!(outside.get("2026-03-04"), Some(&586));
+        assert!(!outside.contains_key("2026-03-03"));
+    }
+
+    #[test]
     fn paper_outside_skips_sub_minute_spans_and_wide_gaps() {
         // 端点床で 0 分になる区間・対と、窓 (d < 1 && h < 12) の外の継ぎ目は数えない
         let rows = vec![
@@ -963,15 +994,21 @@ mod tests {
 
     #[test]
     fn ours_outside_is_empty_when_paper_has_material_for_everything() {
-        // 普通の運行日: 打刻の対とデジタコが勤務を覆う
+        // 普通の運行日: 打刻の対とデジタコが勤務を覆う。勤務の中の継ぎ目
+        // (運行終了 → 運行開始、覆いの中) も紙の材料なので外に出ない
         let rows = vec![
             tc("2026-03-04 08:00:00", "始業"),
             dtako("2026-03-04 08:10:00", "運行開始"),
-            ev("2026-03-04 08:10:00", "2026-03-04 16:00:00", "運転"),
+            ev("2026-03-04 08:10:00", "2026-03-04 12:00:00", "運転"),
+            dtako("2026-03-04 12:00:00", "運行終了"),
+            dtako("2026-03-04 12:30:00", "運行開始"),
+            ev("2026-03-04 12:30:00", "2026-03-04 16:00:00", "運転"),
             dtako("2026-03-04 16:00:00", "運行終了"),
             tc("2026-03-04 16:30:00", "終業"),
         ];
         assert!(ours_outside_by_date(&rows, "2026-03").is_empty());
+        // 継ぎ目は覆いの中 — 対の外の write は起きない (gap_outside 0 の分岐)
+        assert!(paper_outside_by_date(&rows, "2026-03").is_empty());
     }
 
     #[test]
