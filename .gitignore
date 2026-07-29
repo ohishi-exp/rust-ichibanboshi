@@ -5,3 +5,4 @@ nuxt-ichibanboshi
 
 # ローカルの worktree (コミットしない)
 .worktrees/
+.claude/worktrees/
