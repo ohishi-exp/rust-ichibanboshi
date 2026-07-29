@@ -297,10 +297,14 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
 ///   実測ではここが支配的だった — 2026-06 の全乗務員で **1.20 秒 → 0.25 秒 (約 5 倍)**。
 ///   22,092 行それぞれで車輌マスタを引き当て、23 桁の `運行NO` を転送していた分。
 ///   「どの運行・どの車か」に降りるときは 1 名分の `/api/kintai/events` を叩く
-/// - **`dtako_events` はイベント名で絞る。** 日別サマリが見るのは休息 (勤務の切れ目) と
-///   休憩 (実働から差し引く) だけだが、**運行開始・運行終了も読む** — 同日の運行の継ぎ目を
-///   「作業」と判定した根拠 (#123) を後から確かめられなくなるため。絞ると
-///   `dtako_events` は 105,771 行 → 22,092 行 (1/3)
+/// - **`dtako_events` はイベント名で絞らない** (2026-07-29 に絞りを撤回、
+///   Refs ohishi-exp/nuxt-dtako-admin#501)。かつて 休息/休憩/運行開始/運行終了 の
+///   4 種に絞っていた (105,771 行 → 22,092 行) が、**単一乗務員経路と値が割れる**
+///   事故を 2 度起こした — #167 (拾った運行の終わりが経路で変わる) と、1556 林田
+///   03-26 (終業打刻後の運転イベントが見えず `unpunched_ops_shift` が不発、
+///   紙 979 に対し 864 で +115 の未説明差)。この SQL は in-process 消費
+///   ([`kosoku_daily_all`](crate::routes::kintai::kosoku_daily)) で Tunnel を
+///   通らないため、行数よりも**両経路の同値**を優先する
 /// - **`/api/kintai/events` は絞らない。** あちらは数字がおかしいときに 1 名分の生時系列へ
 ///   降りるための口で、種別を絞ると調査ができなくなる (#116 の「解釈しない読み出し口」)
 /// - 2 ブランチに分ける理由・`COALESCE` で 1 本にまとめてはいけない理由は
@@ -331,7 +335,6 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
        e.`イベント名`
   FROM dtako_events e
  WHERE e.`開始日時` >= :from AND e.`開始日時` < :to
-   AND e.`イベント名` IN ('休息', '休憩', '運行開始', '運行終了')
 UNION ALL
 SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
        DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
@@ -341,7 +344,6 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
   FROM dtako_events e
  WHERE e.`終了日時` >= :from AND e.`終了日時` < :to
    AND e.`開始日時` < :from
-   AND e.`イベント名` IN ('休息', '休憩', '運行開始', '運行終了')
  ORDER BY driver_id, datetime, source
 "#;
 
@@ -591,6 +593,14 @@ mod tests {
         // 生イベントの読み出し口 (`/events`) は絞らないまま
         assert!(EVENTS_SQL.contains("dtako_cars"));
         assert!(!EVENTS_SQL.contains("イベント名` IN"));
+    }
+
+    #[test]
+    fn all_events_sql_does_not_filter_event_names() {
+        // イベント名の絞りは単一乗務員経路と値が割れる事故を 2 度起こした
+        // (#167 と 1556 林田 03-26、Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // うっかり戻さないよう固定する
+        assert!(!ALL_EVENTS_SQL.contains("イベント名` IN"));
     }
 
     #[tokio::test]
