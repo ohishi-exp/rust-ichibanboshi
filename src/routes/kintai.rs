@@ -38,6 +38,7 @@ use crate::kosoku::{
     apply_ferry_minus, daily_summary, drop_duplicate_rows, ferry_minus_by_date, month_punches,
     split_by_driver, split_ferry_by_driver, DayPart, DaySummary, KosokuParams, ShiftSource,
 };
+use crate::kosoku_paper::{paper_daily_minutes, paper_drift_by_date};
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
 /// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
@@ -589,6 +590,12 @@ pub async fn kosoku_daily(
             if !duplicate_rows.is_empty() {
                 o["duplicate_rows"] = serde_json::json!(duplicate_rows);
             }
+            // 紙の再現値との日別の差 (cause `rounding` の実額、Refs
+            // ohishi-exp/nuxt-dtako-admin#501)。突合しか使わないので compare だけに載せる
+            let drift = paper_drift_by_date(&days, &paper_daily_minutes(&rows, &month));
+            if !drift.is_empty() {
+                o["paper_drift_by_date"] = serde_json::json!(drift);
+            }
             Ok(Json(o))
         }
         // 画面は月全打刻 (`punches`) も `duplicate_rows` 診断も読まない (Refs #164)
@@ -640,12 +647,18 @@ async fn kosoku_daily_all(
             if let Some(ferry) = ferry_by_driver.get(&driver) {
                 apply_ferry_minus(&mut days, &ferry_minus_by_date(ferry));
             }
+            // 紙の再現値との日別の差 (cause `rounding` の実額)。突合経路だけで計算する
+            let drift = if view == ResponseView::Compare {
+                paper_drift_by_date(&days, &paper_daily_minutes(&rows, month))
+            } else {
+                Default::default()
+            };
             // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
             let punches = month_punches(&rows, month);
-            (driver, days, punches, duplicate_rows)
+            (driver, days, punches, duplicate_rows, drift)
         })
-        .filter(|(_, days, punches, _)| !days.is_empty() || !punches.is_empty())
-        .map(|(driver, days, punches, duplicate_rows)| {
+        .filter(|(_, days, punches, _, _)| !days.is_empty() || !punches.is_empty())
+        .map(|(driver, days, punches, duplicate_rows, drift)| {
             // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
             // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
             // `duplicate_rows` 診断も画面は読まない
@@ -661,6 +674,9 @@ async fn kosoku_daily_all(
             // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
             if !duplicate_rows.is_empty() {
                 o["duplicate_rows"] = serde_json::json!(duplicate_rows);
+            }
+            if !drift.is_empty() {
+                o["paper_drift_by_date"] = serde_json::json!(drift);
             }
             o
         })
