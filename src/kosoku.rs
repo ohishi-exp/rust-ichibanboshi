@@ -248,6 +248,8 @@ pub struct DayPart {
     pub punch_tail_minutes: i64,
     /// この暦日に乗った**日跨ぎ始業の頭** ([`DaySummary::punch_head_minutes`])。
     pub punch_head_minutes: i64,
+    /// この暦日に乗った**始業前の運行の頭** ([`DaySummary::run_head_minutes`])。
+    pub run_head_minutes: i64,
 }
 
 impl DayPart {
@@ -265,6 +267,7 @@ impl DayPart {
             run_gap_minutes: 0,
             punch_tail_minutes: 0,
             punch_head_minutes: 0,
+            run_head_minutes: 0,
         }
     }
 }
@@ -374,6 +377,20 @@ pub struct DaySummary {
     /// の 1495 分 (03-05 に 979 / 03-06 に 516) がそのまま紙との差になっていた。
     /// 同日に最初のイベントがあれば紙も TC_DC で数えるので対象外。
     pub punch_head_minutes: i64,
+    /// **始業前の運行の頭** — 直前の運行開始 → 始業打刻 (分)
+    /// (Refs ohishi-exp/nuxt-dtako-admin#501)。
+    ///
+    /// こちらは打刻優先 (#118) で始業から数えるが、紙は運行スパン (デジタコ) を
+    /// 運行開始から数える。紙の `minus_unko` 控除 (nginx#785) がこの頭を打ち消す
+    /// はずだが、**1 日 1 回しか効かない** — 同じ暦日に勤務が 2 本ある日 (深夜跨ぎの
+    /// 2 回目の始業) や TC_DC が null の日は取り残され、紙がその分だけ大きくなる。
+    /// 実測 (1026 一瀬 03-12): 朝の運行開始 01:17:51 → 始業 01:25:26 の 7 分が
+    /// デジタコ側に残り、控除は夕方の 3 分にしか効いていない (pdf-json の診断値
+    /// `TC_DC_minus_unko:3` で確認)。
+    ///
+    /// **紙が大きくなる向き**の実額 (他の実額と逆) — 突合は cause `run-head` として
+    /// 負の説明に使う。拘束は変えない。
+    pub run_head_minutes: i64,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -1059,6 +1076,34 @@ fn punch_head_span(events: &[Event], shift: &Shift) -> Option<(NaiveDateTime, Na
     (opening_punch.date() < first_ev.date()).then_some((shift.start, first_ev))
 }
 
+/// **始業前の運行の頭** — 直前の運行開始から勤務の始まりまで
+/// ([`DaySummary::run_head_minutes`])。
+///
+/// 対象は「始業打刻で始まる勤務で、直前に運行開始があり、その間に運行終了・休息が
+/// 無い」もの (= 打刻の前から同じ運行が走っている)。8 時間以上前の運行開始は
+/// 別の勤務の話なので見ない。
+fn run_head_span(events: &[Event], shift: &Shift) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    // 勤務の始まりが始業打刻であること
+    events
+        .iter()
+        .filter(|e| e.source == "timecard" && e.state == "始業")
+        .map(|e| e.start)
+        .find(|t| floor_min(*t) == shift.start)?;
+    let run_start = events
+        .iter()
+        .filter(|e| e.state == "運行開始")
+        .map(|e| floor_min(e.start))
+        .filter(|t| *t < shift.start && shift.start - *t < Duration::minutes(RUN_GAP_REST_MINUTES))
+        .max()?;
+    // 間に運行終了・休息があれば、その運行は打刻前に終わっている — 頭ではない
+    let interrupted = events.iter().any(|e| {
+        (e.state == "運行終了" || e.state == "休息")
+            && floor_min(e.start) >= run_start
+            && floor_min(e.start) < shift.start
+    });
+    (!interrupted).then_some((run_start, shift.start))
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -1306,6 +1351,10 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         .iter()
         .map(|(s, e)| (*e - *s).num_minutes())
         .sum();
+    // 始業前の運行の頭 (紙が数える側)。勤務の外なので rests とは重ならない
+    let run_heads: Vec<(NaiveDateTime, NaiveDateTime)> =
+        run_head_span(events, shift).into_iter().collect();
+    let run_head_minutes: i64 = run_heads.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let punch_tail_minutes: i64 = punch_tails
         .iter()
         .map(|(s, e)| (*e - *s).num_minutes())
@@ -1395,6 +1444,14 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
                 .punch_head_minutes += minutes;
         }
     }
+    for (s, e) in &run_heads {
+        for (date, minutes) in split_by_date(*s, *e) {
+            parts
+                .entry(date)
+                .or_insert_with(|| DayPart::new(date))
+                .run_head_minutes += minutes;
+        }
+    }
 
     DaySummary {
         // フェリー控除は勤務の計算に混ぜない。日別サマリを組み終えてから
@@ -1403,6 +1460,7 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         run_gap_minutes,
         punch_tail_minutes,
         punch_head_minutes,
+        run_head_minutes,
         date: shift.start.format("%Y-%m-%d").to_string(),
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
@@ -3501,6 +3559,47 @@ mod tests {
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].start, "2026-06-14 06:05:00");
+    }
+
+    #[test]
+    fn run_head_counts_a_run_started_before_the_punch_in() {
+        // 乗務員 1026 一瀬 / 2026-03-12 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 運行開始 01:17 → 始業 01:25 の 7 分 (floor 後 8 分) を紙はデジタコ側で数え、
+        // minus_unko 控除は 1 日 1 回しか効かないので 2 本目の勤務の頭が残る
+        let rows = vec![
+            dtako("2026-06-12 01:17:00", "運行開始"),
+            tc("2026-06-12 01:25:00", "始業"),
+            tc("2026-06-12 13:58:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].run_head_minutes, 8);
+        // 拘束は変えない (打刻優先 #118)
+        assert_eq!(days[0].restraint_minutes, 753);
+    }
+
+    #[test]
+    fn run_head_is_zero_when_the_run_ended_before_the_punch_in() {
+        // 間に運行終了があれば、その運行は打刻前に終わっている — 頭ではない
+        let rows = vec![
+            dtako("2026-06-12 01:17:00", "運行開始"),
+            dtako("2026-06-12 01:20:00", "運行終了"),
+            tc("2026-06-12 01:25:00", "始業"),
+            tc("2026-06-12 13:58:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].run_head_minutes, 0);
+    }
+
+    #[test]
+    fn run_head_ignores_a_run_started_long_before() {
+        // 8 時間以上前の運行開始は別の勤務の話
+        let rows = vec![
+            dtako("2026-06-11 10:00:00", "運行開始"),
+            tc("2026-06-12 01:25:00", "始業"),
+            tc("2026-06-12 13:58:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].run_head_minutes, 0);
     }
 
     #[test]

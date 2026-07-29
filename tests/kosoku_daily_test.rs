@@ -852,6 +852,26 @@ async fn compare_view_keeps_a_non_zero_punch_head() {
     assert_eq!(d["parts"][1]["punch_head_minutes"], 516);
 }
 
+#[tokio::test]
+async fn compare_view_keeps_a_non_zero_run_head() {
+    // 始業前の運行の頭 (Refs #501、1026 一瀬の形)。0 の日には載せない
+    let (status, body) = serve(
+        vec![
+            dtako("2026-06-11 23:50:00", "運行開始", "u1"),
+            tc("2026-06-12 00:05:00", "始業"),
+            tc("2026-06-12 13:58:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1026&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d = &body["days"][0];
+    assert_eq!(d["run_head_minutes"], 15);
+    // 頭が 0 時を跨ぐので内訳にも配られる
+    assert_eq!(d["parts"][0]["run_head_minutes"], 10);
+    assert_eq!(d["parts"][1]["run_head_minutes"], 5);
+}
+
 // --- 全列同一の行の検知 (Refs nuxt-dtako-admin#501) ---
 
 #[tokio::test]
