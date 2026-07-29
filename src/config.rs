@@ -281,8 +281,9 @@ pub struct KosokuConfigToml {
     #[serde(default = "default_legal_minutes")]
     pub legal_minutes: i64,
 
-    /// 秒の落とし方。`"truncate_elapsed"` (既定、紙のタイムカード表と同じ) か
-    /// `"floor_endpoints"` (従来)。突合で 1 分ずれる原因だったので設定にした
+    /// 秒の落とし方。`"paper_per_segment"` (既定、紙のタイムカード表と同じ区分ごとの
+    /// 切り捨て。Refs #182) / `"truncate_elapsed"` (従来方式 = 勤務単位の経過切り捨て) /
+    /// `"floor_endpoints"` (両端床)。突合で 1 分ずれる原因だったので設定にした
     /// (Refs ohishi-exp/nuxt-dtako-admin#501)。
     #[serde(default = "default_restraint_rounding")]
     pub restraint_rounding: RestraintRoundingToml,
@@ -292,7 +293,9 @@ pub struct KosokuConfigToml {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RestraintRoundingToml {
-    /// 経過時間を切り捨てる (紙と同じ)。
+    /// 区分ごとに紙の流儀で切り捨てる (紙と同じ、Refs #182)。
+    PaperPerSegment,
+    /// 経過時間を切り捨てる (勤務単位の近似。#182 の「従来方式」)。
     TruncateElapsed,
     /// 両端をそれぞれ切り捨てる (従来)。
     FloorEndpoints,
@@ -301,6 +304,7 @@ pub enum RestraintRoundingToml {
 impl From<RestraintRoundingToml> for crate::kosoku::RestraintRounding {
     fn from(v: RestraintRoundingToml) -> Self {
         match v {
+            RestraintRoundingToml::PaperPerSegment => Self::PaperPerSegment,
             RestraintRoundingToml::TruncateElapsed => Self::TruncateElapsed,
             RestraintRoundingToml::FloorEndpoints => Self::FloorEndpoints,
         }
@@ -400,8 +404,8 @@ fn default_legal_minutes() -> i64 {
 }
 
 fn default_restraint_rounding() -> RestraintRoundingToml {
-    // 紙のタイムカード表に合わせる
-    RestraintRoundingToml::TruncateElapsed
+    // 紙のタイムカード表に合わせる (区分ごとの切り捨て、Refs #182)
+    RestraintRoundingToml::PaperPerSegment
 }
 
 impl Default for MariadbConfig {
