@@ -1337,7 +1337,9 @@ fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTim
 ///
 /// 実働区間を**時刻順に 1 分ずつ**歩いて、経過実働で所定内 / 法定内残業 / 法定時間外に
 /// 振り分けながら、その分が深夜帯かを見る。1 勤務は最長でも数千分なので素直に回す。
-fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
+/// `siblings` は同じ乗務員の**全勤務** (自分を含む) — 始業前の運行の頭が他の勤務の
+/// 拘束に既に入っていないかを見るために渡す。
+fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuParams) -> DaySummary {
     // **打刻は打ち切り前の区間から拾う** — 24 時間で切ると、切った先にある終業打刻
     // (実測: 乗務員 1194 の 2026-04-03 16:47) が落ちる。拘束の値は打ち切ったままでよいが、
     // 打刻カードとして出す側にはその時刻が要る (Refs #128)
@@ -1417,9 +1419,22 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         .iter()
         .map(|(s, e)| (*e - *s).num_minutes())
         .sum();
-    // 始業前の運行の頭 (紙が数える側)。勤務の外なので rests とは重ならない
-    let run_heads: Vec<(NaiveDateTime, NaiveDateTime)> =
-        run_head_span(events, shift).into_iter().collect();
+    // 始業前の運行の頭 (紙が数える側)。勤務の外なので rests とは重ならないが、
+    // **他の勤務 (休息由来) が同じ区間を拘束として数えている**ことがある。その分は
+    // こちらも拘束に入れているので「紙だけが数える頭」ではない — 出すと突合の
+    // run-head 補正 (紙の minus_unko − こちらの頭) が打ち消し合って説明が消える。
+    // 実測 (1021 鈴木 2026-03-04): 運行開始 07:09 → 始業 07:29 の 20 分が休息由来の
+    // 勤務として拘束に入り、かつ run_head 20 も出て、unknown -21 の主因になっていた
+    // (Refs ohishi-exp/nuxt-dtako-admin#501)。
+    let covered: Vec<(NaiveDateTime, NaiveDateTime)> = siblings
+        .iter()
+        .filter(|s| (s.start, s.end) != (shift.start, shift.end))
+        .map(|s| (s.start, s.end))
+        .collect();
+    let run_heads = subtract_intervals(
+        &run_head_span(events, shift).into_iter().collect::<Vec<_>>(),
+        &covered,
+    );
     let run_head_minutes: i64 = run_heads.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let punch_tail_minutes: i64 = punch_tails
         .iter()
@@ -1712,13 +1727,18 @@ pub fn apply_ferry_minus(days: &mut [DaySummary], ferry: &BTreeMap<String, i64>)
 pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) -> Vec<DaySummary> {
     let events = parse_events(rows);
     let shifts = merge_shifts(shifts_from_timecard(&events), shifts_from_rest(&events));
-    shifts
+    // 先に勤務の一覧を確定させる — run_head の重なり判定 (summarize の siblings) は
+    // 分割後の勤務どうしで見る
+    let shifts: Vec<Shift> = shifts
         .iter()
         .map(|s| align_shift(s, p.restraint_rounding))
         .filter(|s| s.end > s.start)
         // 打刻が数日をまとめて挟んだ勤務は、中の休息で切り直す (Refs #133)
         .flat_map(|s| split_long_shift(&s, &events))
-        .map(|s| summarize(&s, &events, p))
+        .collect();
+    shifts
+        .iter()
+        .map(|s| summarize(s, &shifts, &events, p))
         .filter(|d| d.date.starts_with(month))
         .collect()
 }
@@ -3727,6 +3747,36 @@ mod tests {
         ];
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days[0].run_head_minutes, 0);
+    }
+
+    #[test]
+    fn run_head_is_zero_when_another_shift_already_counts_the_head() {
+        // 乗務員 1021 鈴木 / 2026-03-04 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 運行開始 07:09 → 始業 07:29 の頭が**休息由来の勤務として拘束に入っている**。
+        // 紙は minus_unko でこの頭を引くので、こちらだけが数えている分 = 差そのもの。
+        // run_head も出すと突合の補正 (minus_unko − run_head) が 0 に打ち消される
+        let rows = vec![
+            ev("2026-06-03 20:00:00", "2026-06-04 06:00:00", "休息"),
+            dtako("2026-06-04 07:09:00", "運行開始"),
+            ev("2026-06-04 07:09:00", "2026-06-04 07:26:00", "運転"),
+            ev("2026-06-04 07:26:00", "2026-06-04 08:12:00", "休憩"),
+            tc("2026-06-04 07:29:00", "始業"),
+            dtako("2026-06-04 08:12:00", "運行終了"),
+            dtako("2026-06-04 09:36:00", "運行開始"),
+            ev("2026-06-04 09:36:00", "2026-06-04 10:36:00", "運転"),
+            dtako("2026-06-04 10:36:00", "休息"),
+            ev("2026-06-04 10:36:00", "2026-06-04 13:43:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        // 頭は休息由来の勤務 (06:00 → 始業で閉じる) の中にある
+        let rest_shift = days.iter().find(|d| d.source == ShiftSource::Rest).unwrap();
+        assert_eq!(rest_shift.end, "2026-06-04 07:29:00");
+        // その分 run_head は出さない
+        let punched = days
+            .iter()
+            .find(|d| d.source == ShiftSource::Timecard)
+            .unwrap();
+        assert_eq!(punched.run_head_minutes, 0);
     }
 
     #[test]
