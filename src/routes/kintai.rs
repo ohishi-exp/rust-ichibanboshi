@@ -23,6 +23,7 @@
 //! 将来この endpoint に金額を足すことになったら、その時点で `/kyuyo/*` と同じ
 //! in-service gate へ移すこと。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::Query;
@@ -578,8 +579,12 @@ pub async fn kosoku_daily(
     // **拘束の計算には入れない** — 突合で差の原因を説明するためだけ。
     // 取れなくても日別サマリは返す (控除が 0 になるだけ) — 突合の付帯情報のために
     // 本体を落とさない
+    let mut ferry_map: BTreeMap<String, i64> = BTreeMap::new();
     match repo.fetch_ferry(&month, Some(driver)).await {
-        Ok(ferry) => apply_ferry_minus(&mut days, &ferry_minus_by_date(&ferry)),
+        Ok(ferry) => {
+            ferry_map = ferry_minus_by_date(&ferry);
+            apply_ferry_minus(&mut days, &ferry_map);
+        }
         Err(e) => tracing::warn!("ferry fetch failed — ferry_minus stays 0: {e}"),
     }
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
@@ -604,6 +609,15 @@ pub async fn kosoku_daily(
                 .unwrap_or_default();
             if !drift.is_empty() {
                 o["paper_drift_by_date"] = serde_json::json!(drift);
+            }
+            // フェリー控除の**日別マップそのもの**も載せる — 勤務への貼り付け
+            // (`apply_ferry_minus`) は「その日に始まる勤務か、その日に掛かる parts」
+            // が応答に居ることが前提で、**前月に始業した勤務だけが覆う日**の控除は
+            // どの勤務にも貼れずに落ちる (実測 1026 一瀬 2026-05-01: 出庫 04-30 の
+            // 運行のフェリー 76 分。5 月応答に勤務が無く、4 月応答のフェリー窓は
+            // 4 月分だけ)。突合はこのマップを優先して読む
+            if !ferry_map.is_empty() {
+                o["ferry_minus_by_date"] = serde_json::json!(ferry_map);
             }
             Ok(Json(o))
         }
@@ -656,40 +670,49 @@ async fn kosoku_daily_all(
             // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
             let (rows, duplicate_rows) = drop_duplicate_rows(rows);
             let mut days = daily_summary(&rows, month, params_cfg);
-            if let Some(ferry) = ferry_by_driver.get(&driver) {
-                apply_ferry_minus(&mut days, &ferry_minus_by_date(ferry));
-            }
+            // 単一乗務員経路と同じく日別マップも持ち回る — 前月に始業した勤務だけが
+            // 覆う日の控除は勤務に貼れないため、突合はマップを優先して読む
+            let ferry_map = ferry_by_driver
+                .get(&driver)
+                .map(|f| ferry_minus_by_date(f))
+                .unwrap_or_default();
+            apply_ferry_minus(&mut days, &ferry_map);
             // 紙の再現値との日別の差 (cause `rounding` の実額)
             let drift = paper
                 .map(|p| paper_drift_by_date(&days, &p))
                 .unwrap_or_default();
             // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
             let punches = month_punches(&rows, month);
-            (driver, days, punches, duplicate_rows, drift)
+            (driver, days, punches, duplicate_rows, drift, ferry_map)
         })
-        .filter(|(_, days, punches, _, _)| !days.is_empty() || !punches.is_empty())
-        .map(|(driver, days, punches, duplicate_rows, drift)| {
-            // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
-            // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
-            // `duplicate_rows` 診断も画面は読まない
-            if view == ResponseView::Timecard {
-                return serde_json::json!({ "driver": driver, "days": timecard_days(&days) });
-            }
-            let mut o = if view == ResponseView::Compare {
-                // 突合は打刻を見ない。日別も要る項目だけに絞る (Refs #157)
-                serde_json::json!({ "driver": driver, "days": compare_days(&days) })
-            } else {
-                serde_json::json!({ "driver": driver, "days": days, "punches": punches })
-            };
-            // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
-            if !duplicate_rows.is_empty() {
-                o["duplicate_rows"] = serde_json::json!(duplicate_rows);
-            }
-            if !drift.is_empty() {
-                o["paper_drift_by_date"] = serde_json::json!(drift);
-            }
-            o
-        })
+        .filter(|(_, days, punches, _, _, _)| !days.is_empty() || !punches.is_empty())
+        .map(
+            |(driver, days, punches, duplicate_rows, drift, ferry_map)| {
+                // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
+                // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
+                // `duplicate_rows` 診断も画面は読まない
+                if view == ResponseView::Timecard {
+                    return serde_json::json!({ "driver": driver, "days": timecard_days(&days) });
+                }
+                let mut o = if view == ResponseView::Compare {
+                    // 突合は打刻を見ない。日別も要る項目だけに絞る (Refs #157)
+                    serde_json::json!({ "driver": driver, "days": compare_days(&days) })
+                } else {
+                    serde_json::json!({ "driver": driver, "days": days, "punches": punches })
+                };
+                // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
+                if !duplicate_rows.is_empty() {
+                    o["duplicate_rows"] = serde_json::json!(duplicate_rows);
+                }
+                if !drift.is_empty() {
+                    o["paper_drift_by_date"] = serde_json::json!(drift);
+                }
+                if view == ResponseView::Compare && !ferry_map.is_empty() {
+                    o["ferry_minus_by_date"] = serde_json::json!(ferry_map);
+                }
+                o
+            },
+        )
         .collect();
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = drivers.len();
