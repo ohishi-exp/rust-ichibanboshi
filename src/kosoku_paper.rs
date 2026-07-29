@@ -35,8 +35,8 @@ use std::collections::BTreeMap;
 use chrono::{Duration, NaiveDateTime, Timelike};
 
 use crate::kosoku::{
-    floor_min, midnight_after, parse_events, shift_cover, subtract_intervals, DaySummary, Event,
-    DIGI_STATES,
+    floor_min, midnight_after, parse_events, restraint_spans_and_diagnostics, shift_cover,
+    subtract_intervals, DaySummary, Event, DIGI_STATES,
 };
 
 /// `date_diff()->h*60 + ->i` 相当: 経過秒を切り捨てた分。**日の成分は落とす** —
@@ -297,7 +297,11 @@ pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMa
             cur = bound;
         }
     };
-    // デジタコ type: DIGI イベントのうち勤務が覆っていない部分 (端点床)
+    // デジタコ type: DIGI イベントのうち勤務が覆っていない部分 (端点床)。
+    // 勤務の中に落ちる部分は、イベント重複の二重計上 (下) のために別に集める
+    let mut digi_spans: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+    let mut inside_sum: BTreeMap<String, i64> = BTreeMap::new();
+    let mut inside_portions: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
     for e in &events {
         if e.source != "dtako_events" || !DIGI_STATES.contains(&e.state.as_str()) {
             continue;
@@ -307,8 +311,32 @@ pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMa
         if span.1 <= span.0 {
             continue;
         }
+        digi_spans.push(span);
         for (s, x) in subtract_intervals(&[span], &cover) {
             add_span(&mut out, s, x);
+        }
+        for c in &cover {
+            let (s, x) = (span.0.max(c.0), span.1.min(c.1));
+            if x > s {
+                add_span(&mut inside_sum, s, x);
+                inside_portions.push((s, x));
+            }
+        }
+    }
+    let digi_spans = crate::kosoku::merge_intervals(digi_spans);
+    // 紙の**イベント重複の二重計上**: 運行 NO が並走する日 (乗り換え・二重記録) は
+    // DIGI イベント同士が重なる。紙はイベントごとに区間時間を足すので重なりが
+    // 二重に積まれる — こちらは union で 1 回だけ数える (実測 1740 / 2026-05-09:
+    // 並走 2 本の重なり 104 分)。勤務の外は上の加算がイベントごと (= 重なり込み) に
+    // 数えているので、**勤務の中の重なりだけ**を足す
+    let mut inside_union: BTreeMap<String, i64> = BTreeMap::new();
+    for (s, x) in crate::kosoku::merge_intervals(inside_portions) {
+        add_span(&mut inside_union, s, x);
+    }
+    for (date, total) in &inside_sum {
+        let extra = total - inside_union.get(date).copied().unwrap_or(0);
+        if extra > 0 {
+            *out.entry(date.clone()).or_default() += extra;
         }
     }
     // TC_DC type: 隣接する 運行終了 → 運行開始 の対 (窓 d < 1 && h < 12) の勤務外の部分
@@ -330,9 +358,126 @@ pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMa
             add_span(&mut out, s, x);
         }
     }
-    // 0 分の日はできない — span は分に揃えてから引くので、残った部分は必ず 1 分以上。
-    // 行データの端 (翌月頭の margin) は勤務が組めず全部が「外」に見えるので、
-    // 対象月の日だけ返す
+    // 紙の**二重計上** (`time_card_dtako` の運行行が欠けた日、Refs #182 フォローアップ)。
+    // 運行開始/終了の行が無いと 始業 → 終業 が隣接したままになり、紙は打刻の対
+    // (TC_DC) と同じ時間のデジタコイベント (digi) を**両方**数える — 対とイベントの
+    // 重なりがそのまま紙の水増しになる (実測 1108 福留 2026-01-13: 対 357 +
+    // digi 357 = 715 で、こちらの 358 のほぼ 2 倍)。重なり分を「紙だけが数える分」
+    // として足す
+    for w in stream.windows(2) {
+        let (t, nt) = (&w[0], &w[1]);
+        if t.st != "始業" || nt.st != "終業" || nt.at <= t.at {
+            continue;
+        }
+        let (d, _) = interval_d_h(t.at, nt.at);
+        if d >= 1 {
+            continue;
+        }
+        let pair = (floor_min(t.at), floor_min(nt.at));
+        if pair.1 <= pair.0 {
+            continue;
+        }
+        let mut added = 0i64;
+        for digi in &digi_spans {
+            let (s, x) = (pair.0.max(digi.0), pair.1.min(digi.1));
+            if x > s {
+                added += (x - s).num_seconds() / 60;
+                add_span(&mut out, s, x);
+            }
+        }
+        if added == 0 {
+            continue;
+        }
+        // 紙は対から昼休を引く ([`tc_dc_daily`] と同じ窓) — 二重計上の水増しは
+        // その分だけ小さい (実測 1078 / 2026-04-04: 対 646 + digi − 昼休 60)。
+        // この成分が負になることはない — 引くのは対に足した分まで
+        let noon = t.at.date().and_hms_opt(12, 0, 0).expect("12:00 は常に有効");
+        let one = t.at.date().and_hms_opt(13, 0, 0).expect("13:00 は常に有効");
+        let ded = if t.at < noon && nt.at > one {
+            60
+        } else if t.at < noon && nt.at > noon {
+            elapsed_min_drop_days(noon, nt.at) % 60
+        } else {
+            0
+        };
+        *out
+            .entry(nt.at.format("%Y-%m-%d").to_string())
+            .or_default() -= ded.min(added);
+    }
+    // 昼休の控除で 0 に落ちた日は載せない。行データの端 (翌月頭の margin) は
+    // 勤務が組めず全部が「外」に見えるので、対象月の日だけ返す
+    out.retain(|date, m| *m != 0 && date.starts_with(month));
+    out
+}
+
+/// **こちらだけが数える時間** (`YYYY-MM-DD → 分`、[`paper_outside_by_date`] の鏡像、
+/// Refs #182 フォローアップ)。
+///
+/// こちらの拘束のうち、**紙の計上材料に覆われていない**部分。紙の材料は
+/// デジタコの DIGI イベントと、tc_stream の隣接対 (窓つき) — それに無い時間は
+/// 紙のどの type にも積まれない。実データの形は 2 つ:
+///
+/// - **アイドリングだけの休息明け勤務**: 車中泊のアイドリング (DIGI に無い) しか
+///   イベントが無い区間を、こちらは運行の証拠として勤務に数える
+///   (実測 1442 / 2026-05-27: 05:52→18:55 の 782 分)
+/// - **紙の対の窓から落ちた打刻の対**: d ≥ 1 の対などは紙がどこにも数えない
+///
+/// 突合 (relay) が cause `ours-outside` の実額に使う (**紙が小さくなる向き** =
+/// run-gap などと同じ符号)。運行の継ぎ目・日跨ぎの頭尻尾は個別 cause が実額を
+/// 持っているので、二重説明を避けるため覆いに足して除く
+/// ([`restraint_spans_and_diagnostics`] の診断区間)。
+pub fn ours_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMap<String, i64> {
+    let events = parse_events(rows);
+    let (restraint, diags) = restraint_spans_and_diagnostics(&events);
+    // 紙の計上材料: DIGI イベント + tc_stream の隣接対 (tc_dc_daily と同じ窓)
+    let mut material: Vec<(NaiveDateTime, NaiveDateTime)> = diags;
+    for e in &events {
+        if e.source != "dtako_events" || !DIGI_STATES.contains(&e.state.as_str()) {
+            continue;
+        }
+        let Some(end) = e.end else { continue };
+        let span = (floor_min(e.start), floor_min(end));
+        if span.1 > span.0 {
+            material.push(span);
+        }
+    }
+    let stream = tc_stream(&events, month);
+    for w in stream.windows(2) {
+        let (t, nt) = (&w[0], &w[1]);
+        if nt.at <= t.at {
+            continue;
+        }
+        let (d, h) = interval_d_h(t.at, nt.at);
+        let counted = match (t.st.as_str(), nt.st.as_str()) {
+            ("始業", "運行開始") => d < 2 && h < 14 && t.at.date() == nt.at.date(),
+            ("始業", "終業") => d < 1,
+            ("運行終了", "終業") | ("休息開始", "終業") => {
+                d < 2 && h < 14 && t.at.date() == nt.at.date()
+            }
+            ("運行終了", "運行開始") => d < 1 && h < 12,
+            _ => false,
+        };
+        if !counted {
+            continue;
+        }
+        let span = (floor_min(t.at), floor_min(nt.at));
+        if span.1 > span.0 {
+            material.push(span);
+        }
+    }
+    let material = crate::kosoku::merge_intervals(material);
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    for span in &restraint {
+        for (s, x) in subtract_intervals(&[*span], &material) {
+            let mut cur = s;
+            while cur < x {
+                let bound = midnight_after(cur).min(x);
+                *out.entry(cur.format("%Y-%m-%d").to_string()).or_default() +=
+                    (bound - cur).num_seconds() / 60;
+                cur = bound;
+            }
+        }
+    }
     out.retain(|date, _| date.starts_with(month));
     out
 }
@@ -664,9 +809,11 @@ mod tests {
             tc("2026-03-05 10:06:03", "終業"),
         ];
         let outside = paper_outside_by_date(&rows, "2026-03");
-        // 17:17 → 24:00 の 403 分と、0:00 → 始業 07:36 の 456 分
-        assert_eq!(outside.get("2026-03-04"), Some(&403));
-        assert_eq!(outside.get("2026-03-05"), Some(&456));
+        // 17:17 → 24:00 の 403 分 + 対の二重計上 (運行行が無いので 始業 → 終業 が
+        // 隣接のまま。積みとの重なり 72 − 昼休 60 = 12)。
+        // 翌日は 0:00 → 始業 07:36 の 456 分 + 対の二重 31 (07:36 → 08:07)
+        assert_eq!(outside.get("2026-03-04"), Some(&415));
+        assert_eq!(outside.get("2026-03-05"), Some(&487));
     }
 
     #[test]
@@ -696,6 +843,156 @@ mod tests {
             dtako("2026-03-05 19:00:00", "運行開始"),
         ];
         assert!(paper_outside_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn paper_outside_counts_a_long_gap_between_split_shifts() {
+        // 1674 前田 2026-05-13 の形 (Refs #182)。8 時間以上の継ぎ目で勤務が割れると
+        // その空きはこちらの拘束に無いが、紙の対の窓は h < 12 なので数える。
+        // 覆いを**分割後の勤務**で取らないとここが漏れる
+        let rows = vec![
+            ev("2026-03-03 20:00:00", "2026-03-04 05:00:00", "休息"),
+            dtako("2026-03-04 05:00:00", "運行開始"),
+            ev("2026-03-04 05:00:00", "2026-03-04 08:28:00", "運転"),
+            dtako("2026-03-04 08:28:00", "運行終了"),
+            dtako("2026-03-04 19:56:00", "運行開始"),
+            ev("2026-03-04 19:56:00", "2026-03-05 06:00:00", "運転"),
+            dtako("2026-03-05 06:00:00", "運行終了"),
+            ev("2026-03-05 06:00:00", "2026-03-05 20:00:00", "休息"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 08:28 → 19:56 の 688 分 (勤務は 25 時間 → 継ぎ目で割れて空きが外に出る)
+        assert_eq!(outside.get("2026-03-04"), Some(&688));
+    }
+
+    #[test]
+    fn paper_outside_counts_the_punch_pair_double_when_run_rows_are_missing() {
+        // 1108 福留 2026-01-13 の形 (Refs #182)。time_card_dtako の運行開始行が
+        // 無いと 始業 → 終業 が隣接したままになり、紙は対とデジタコを両方数える
+        let rows = vec![
+            tc("2026-03-04 04:40:37", "始業"),
+            ev("2026-03-04 04:40:37", "2026-03-04 10:38:03", "運転"),
+            tc("2026-03-04 10:38:03", "終業"),
+            dtako("2026-03-04 10:38:03", "運行終了"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 対 (04:40〜10:38) とデジタコの重なり 358 分 (昼の窓には掛からない)。
+        // 同時刻の運行終了は 終業 の後に並ぶので隣接を壊さない (実データと同じ)
+        assert_eq!(outside.get("2026-03-04"), Some(&358));
+        // 拘束は対とデジタコに覆われている — こちらだけの時間は無い
+        assert!(ours_outside_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn the_pair_double_subtracts_the_paper_lunch_deduction() {
+        // 1078 立山 2026-04-04 の形: 対が昼の窓を跨ぐと紙は 60 分引くので、
+        // 二重計上の水増しもその分だけ小さい
+        let rows = vec![
+            tc("2026-03-04 09:08:00", "始業"),
+            ev("2026-03-04 09:08:00", "2026-03-04 19:54:00", "運転"),
+            tc("2026-03-04 19:54:00", "終業"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 対 646 − 昼休 60
+        assert_eq!(outside.get("2026-03-04"), Some(&586));
+    }
+
+    #[test]
+    fn the_pair_double_deducts_only_the_window_overlap_when_it_ends_inside() {
+        // 終業が窓の中に落ちる対は重なり分だけ引かれる (紙の `->i` の再現)
+        let rows = vec![
+            tc("2026-03-04 09:00:00", "始業"),
+            ev("2026-03-04 09:00:00", "2026-03-04 12:20:00", "運転"),
+            tc("2026-03-04 12:20:00", "終業"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 対 200 − 窓の重なり 20
+        assert_eq!(outside.get("2026-03-04"), Some(&180));
+    }
+
+    #[test]
+    fn the_pair_double_skips_pairs_without_digitaco_and_full_day_pairs() {
+        // digi の無い対 (added 0) と 24 時間以上離れた対 (d >= 1) は二重にならない
+        let rows = vec![
+            tc("2026-03-04 08:00:00", "始業"),
+            tc("2026-03-04 12:00:00", "終業"),
+            tc("2026-03-06 08:00:00", "始業"),
+            ev("2026-03-06 08:00:00", "2026-03-06 09:00:00", "運転"),
+            tc("2026-03-07 09:00:00", "終業"),
+        ];
+        assert!(paper_outside_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn paper_outside_counts_overlapping_digitaco_events_twice_like_the_paper() {
+        // 1740 佐藤 2026-05-09 の形 (Refs #182): 運行 NO が並走すると DIGI イベントが
+        // 重なる。紙はイベントごとに足すので重なりが二重に積まれる — 勤務の中の
+        // 重なり分を「紙だけが数える分」として足す
+        let rows = vec![
+            tc("2026-03-04 08:00:00", "始業"),
+            dtako("2026-03-04 08:00:00", "運行開始"),
+            ev("2026-03-04 08:00:00", "2026-03-04 12:00:00", "運転"),
+            ev("2026-03-04 11:00:00", "2026-03-04 13:00:00", "運転"),
+            dtako("2026-03-04 13:00:00", "運行終了"),
+            tc("2026-03-04 13:00:00", "終業"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 11:00 → 12:00 の重なり 60 分だけ (運行行があるので対の二重は無い)
+        assert_eq!(outside.get("2026-03-04"), Some(&60));
+    }
+
+    #[test]
+    fn ours_outside_counts_the_span_paper_has_no_material_for() {
+        // 1442 廣々 2026-05-27 の形 (Refs #182)。休息明けから次の始業までの勤務に
+        // アイドリング (DIGI に無い) しかイベントが無い区間 — こちらは運行の証拠と
+        // して拘束に数えるが、紙にはどの type の材料も無い
+        let rows = vec![
+            ev("2026-03-03 20:00:00", "2026-03-04 06:00:00", "休息"),
+            ev("2026-03-04 06:00:00", "2026-03-04 16:30:00", "アイドリング"),
+            dtako("2026-03-04 17:00:00", "運行開始"),
+            ev("2026-03-04 17:00:00", "2026-03-04 17:30:00", "運転"),
+            tc("2026-03-04 18:00:00", "始業"),
+            tc("2026-03-04 23:00:00", "終業"),
+        ];
+        let ours = ours_outside_by_date(&rows, "2026-03");
+        // 休息明け 06:00 → 運行開始 17:00 の 660 分 (運転 17:00〜17:30 は紙の材料、
+        // 17:30 → 18:00 は 始業 との対にならず紙に無いが勤務にもならない…
+        // 勤務は 06:00 → 18:00 で、材料は 運転 30 分だけ)
+        assert_eq!(ours.get("2026-03-04"), Some(&690));
+    }
+
+    #[test]
+    fn ours_outside_is_empty_when_paper_has_material_for_everything() {
+        // 普通の運行日: 打刻の対とデジタコが勤務を覆う
+        let rows = vec![
+            tc("2026-03-04 08:00:00", "始業"),
+            dtako("2026-03-04 08:10:00", "運行開始"),
+            ev("2026-03-04 08:10:00", "2026-03-04 16:00:00", "運転"),
+            dtako("2026-03-04 16:00:00", "運行終了"),
+            tc("2026-03-04 16:30:00", "終業"),
+        ];
+        assert!(ours_outside_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn degenerate_pairs_and_swallowed_shifts_add_nothing() {
+        // 同時刻打刻 (分床で 0 の対) と、休息が勤務を丸ごと覆う形 (拘束は勤務の
+        // まま残す) の両方で、外の写像は静かに空になる
+        let rows = vec![
+            tc("2026-03-04 08:00:10", "始業"),
+            ev("2026-03-04 08:00:00", "2026-03-04 17:00:00", "休息"),
+            ev("2026-03-04 08:00:20", "2026-03-04 08:00:40", "運転"),
+            tc("2026-03-04 08:00:30", "終業"),
+        ];
+        assert!(paper_outside_by_date(&rows, "2026-03").is_empty());
+        assert!(ours_outside_by_date(&rows, "2026-03").is_empty());
+        // 休息が勤務を丸ごと覆う形 — 拘束は勤務のまま残す ([`summarize`] と同じ)
+        let rows = vec![
+            tc("2026-03-05 08:00:00", "始業"),
+            ev("2026-03-05 08:00:00", "2026-03-05 17:00:00", "休息"),
+            tc("2026-03-05 17:00:00", "終業"),
+        ];
+        assert!(ours_outside_by_date(&rows, "2026-03").is_empty());
     }
 
     #[test]
