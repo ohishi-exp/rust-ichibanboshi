@@ -1173,6 +1173,35 @@ async fn compare_view_carries_the_ours_outside_map() {
 }
 
 #[tokio::test]
+async fn compare_view_carries_the_gap_midnight_map() {
+    // 深夜を跨ぐ継ぎ目の対 (1536 の形、Refs #182) — 紙は丸ごと運行開始の日へ載せるが
+    // こちらは暦日で割るので、0 時前の 8 分が前日へ回る。単一乗務員と全乗務員の両経路で
+    let with_driver = |mut v: serde_json::Value| {
+        v["driver_id"] = json!(1536);
+        v
+    };
+    let rows = vec![
+        with_driver(tc("2026-06-02 20:00:00", "始業")),
+        with_driver(ev("2026-06-02 20:00:00", "2026-06-02 23:51:55", "運転")),
+        with_driver(dtako("2026-06-02 23:51:55", "運行終了", "u1")),
+        with_driver(dtako("2026-06-03 07:03:07", "運行開始", "u2")),
+        with_driver(ev("2026-06-03 07:03:07", "2026-06-03 10:00:00", "運転")),
+        with_driver(tc("2026-06-03 10:00:00", "終業")),
+    ];
+    let (status, body) = serve(
+        rows.clone(),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1536&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["gap_midnight_by_date"]["2026-06-02"], -8);
+    assert_eq!(body["gap_midnight_by_date"]["2026-06-03"], 8);
+    let (status, body) = serve(rows, "/api/kintai/kosoku-daily?month=2026-06&view=compare").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drivers"][0]["gap_midnight_by_date"]["2026-06-03"], 8);
+}
+
+#[tokio::test]
 async fn paper_drift_counts_duplicate_rows_the_way_the_paper_does() {
     // 取り込み 2 回で全列同一の行が入ると**紙は二重計上する** (実測 1339 渡邊
     // 2026-04-04)。再現は重複除去の**前**の行で計算しないと drift が 0 になり
