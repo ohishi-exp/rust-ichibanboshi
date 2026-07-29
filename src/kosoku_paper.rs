@@ -34,11 +34,7 @@ use std::collections::BTreeMap;
 
 use chrono::{Duration, NaiveDateTime, Timelike};
 
-use crate::kosoku::{parse_events, DaySummary, Event};
-
-/// 紙のデジタコ type が数えるイベント名 (`_make_kosoku_time` の `イベント名 in`)。
-/// 道路種別 (一般道/高速道/専用道など) は運転の中に入れ子で記録されるため含まれない。
-const DIGI_STATES: [&str; 6] = ["積み", "降し", "休憩", "運転", "その他", "待機"];
+use crate::kosoku::{midnight_after, parse_events, DaySummary, Event, DIGI_STATES};
 
 /// `date_diff()->h*60 + ->i` 相当: 経過秒を切り捨てた分。**日の成分は落とす** —
 /// 紙は「昨日の 0 時からの差」で終端の時刻を取り出すとき、意図的に日を無視している。
@@ -57,14 +53,6 @@ fn endpoint_floor_min(a: NaiveDateTime, b: NaiveDateTime) -> i64 {
     let fa = a - Duration::seconds(a.second() as i64);
     let fb = b - Duration::seconds(b.second() as i64);
     (fb - fa).num_seconds() / 60
-}
-
-/// その日の翌日 0 時。
-fn midnight_after(dt: NaiveDateTime) -> NaiveDateTime {
-    (dt + Duration::days(1))
-        .date()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
 }
 
 /// PHP `DateInterval` の `d` / `h` 成分 (絶対値)。対の窓 (`d < 2 && h < 14` 等) の判定用。
@@ -350,6 +338,25 @@ mod tests {
         assert_eq!(drift.get("2026-03-04"), Some(&60));
         // 値の無い日は載らない
         assert!(!drift.contains_key("2026-03-05"));
+    }
+
+    #[test]
+    fn paper_rounding_mode_zeroes_the_drift_for_a_mixed_day() {
+        // 打刻の頭・尻尾 (経過床) とデジタコの連鎖 (端点床) が混ざる日 — 勤務単位の
+        // 丸めでは ±1 が cause `rounding` として残った形。既定 (紙丸め、Refs #182)
+        // では公式値がそのまま紙と一致して drift が消える
+        let rows = vec![
+            tc("2026-06-02 08:00:20", "始業"),
+            dtako("2026-06-02 08:10:40", "運行開始"),
+            ev("2026-06-02 08:10:40", "2026-06-02 09:20:10", "運転"),
+            ev("2026-06-02 09:20:10", "2026-06-02 10:30:50", "積み"),
+            dtako("2026-06-02 10:30:50", "運行終了"),
+            tc("2026-06-02 10:40:30", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let paper = paper_daily_minutes(&rows, "2026-06");
+        assert_eq!(paper.get("2026-06-02"), Some(&159));
+        assert!(paper_drift_by_date(&days, &paper).is_empty());
     }
 
     #[test]

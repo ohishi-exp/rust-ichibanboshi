@@ -145,11 +145,21 @@ const MAX_RESTRAINT_MINUTES: i64 = 24 * 60;
 /// その大半がこの違いによるもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestraintRounding {
-    /// **紙と同じ**: 経過時間を切り捨てる。`floor(end - start)`。
+    /// **紙と同じ・区分ごと** (既定、Refs #182): 勤務の境界を秒のまま持ち回り、
+    /// 拘束を日別へ落とす瞬間に**区分ごとに**紙の流儀で切り捨てる
+    /// ([`paper_minutes_by_date`])。
+    ///
+    /// 紙は区分の切れ目が多い日に ±1 分を堆積させる ([`crate::kosoku_paper`] の
+    /// モジュール docs)。勤務単位の [`RestraintRounding::TruncateElapsed`] では
+    /// この堆積を再現できず、突合の cause `rounding` として残っていた。
+    /// **丸めだけ**を寄せる — 何を数えるか (構造) は変えない (#182 の決定 3)。
+    PaperPerSegment,
+    /// 勤務単位の近似: 経過時間を切り捨てる。`floor(end - start)`。
     ///
     /// nginx 側は `date_diff()` の `->h * 60 + ->i` で**差の秒を捨てて**いる
     /// (`TimeCardKosokuController::_make_tc_to_tc`)。始業 09:00:30 / 終業 17:00:20 なら
-    /// 経過 7:59:50 → **479 分**。
+    /// 経過 7:59:50 → **479 分**。打刻の対だけの勤務では紙と一致するが、
+    /// デジタコの区分が混ざる日は紙の堆積とずれる。#182 の「従来方式」。
     TruncateElapsed,
     /// 従来: 両端をそれぞれ分に切り捨ててから引く。`floor(end) - floor(start)`。
     ///
@@ -167,7 +177,7 @@ pub struct KosokuParams {
     pub prescribed_minutes: i64,
     /// 法定労働時間 (分)。既定 480 = 8 時間。`prescribed_minutes` との差が法定内残業。
     pub legal_minutes: i64,
-    /// 秒の落とし方。既定は紙に合わせた [`RestraintRounding::TruncateElapsed`]。
+    /// 秒の落とし方。既定は紙に合わせた [`RestraintRounding::PaperPerSegment`]。
     pub restraint_rounding: RestraintRounding,
 }
 
@@ -177,7 +187,7 @@ impl Default for KosokuParams {
             break_threshold_minutes: 10,
             prescribed_minutes: 450,
             legal_minutes: 480,
-            restraint_rounding: RestraintRounding::TruncateElapsed,
+            restraint_rounding: RestraintRounding::PaperPerSegment,
         }
     }
 }
@@ -315,10 +325,13 @@ pub struct DaySummary {
     pub over_24h: bool,
 
     /// 拘束 = 終業 − 始業 − 中の休息 ([`rest_minus_minutes`](Self::rest_minus_minutes))。
+    ///
+    /// 秒の落とし方は [`RestraintRounding`]。既定の紙丸めでは区分ごとに切り捨てるため、
+    /// 分の格子で出す実働・休憩と最大 1 分ずれ得る (`拘束 ≒ 実働 + 休憩`、Refs #182)。
     pub restraint_minutes: i64,
     /// 閾値以上の休憩の合計。
     pub break_minutes: i64,
-    /// 実働 = 拘束 − 休憩。
+    /// 実働 = 拘束 − 休憩 (紙丸めでは ±1 分の誤差あり — [`restraint_minutes`](Self::restraint_minutes))。
     pub working_minutes: i64,
     /// **勤務の中にあった休息の合計** (ユーザー決定 2026-07-28、Refs
     /// ohishi-exp/nuxt-dtako-admin#501)。拘束からも実働からも**外してある**。
@@ -448,15 +461,20 @@ fn floor_min(dt: NaiveDateTime) -> NaiveDateTime {
 ///
 /// 始業は常に切り捨てる。終業の置き方だけが [`RestraintRounding`] で変わる:
 ///
+/// - [`RestraintRounding::PaperPerSegment`] — **揃えない** (秒のまま返す)。紙丸めは
+///   境界の秒を持ち回り、日別へ落とす瞬間に区分ごとに丸める
+///   ([`paper_minutes_by_date`])。分単位の区間計算は [`summarize`] が分に揃えた影
+///   (walk) を別に作って行う
 /// - [`RestraintRounding::TruncateElapsed`] — 始業から**経過の切り捨てぶんだけ**進めた
-///   時刻に置く。拘束が `floor(end - start)` になり紙と一致する
+///   時刻に置く。拘束が `floor(end - start)` になる
 /// - [`RestraintRounding::FloorEndpoints`] — 終業も単に切り捨てる (従来)
 ///
-/// どちらでも終業は分の境界に乗るので、下流の区間計算は変わらない。**拘束・実働が
-/// 最大 1 分小さくなるだけ**で、`拘束 = 実働 + 休憩` の関係も崩れない。
+/// 揃えるモードでは終業が分の境界に乗るので、下流の区間計算は変わらない。**拘束・
+/// 実働が最大 1 分小さくなるだけ**で、`拘束 = 実働 + 休憩` の関係も崩れない。
 fn align_shift(s: &Shift, rounding: RestraintRounding) -> Shift {
     let start = floor_min(s.start);
     let end = match rounding {
+        RestraintRounding::PaperPerSegment => return s.clone(),
         RestraintRounding::TruncateElapsed => {
             start + Duration::minutes((s.end - s.start).num_minutes())
         }
@@ -897,7 +915,9 @@ fn split_by_date(start: NaiveDateTime, end: NaiveDateTime) -> Vec<(chrono::Naive
 fn punch_window_end(shift: &Shift, rounding: RestraintRounding) -> NaiveDateTime {
     match rounding {
         RestraintRounding::TruncateElapsed => shift.end + Duration::minutes(1),
-        RestraintRounding::FloorEndpoints => shift.end,
+        // 紙丸めの勤務は [`summarize`] が分に揃えた影 (walk) を渡す — 終業打刻の
+        // 分は walk の終わりと一致するので、足し戻しは要らない
+        RestraintRounding::PaperPerSegment | RestraintRounding::FloorEndpoints => shift.end,
     }
 }
 
@@ -1333,6 +1353,118 @@ fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTim
     merge_intervals(out)
 }
 
+/// [`rests_in`] の**秒を保つ**版 (紙丸め用、Refs #182)。区間の端を分に落とさず、
+/// 生のまま勤務内へ切り詰める — 紙の区分丸めは秒を見て切り捨てるので、先に分へ
+/// 落とすと丸めの向きが変わってしまう。
+fn rests_in_raw(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let out: Vec<(NaiveDateTime, NaiveDateTime)> = rest_spans(events)
+        .into_iter()
+        .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
+        .filter(|(s, e)| e > s)
+        .collect();
+    merge_intervals(out)
+}
+
+/// 紙のデジタコ type が数えるイベント名 (`_make_kosoku_time` の `イベント名 in`)。
+/// 道路種別 (一般道/高速道/専用道など) は運転の中に入れ子で記録されるため含まれない。
+pub(crate) const DIGI_STATES: [&str; 6] = ["積み", "降し", "休憩", "運転", "その他", "待機"];
+
+/// その日の翌日 0 時。
+pub(crate) fn midnight_after(dt: NaiveDateTime) -> NaiveDateTime {
+    (dt + Duration::days(1))
+        .date()
+        .and_hms_opt(0, 0, 0)
+        .expect("0:00 は常に有効")
+}
+
+/// 拘束区間 `[start, end)` (秒付き) を**紙の丸め**で暦日別の分へ落とす
+/// ([`RestraintRounding::PaperPerSegment`]、Refs #182)。
+///
+/// 紙のタイムカード表は秒を持ったまま**区分ごとに**切り捨てて日計へ足す
+/// (丸めのモデル全体は [`crate::kosoku_paper`] のモジュール docs)。公式の拘束を
+/// これへ寄せるため、区間を運行の境界 (`運行開始` / `運行終了` の点イベント) で
+/// 区分に割り、それぞれを紙と同じ規則で丸める:
+///
+/// - **運行の中** (デジタコの `区間時間` 列): 端点をそれぞれ分に切り捨てた差。
+///   連続するイベントは端点が telescoping するので、区分の端だけ見れば紙の合算と
+///   同じ値になる
+/// - **運行の外** (打刻 ↔ 運行境界の対 = TC_DC): 経過秒の切り捨て
+/// - **日跨ぎ**は深夜 0 時で割る。前半は経過秒切り捨て — 運行の中では「0 時を
+///   跨いでいるイベント」の開始からの経過なので、そのイベントの開始秒で決まる。
+///   後半は終端の時刻の分 (紙は日の成分を落とす)
+///
+/// 区分の割り方は**こちらの構造のまま** — 紙が数えない継ぎ目・頭尻尾も、ここでは
+/// 同じ丸めで数える (構造差は突合の cause で説明する。#182 の決定 3)。紙の
+/// 「対 = 経過床」をこちらの区分へ移すときの対応づけには ±1 分の近似が残り得るが、
+/// 突合の許容誤差 (2 分) の中に収まる。
+fn paper_minutes_by_date(
+    start: NaiveDateTime,
+    end: NaiveDateTime,
+    events: &[Event],
+    out: &mut BTreeMap<chrono::NaiveDate, i64>,
+) {
+    let mut bounds = vec![start];
+    bounds.extend(
+        events
+            .iter()
+            .filter(|e| e.state == "運行開始" || e.state == "運行終了")
+            .map(|e| e.start)
+            .filter(|t| *t > start && *t < end),
+    );
+    bounds.sort();
+    bounds.dedup();
+    bounds.push(end);
+    for w in bounds.windows(2) {
+        // 区分の頭までに最後に見えた運行境界が「開始」なら運行の中
+        let in_run = events
+            .iter()
+            .filter(|e| e.state == "運行開始" || e.state == "運行終了")
+            .filter(|e| e.start <= w[0])
+            .max_by_key(|e| e.start)
+            .is_some_and(|e| e.state == "運行開始");
+        add_paper_segment(out, w[0], w[1], in_run, events);
+    }
+}
+
+/// [`paper_minutes_by_date`] の区分 1 つ分。`in_run` で丸めの規則を切り替える。
+fn add_paper_segment(
+    out: &mut BTreeMap<chrono::NaiveDate, i64>,
+    a: NaiveDateTime,
+    b: NaiveDateTime,
+    in_run: bool,
+    events: &[Event],
+) {
+    if a.date() == b.date() {
+        let minutes = if in_run {
+            (floor_min(b) - floor_min(a)).num_minutes()
+        } else {
+            (b - a).num_seconds() / 60
+        };
+        *out.entry(a.date()).or_default() += minutes;
+        return;
+    }
+    let midnight = midnight_after(a);
+    let first = if in_run {
+        // 0 時を跨いでいるデジタコイベントの開始が前半の切り捨ての起点。跨ぐ
+        // イベントが見つからなければ区分の頭から数える (= 経過床と同じ向き)
+        let anchor = events
+            .iter()
+            .filter(|e| e.source == "dtako_events" && DIGI_STATES.contains(&e.state.as_str()))
+            .find(|e| e.start < midnight && e.end.is_some_and(|x| x > midnight))
+            .map_or(a, |e| e.start);
+        (midnight - floor_min(a)).num_minutes() - i64::from(anchor.second() > 0)
+    } else {
+        (midnight - a).num_seconds() / 60
+    };
+    *out.entry(a.date()).or_default() += first;
+    let mut day = a.date() + Duration::days(1);
+    while day < b.date() {
+        *out.entry(day).or_default() += 1440;
+        day += Duration::days(1);
+    }
+    *out.entry(b.date()).or_default() += i64::from(b.hour() * 60 + b.minute());
+}
+
 /// 勤務 1 回を日別サマリへ畳む。
 ///
 /// 実働区間を**時刻順に 1 分ずつ**歩いて、経過実働で所定内 / 法定内残業 / 法定時間外に
@@ -1340,13 +1472,22 @@ fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTim
 /// `siblings` は同じ乗務員の**全勤務** (自分を含む) — 始業前の運行の頭が他の勤務の
 /// 拘束に既に入っていないかを見るために渡す。
 fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuParams) -> DaySummary {
+    // 紙丸め ([`RestraintRounding::PaperPerSegment`]) の勤務は**秒を持ったまま**来る
+    // ([`align_shift`])。実働・休憩・診断の区間計算は従来どおり分単位で行うので、
+    // 分に揃えた影 (walk) を作ってそちらに使う — 生の秒は拘束の日別値
+    // ([`paper_minutes_by_date`]) だけが見る。揃えるモードでは walk = shift そのもの
+    let walk = Shift {
+        start: floor_min(shift.start),
+        end: floor_min(shift.end),
+        source: shift.source,
+    };
     // **打刻は打ち切り前の区間から拾う** — 24 時間で切ると、切った先にある終業打刻
     // (実測: 乗務員 1194 の 2026-04-03 16:47) が落ちる。拘束の値は打ち切ったままでよいが、
     // 打刻カードとして出す側にはその時刻が要る (Refs #128)
     let punches = punches_in(
         events,
-        shift.start,
-        punch_window_end(shift, p.restraint_rounding),
+        walk.start,
+        punch_window_end(&walk, p.restraint_rounding),
     );
     // 24 時間を超える拘束はここで打ち切る (法令違反なので積み上げる意味がない)
     // **打ち切らない** (Refs #152)。24 時間を超えた勤務は、帰宅日の混入ではなく
@@ -1356,31 +1497,61 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     // 出して `over_24h` で目立たせる。
     // 勤務の中に残った休息は拘束からも実働からも外す (ユーザー決定 2026-07-28)。
     // 拘束の実体はここから下の `restraint` — 以降は「終業 − 始業」を直接使わない
-    let rests = rests_in(events, shift);
-    let restraint = subtract_intervals(&[(shift.start, shift.end)], &rests);
+    let rests = rests_in(events, &walk);
+    let restraint = subtract_intervals(&[(walk.start, walk.end)], &rests);
     // **外して何も残らないなら外さない** ([`split_long_shift`] の打ち切りと同じ扱い)。
     // 勤務を丸ごと覆う休息はデータの壊れ方であって「拘束 0 の出勤日」ではない
     let (rests, restraint) = if restraint.is_empty() {
-        (Vec::new(), vec![(shift.start, shift.end)])
+        (Vec::new(), vec![(walk.start, walk.end)])
     } else {
         (rests, restraint)
     };
-    let restraint_minutes: i64 = restraint.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
+    // **公式の拘束は暦日別のこの写像が持つ** — 紙丸めは生の秒の区間から区分ごとに
+    // 落とし、従来モードは walk の区間を暦日で切る (どちらも合計 = 本体の拘束)
+    let restraint_by_date: BTreeMap<chrono::NaiveDate, i64> = match p.restraint_rounding {
+        RestraintRounding::PaperPerSegment => {
+            let raw_rests = rests_in_raw(events, shift);
+            let raw = subtract_intervals(&[(shift.start, shift.end)], &raw_rests);
+            // 空のフォールバックは walk 側 (上の restraint) と同じ判断
+            let raw = if raw.is_empty() {
+                vec![(shift.start, shift.end)]
+            } else {
+                raw
+            };
+            let mut map = BTreeMap::new();
+            for (s, e) in &raw {
+                paper_minutes_by_date(*s, *e, events, &mut map);
+            }
+            // 0 分の日は載せない — 従来モードの暦日切りも 0 分の日を作らない
+            map.retain(|_, m| *m != 0);
+            map
+        }
+        RestraintRounding::TruncateElapsed | RestraintRounding::FloorEndpoints => {
+            let mut map = BTreeMap::new();
+            for (s, e) in &restraint {
+                for (date, minutes) in split_by_date(*s, *e) {
+                    *map.entry(date).or_insert(0) += minutes;
+                }
+            }
+            map
+        }
+    };
+    let restraint_minutes: i64 = restraint_by_date.values().sum();
     let rest_minus_minutes: i64 = rests.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     let over_24h = restraint_minutes > MAX_RESTRAINT_MINUTES;
     // 運行に出ていない勤務は昼休憩を引く (ユーザー決定 2026-07-28)。運行中なら
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
-    let has_op = has_operation(events, shift);
+    let has_op = has_operation(events, &walk);
     let breaks = if has_op {
-        breaks_in(events, shift, p.break_threshold_minutes)
+        breaks_in(events, &walk, p.break_threshold_minutes)
     } else {
         // **運行に出ていない勤務にはデジタコの休憩イベントも無い** — 休憩イベントは
         // 運行に紐づいて記録されるので、勤務に重なる休憩が 1 件でもあれば
         // `has_operation` が true になりこちらへは来ない。足し合わせは起きえない
-        let lunch = lunch_windows(shift);
+        let lunch = lunch_windows(&walk);
         // 夜勤のように昼の窓へ 1 分も掛からない勤務は、時計の窓では休憩を置けない
         if lunch.is_empty() {
-            off_hours_break(shift)
+            off_hours_break(&walk)
         } else {
             lunch
         }
@@ -1389,18 +1560,18 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     let breaks = subtract_intervals(&breaks, &rests);
     let break_minutes: i64 = breaks.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     // 運行の継ぎ目 (紙が拘束に入れない分)。休息と重なる分は拘束から外れているので除く
-    let run_gaps = subtract_intervals(&run_gap_spans(events, shift), &rests);
+    let run_gaps = subtract_intervals(&run_gap_spans(events, &walk), &rests);
     let run_gap_minutes: i64 = run_gaps.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
     // 日跨ぎ終業の尻尾 (紙が数えない分)。休息と重なる分は拘束から外れているので除く
     let punch_tails = subtract_intervals(
-        &punch_tail_span(events, shift)
+        &punch_tail_span(events, &walk)
             .into_iter()
             .collect::<Vec<_>>(),
         &rests,
     );
     // 日跨ぎ始業の頭 (尻尾の鏡像)
     let punch_heads = subtract_intervals(
-        &punch_head_span(events, shift)
+        &punch_head_span(events, &walk)
             .into_iter()
             .collect::<Vec<_>>(),
         &rests,
@@ -1413,7 +1584,7 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     let lunch_overlaps = if has_op {
         Vec::new()
     } else {
-        subtract_intervals(&lunch_windows(shift), &rests)
+        subtract_intervals(&lunch_windows(&walk), &rests)
     };
     let lunch_overlap_minutes: i64 = lunch_overlaps
         .iter()
@@ -1426,13 +1597,15 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     // 実測 (1021 鈴木 2026-03-04): 運行開始 07:09 → 始業 07:29 の 20 分が休息由来の
     // 勤務として拘束に入り、かつ run_head 20 も出て、unknown -21 の主因になっていた
     // (Refs ohishi-exp/nuxt-dtako-admin#501)。
+    // siblings は紙丸めでは秒付きで来るので、比べる前に分へ揃える (自分の除外は
+    // 生の境界どうしで一致を見る)
     let covered: Vec<(NaiveDateTime, NaiveDateTime)> = siblings
         .iter()
         .filter(|s| (s.start, s.end) != (shift.start, shift.end))
-        .map(|s| (s.start, s.end))
+        .map(|s| (floor_min(s.start), floor_min(s.end)))
         .collect();
     let run_heads = subtract_intervals(
-        &run_head_span(events, shift).into_iter().collect::<Vec<_>>(),
+        &run_head_span(events, &walk).into_iter().collect::<Vec<_>>(),
         &covered,
     );
     let run_head_minutes: i64 = run_heads.iter().map(|(s, e)| (*e - *s).num_minutes()).sum();
@@ -1441,7 +1614,7 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
         .map(|(s, e)| (*e - *s).num_minutes())
         .sum();
     let intervals = subtract_intervals(&restraint, &breaks);
-    let is_legal_holiday = shift.start.weekday() == Weekday::Sun;
+    let is_legal_holiday = walk.start.weekday() == Weekday::Sun;
 
     let mut elapsed = 0i64;
     let (mut statutory, mut within, mut overtime, mut holiday) = (0i64, 0i64, 0i64, 0i64);
@@ -1489,15 +1662,14 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
             t += Duration::minutes(1);
         }
     }
-    // 拘束は休憩も含む区間なので、実働の歩きとは別に暦日へ切り分ける。
-    // **休息を抜いた区間ごとに**配る — 勤務の端から端で配ると外したはずの休息が戻る
-    for (s, e) in &restraint {
-        for (date, minutes) in split_by_date(*s, *e) {
-            parts
-                .entry(date)
-                .or_insert_with(|| DayPart::new(date))
-                .restraint_minutes += minutes;
-        }
+    // 拘束は休憩も含む区間なので、実働の歩きとは別に暦日へ配る。配り方 (紙丸め /
+    // 暦日切り) は `restraint_by_date` で確定済み — どちらも休息を抜いた区間から
+    // 出している (勤務の端から端で配ると外したはずの休息が戻る)
+    for (date, minutes) in &restraint_by_date {
+        parts
+            .entry(*date)
+            .or_insert_with(|| DayPart::new(*date))
+            .restraint_minutes += minutes;
     }
     // 継ぎ目も暦日へ配る — 突合は暦日単位なので、日跨ぎの継ぎ目を始業日に寄せると
     // 残差の説明が別の日に付いてしまう
@@ -1551,10 +1723,11 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
         punch_head_minutes,
         run_head_minutes,
         lunch_overlap_minutes,
-        date: shift.start.format("%Y-%m-%d").to_string(),
-        start: shift.start.format(FMT).to_string(),
-        end: shift.end.format(FMT).to_string(),
-        source: shift.source,
+        // 表示の境界は従来どおり分に揃える — 紙丸めでも応答の形は変えない
+        date: walk.start.format("%Y-%m-%d").to_string(),
+        start: walk.start.format(FMT).to_string(),
+        end: walk.end.format(FMT).to_string(),
+        source: walk.source,
         punches,
         // 1 日で終わる勤務は内訳がこの行そのものなので出さない (応答を膨らませない)
         parts: if parts.len() > 1 {
@@ -1732,7 +1905,15 @@ pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) 
     let shifts: Vec<Shift> = shifts
         .iter()
         .map(|s| align_shift(s, p.restraint_rounding))
-        .filter(|s| s.end > s.start)
+        // 1 分に満たない勤務は落とす。紙丸めは境界を揃えない ([`align_shift`]) ので
+        // 経過で見る — 揃えるモードの「end > start」と同じ判断 (TruncateElapsed は
+        // 経過 1 分未満で end == start に落ちる)
+        .filter(|s| match p.restraint_rounding {
+            RestraintRounding::PaperPerSegment => s.end - s.start >= Duration::minutes(1),
+            RestraintRounding::TruncateElapsed | RestraintRounding::FloorEndpoints => {
+                s.end > s.start
+            }
+        })
         // 打刻が数日をまとめて挟んだ勤務は、中の休息で切り直す (Refs #133)
         .flat_map(|s| split_long_shift(&s, &events))
         .collect();
@@ -2620,6 +2801,120 @@ mod tests {
         assert_eq!(floor.restraint_minutes, 480);
     }
 
+    // --- 紙丸め: 区分ごとの切り捨て (Refs #182) ---
+
+    #[test]
+    fn paper_rounds_each_segment_separately() {
+        // 打刻 ↔ 運行境界の対は経過床、運行の中は端点床。勤務単位の経過床
+        // (TruncateElapsed) では 160 になる形が、区分ごとだと 159 で紙と一致する
+        let rows = vec![
+            tc("2026-06-02 08:00:20", "始業"),
+            dtako("2026-06-02 08:10:40", "運行開始"),
+            ev("2026-06-02 08:10:40", "2026-06-02 09:20:10", "運転"),
+            ev("2026-06-02 09:20:10", "2026-06-02 10:30:50", "積み"),
+            dtako("2026-06-02 10:30:50", "運行終了"),
+            tc("2026-06-02 10:40:30", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        // 頭 10 (10 分 20 秒の経過床) + 運行 140 (10:30 − 08:10 の端点床) + 尻尾 9
+        assert_eq!(d.restraint_minutes, 159);
+        let p = KosokuParams {
+            restraint_rounding: RestraintRounding::TruncateElapsed,
+            ..KosokuParams::default()
+        };
+        assert_eq!(daily_summary(&rows, "2026-06", &p)[0].restraint_minutes, 160);
+    }
+
+    #[test]
+    fn paper_splits_a_run_at_midnight_using_the_crossing_events_seconds() {
+        // 0 時を跨ぐ運転 22:30:20 → 01:00:05。前半は跨いでいるイベントの開始からの
+        // 経過床 — 開始に秒 (20) があるので端点床より 1 小さい 179。後半は終端の
+        // 時刻の分 (60)
+        let rows = vec![
+            tc("2026-06-02 21:00:10", "始業"),
+            dtako("2026-06-02 21:00:10", "運行開始"),
+            ev("2026-06-02 21:00:10", "2026-06-02 22:30:20", "運転"),
+            ev("2026-06-02 22:30:20", "2026-06-03 01:00:05", "運転"),
+            dtako("2026-06-03 01:00:05", "運行終了"),
+            tc("2026-06-03 01:00:05", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 239);
+        let parts: Vec<(&str, i64)> = d
+            .parts
+            .iter()
+            .map(|p| (p.date.as_str(), p.restraint_minutes))
+            .collect();
+        assert_eq!(parts, vec![("2026-06-02", 179), ("2026-06-03", 60)]);
+    }
+
+    #[test]
+    fn paper_midnight_split_falls_back_to_the_segment_start_without_a_crossing_event() {
+        // 0 時を跨ぐ区分に「跨いでいるデジタコイベント」が無い形 (点イベントだけ)。
+        // 起点は区分の頭 (運行開始 23:40:30) になり、前半は 20 − 1 = 19
+        let rows = vec![
+            tc("2026-06-02 23:30:40", "始業"),
+            dtako("2026-06-02 23:40:30", "運行開始"),
+            tc("2026-06-03 00:30:10", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        // 頭 9 (23:30:40 → 23:40:30 の経過床) + 前半 19 + 後半 30
+        assert_eq!(d.restraint_minutes, 58);
+        let parts: Vec<(&str, i64)> = d
+            .parts
+            .iter()
+            .map(|p| (p.date.as_str(), p.restraint_minutes))
+            .collect();
+        assert_eq!(parts, vec![("2026-06-02", 28), ("2026-06-03", 30)]);
+    }
+
+    #[test]
+    fn paper_drops_a_zero_minute_calendar_day() {
+        // ちょうど 0 時に終わる勤務 — 後半 (終端の時刻の分) は 0 分。0 の日は
+        // 載せない (従来モードの暦日切りも 0 分の日を作らない)
+        let rows = vec![
+            tc("2026-06-02 20:00:00", "始業"),
+            tc("2026-06-03 00:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 240);
+        assert!(d.parts.is_empty());
+    }
+
+    #[test]
+    fn paper_subtracts_rests_with_raw_seconds() {
+        // 勤務の中の休息は秒のまま引いてから区分丸め — 休息の端の秒が両側の区分の
+        // 経過床に効く (2:00:20 → 120 と 1:59:50 → 119)
+        let rows = vec![
+            tc("2026-06-02 08:00:20", "始業"),
+            ev("2026-06-02 10:00:40", "2026-06-02 12:00:20", "休息"),
+            tc("2026-06-02 14:00:10", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 239);
+        assert_eq!(d.rest_minus_minutes, 120);
+    }
+
+    #[test]
+    fn over_24h_verdict_is_stable_across_rounding_modes() {
+        // 遵守チェック (24 時間超) は丸め方式で判定が変わらない (Refs #182 の決定 3)
+        let rows = vec![
+            tc("2026-06-01 21:31:32", "始業"),
+            tc("2026-06-03 16:47:04", "終業"),
+        ];
+        for rounding in [
+            RestraintRounding::PaperPerSegment,
+            RestraintRounding::TruncateElapsed,
+            RestraintRounding::FloorEndpoints,
+        ] {
+            let p = KosokuParams {
+                restraint_rounding: rounding,
+                ..KosokuParams::default()
+            };
+            assert!(daily_summary(&rows, "2026-06", &p)[0].over_24h, "{rounding:?}");
+        }
+    }
+
     #[test]
     fn truncate_elapsed_keeps_restraint_equal_to_working_plus_break() {
         // 1 分削っても `拘束 = 実働 + 休憩` は崩さない (削るのは終業側なので実働が吸う)
@@ -2628,9 +2923,28 @@ mod tests {
             ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休憩"),
             tc("2026-06-02 17:00:20", "終業"),
         ];
-        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        let p = KosokuParams {
+            restraint_rounding: RestraintRounding::TruncateElapsed,
+            ..KosokuParams::default()
+        };
+        let d = &daily_summary(&rows, "2026-06", &p)[0];
         assert_eq!(d.restraint_minutes, d.working_minutes + d.break_minutes);
         assert_eq!(d.restraint_minutes, 479);
+    }
+
+    #[test]
+    fn paper_restraint_may_deviate_from_working_plus_break_by_one() {
+        // 紙丸めの拘束は区分ごとの経過床 (479)。実働・休憩は従来どおり分の格子で
+        // 出す (420 + 60) ので、`拘束 = 実働 + 休憩` は最大 1 分ずれる —
+        // 拘束の公式値を紙へ寄せる代償 (Refs #182)
+        let rows = vec![
+            tc("2026-06-02 09:00:30", "始業"),
+            ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休憩"),
+            tc("2026-06-02 17:00:20", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 479);
+        assert_eq!(d.working_minutes + d.break_minutes, 480);
     }
 
     #[test]
@@ -2640,7 +2954,11 @@ mod tests {
             tc("2026-06-02 09:25:37", "始業"),
             tc("2026-06-02 19:39:04", "終業"),
         ];
-        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        let p = KosokuParams {
+            restraint_rounding: RestraintRounding::TruncateElapsed,
+            ..KosokuParams::default()
+        };
+        let d = &daily_summary(&rows, "2026-06", &p)[0];
         assert_eq!(d.end, "2026-06-02 19:38:00");
         assert_eq!(
             d.punches.len(),
@@ -2687,9 +3005,10 @@ mod tests {
         ];
         let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
         assert!(d.over_24h);
+        // 紙丸め: 前半 148 (経過床) + まる 1 日 1440 + 後半 1007 (終端の時刻の分)
         assert_eq!(d.restraint_minutes, 2595);
-        // 秒は経過時間の切り捨て (#149) — 終業の秒 04 < 始業の秒 32 なので 1 分手前
-        assert_eq!(d.end, "2026-06-03 16:46:00");
+        // 表示の境界は分に揃える (walk) — 終業 16:47:04 の床
+        assert_eq!(d.end, "2026-06-03 16:47:00");
         // 打刻は実際の終業まで残る
         assert_eq!(d.punches.len(), 2);
         assert_eq!(d.punches[1].at, "2026-06-03 16:47:04");

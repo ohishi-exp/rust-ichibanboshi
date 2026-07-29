@@ -433,15 +433,29 @@ fn test_kosoku_config_partial_keeps_other_defaults() {
 
 #[test]
 fn test_restraint_rounding_defaults_to_the_paper_rule() {
-    // 既定は紙のタイムカード表と同じ「経過時間を切り捨て」(Refs #149)
+    // 既定は紙のタイムカード表と同じ「区分ごとの切り捨て」(Refs #182)
     let config: Config = toml::from_str("").unwrap();
     assert_eq!(
         config.kosoku.restraint_rounding,
-        RestraintRoundingToml::TruncateElapsed
+        RestraintRoundingToml::PaperPerSegment
     );
     assert_eq!(
         RestraintRounding::from(config.kosoku.restraint_rounding),
-        RestraintRounding::TruncateElapsed
+        RestraintRounding::PaperPerSegment
+    );
+}
+
+#[test]
+fn test_restraint_rounding_accepts_paper_per_segment_explicitly() {
+    let config: Config = toml::from_str(
+        "[kosoku]
+restraint_rounding = \"paper_per_segment\"
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.kosoku.restraint_rounding,
+        RestraintRoundingToml::PaperPerSegment
     );
 }
 
@@ -467,7 +481,8 @@ restraint_rounding = \"floor_endpoints\"
 }
 
 #[test]
-fn test_restraint_rounding_accepts_the_explicit_default() {
+fn test_restraint_rounding_can_go_back_to_truncate_elapsed() {
+    // #182 の「従来方式」に TOML だけで戻せる (再デプロイのみ、コード変更不要)
     let config: Config = toml::from_str(
         "[kosoku]
 restraint_rounding = \"truncate_elapsed\"
@@ -477,6 +492,10 @@ restraint_rounding = \"truncate_elapsed\"
     assert_eq!(
         config.kosoku.restraint_rounding,
         RestraintRoundingToml::TruncateElapsed
+    );
+    assert_eq!(
+        RestraintRounding::from(config.kosoku.restraint_rounding),
+        RestraintRounding::TruncateElapsed
     );
     // Debug / Clone / Copy を通しておく
     let c = config.kosoku.restraint_rounding;
