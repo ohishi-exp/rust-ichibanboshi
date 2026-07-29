@@ -452,7 +452,8 @@ pub async fn pdf_json(
 /// 生イベント読み取りのエラーを HTTP ステータスへ写す。
 ///
 /// 未設定は 503 (`base_url` 未設定と同じ fail-closed)、DB 停止・クエリ失敗は 502。
-fn map_repo_err(e: KintaiRepoError) -> (StatusCode, String) {
+/// `/kintai/version` (routes/kintai_version.rs) も同じ写し方を共有する (Refs #184)。
+pub(crate) fn map_repo_err(e: KintaiRepoError) -> (StatusCode, String) {
     match e {
         KintaiRepoError::NotConfigured => (
             StatusCode::SERVICE_UNAVAILABLE,
