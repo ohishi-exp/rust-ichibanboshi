@@ -40,8 +40,8 @@ use crate::kosoku::{
     split_by_driver, split_ferry_by_driver, DayPart, DaySummary, KosokuParams, ShiftSource,
 };
 use crate::kosoku_paper::{
-    minus_unko_by_date, ours_outside_by_date, paper_daily_minutes, paper_drift_by_date,
-    paper_outside_by_date,
+    gap_midnight_by_date, minus_unko_by_date, ours_outside_by_date, paper_daily_minutes,
+    paper_drift_by_date, paper_outside_by_date,
 };
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
@@ -594,6 +594,8 @@ pub async fn kosoku_daily(
     let ours_only = (view == ResponseView::Compare).then(|| ours_outside_by_date(&rows, &month));
     // 紙が引く 運行開始 → 始業 (cause `minus-unko` の実額、Refs #546)
     let minus_unko = (view == ResponseView::Compare).then(|| minus_unko_by_date(&rows, &month));
+    // 深夜を跨ぐ継ぎ目の暦日配分の差 (cause `gap-midnight` の実額、Refs #546)
+    let gap_midnight = (view == ResponseView::Compare).then(|| gap_midnight_by_date(&rows, &month));
     // 取り込みが 2 回走ると全列同一の行が入る。**紙は二重計上する**ので件数を返す
     let (rows, duplicate_rows) = drop_duplicate_rows(rows);
     let mut days = daily_summary(&rows, &month, &params_cfg);
@@ -656,6 +658,11 @@ pub async fn kosoku_daily(
             if !minus_unko.is_empty() {
                 o["minus_unko_by_date"] = serde_json::json!(minus_unko);
             }
+            // 深夜を跨ぐ継ぎ目の暦日配分の差 — 突合が cause `gap-midnight` に使う
+            let gap_midnight = gap_midnight.unwrap_or_default();
+            if !gap_midnight.is_empty() {
+                o["gap_midnight_by_date"] = serde_json::json!(gap_midnight);
+            }
             Ok(Json(o))
         }
         // 画面は月全打刻 (`punches`) も `duplicate_rows` 診断も読まない (Refs #164)
@@ -716,6 +723,10 @@ async fn kosoku_daily_all(
             let minus_unko = (view == ResponseView::Compare)
                 .then(|| minus_unko_by_date(&rows, month))
                 .unwrap_or_default();
+            // 深夜を跨ぐ継ぎ目の暦日配分の差 (cause `gap-midnight` の実額、Refs #546)
+            let gap_midnight = (view == ResponseView::Compare)
+                .then(|| gap_midnight_by_date(&rows, month))
+                .unwrap_or_default();
             // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
             let (rows, duplicate_rows) = drop_duplicate_rows(rows);
             let mut days = daily_summary(&rows, month, params_cfg);
@@ -742,9 +753,10 @@ async fn kosoku_daily_all(
                 outside,
                 ours_only,
                 minus_unko,
+                gap_midnight,
             )
         })
-        .filter(|(_, days, punches, _, _, _, _, _, _)| !days.is_empty() || !punches.is_empty())
+        .filter(|(_, days, punches, _, _, _, _, _, _, _)| !days.is_empty() || !punches.is_empty())
         .map(
             |(
                 driver,
@@ -756,6 +768,7 @@ async fn kosoku_daily_all(
                 outside,
                 ours_only,
                 minus_unko,
+                gap_midnight,
             )| {
                 // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
                 // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
@@ -787,6 +800,9 @@ async fn kosoku_daily_all(
                 }
                 if view == ResponseView::Compare && !minus_unko.is_empty() {
                     o["minus_unko_by_date"] = serde_json::json!(minus_unko);
+                }
+                if view == ResponseView::Compare && !gap_midnight.is_empty() {
+                    o["gap_midnight_by_date"] = serde_json::json!(gap_midnight);
                 }
                 o
             },
