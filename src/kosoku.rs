@@ -1362,6 +1362,35 @@ pub(crate) fn subtract_intervals(
 ///
 /// **閾値は設けない** — 休憩イベント ([`breaks_in`]) と違い、休息はデジタコが
 /// 「運行を終えて休んだ」と判定した区間そのものなので、短くても休憩ではない。
+/// 休息の中で**運行が始まっていたら、休息はそこで終わっている** (Refs #182)。
+///
+/// 車両を乗り換えると、前の車両の記録に休息が開いたまま次の運行が始まることがある。
+/// 実測 1029 冨田 / 2026-05-13 は車両 1867 に 休息 00:25:04 → 13:58:52 (813 分) が
+/// 残ったまま、03:32:19 から車両 2409 で走っていた。丸ごと引くと拘束が 118 分になり、
+/// 紙 (745) と 555 分ずれる。
+///
+/// **入れ子の休憩とは区別できる** — 休息の中の休憩 (同じ運行) には `運行開始` が
+/// 挟まらない。運行が始まった時点で休息を閉じれば、休んでいた分 (00:25:04 → 03:32:19
+/// の 187 分) だけが残る。
+fn close_rest_at_run_start(
+    events: &[Event],
+    rests: Vec<(NaiveDateTime, NaiveDateTime)>,
+) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    rests
+        .into_iter()
+        .map(|(s, e)| {
+            let cut = events
+                .iter()
+                .filter(|ev| ev.state == "運行開始")
+                .map(|ev| ev.start)
+                .filter(|t| *t > s && *t < e)
+                .min();
+            (s, cut.unwrap_or(e))
+        })
+        .filter(|(s, e)| e > s)
+        .collect()
+}
+
 fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     // 休息は打刻で切り詰めた後の区間を使う ([`rest_spans`]) — 切り詰め前で引くと、
     // 勤務の終わりを終業打刻まで伸ばした分 (休息開始→打刻) をここで引き戻してしまう
@@ -1371,7 +1400,7 @@ fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTim
         .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
         .filter(|(s, e)| e > s)
         .collect();
-    merge_intervals(out)
+    close_rest_at_run_start(events, merge_intervals(out))
 }
 
 /// [`rests_in`] の**秒を保つ**版 (紙丸め用、Refs #182)。区間の端を分に落とさず、
@@ -1383,7 +1412,7 @@ fn rests_in_raw(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDat
         .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
         .filter(|(s, e)| e > s)
         .collect();
-    merge_intervals(out)
+    close_rest_at_run_start(events, merge_intervals(out))
 }
 
 /// 紙のデジタコ type が数えるイベント名 (`_make_kosoku_time` の `イベント名 in`)。
@@ -3771,6 +3800,23 @@ mod tests {
         assert_eq!(days[0].restraint_minutes, 600); // 840 − 240
         assert_eq!(days[0].break_minutes, 0);
         assert_eq!(days[0].working_minutes, 600);
+    }
+
+    #[test]
+    fn a_rest_is_closed_when_another_run_starts_inside_it() {
+        // 1029 冨田 / 2026-05-13 の形。車両を乗り換えると前の車両の休息が開いたまま
+        // 次の運行が始まる — 丸ごと引くと拘束が 555 分小さくなる (紙 745 に対し 118)。
+        // 運行が始まった時点で休息を閉じ、休んでいた 187 分だけを引く
+        let rows = vec![
+            tc("2026-03-02 06:00:00", "始業"),
+            ev("2026-03-02 06:30:00", "2026-03-02 18:00:00", "休息"), // 690 分
+            dtako("2026-03-02 09:37:00", "運行開始"), // 休息の中で別車両が動き出す
+            ev("2026-03-02 09:37:00", "2026-03-02 17:00:00", "運転"),
+            tc("2026-03-02 20:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-03", &KosokuParams::default());
+        // 引くのは 06:30 → 09:37 の 187 分だけ
+        assert_eq!(days[0].rest_minus_minutes, 187);
     }
 
     #[test]
