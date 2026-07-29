@@ -83,6 +83,18 @@ pub async fn run(
         Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo)
     };
 
+    // 勤怠の月別バージョン (ETag) 読み取り (Refs #184)。events と同じ MariaDB を
+    // 読むが trait / pool は分離 — 未設定なら Disabled で 503 fail-closed
+    let kintai_version_repo: crate::kintai_version::DynKintaiVersionRepo =
+        if config.mariadb.enabled() {
+            Arc::new(crate::kintai_version::MariadbKintaiVersionRepo::new(
+                &config.mariadb,
+            ))
+        } else {
+            tracing::info!("mariadb not configured — /api/kintai/version returns 503");
+            Arc::new(crate::kintai_version::DisabledKintaiVersionRepo)
+        };
+
     // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
     // 就業規則が変わったら TOML で追随できるよう config から取る。
     let kosoku_params = Arc::new(crate::kosoku::KosokuParams {
@@ -217,6 +229,7 @@ pub async fn run(
         .route("/kintai/events", get(routes::kintai::events))
         .route("/kintai/kosoku-daily", get(routes::kintai::kosoku_daily))
         .route("/kintai/pdf-json", get(routes::kintai::pdf_json))
+        .route("/kintai/version", get(routes::kintai_version::version))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
@@ -258,6 +271,7 @@ pub async fn run(
         .layer(Extension(kyuyo_store))
         .layer(Extension(kintai_store))
         .layer(Extension(kintai_events_repo))
+        .layer(Extension(kintai_version_repo))
         .layer(Extension(kosoku_params))
         .layer(Extension(restraint_store));
 

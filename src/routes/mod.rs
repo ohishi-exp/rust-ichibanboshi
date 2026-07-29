@@ -1,6 +1,7 @@
 pub mod employees;
 pub mod health;
 pub mod kintai;
+pub mod kintai_version;
 pub mod kyuyo;
 pub mod restraint;
 pub mod sales;
