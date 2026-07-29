@@ -1408,7 +1408,8 @@ pub(crate) fn midnight_after(dt: NaiveDateTime) -> NaiveDateTime {
 ///
 /// - **運行の中** (デジタコの `区間時間` 列): 端点をそれぞれ分に切り捨てた差。
 ///   連続するイベントは端点が telescoping するので、区分の端だけ見れば紙の合算と
-///   同じ値になる
+///   同じ値になる。運行の中かどうかは [`in_run_at`] — 月をまたいで続く運行は
+///   当月に頭が無いので、後ろの境界から遡って決める
 /// - **運行の外** (打刻 ↔ 運行境界の対 = TC_DC): 経過秒の切り捨て
 /// - **日跨ぎ**は深夜 0 時で割る。前半は経過秒切り捨て — 運行の中では「0 時を
 ///   跨いでいるイベント」の開始からの経過なので、そのイベントの開始秒で決まる。
@@ -1436,14 +1437,34 @@ fn paper_minutes_by_date(
     bounds.dedup();
     bounds.push(end);
     for w in bounds.windows(2) {
-        // 区分の頭までに最後に見えた運行境界が「開始」なら運行の中
-        let in_run = events
+        add_paper_segment(out, w[0], w[1], in_run_at(events, w[0]), events);
+    }
+}
+
+/// 時刻 `at` が運行の中か。
+///
+/// 素直には「直前に見えた運行境界が `運行開始` なら中」だが、**運行が月をまたいで
+/// 続いている**とき当月データに頭が無く、境界が 1 つも見つからない (実測: 乗務員 1041
+/// の 2026-03、2/28 に始まった運行が 03-07 00:02 の `運行終了` まで続く)。それを
+/// 「運行の外」に倒すと丸めが経過床へ入れ替わり、紙 (端点床) と系統的にずれる —
+/// 03-01〜03-06 の全日で 1 区分あたり 1 分ずつ足りなくなっていた (Refs #182)。
+///
+/// 頭が見えないときは**後ろに最初に来る境界**で決める: それが `運行終了` なら、
+/// その手前は運行の中。`運行開始` なら外 (打刻だけの日)。
+fn in_run_at(events: &[Event], at: NaiveDateTime) -> bool {
+    let is_bound = |e: &&Event| e.state == "運行開始" || e.state == "運行終了";
+    match events
+        .iter()
+        .filter(is_bound)
+        .filter(|e| e.start <= at)
+        .max_by_key(|e| e.start)
+    {
+        Some(e) => e.state == "運行開始",
+        None => events
             .iter()
-            .filter(|e| e.state == "運行開始" || e.state == "運行終了")
-            .filter(|e| e.start <= w[0])
-            .max_by_key(|e| e.start)
-            .is_some_and(|e| e.state == "運行開始");
-        add_paper_segment(out, w[0], w[1], in_run, events);
+            .filter(is_bound)
+            .min_by_key(|e| e.start)
+            .is_some_and(|e| e.state == "運行終了"),
     }
 }
 
@@ -2911,6 +2932,38 @@ mod tests {
             ..KosokuParams::default()
         };
         assert_eq!(daily_summary(&rows, "2026-06", &p)[0].restraint_minutes, 160);
+    }
+
+    #[test]
+    fn a_run_carried_over_from_the_previous_month_is_still_inside_the_run() {
+        // 運行が月をまたいで続くと当月に `運行開始` が無く、最初の境界が `運行終了`
+        // になる (実測: 乗務員 1041 の 2026-03、2/28 に始まった運行が 03-07 まで続く)。
+        // 頭が見えないからと「運行の外」に倒すと丸めが経過床へ落ち、紙 (端点床) より
+        // 1 分小さくなっていた — 03:24:03 → 23:24:01 は端点床で 1200、経過床で 1199
+        let rows = vec![
+            ev("2026-06-02 00:00:00", "2026-06-02 03:24:03", "休息"),
+            ev("2026-06-02 03:24:03", "2026-06-02 23:24:01", "運転"),
+            ev("2026-06-02 23:24:01", "2026-06-03 06:00:00", "休息"),
+            ev("2026-06-03 06:00:00", "2026-06-03 06:30:00", "運転"),
+            dtako("2026-06-03 06:30:00", "運行終了"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 1200);
+    }
+
+    #[test]
+    fn a_month_whose_first_boundary_is_a_run_start_stays_outside_the_run() {
+        // 鏡像: 最初の境界が `運行開始` なら、その手前は運行の外 (打刻だけの日) の
+        // まま — 経過床で 1199 になる
+        let rows = vec![
+            ev("2026-06-02 00:00:00", "2026-06-02 03:24:03", "休息"),
+            ev("2026-06-02 03:24:03", "2026-06-02 23:24:01", "運転"),
+            ev("2026-06-02 23:24:01", "2026-06-03 06:00:00", "休息"),
+            dtako("2026-06-03 06:00:00", "運行開始"),
+            ev("2026-06-03 06:00:00", "2026-06-03 06:30:00", "運転"),
+        ];
+        let d = &daily_summary(&rows, "2026-06", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 1199);
     }
 
     #[test]
