@@ -246,6 +246,8 @@ pub struct DayPart {
     pub run_gap_minutes: i64,
     /// この暦日に乗った**日跨ぎ終業の尻尾** ([`DaySummary::punch_tail_minutes`])。
     pub punch_tail_minutes: i64,
+    /// この暦日に乗った**日跨ぎ始業の頭** ([`DaySummary::punch_head_minutes`])。
+    pub punch_head_minutes: i64,
 }
 
 impl DayPart {
@@ -262,6 +264,7 @@ impl DayPart {
             ferry_minus_minutes: 0,
             run_gap_minutes: 0,
             punch_tail_minutes: 0,
+            punch_head_minutes: 0,
         }
     }
 }
@@ -361,6 +364,16 @@ pub struct DaySummary {
     /// 同日の終業なら紙も TC_DC で数えるので対象外 — 打刻が暦日を跨ぐときだけ。
     /// 休息と重なる分は除く。拘束は変えない (説明用の実額)。
     pub punch_tail_minutes: i64,
+    /// **日跨ぎ始業の頭** — 始業打刻 → 最初のデジタコイベント (分)
+    /// ([`punch_tail_minutes`](Self::punch_tail_minutes) の鏡像、
+    /// Refs ohishi-exp/nuxt-dtako-admin#501)。
+    ///
+    /// 対の無い始業は次の休息まで伸びる (#137) が、最初のデジタコイベントが
+    /// **後の暦日**にあると、紙 (暦日ごとに最初→最後のイベント) は打刻の日を
+    /// 数えない。実測 (1108 福留 03-05): 始業 03-05 07:41 → 運行開始 03-06 08:36
+    /// の 1495 分 (03-05 に 979 / 03-06 に 516) がそのまま紙との差になっていた。
+    /// 同日に最初のイベントがあれば紙も TC_DC で数えるので対象外。
+    pub punch_head_minutes: i64,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -601,13 +614,38 @@ fn shifts_from_rest(events: &[Event]) -> Vec<Shift> {
         let next_rest = rests.get(i + 1).map(|n| n.0);
         let punch = next_punch_out(events, r.1);
         // 次の休息と終業打刻の**早い方**で閉じる
-        let end = match (next_rest, punch) {
+        let mut end = match (next_rest, punch) {
             (Some(rest), Some(punch)) => rest.min(punch),
             (Some(rest), None) => rest,
             (None, Some(punch)) => punch,
             (None, None) => continue,
         };
-        if end > r.1 {
+        // **次の始業打刻でも閉じる** (Refs ohishi-exp/nuxt-dtako-admin#501) —
+        // そこから先は打刻由来の勤務の領分。閉じないと [`merge_shifts`] が勤務
+        // 丸ごと (重なっていない前半も) 捨てる。実測 (1108 福留 / 2026-03):
+        // 休息明け 03-14 06:44 の勤務が次の休息 03-17 16:12 まで伸び、03-17 の
+        // 始業 07:22 由来の勤務と重なって全部消えた — 03-14 の運行 (紙 370) ごと。
+        //
+        // ただし**運行イベントを含む場合だけ残す** — 通常の朝 (休息明けの数分後に
+        // 始業を打刻する) では「休息の終わり → 始業」の数分の欠片ができてしまう。
+        // 従来この欠片は重なりで捨てられていた。運行が無ければ従来どおり捨てる
+        let mut keep = true;
+        if let Some(pin) = next_punch_in(events, r.1) {
+            if pin < end {
+                let probe = Shift {
+                    start: r.1,
+                    end: pin,
+                    source: ShiftSource::Rest,
+                };
+                if has_operation(events, &probe) {
+                    end = pin;
+                } else {
+                    // 捨てるのはこの勤務だけ — 後段の「打刻の無い運行」拾いは生かす
+                    keep = false;
+                }
+            }
+        }
+        if keep && end > r.1 {
             out.push(Shift {
                 start: r.1,
                 end,
@@ -1001,6 +1039,26 @@ fn punch_tail_span(events: &[Event], shift: &Shift) -> Option<(NaiveDateTime, Na
     (closing_punch.date() > last_ev.date()).then_some((last_ev, shift.end))
 }
 
+/// **日跨ぎ始業の頭** — 勤務の始まりから最初のデジタコイベントまで
+/// ([`DaySummary::punch_head_minutes`]、[`punch_tail_span`] の鏡像)。
+///
+/// 対象は「勤務を開いた始業打刻が、最初のデジタコイベントより**前の暦日**にある」
+/// 勤務だけ。同日ならその隙間は紙も TC_DC で数える。
+fn punch_head_span(events: &[Event], shift: &Shift) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let first_ev = events
+        .iter()
+        .filter(|e| e.source != "timecard")
+        .map(|e| floor_min(e.start))
+        .filter(|t| *t > shift.start && *t < shift.end)
+        .min()?;
+    let opening_punch = events
+        .iter()
+        .filter(|e| e.source == "timecard" && e.state == "始業")
+        .map(|e| e.start)
+        .find(|t| floor_min(*t) == shift.start)?;
+    (opening_punch.date() < first_ev.date()).then_some((shift.start, first_ev))
+}
+
 /// 2 つの区間が重なるか。
 fn overlaps(a: (NaiveDateTime, NaiveDateTime), b: (NaiveDateTime, NaiveDateTime)) -> bool {
     a.0 < b.1 && b.0 < a.1
@@ -1237,6 +1295,17 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
             .collect::<Vec<_>>(),
         &rests,
     );
+    // 日跨ぎ始業の頭 (尻尾の鏡像)
+    let punch_heads = subtract_intervals(
+        &punch_head_span(events, shift)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        &rests,
+    );
+    let punch_head_minutes: i64 = punch_heads
+        .iter()
+        .map(|(s, e)| (*e - *s).num_minutes())
+        .sum();
     let punch_tail_minutes: i64 = punch_tails
         .iter()
         .map(|(s, e)| (*e - *s).num_minutes())
@@ -1318,6 +1387,14 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
                 .punch_tail_minutes += minutes;
         }
     }
+    for (s, e) in &punch_heads {
+        for (date, minutes) in split_by_date(*s, *e) {
+            parts
+                .entry(date)
+                .or_insert_with(|| DayPart::new(date))
+                .punch_head_minutes += minutes;
+        }
+    }
 
     DaySummary {
         // フェリー控除は勤務の計算に混ぜない。日別サマリを組み終えてから
@@ -1325,6 +1402,7 @@ fn summarize(shift: &Shift, events: &[Event], p: &KosokuParams) -> DaySummary {
         ferry_minus_minutes: 0,
         run_gap_minutes,
         punch_tail_minutes,
+        punch_head_minutes,
         date: shift.start.format("%Y-%m-%d").to_string(),
         start: shift.start.format(FMT).to_string(),
         end: shift.end.format(FMT).to_string(),
@@ -3350,6 +3428,79 @@ mod tests {
         ];
         let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
         assert_eq!(days[0].punch_tail_minutes, 0);
+    }
+
+    #[test]
+    fn punch_head_counts_when_the_first_event_is_on_a_later_day() {
+        // 乗務員 1108 福留 / 2026-03-05 の形 (Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // 始業 03-05 07:41 の対が無く、当日はデジタコイベントも無い。紙は 03-05 を
+        // 数えず 03-06 も運行開始 08:36 から — 頭 1495 分がそのまま差になっていた
+        let rows = vec![
+            tc("2026-06-05 07:41:00", "始業"),
+            dtako("2026-06-06 08:36:00", "運行開始"),
+            ev("2026-06-06 13:54:00", "2026-06-07 04:54:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        let d = days.iter().find(|d| d.date == "2026-06-05").unwrap();
+        assert_eq!(d.punch_head_minutes, 979 + 516); // 07:41→翌 08:36
+        let by_date: Vec<_> = d
+            .parts
+            .iter()
+            .map(|p| (p.date.as_str(), p.punch_head_minutes))
+            .collect();
+        assert_eq!(by_date, vec![("2026-06-05", 979), ("2026-06-06", 516)]);
+    }
+
+    #[test]
+    fn punch_head_is_zero_when_the_first_event_is_same_day() {
+        // 同日に最初のイベントがあれば紙も TC_DC で数える — 頭ではない
+        let rows = vec![
+            tc("2026-06-05 06:11:00", "始業"),
+            dtako("2026-06-05 06:49:00", "運行開始"),
+            ev("2026-06-05 16:00:00", "2026-06-06 04:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days[0].punch_head_minutes, 0);
+    }
+
+    #[test]
+    fn a_rest_shift_closes_at_the_next_punch_in_when_it_has_operations() {
+        // 乗務員 1108 福留 / 2026-03-14 の形。休息明け 03-14 06:44 の勤務が次の
+        // 休息 03-17 16:12 まで伸び、03-17 の始業 07:22 由来の勤務と重なって
+        // merge_shifts に丸ごと捨てられていた — 03-14 の運行 (紙 370) ごと。
+        // 始業打刻で閉じれば、run-gap 分割で 03-14 の運行と 03-17 の
+        // 運行開始→始業の 38 分が残る
+        let rows = vec![
+            ev("2026-06-13 10:42:00", "2026-06-14 06:44:00", "休息"),
+            dtako("2026-06-14 12:54:00", "運行終了"),
+            dtako("2026-06-17 06:44:00", "運行開始"),
+            tc("2026-06-17 07:22:00", "始業"),
+            ev("2026-06-17 16:12:00", "2026-06-18 03:24:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(
+            days.iter()
+                .map(|d| (d.start.as_str(), d.end.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-06-14 06:44:00", "2026-06-14 12:54:00"),
+                ("2026-06-17 06:44:00", "2026-06-17 07:22:00"),
+                ("2026-06-17 07:22:00", "2026-06-17 16:12:00"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_rest_shift_without_operations_before_the_punch_in_is_dropped() {
+        // 通常の朝: 休息明けの数分後に始業を打刻する。運行の無い欠片は作らない
+        let rows = vec![
+            ev("2026-06-13 20:00:00", "2026-06-14 06:00:00", "休息"),
+            tc("2026-06-14 06:05:00", "始業"),
+            tc("2026-06-14 15:00:00", "終業"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-06-14 06:05:00");
     }
 
     #[test]
