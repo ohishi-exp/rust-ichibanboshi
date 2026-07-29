@@ -1145,6 +1145,34 @@ async fn compare_view_carries_the_paper_outside_map() {
 }
 
 #[tokio::test]
+async fn compare_view_carries_the_ours_outside_map() {
+    // アイドリングしか無い休息明け勤務 (1442 の形、Refs #182) — こちらだけが数える
+    // 時間を `ours_outside_by_date` として載せる。単一乗務員と全乗務員の両経路で
+    let with_driver = |mut v: serde_json::Value| {
+        v["driver_id"] = json!(1442);
+        v
+    };
+    let rows = vec![
+        with_driver(ev("2026-06-01 20:00:00", "2026-06-02 06:00:00", "休息")),
+        with_driver(ev("2026-06-02 06:00:00", "2026-06-02 16:30:00", "アイドリング")),
+        with_driver(dtako("2026-06-02 17:00:00", "運行開始", "u1")),
+        with_driver(ev("2026-06-02 17:00:00", "2026-06-02 17:30:00", "運転")),
+        with_driver(tc("2026-06-02 18:00:00", "始業")),
+        with_driver(tc("2026-06-02 23:00:00", "終業")),
+    ];
+    let (status, body) = serve(
+        rows.clone(),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1442&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ours_outside_by_date"]["2026-06-02"], 690);
+    let (status, body) = serve(rows, "/api/kintai/kosoku-daily?month=2026-06&view=compare").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drivers"][0]["ours_outside_by_date"]["2026-06-02"], 690);
+}
+
+#[tokio::test]
 async fn paper_drift_counts_duplicate_rows_the_way_the_paper_does() {
     // 取り込み 2 回で全列同一の行が入ると**紙は二重計上する** (実測 1339 渡邊
     // 2026-04-04)。再現は重複除去の**前**の行で計算しないと drift が 0 になり
