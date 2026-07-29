@@ -47,6 +47,10 @@ flate2 = "1"
 sha2 = "0.10"
 mysql_async = { version = "0.37.0", default-features = false, features = ["minimal-rust"] }
 
+[build-dependencies]
+# build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ、Refs #191)
+sha2 = "0.10"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 

@@ -49,11 +49,14 @@ pub async fn version(
         ));
     }
     let markers = repo.fetch_markers(&month).await.map_err(map_repo_err)?;
-    // BUILD_SHA: デプロイ (= 計算ロジックの変化) で etag を変える。
+    // KINTAI_OUTPUT_SHA: 応答を形づくるコード (kosoku* / kintai* / routes/kintai*) の
+    //   内容ハッシュ。**リポジトリ全体の BUILD_SHA ではない** — 全体を畳むと ETC・日報など
+    //   kintai と無関係なデプロイでも relay の上流キャッシュが全月無効になる (Refs #191)。
+    //   対象の決め方と「取りこぼしたら古い値」の警戒点は build.rs 参照
     // KosokuParams: 再ビルド無しの TOML 変更 (丸め方・閾値) でも応答が変わるため畳む
     let etag = fold_etag(
         &month,
-        env!("BUILD_SHA"),
+        env!("KINTAI_OUTPUT_SHA"),
         &format!("{:?}", *params_cfg),
         &markers,
     );
