@@ -815,6 +815,59 @@ async fn compare_view_keeps_ferry_on_parts_of_an_overnight_shift() {
 }
 
 #[tokio::test]
+async fn compare_view_carries_the_ferry_map_even_when_no_shift_covers_the_day() {
+    // 1026 一瀬 2026-05-01 の形 (Refs nuxt-dtako-admin#501): 前月に始業した勤務だけが
+    // 覆う日のフェリー控除は、当月応答のどの勤務にも貼れずに落ちる。日別マップを
+    // そのまま載せ、突合はマップを優先して読む
+    let rows = vec![
+        tc("2026-06-10 06:00:00", "始業"),
+        tc("2026-06-10 15:00:00", "終業"),
+    ];
+    let ferry = vec![json!({
+        // 勤務の無い 06-05 のフェリー (前月始業の勤務が覆う想定)
+        "start_datetime": "2026-06-05 09:40:41",
+        "end_datetime": "2026-06-05 10:56:51",
+        "driver_id": 1026,
+    })];
+    let (status, body) = call(
+        app(MockRepo::with_ferry(rows, ferry)),
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1026&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    // 勤務には貼れない (06-05 の日別行が無い) が、マップには居る
+    assert!(body["days"][0].get("ferry_minus_minutes").is_none());
+    assert_eq!(body["ferry_minus_by_date"]["2026-06-05"], 76);
+}
+
+#[tokio::test]
+async fn compare_view_carries_the_ferry_map_for_all_drivers_too() {
+    let with_driver = |dt: &str, st: &str| {
+        let mut v = tc(dt, st);
+        v["driver_id"] = json!(1026);
+        v
+    };
+    let rows = vec![
+        with_driver("2026-06-10 06:00:00", "始業"),
+        with_driver("2026-06-10 15:00:00", "終業"),
+    ];
+    let ferry = vec![json!({
+        "start_datetime": "2026-06-05 09:40:41",
+        "end_datetime": "2026-06-05 10:56:51",
+        "driver_id": 1026,
+    })];
+    let (status, body) = call(
+        app(MockRepo::with_ferry(rows, ferry)),
+        "/api/kintai/kosoku-daily?month=2026-06&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["drivers"][0]["ferry_minus_by_date"]["2026-06-05"], 76);
+}
+
+#[tokio::test]
 async fn compare_view_keeps_a_non_zero_punch_tail() {
     // 日跨ぎ終業の尻尾 (Refs #501、1708 松江 03-13 の形)。0 の日には載せない。
     // 尻尾が 0 時を跨げば内訳 (parts) にも配られる
