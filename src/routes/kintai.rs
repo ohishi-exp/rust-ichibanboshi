@@ -40,7 +40,8 @@ use crate::kosoku::{
     split_by_driver, split_ferry_by_driver, DayPart, DaySummary, KosokuParams, ShiftSource,
 };
 use crate::kosoku_paper::{
-    ours_outside_by_date, paper_daily_minutes, paper_drift_by_date, paper_outside_by_date,
+    minus_unko_by_date, ours_outside_by_date, paper_daily_minutes, paper_drift_by_date,
+    paper_outside_by_date,
 };
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
@@ -591,6 +592,8 @@ pub async fn kosoku_daily(
     let outside = (view == ResponseView::Compare).then(|| paper_outside_by_date(&rows, &month));
     // こちらだけが数える時間 (cause `ours-outside` の実額、鏡像)
     let ours_only = (view == ResponseView::Compare).then(|| ours_outside_by_date(&rows, &month));
+    // 紙が引く 運行開始 → 始業 (cause `minus-unko` の実額、Refs #546)
+    let minus_unko = (view == ResponseView::Compare).then(|| minus_unko_by_date(&rows, &month));
     // 取り込みが 2 回走ると全列同一の行が入る。**紙は二重計上する**ので件数を返す
     let (rows, duplicate_rows) = drop_duplicate_rows(rows);
     let mut days = daily_summary(&rows, &month, &params_cfg);
@@ -648,6 +651,11 @@ pub async fn kosoku_daily(
             if !ours_only.is_empty() {
                 o["ours_outside_by_date"] = serde_json::json!(ours_only);
             }
+            // 紙が引く 運行開始 → 始業 — 突合が cause `minus-unko` に使う
+            let minus_unko = minus_unko.unwrap_or_default();
+            if !minus_unko.is_empty() {
+                o["minus_unko_by_date"] = serde_json::json!(minus_unko);
+            }
             Ok(Json(o))
         }
         // 画面は月全打刻 (`punches`) も `duplicate_rows` 診断も読まない (Refs #164)
@@ -704,6 +712,10 @@ async fn kosoku_daily_all(
             let ours_only = (view == ResponseView::Compare)
                 .then(|| ours_outside_by_date(&rows, month))
                 .unwrap_or_default();
+            // 紙が引く 運行開始 → 始業 (cause `minus-unko` の実額、Refs #546)
+            let minus_unko = (view == ResponseView::Compare)
+                .then(|| minus_unko_by_date(&rows, month))
+                .unwrap_or_default();
             // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
             let (rows, duplicate_rows) = drop_duplicate_rows(rows);
             let mut days = daily_summary(&rows, month, params_cfg);
@@ -729,11 +741,22 @@ async fn kosoku_daily_all(
                 ferry_map,
                 outside,
                 ours_only,
+                minus_unko,
             )
         })
-        .filter(|(_, days, punches, _, _, _, _, _)| !days.is_empty() || !punches.is_empty())
+        .filter(|(_, days, punches, _, _, _, _, _, _)| !days.is_empty() || !punches.is_empty())
         .map(
-            |(driver, days, punches, duplicate_rows, drift, ferry_map, outside, ours_only)| {
+            |(
+                driver,
+                days,
+                punches,
+                duplicate_rows,
+                drift,
+                ferry_map,
+                outside,
+                ours_only,
+                minus_unko,
+            )| {
                 // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
                 // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
                 // `duplicate_rows` 診断も画面は読まない
@@ -761,6 +784,9 @@ async fn kosoku_daily_all(
                 }
                 if view == ResponseView::Compare && !ours_only.is_empty() {
                     o["ours_outside_by_date"] = serde_json::json!(ours_only);
+                }
+                if view == ResponseView::Compare && !minus_unko.is_empty() {
+                    o["minus_unko_by_date"] = serde_json::json!(minus_unko);
                 }
                 o
             },
