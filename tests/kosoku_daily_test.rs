@@ -1062,6 +1062,31 @@ async fn compare_view_carries_the_paper_drift() {
 }
 
 #[tokio::test]
+async fn paper_drift_counts_duplicate_rows_the_way_the_paper_does() {
+    // 取り込み 2 回で全列同一の行が入ると**紙は二重計上する** (実測 1339 渡邊
+    // 2026-04-04)。再現は重複除去の**前**の行で計算しないと drift が 0 になり
+    // 差が unknown に残る。こちらの拘束は除去後 (540) のまま
+    let rows = vec![
+        tc("2026-06-02 06:00:00", "始業"),
+        ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休憩"),
+        ev("2026-06-02 12:00:00", "2026-06-02 13:00:00", "休憩"),
+        tc("2026-06-02 15:00:00", "終業"),
+    ];
+    let (status, body) = serve(
+        rows,
+        "/api/kintai/kosoku-daily?month=2026-06&driver=1339&view=compare",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["days"][0]["restraint_minutes"], 540);
+    // 紙 = TC_DC 540 − 昼休 60 + デジタコ 60×2 (重複) = 600 → drift 540 − 600 = -60。
+    // 除去後の行で計算すると -0 になってしまう
+    assert_eq!(body["paper_drift_by_date"]["2026-06-02"], -60);
+    // 重複そのものの診断は従来どおり出る
+    assert_eq!(body["duplicate_rows"]["2026-06-02"], 1);
+}
+
+#[tokio::test]
 async fn full_view_does_not_carry_the_paper_drift() {
     // 突合しか使わないので compare 以外には載せない (#157 の絞りと同じ方針)
     let (_, body) = serve(

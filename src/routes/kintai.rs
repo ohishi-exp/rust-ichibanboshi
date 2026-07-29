@@ -564,6 +564,13 @@ pub async fn kosoku_daily(
         .fetch_events(&month, driver)
         .await
         .map_err(map_repo_err)?;
+    let view = parse_view(params.view.as_deref());
+    // 紙の再現は**重複除去の前**の行で計算する — 紙は重複行を二重計上するので、
+    // 除去後の行では再現にならない (実測 1339 渡邊 2026-04-04: 二重登録の運行 11 分を
+    // 紙は数え、除去後の再現では drift 0 になって差が unknown に残った)。
+    // 単一乗務員経路の行は `運行NO` を持ち全列同一にならないことがあるため、
+    // ここで計算しないと全乗務員経路と値が割れる (Refs nuxt-dtako-admin#501)
+    let paper = (view == ResponseView::Compare).then(|| paper_daily_minutes(&rows, &month));
     // 取り込みが 2 回走ると全列同一の行が入る。**紙は二重計上する**ので件数を返す
     let (rows, duplicate_rows) = drop_duplicate_rows(rows);
     let mut days = daily_summary(&rows, &month, &params_cfg);
@@ -578,7 +585,7 @@ pub async fn kosoku_daily(
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = days.len();
     tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
-    match parse_view(params.view.as_deref()) {
+    match view {
         ResponseView::Compare => {
             // 突合は打刻を見ない
             let mut o = serde_json::json!({
@@ -592,7 +599,9 @@ pub async fn kosoku_daily(
             }
             // 紙の再現値との日別の差 (cause `rounding` の実額、Refs
             // ohishi-exp/nuxt-dtako-admin#501)。突合しか使わないので compare だけに載せる
-            let drift = paper_drift_by_date(&days, &paper_daily_minutes(&rows, &month));
+            let drift = paper
+                .map(|p| paper_drift_by_date(&days, &p))
+                .unwrap_or_default();
             if !drift.is_empty() {
                 o["paper_drift_by_date"] = serde_json::json!(drift);
             }
@@ -641,18 +650,19 @@ async fn kosoku_daily_all(
     let drivers: Vec<serde_json::Value> = split_by_driver(rows)
         .into_iter()
         .map(|(driver, rows)| {
+            // 紙の再現は**重複除去の前**の行で計算する (単一乗務員経路と同じ理由 —
+            // 紙は重複行を二重計上する)。突合経路だけで計算する
+            let paper = (view == ResponseView::Compare).then(|| paper_daily_minutes(&rows, month));
             // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
             let (rows, duplicate_rows) = drop_duplicate_rows(rows);
             let mut days = daily_summary(&rows, month, params_cfg);
             if let Some(ferry) = ferry_by_driver.get(&driver) {
                 apply_ferry_minus(&mut days, &ferry_minus_by_date(ferry));
             }
-            // 紙の再現値との日別の差 (cause `rounding` の実額)。突合経路だけで計算する
-            let drift = if view == ResponseView::Compare {
-                paper_drift_by_date(&days, &paper_daily_minutes(&rows, month))
-            } else {
-                Default::default()
-            };
+            // 紙の再現値との日別の差 (cause `rounding` の実額)
+            let drift = paper
+                .map(|p| paper_drift_by_date(&days, &p))
+                .unwrap_or_default();
             // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
             let punches = month_punches(&rows, month);
             (driver, days, punches, duplicate_rows, drift)
