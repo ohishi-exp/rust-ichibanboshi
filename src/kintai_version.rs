@@ -29,8 +29,15 @@
 //! **覆えないもの**: dailyJson の国民の祝日は外部 API
 //! (`holidays-jp.github.io`) で DB に無い — etag には畳めない (変化は年 1 回程度、
 //! 祝日は `holiday` 区分の表示にしか効かない)。計算ロジック側の変化は
-//! `BUILD_SHA` (デプロイごとに変わる) と `KosokuParams` (TOML 追随) を
-//! 畳んで覆う — route 側 (`routes/kintai_version.rs`) の担当。
+//! `KINTAI_OUTPUT_SHA` (応答を形づくるコードの内容ハッシュ、`build.rs`) と
+//! `KosokuParams` (TOML 追随) を畳んで覆う — route 側
+//! (`routes/kintai_version.rs`) の担当。
+//!
+//! **リポジトリ全体の `BUILD_SHA` は使わない** (Refs #191): 全体を畳むと ETC・日報など
+//! kintai と無関係なデプロイでも etag が動き、relay (nuxt-dtako-admin#543) の上流
+//! キャッシュが全月まとめて無効になって 1.7MB 級の取り直しが起きていた。データ側は
+//! 11 テーブルを範囲まで詰めて列挙しているのに、コード側だけ雑な代理指標だった、という
+//! 非対称が実害の正体。対象の決め方と「取りこぼしたら古い値」の警戒点は `build.rs` 参照。
 //!
 //! ## マーカーの形 — COUNT + CRC32 の SUM (updated_at に頼らない)
 //!
@@ -292,9 +299,9 @@ impl KintaiVersionApi for MariadbKintaiVersionRepo {
 ///
 /// - **マーカーの並び順に依存しない** — source 名で整列してから畳む。
 ///   `UNION ALL` の行順は保証されないため、順序を意味に含めない
-/// - `month` / `build` (BUILD_SHA) / `params` (`KosokuParams` の Debug 表現) も
-///   材料に入れる — テーブルが 1 行も変わらなくても、デプロイ (計算ロジック) や
-///   TOML (丸め方・閾値) が変われば応答は変わるため
+/// - `month` / `build` (`KINTAI_OUTPUT_SHA`) / `params` (`KosokuParams` の Debug 表現)
+///   も材料に入れる — テーブルが 1 行も変わらなくても、計算ロジックや TOML
+///   (丸め方・閾値) が変われば応答は変わるため
 /// - 返り値は HTTP の quoted ETag そのもの (`"…"` 込み)。JSON の `etag` と
 ///   `ETag` ヘッダに**同じ文字列**を使い、relay は文字列比較だけで済ませる
 pub fn fold_etag(month: &str, build: &str, params: &str, markers: &[SourceMarker]) -> String {
@@ -397,6 +404,21 @@ mod tests {
         assert!(VERSION_SQL.contains("COUNT(f.`開始日時`)"));
         assert!(!VERSION_SQL.contains("標準料金"));
         assert!(!VERSION_SQL.contains("契約料金"));
+    }
+
+    /// `build.rs` が焼き込む出力コード版が「取れている」ことを固定する (Refs #191)。
+    ///
+    /// 空文字や `unknown` に化けると **全デプロイで etag が同じ**になり、計算ロジックを
+    /// 変えても relay が古い本文を返し続ける (この仕組みで最悪の壊れ方)。build.rs 側は
+    /// 対象ファイルの欠落でビルドを落とすので、ここは「値が届いているか」を見る。
+    #[test]
+    fn kintai_output_sha_is_baked_in() {
+        let sha = env!("KINTAI_OUTPUT_SHA");
+        assert_eq!(sha.len(), 16, "KINTAI_OUTPUT_SHA={sha}");
+        assert!(
+            sha.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "KINTAI_OUTPUT_SHA={sha} (小文字 hex のはず)"
+        );
     }
 
     #[test]
