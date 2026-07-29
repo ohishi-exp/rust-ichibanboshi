@@ -1225,7 +1225,7 @@ fn breaks_in(
 }
 
 /// 時刻順に並べて重なりをまとめる (重複して引かないため)。
-fn merge_intervals(
+pub(crate) fn merge_intervals(
     mut v: Vec<(NaiveDateTime, NaiveDateTime)>,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     v.sort();
@@ -1913,28 +1913,71 @@ pub fn apply_ferry_minus(days: &mut [DaySummary], ferry: &BTreeMap<String, i64>)
     }
 }
 
+/// 分割後の勤務 (分に揃えた影)。覆い ([`shift_cover`]) と拘束区間
+/// ([`restraint_spans_and_diagnostics`]) の共通の土台。
+fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
+    merge_shifts(shifts_from_timecard(events), shifts_from_rest(events))
+        .iter()
+        .filter(|s| s.end > s.start)
+        // **分割後の勤務で見る** (Refs #182 フォローアップ)。[`split_long_shift`] は
+        // 8 時間以上の継ぎ目や帰宅後の尻尾を勤務から外す — 外れた領域は紙が数えても
+        // こちらの拘束には無い。分割前の勤務で覆うと、その領域が覆いに残って
+        // `paper_outside` が取り漏らす (実測 1674 / 2026-05-13: 日中の 11.5 時間の
+        // 空きを紙が 運行終了 → 運行開始 の対で数える 688 分が漏れていた)
+        .flat_map(|s| split_long_shift(s, events))
+        .map(|s| Shift {
+            start: floor_min(s.start),
+            end: floor_min(s.end),
+            source: s.source,
+        })
+        .filter(|s| s.end > s.start)
+        .collect()
+}
+
 /// 勤務が**覆っている**区間 (分に揃えた span、Refs #182 フォローアップ)。
 ///
 /// 紙が勤務の外で数えている分 ([`crate::kosoku_paper::paper_outside_by_date`]) を
 /// 測るときの「外」の定義に使う。**始業前の運行の頭 ([`run_head_span`]) も覆いに
 /// 足す** — あちらは cause `run-head` の領分で、外に残すと二重説明になる。
 pub(crate) fn shift_cover(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
-    let shifts = merge_shifts(shifts_from_timecard(events), shifts_from_rest(events));
     let mut cover: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
-    for s in &shifts {
-        let aligned = Shift {
-            start: floor_min(s.start),
-            end: floor_min(s.end),
-            source: s.source,
-        };
-        if aligned.end > aligned.start {
-            cover.push((aligned.start, aligned.end));
-        }
-        if let Some(span) = run_head_span(events, &aligned) {
+    for s in final_shifts_aligned(events) {
+        cover.push((s.start, s.end));
+        if let Some(span) = run_head_span(events, &s) {
             cover.push(span);
         }
     }
     merge_intervals(cover)
+}
+
+/// 分割後の勤務から**拘束として残る区間**と、突合の個別 cause が既に実額を持つ
+/// **診断区間** (運行の継ぎ目・日跨ぎの頭尻尾) を返す (Refs #182 フォローアップ)。
+///
+/// [`crate::kosoku_paper::ours_outside_by_date`] が「こちらだけが数える時間」を測る
+/// ときの土台。診断区間を別に返すのは、あちらを外に含めると cause `run-gap` /
+/// `punch-head` / `punch-tail` と二重説明になるため。
+pub(crate) fn restraint_spans_and_diagnostics(
+    events: &[Event],
+) -> (
+    Vec<(NaiveDateTime, NaiveDateTime)>,
+    Vec<(NaiveDateTime, NaiveDateTime)>,
+) {
+    let mut restraint_all: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+    let mut diags: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+    for s in final_shifts_aligned(events) {
+        let rests = rests_in(events, &s);
+        let restraint = subtract_intervals(&[(s.start, s.end)], &rests);
+        // 勤務を丸ごと覆う休息は外さない ([`summarize`] と同じ判断)
+        if restraint.is_empty() {
+            restraint_all.push((s.start, s.end));
+        } else {
+            restraint_all.extend(restraint);
+        }
+        diags.extend(run_gap_spans(events, &s));
+        diags.extend(punch_tail_span(events, &s));
+        diags.extend(punch_head_span(events, &s));
+    }
+    (merge_intervals(restraint_all), merge_intervals(diags))
 }
 
 /// 生イベント列 → 対象月の日別サマリ。
