@@ -237,7 +237,10 @@ impl MariadbKintaiVersionRepo {
             .tcp_port(cfg.port)
             .user(Some(cfg.user.clone()))
             .pass(Some(cfg.password.clone()))
-            .db_name(Some(cfg.database.clone()));
+            .db_name(Some(cfg.database.clone()))
+            // 60 秒超のステートメントを MariaDB 側で自動 abort (convoy 防止、
+            // kintai_repo.rs の MARIADB_SESSION_SETUP 参照)
+            .setup(vec![crate::kintai_repo::MARIADB_SESSION_SETUP.to_string()]);
         Self {
             pool: Pool::new(opts),
         }
