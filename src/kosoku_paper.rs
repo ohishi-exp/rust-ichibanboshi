@@ -34,7 +34,10 @@ use std::collections::BTreeMap;
 
 use chrono::{Duration, NaiveDateTime, Timelike};
 
-use crate::kosoku::{midnight_after, parse_events, DaySummary, Event, DIGI_STATES};
+use crate::kosoku::{
+    floor_min, midnight_after, parse_events, shift_cover, subtract_intervals, DaySummary, Event,
+    DIGI_STATES,
+};
 
 /// `date_diff()->h*60 + ->i` 相当: 経過秒を切り捨てた分。**日の成分は落とす** —
 /// 紙は「昨日の 0 時からの差」で終端の時刻を取り出すとき、意図的に日を無視している。
@@ -260,6 +263,78 @@ pub fn paper_drift_by_date(
             (o != *p).then_some((date, o - p))
         })
         .collect()
+}
+
+/// 紙が**勤務の外で**数えている分 (`YYYY-MM-DD → 分`、Refs #182 フォローアップ)。
+///
+/// 紙は打刻に縛られず、デジタコのイベントと隣接対を数え続ける。こちらの勤務が
+/// 覆っていない時間に紙の計上が残る形は 2 つ:
+///
+/// - **終業後もイベントが続く**: 状態の切り忘れ (実測 1069 前田 2026-01-05: 終業
+///   17:17 の後も夜通し続く 16 時間の「積み」。紙は深夜 0 時まで 403 分、翌朝も
+///   始業 07:36 まで 456 分を数える) や、終業打刻後の構内ミニ運行
+///   (1018 金原 2026-03-03: 18〜27 秒の運行 2 本 = digi 1 分)
+/// - **運行の継ぎ目が勤務の外にある**: 上の構内運行の間の 運行終了 → 運行開始
+///   (1018 の 5 分)。隣接判定は紙と同じ stream ([`tc_stream`]) — 間に打刻や休息の
+///   行が挟まれば紙も数えないので、こちらも数えない
+///
+/// 「外」は [`crate::kosoku::shift_cover`] (勤務 span + 始業前の運行の頭 — 頭は
+/// cause `run-head` の領分で、ここに混ぜると二重説明になる)。突合 (relay) が
+/// cause `paper-outside` の実額として使う (**紙が大きくなる向き**、`run-head` と同じ)。
+///
+/// 日跨ぎの外は暦日で切って各日へ足す。紙の深夜割り (経過床) との差は ±1 分で、
+/// 突合の許容誤差 (2 分) の中。
+pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMap<String, i64> {
+    let events = parse_events(rows);
+    let cover = shift_cover(&events);
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    let add_span = |out: &mut BTreeMap<String, i64>, s: NaiveDateTime, e: NaiveDateTime| {
+        let mut cur = s;
+        while cur < e {
+            let bound = midnight_after(cur).min(e);
+            *out.entry(cur.format("%Y-%m-%d").to_string()).or_default() +=
+                (bound - cur).num_seconds() / 60;
+            cur = bound;
+        }
+    };
+    // デジタコ type: DIGI イベントのうち勤務が覆っていない部分 (端点床)
+    for e in &events {
+        if e.source != "dtako_events" || !DIGI_STATES.contains(&e.state.as_str()) {
+            continue;
+        }
+        let Some(end) = e.end else { continue };
+        let span = (floor_min(e.start), floor_min(end));
+        if span.1 <= span.0 {
+            continue;
+        }
+        for (s, x) in subtract_intervals(&[span], &cover) {
+            add_span(&mut out, s, x);
+        }
+    }
+    // TC_DC type: 隣接する 運行終了 → 運行開始 の対 (窓 d < 1 && h < 12) の勤務外の部分
+    let stream = tc_stream(&events, month);
+    for w in stream.windows(2) {
+        let (t, nt) = (&w[0], &w[1]);
+        if t.st != "運行終了" || nt.st != "運行開始" || nt.at <= t.at {
+            continue;
+        }
+        let (d, h) = interval_d_h(t.at, nt.at);
+        if !(d < 1 && h < 12) {
+            continue;
+        }
+        let span = (floor_min(t.at), floor_min(nt.at));
+        if span.1 <= span.0 {
+            continue;
+        }
+        for (s, x) in subtract_intervals(&[span], &cover) {
+            add_span(&mut out, s, x);
+        }
+    }
+    // 0 分の日はできない — span は分に揃えてから引くので、残った部分は必ず 1 分以上。
+    // 行データの端 (翌月頭の margin) は勤務が組めず全部が「外」に見えるので、
+    // 対象月の日だけ返す
+    out.retain(|date, _| date.starts_with(month));
+    out
 }
 
 #[cfg(test)]
@@ -552,6 +627,75 @@ mod tests {
             dtako("2026-03-04 09:36:06", "運行開始"),
         ];
         assert!(paper_daily_minutes(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn paper_outside_counts_events_and_gaps_after_the_closing_punch() {
+        // 1018 金原 2026-03-03 の形: 終業打刻の後の構内ミニ運行 (Refs #182)。
+        // digi 1 分 + 運行の継ぎ目 5 分。最初の 運行終了 → 運行開始 は間に終業打刻が
+        // 挟まるので紙も対にしない (数えない)
+        let rows = vec![
+            tc("2026-03-03 09:23:49", "始業"),
+            dtako("2026-03-03 09:39:52", "運行開始"),
+            ev("2026-03-03 09:39:52", "2026-03-03 20:06:44", "運転"),
+            dtako("2026-03-03 20:06:44", "運行終了"),
+            tc("2026-03-03 20:25:27", "終業"),
+            dtako("2026-03-03 20:36:57", "運行開始"),
+            ev("2026-03-03 20:36:57", "2026-03-03 20:37:15", "運転"),
+            dtako("2026-03-03 20:37:15", "運行終了"),
+            dtako("2026-03-03 20:42:29", "運行開始"),
+            ev("2026-03-03 20:42:29", "2026-03-03 20:42:56", "一般道空車"),
+            dtako("2026-03-03 20:42:56", "運行終了"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        assert_eq!(outside.get("2026-03-03"), Some(&6));
+        assert_eq!(outside.len(), 1);
+    }
+
+    #[test]
+    fn paper_outside_splits_an_overnight_event_at_midnight() {
+        // 1069 前田 2026-01-05 の形: 終業の後も夜通し続く「積み」(状態の切り忘れ)。
+        // 紙は 0 時まで前日に、0 時から翌朝の始業までを翌日に数える (Refs #182)
+        let rows = vec![
+            tc("2026-03-04 07:31:00", "始業"),
+            ev("2026-03-04 16:05:20", "2026-03-05 08:07:09", "積み"),
+            tc("2026-03-04 17:17:34", "終業"),
+            tc("2026-03-05 07:36:09", "始業"),
+            tc("2026-03-05 10:06:03", "終業"),
+        ];
+        let outside = paper_outside_by_date(&rows, "2026-03");
+        // 17:17 → 24:00 の 403 分と、0:00 → 始業 07:36 の 456 分
+        assert_eq!(outside.get("2026-03-04"), Some(&403));
+        assert_eq!(outside.get("2026-03-05"), Some(&456));
+    }
+
+    #[test]
+    fn paper_outside_excludes_the_run_head_before_the_punch_in() {
+        // 始業前の運行の頭は cause `run-head` の領分 — 外に数えると二重説明になる。
+        // 翌月頭の margin 行 (勤務が組めず全部が外に見える) も対象月ではないので返さない
+        let rows = vec![
+            dtako("2026-03-04 07:09:00", "運行開始"),
+            ev("2026-03-04 07:09:00", "2026-03-04 08:00:00", "運転"),
+            tc("2026-03-04 07:29:00", "始業"),
+            tc("2026-03-04 17:00:00", "終業"),
+            ev("2026-04-01 09:00:00", "2026-04-01 10:00:00", "運転"),
+        ];
+        assert!(paper_outside_by_date(&rows, "2026-03").is_empty());
+    }
+
+    #[test]
+    fn paper_outside_skips_sub_minute_spans_and_wide_gaps() {
+        // 端点床で 0 分になる区間・対と、窓 (d < 1 && h < 12) の外の継ぎ目は数えない
+        let rows = vec![
+            tc("2026-03-04 08:00:00", "始業"),
+            tc("2026-03-04 12:00:00", "終業"),
+            ev("2026-03-04 20:36:10", "2026-03-04 20:36:50", "運転"),
+            dtako("2026-03-04 20:40:10", "運行終了"),
+            dtako("2026-03-04 20:40:50", "運行開始"),
+            dtako("2026-03-05 06:00:00", "運行終了"),
+            dtako("2026-03-05 19:00:00", "運行開始"),
+        ];
+        assert!(paper_outside_by_date(&rows, "2026-03").is_empty());
     }
 
     #[test]
