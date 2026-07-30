@@ -223,6 +223,117 @@ impl MariadbConfig {
     }
 }
 
+/// 勤怠の生イベントをどこから読むか (Refs #205 実装計画 02)。
+///
+/// オンプレ (`ohishi-data`) は社内 MariaDB を直読みできるが、GCP (Cloud Run) からは
+/// 到達できない。そこで**読み先を宣言で切り替える** — `source = "http"` にすると
+/// `rust-alc-api` の `GET /api/dtako/events` (ippoan/rust-alc-api#578) から生 CSV 行を
+/// 取り、`kintai_repo` の戻り値の形に写す ([`crate::kintai_http_repo`])。
+///
+/// **既定は `mariadb`** なのでオンプレの挙動は 1 バイトも変わらない。MariaDB 実装は
+/// 撤去せず残す — 上流に口が無い読み出し (打刻 / フェリー) の委譲先になり、
+/// HTTP 経路の出力を MariaDB と突き合わせて検証する足場でもある (#205 の G6)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct KintaiEventsConfig {
+    /// 読み先の宣言。`"mariadb"` (既定) / `"http"`。
+    #[serde(default)]
+    pub source: KintaiEventsSource,
+
+    /// `rust-alc-api` の origin (例 `https://rust-alc-api-xxxx.asia-northeast1.run.app`)。
+    /// 末尾の `/` は付けても付けなくてもよい。`source = "http"` では必須。
+    #[serde(default)]
+    pub base_url: String,
+
+    /// 上流に渡す `X-Tenant-ID` (一番星のテナント UUID)。`source = "http"` では必須。
+    ///
+    /// 上流の tenant 経路は「前段が検証済み identity をヘッダーで注入する」前提の
+    /// dumb backend (`alc-core` の `require_tenant_header`) なので、直叩きする
+    /// こちらがテナントを名乗る。網層のロックダウンは Cloud Run IAM が担う。
+    #[serde(default)]
+    pub tenant_id: String,
+
+    /// HTTP request timeout (秒)。全乗務員 1 か月は R2 GET 約 1,100 回を上流が
+    /// 並列で回すため、CakePHP 中継 (30 秒) より長めの既定にしてある。
+    #[serde(default = "default_kintai_events_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// 静的な Bearer token。**取得方法をコードに焼かないための 2 経路のうち片方**で、
+    /// device JWT へ差し替える 07 の受け皿でもある (#205 実装計画 07)。
+    #[serde(default)]
+    pub auth_token: String,
+
+    /// token を吐くコマンド (例 `gcloud auth print-identity-token`)。当面の Google
+    /// 認証はこちら。**シェルは経由しない** — 空白で argv に分割して直接 exec する
+    /// ので、パイプ・リダイレクト・クォートは使えない (使えたら設定が注入経路になる)。
+    #[serde(default)]
+    pub auth_token_command: String,
+
+    /// `auth_token_command` の結果をキャッシュする秒数。Google の identity token は
+    /// 1 時間有効なので、既定 900 秒なら毎リクエストで `gcloud` を起こさずに済む。
+    #[serde(default = "default_kintai_events_token_ttl_secs")]
+    pub auth_token_ttl_secs: u64,
+}
+
+/// [`KintaiEventsConfig::source`] の TOML / env 表現。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KintaiEventsSource {
+    /// 社内 MariaDB 直読み (既定 = オンプレの形、Refs #116)。
+    #[default]
+    Mariadb,
+    /// `rust-alc-api` の `GET /api/dtako/events` 経由 (GCP の形、Refs #205 の 02)。
+    Http,
+}
+
+impl KintaiEventsConfig {
+    /// HTTP 読み先を使うと宣言したか。
+    pub fn http_enabled(&self) -> bool {
+        self.source == KintaiEventsSource::Http
+    }
+
+    /// 宣言の整合性検査。**足りない設定を黙って既定へ落とさず起動を失敗させる**
+    /// (`[database] enabled` と同じ方針 — 「起動はしているが実は読めていない」を作らない)。
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.http_enabled() {
+            return Ok(());
+        }
+        if self.base_url.trim().is_empty() {
+            return Err("[kintai_events] source = \"http\" requires base_url".to_string());
+        }
+        if self.tenant_id.trim().is_empty() {
+            return Err("[kintai_events] source = \"http\" requires tenant_id".to_string());
+        }
+        if !self.auth_token.is_empty() && !self.auth_token_command.is_empty() {
+            return Err(
+                "[kintai_events] set only one of auth_token / auth_token_command".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for KintaiEventsConfig {
+    fn default() -> Self {
+        Self {
+            source: KintaiEventsSource::default(),
+            base_url: String::new(),
+            tenant_id: String::new(),
+            timeout_secs: default_kintai_events_timeout_secs(),
+            auth_token: String::new(),
+            auth_token_command: String::new(),
+            auth_token_ttl_secs: default_kintai_events_token_ttl_secs(),
+        }
+    }
+}
+
+fn default_kintai_events_timeout_secs() -> u64 {
+    120
+}
+
+fn default_kintai_events_token_ttl_secs() -> u64 {
+    900
+}
+
 /// Runtime configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -259,6 +370,10 @@ pub struct Config {
 
     #[serde(default)]
     pub mariadb: MariadbConfig,
+
+    /// 生イベントの読み先の宣言 (Refs #205 実装計画 02)。既定は MariaDB 直読み。
+    #[serde(default)]
+    pub kintai_events: KintaiEventsConfig,
 
     #[serde(default)]
     pub kosoku: KosokuConfigToml,
@@ -539,6 +654,36 @@ fn env_opt_u16(get: EnvLookup, key: &str) -> Result<Option<Option<u16>>, String>
     }
 }
 
+/// 秒数などの `u64` 項目。`env_u16` と同じく壊れた値で起動を失敗させる。
+fn env_u64(get: EnvLookup, key: &str) -> Result<Option<u64>, String> {
+    match get(key) {
+        None => Ok(None),
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|e| format!("{key}: invalid number {raw:?} ({e})")),
+    }
+}
+
+/// 生イベントの読み先の宣言。**知らない値は既定へ落とさず起動を失敗させる**
+/// (`KINTAI_EVENTS_SOURCE=htpp` が静かに MariaDB 読みになると事故る)。
+fn env_kintai_events_source(
+    get: EnvLookup,
+    key: &str,
+) -> Result<Option<KintaiEventsSource>, String> {
+    match get(key) {
+        None => Ok(None),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "mariadb" => Ok(Some(KintaiEventsSource::Mariadb)),
+            "http" => Ok(Some(KintaiEventsSource::Http)),
+            _ => Err(format!(
+                "{key}: invalid source {raw:?} (expected mariadb/http)"
+            )),
+        },
+    }
+}
+
 /// 真偽値。`true` / `false` / `1` / `0` (大文字小文字を問わない) のみ受ける。
 fn env_bool(get: EnvLookup, key: &str) -> Result<Option<bool>, String> {
     match get(key) {
@@ -626,6 +771,31 @@ impl Config {
         }
         if let Some(v) = env_str(get, "MARIADB_DATABASE") {
             self.mariadb.database = v;
+        }
+
+        // ── 生イベントの読み先 (Refs #205 実装計画 02) ──
+        // GCP instance は MariaDB に到達できないので、ここを env だけで宣言できる
+        // 必要がある (`secretKeyRef` が token を入れる形も含む)
+        if let Some(v) = env_kintai_events_source(get, "KINTAI_EVENTS_SOURCE")? {
+            self.kintai_events.source = v;
+        }
+        if let Some(v) = env_str(get, "KINTAI_EVENTS_BASE_URL") {
+            self.kintai_events.base_url = v;
+        }
+        if let Some(v) = env_str(get, "KINTAI_EVENTS_TENANT_ID") {
+            self.kintai_events.tenant_id = v;
+        }
+        if let Some(v) = env_u64(get, "KINTAI_EVENTS_TIMEOUT_SECS")? {
+            self.kintai_events.timeout_secs = v;
+        }
+        if let Some(v) = env_str(get, "KINTAI_EVENTS_AUTH_TOKEN") {
+            self.kintai_events.auth_token = v;
+        }
+        if let Some(v) = env_str(get, "KINTAI_EVENTS_AUTH_TOKEN_COMMAND") {
+            self.kintai_events.auth_token_command = v;
+        }
+        if let Some(v) = env_u64(get, "KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS")? {
+            self.kintai_events.auth_token_ttl_secs = v;
         }
 
         // ── 給与大臣 (OHKEN) + introspect 認可 (Refs #82) ──
@@ -718,6 +888,7 @@ impl Config {
             kyuyo: KyuyoConfig::default(),
             restraint: RestraintConfig::default(),
             mariadb: MariadbConfig::default(),
+            kintai_events: KintaiEventsConfig::default(),
             kosoku: KosokuConfigToml::default(),
         })
     }

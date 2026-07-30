@@ -52,3 +52,31 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # user = "kintai_reader"
 # password = "<kintai_reader パスワード>"
 # database = "<CakePHP の DB 名>"
+
+# 勤怠の生イベントをどこから読むか (Refs #205 実装計画 02)。
+# 既定は "mariadb" = 上の [mariadb] を直読みするオンプレの形 (挙動は従来どおり)。
+#
+# "http" にすると rust-alc-api の GET /api/dtako/events から生 CSV 行を取り、
+# 同じ形に写して返す (MariaDB に到達できない Cloud Run 用)。宣言したのに
+# base_url / tenant_id が無ければ**起動を失敗させる** ([database] enabled と同じ流儀)。
+#
+# 上流に口が無い読み出し (始業/終業の打刻・運行の確定イベント・フェリー) は
+# [mariadb] が設定されていればそちらへ委譲する。委譲先が無い形態では打刻が読めず、
+# 拘束は休息イベント由来の勤務しか組めない (#205 の 04 / 05 が埋める穴)。
+#
+# 認証 token は 2 経路のどちらか片方だけを指定する (両方指定は起動失敗):
+#   auth_token         — 静的な Bearer (device JWT を注入する 07 の受け皿)
+#   auth_token_command — 出力を token として使うコマンド。当面の Google 認証はこちら。
+#                        シェルは経由せず空白で argv に分割して exec する
+#                        (パイプ・リダイレクト・クォートは使えない)
+#
+# 環境変数でも同じ項目を指定できる (Cloud Run の主経路):
+#   KINTAI_EVENTS_SOURCE / _BASE_URL / _TENANT_ID / _TIMEOUT_SECS
+#   KINTAI_EVENTS_AUTH_TOKEN / _AUTH_TOKEN_COMMAND / _AUTH_TOKEN_TTL_SECS
+# [kintai_events]
+# source = "http"
+# base_url = "https://<rust-alc-api の Cloud Run URL>"
+# tenant_id = "<一番星のテナント UUID>"
+# timeout_secs = 120
+# auth_token_command = "gcloud auth print-identity-token"
+# auth_token_ttl_secs = 900

@@ -1015,6 +1015,7 @@ pub fn health_state() -> routes::health::HealthState {
         sqlserver: true,
         mariadb: false,
         kyuyo: false,
+        kintai_events: "disabled",
     }
 }
 
@@ -1129,4 +1130,3 @@ pub fn error_repo() -> DynRepo {
 pub fn query_error_repo() -> DynRepo {
     Arc::new(QueryErrorRepo)
 }
-
