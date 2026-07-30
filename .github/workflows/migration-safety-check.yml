@@ -1,0 +1,92 @@
+name: Migration Safety Check
+
+# PR で触られた migration SQL を 2 つの観点で検査する (rust-alc-api から移植)。
+#
+#   1. 適用済み migration の改変 (= 既存ファイルの変更 / 削除 / rename) → **fail**
+#      `_sqlx_migrations` の checksum 照合により、これは適用時に必ず落ちる
+#      (`ERROR: checksum mismatch`)。main に merge された migration は直後の
+#      ci.yml の kintai-migrate job で当たるので、「まだ適用されていないから
+#      直してよい」窓は実質無い。適用時に気付くより PR で止める方が早い。
+#
+#   2. 追加された migration に rollback 不可なパターンが無いか → **warning only**
+#      判定は .github/scripts/migration-safety-check.sh (正規表現ベース)。
+#      SQL コメントは除去してから照合するので、コメント内の DROP TABLE 等は
+#      誤検出しない。
+#
+# 2 を warning に留めるのは、contract migration そのものを禁じたいのではなく
+# 「気付かずに書く」のを防ぎたいため。1 を fail にするのは、そちらが「意図の
+# 問題」ではなく「確実に壊れる」からで、性質が違う。
+
+on:
+  pull_request:
+    paths:
+      - 'migrations/**.sql'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Migration safety
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # SHA は GitHub 生成の 40-char hex で injection リスクは無いが、念のため
+      # env 経由で受ける (以降の step も同様)。
+      - name: Reject edits to already-applied migrations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          modified=$(git diff --name-only --diff-filter=MRD "$BASE_SHA"..."$HEAD_SHA" -- 'migrations/*.sql' || true)
+          if [ -n "$modified" ]; then
+            echo "::error::適用済み migration を変更している。checksum 照合で apply が必ず落ちる:"
+            echo "$modified" | while IFS= read -r f; do echo "::error::  $f"; done
+            echo "修正は新しい連番ファイルを足すこと (002_*.sql)。" >&2
+            exit 1
+          fi
+          echo "ok: no edits to existing migrations"
+
+      - name: Collect added migration files
+        id: collect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          added=$(git diff --name-only --diff-filter=A "$BASE_SHA"..."$HEAD_SHA" -- 'migrations/*.sql' || true)
+          if [ -z "$added" ]; then
+            echo "added_count=0" >> "$GITHUB_OUTPUT"
+            echo "no added migrations"
+            exit 0
+          fi
+          {
+            echo "added_count=$(echo "$added" | wc -l | tr -d ' ')"
+            echo 'added_files<<EOF_ADDED'
+            echo "$added"
+            echo 'EOF_ADDED'
+          } >> "$GITHUB_OUTPUT"
+          echo "added files:"
+          echo "$added"
+
+      - name: Run safety check
+        if: steps.collect.outputs.added_count != '0'
+        env:
+          # ファイル名は git tracked path だが PR 作成者が任意の名前を選べるので
+          # Actions 式で直接展開せず env 経由で受ける (command injection 防止)。
+          ADDED_FILES: ${{ steps.collect.outputs.added_files }}
+        run: |
+          set -euo pipefail
+          mapfile -t files <<< "$ADDED_FILES"
+          report=$(bash .github/scripts/migration-safety-check.sh "${files[@]}")
+          echo "$report"
+          {
+            echo "## Migration Safety Check"
+            echo ""
+            echo "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
