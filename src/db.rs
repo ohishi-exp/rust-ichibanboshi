@@ -6,7 +6,16 @@ use crate::config::DatabaseConfig;
 
 pub type DbPool = Pool<ConnectionManager>;
 
+/// pool から取り出した接続。`TiberiusRepo::conn()` の戻り値。
+pub type DbConn<'a> = bb8::PooledConnection<'a, ConnectionManager>;
+
 /// SQL Server 接続プールを作成
+///
+/// **`[database] enabled = true` (= この instance が SQL Server を使うと宣言した)
+/// ときにだけ呼ばれる。** 宣言したものに繋がらなければ `Err` を返して起動を
+/// 失敗させる — この挙動は意図的で、オンプレでは「繋がらないまま起動してしまう」
+/// より即座に落ちた方が気付ける。SQL Server を持たない実行形態 (Cloud Run 等) は
+/// `enabled = false` を宣言し、この関数を**呼ばない** (`server::run` を参照)。
 pub async fn create_pool(config: &DatabaseConfig) -> Result<DbPool, Box<dyn std::error::Error>> {
     let mut tib_config = TiberiusConfig::new();
 

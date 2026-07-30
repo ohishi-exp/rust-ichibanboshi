@@ -21,8 +21,21 @@ pub async fn run(
     config: Config,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = db::create_pool(&config.database).await?;
-    let repo: crate::repo::DynRepo = Arc::new(TiberiusRepo::new(pool));
+    // SQL Server (CAPE#01) を**使うと宣言したか**で分岐する (オンプレ / GCP 両対応)。
+    // 宣言した場合は create_pool が起動時に `SELECT 1` を打ち、繋がらなければ
+    // ここで Err → 起動失敗 (オンプレの既定・従来どおり)。宣言していない場合は
+    // pool を作らず、SQL Server 依存ルートは全て 503 fail-closed になる。
+    let repo: crate::repo::DynRepo = if config.database.enabled {
+        let pool = db::create_pool(&config.database).await?;
+        Arc::new(TiberiusRepo::new(pool))
+    } else {
+        tracing::warn!(
+            "[database] enabled = false — this instance does not use SQL Server (CAPE#01). \
+             /api/sales/*, /api/schema/*, /api/surcharge/*, /api/unchin/*, /api/uriage/*, \
+             /api/employees, /api/vehicles return 503. /health reports backends.sqlserver=disabled."
+        );
+        Arc::new(TiberiusRepo::disabled())
+    };
 
     // SQLite local store (Phase 2、担当者別売上 summary 永続化)
     let local_store: DynLocalStore = Arc::new(LocalStore::open(&config.sqlite.path)?);
@@ -134,6 +147,13 @@ pub async fn run(
                 Arc::new(kyuyo::store::NoopKyuyoStore)
             }
         }
+    };
+
+    // 宣言したバックエンドの一覧を /health に出す (実行形態を外から判別可能にする)。
+    let health_state = crate::routes::health::HealthState {
+        sqlserver: config.database.enabled,
+        mariadb: config.mariadb.enabled(),
+        kyuyo: config.kyuyo.db_enabled(),
     };
 
     let origins: Vec<_> = config
@@ -258,6 +278,7 @@ pub async fn run(
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(repo))
+        .layer(Extension(health_state))
         .layer(Extension(local_store))
         .layer(Extension(cakephp_client))
         .layer(Extension(raw_cfg))
