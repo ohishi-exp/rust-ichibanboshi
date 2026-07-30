@@ -3,6 +3,9 @@
 .env
 nuxt-ichibanboshi
 
+# docker build context (make image / gcp-image.yml が組み立てる使い捨て)
+/ctx/
+
 # ローカルの worktree (コミットしない)
 .worktrees/
 .claude/worktrees/
