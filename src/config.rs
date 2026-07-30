@@ -77,7 +77,14 @@ pub struct CorsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SqliteConfig {
     /// SQLite データベースファイルのパス。`:memory:` で in-memory (テスト用)。
-    /// 本番デフォルトは `/var/lib/ichibanboshi/state.db`。
+    /// 既定は `/opt/ichibanboshi/state.db` ([`default_sqlite_path`])。
+    ///
+    /// **空 = 置き場を持たないと宣言する。** file を作らず `/api/uriage/*` が 503 に
+    /// なる (Refs #205 の G4)。GCP (Cloud Run) の instance 向け — SQL Server
+    /// (CAPE#01) に到達できないので売上を計算できず、揮発 FS に空の `state.db` を
+    /// 作ると「壊れている」ではなく「0 件」を返してしまう。とくに `recalc_jobs` は
+    /// `fingerprint` と R2 同期状態の唯一の記録なので、空で立ち上がると差分再計算の
+    /// 基準が消える。オンプレは既定のまま (宣言済み) で挙動不変。
     #[serde(default = "default_sqlite_path")]
     pub path: String,
 }
@@ -915,6 +922,16 @@ impl Config {
         }
         if let Some(v) = env_str(get, "BIND_ADDR") {
             self.bind_addr = v;
+        }
+
+        // ── ローカル状態の置き場 (Refs #205 の G4) ──
+        // **`SQLITE_PATH=""` で「置き場を持たない」と宣言できる**必要がある。
+        // イメージに TOML を焼かない方針 (Dockerfile) なので、env で宣言できないと
+        // Cloud Run は既定の `/opt/ichibanboshi/state.db` を使い、揮発 FS に空の
+        // state.db を作って `/api/uriage/*` が 0 件を返す。`env_str` は空でも
+        // 上書きするので、空文字が「未設定」に落ちない
+        if let Some(v) = env_str(get, "SQLITE_PATH") {
+            self.sqlite.path = v;
         }
 
         // ── SQL Server (CAPE#01) ──

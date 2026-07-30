@@ -622,3 +622,31 @@ target_url = "https://relay.example"
     assert_eq!(config.kintai_send.target_url, "");
     assert!(config.kintai_send.validate().is_err());
 }
+
+/// **`SQLITE_PATH=""` で「ローカル状態の置き場を持たない」と宣言できる**
+/// (Refs #205 の G4)。
+///
+/// イメージに TOML を焼かない方針なので、env で宣言できないと Cloud Run は既定の
+/// `/opt/ichibanboshi/state.db` を使い、揮発 FS に空の state.db を作って
+/// `/api/uriage/*` が「壊れている」ではなく「0 件」を返す。
+#[test]
+fn test_sqlite_path_can_be_declared_empty_from_env() {
+    // 既定は宣言済み (オンプレの形)
+    let config = base();
+    assert!(!config.sqlite.path.is_empty());
+
+    // 空で上書きできる = 置き場を持たない宣言。「未設定」に落ちてはいけない
+    let mut config = base();
+    apply(&mut config, &[("SQLITE_PATH", "")]).unwrap();
+    assert_eq!(config.sqlite.path, "");
+
+    // 値を入れれば置き場の差し替えとして効く
+    let mut config = base();
+    apply(&mut config, &[("SQLITE_PATH", "/mnt/state/state.db")]).unwrap();
+    assert_eq!(config.sqlite.path, "/mnt/state/state.db");
+
+    // TOML の値も env が勝つ
+    let mut config: Config = toml::from_str("[sqlite]\npath = \"/opt/a.db\"\n").unwrap();
+    apply(&mut config, &[("SQLITE_PATH", "")]).unwrap();
+    assert_eq!(config.sqlite.path, "");
+}

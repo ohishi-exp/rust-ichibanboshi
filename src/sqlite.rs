@@ -22,6 +22,8 @@ pub enum LocalStoreError {
     OpenFailed(String),
     QueryError(String),
     JoinError(String),
+    /// `[sqlite] path` が空 = 置き場を宣言していない instance。**503 に倒す**。
+    Disabled,
 }
 
 impl std::fmt::Display for LocalStoreError {
@@ -30,6 +32,10 @@ impl std::fmt::Display for LocalStoreError {
             Self::OpenFailed(m) => write!(f, "sqlite open failed: {m}"),
             Self::QueryError(m) => write!(f, "sqlite query error: {m}"),
             Self::JoinError(m) => write!(f, "tokio join error: {m}"),
+            Self::Disabled => write!(
+                f,
+                "[sqlite] path が空です (ローカル状態の置き場がありません)"
+            ),
         }
     }
 }
@@ -154,9 +160,19 @@ pub struct VerifyJobRow {
 }
 
 /// SQLite local store (Phase 2、担当者別売上 summary)。
+///
+/// **無効宣言 ([`LocalStore::disabled`]) を持てる。** GCP (Cloud Run) の instance は
+/// SQL Server (CAPE#01) に到達できないので売上を計算できず、この store に書く材料が
+/// そもそも無い。それでも `open` すると**揮発 FS に空の DB が普通に作られ**、
+/// `/api/uriage/*` が「壊れている」ではなく「0 件」を返す (Refs #205 の G4)。
+///
+/// `uriage_person_*` の 2 表は SQL Server から作り直せるキャッシュだが、`recalc_jobs`
+/// は `fingerprint` と R2 同期状態の**唯一の記録**で、空で立ち上がると差分再計算の
+/// 基準が消える。空を配るくらいなら 503 で断る。
 #[derive(Clone)]
 pub struct LocalStore {
-    conn: Arc<Mutex<Connection>>,
+    /// `None` = 無効宣言。全ての読み書きが [`LocalStoreError::Disabled`] になる。
+    conn: Option<Arc<Mutex<Connection>>>,
 }
 
 impl std::fmt::Debug for LocalStore {
@@ -189,8 +205,22 @@ impl LocalStore {
             Connection::open(path).map_err(|e| LocalStoreError::OpenFailed(e.to_string()))?;
         Self::migrate(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Some(Arc::new(Mutex::new(conn))),
         })
+    }
+
+    /// 置き場を持たない instance の宣言 (`[sqlite] path` が空)。
+    ///
+    /// **file を作らない。** 起動は通し、`/api/uriage/*` など この store を要る口だけが
+    /// 503 になる — Cloud Run の instance は打刻の受け口を出す必要があるので、
+    /// 起動ごと失敗させると kintai まで巻き添えになる。
+    pub fn disabled() -> Self {
+        Self { conn: None }
+    }
+
+    /// 接続を取り出す。無効宣言なら [`LocalStoreError::Disabled`]。
+    fn conn(&self) -> Result<Arc<Mutex<Connection>>, LocalStoreError> {
+        self.conn.clone().ok_or(LocalStoreError::Disabled)
     }
 
     /// `sqlite_master.type` を見て TABLE or VIEW を判別し、適切な DROP を発行する。
@@ -486,7 +516,7 @@ impl LocalStore {
     ) -> Result<Vec<PersonMonthlyRow>, LocalStoreError> {
         let month = month.to_string();
         let cal_int = if cal { 1 } else { 0 };
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let mut stmt = guard
@@ -561,7 +591,7 @@ impl LocalStore {
             })
             .collect();
 
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let mut guard = futures_lock(&conn);
             let tx = guard
@@ -642,7 +672,7 @@ impl LocalStore {
             })
             .collect();
 
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let mut guard = futures_lock(&conn);
             let tx = guard
@@ -709,7 +739,7 @@ impl LocalStore {
         let to_month = to_month.to_string();
         let cal_int = if cal { 1 } else { 0 };
         let kind_str = partner_kind.as_str().to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let mut stmt = guard
@@ -755,7 +785,7 @@ impl LocalStore {
     ) -> Result<Vec<PersonDailyRow>, LocalStoreError> {
         let month = month.to_string();
         let cal_int = if cal { 1 } else { 0 };
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let mut stmt = guard
@@ -806,7 +836,7 @@ impl LocalStore {
         let from_month = from_month.to_string();
         let to_month = to_month.to_string();
         let cal_int = if cal { 1 } else { 0 };
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let mut stmt = guard
@@ -856,7 +886,7 @@ impl LocalStore {
     ) -> Result<Option<String>, LocalStoreError> {
         let month = month.to_string();
         let cal_int = if cal { 1 } else { 0 };
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let ts: Option<String> = guard
@@ -894,7 +924,7 @@ impl LocalStore {
     ) -> Result<Vec<RecalcJob>, LocalStoreError> {
         let from = from.map(|s| s.to_string());
         let to = to.map(|s| s.to_string());
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match (&from, &to) {
@@ -968,7 +998,7 @@ impl LocalStore {
         eigyosho_id: i64,
     ) -> Result<Option<RecalcJob>, LocalStoreError> {
         let month = month.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let mut stmt = guard
@@ -1029,7 +1059,7 @@ impl LocalStore {
         let fingerprint_after = fingerprint_after.to_string();
         let raw_path = raw_path.map(str::to_string);
         let computed_at = computed_at.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             // 既存 fingerprint_after を fingerprint_before に持ち上げて upsert。
@@ -1091,7 +1121,7 @@ impl LocalStore {
         let month = month.to_string();
         let last_error = last_error.to_string();
         let now = now.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             guard
@@ -1123,7 +1153,7 @@ impl LocalStore {
     ) -> Result<Vec<R2PendingRow>, LocalStoreError> {
         let from = from.map(|s| s.to_string());
         let to = to.map(|s| s.to_string());
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match (&from, &to) {
@@ -1193,7 +1223,7 @@ impl LocalStore {
         let skipped_reason = skipped_reason.map(|s| s.to_string());
         let diff_json = diff_json.map(|s| s.to_string());
         let ran_at = ran_at.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             guard
@@ -1240,7 +1270,7 @@ impl LocalStore {
     ) -> Result<Vec<VerifyJobRow>, LocalStoreError> {
         let from = from.to_string();
         let to = to.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) =
@@ -1300,7 +1330,7 @@ impl LocalStore {
     ) -> Result<usize, LocalStoreError> {
         let month = month.to_string();
         let synced_at = synced_at.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             let n = guard
@@ -1337,7 +1367,7 @@ impl LocalStore {
         eigyosho_id: i64,
     ) -> Result<DeleteBucketResult, LocalStoreError> {
         let month = month.to_string();
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let mut guard = futures_lock(&conn);
             let tx = guard
@@ -1377,7 +1407,7 @@ impl LocalStore {
     /// `uriage_person_monthly` view も一緒に再作成される。
     /// 呼び出し後は recalc を叩き直して再生成する必要あり。
     pub async fn rebuild_schema(&self) -> Result<(), LocalStoreError> {
-        let conn = self.conn.clone();
+        let conn = self.conn()?;
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
             guard
@@ -1699,6 +1729,58 @@ mod tests {
         assert!(nested.exists(), "state.db file should be created");
         // 後始末
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// **無効宣言は file を作らない。** Cloud Run の揮発 FS に空の state.db が
+    /// 生えると `/api/uriage/*` が「壊れている」ではなく「0 件」を返す
+    /// (Refs #205 の G4)。
+    #[tokio::test]
+    async fn a_disabled_store_touches_no_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("ichibanboshi-disabled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = LocalStore::disabled();
+        assert!(matches!(
+            store.get_person_monthly("2026-06", 1, true).await,
+            Err(LocalStoreError::Disabled)
+        ));
+        assert!(!tmp.exists(), "disabled store must not create anything");
+    }
+
+    /// 読みも書きも管理操作も、**全部** `Disabled` で断る。
+    /// 1 つでも素通しすると「受け取ったがどこにも書いていない」が作れてしまう。
+    #[tokio::test]
+    async fn a_disabled_store_refuses_every_route_into_it() {
+        let s = LocalStore::disabled();
+        let dis = |e: LocalStoreError| matches!(e, LocalStoreError::Disabled);
+        assert!(dis(s
+            .get_person_daily("2026-06", 1, true)
+            .await
+            .unwrap_err()));
+        assert!(dis(s
+            .person_monthly_totals("2026-06", "2026-06", true)
+            .await
+            .unwrap_err()));
+        assert!(dis(s
+            .last_calculated_at("2026-06", 1, true)
+            .await
+            .unwrap_err()));
+        assert!(dis(s.list_recalc_jobs(None, None).await.unwrap_err()));
+        assert!(dis(s.get_recalc_job("2026-06", 1).await.unwrap_err()));
+        assert!(dis(s.list_r2_pending(None, None).await.unwrap_err()));
+        assert!(dis(s
+            .list_verify_jobs("2026-06-01", "2026-06-30", None)
+            .await
+            .unwrap_err()));
+        assert!(dis(s.rebuild_schema().await.unwrap_err()));
+    }
+
+    /// 宣言していない、と読めるメッセージにする (ログで file 権限の話に見えない)。
+    #[test]
+    fn the_disabled_error_says_it_is_a_declaration() {
+        let msg = LocalStoreError::Disabled.to_string();
+        assert!(msg.contains("sqlite"), "{msg}");
+        assert!(msg.contains("置き場"), "{msg}");
     }
 
     // ──────────────────────────────────────────────────────────────────
