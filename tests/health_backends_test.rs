@@ -48,6 +48,7 @@ async fn test_health_reports_onprem_shape() {
             sqlserver: true,
             mariadb: true,
             kyuyo: true,
+            kintai_events: "mariadb",
         },
     )
     .await;
@@ -55,6 +56,7 @@ async fn test_health_reports_onprem_shape() {
     assert!(body.contains("\"sqlserver\":\"ok\""), "{body}");
     assert!(body.contains("\"mariadb\":\"declared\""), "{body}");
     assert!(body.contains("\"kyuyo\":\"declared\""), "{body}");
+    assert!(body.contains("\"kintai_events\":\"mariadb\""), "{body}");
 }
 
 #[tokio::test]
@@ -68,6 +70,7 @@ async fn test_health_reports_gcp_shape_without_touching_sqlserver() {
             sqlserver: false,
             mariadb: false,
             kyuyo: false,
+            kintai_events: "http",
         },
     )
     .await;
@@ -75,6 +78,8 @@ async fn test_health_reports_gcp_shape_without_touching_sqlserver() {
     assert!(body.contains("\"sqlserver\":\"disabled\""), "{body}");
     assert!(body.contains("\"mariadb\":\"disabled\""), "{body}");
     assert!(body.contains("\"kyuyo\":\"disabled\""), "{body}");
+    // GCP の形では生イベントを HTTP (rust-alc-api) から読む
+    assert!(body.contains("\"kintai_events\":\"http\""), "{body}");
 }
 
 #[tokio::test]
@@ -86,6 +91,7 @@ async fn test_health_declared_sqlserver_down_is_still_503() {
             sqlserver: true,
             mariadb: false,
             kyuyo: false,
+            kintai_events: "disabled",
         },
     )
     .await;
@@ -100,6 +106,7 @@ async fn test_health_query_error_on_declared_sqlserver_is_503() {
             sqlserver: true,
             mariadb: false,
             kyuyo: false,
+            kintai_events: "disabled",
         },
     )
     .await;

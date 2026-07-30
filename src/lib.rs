@@ -1,6 +1,7 @@
 pub mod cakephp;
 pub mod config;
 pub mod db;
+pub mod kintai_http_repo;
 pub mod kintai_repo;
 pub mod kintai_store;
 pub mod kintai_version;
