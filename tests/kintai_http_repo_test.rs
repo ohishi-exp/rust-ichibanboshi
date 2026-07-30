@@ -42,6 +42,7 @@ fn cfg(base_url: &str) -> KintaiEventsConfig {
         timeout_secs: 10,
         auth_token: "test-id-token".to_string(),
         auth_token_command: String::new(),
+        auth_token_metadata: false,
         auth_token_ttl_secs: 900,
     }
 }

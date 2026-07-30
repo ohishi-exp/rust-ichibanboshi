@@ -101,6 +101,7 @@ fn test_env_overrides_every_supported_key() {
             ),
             ("KINTAI_EVENTS_TIMEOUT_SECS", "90"),
             ("KINTAI_EVENTS_AUTH_TOKEN", "id-token"),
+            ("KINTAI_EVENTS_AUTH_TOKEN_METADATA", "false"),
             ("KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS", "600"),
             ("KINTAI_PUSH_ENABLED", "true"),
             (
@@ -288,6 +289,46 @@ fn test_kintai_events_two_token_routes_at_once_fails_startup() {
     .unwrap();
     let err = config.kintai_events.validate().unwrap_err();
     assert!(err.contains("only one of"), "{err}");
+}
+
+#[test]
+fn test_kintai_events_metadata_route_is_exclusive_too() {
+    // Cloud Run の中では metadata server が唯一の経路 (gcloud も curl も image に無い)。
+    // 静的 token / コマンドと同時に宣言されたら、どれが効くか外から分からないので落とす
+    let mut config = base();
+    apply(
+        &mut config,
+        &[
+            ("KINTAI_EVENTS_SOURCE", "http"),
+            ("KINTAI_EVENTS_BASE_URL", "https://alc.example"),
+            ("KINTAI_EVENTS_TENANT_ID", "t"),
+            ("KINTAI_EVENTS_AUTH_TOKEN_METADATA", "true"),
+        ],
+    )
+    .unwrap();
+    assert!(config.kintai_events.auth_token_metadata);
+    // metadata だけなら通る
+    config.kintai_events.validate().unwrap();
+
+    // command と併記したら落ちる
+    apply(
+        &mut config,
+        &[(
+            "KINTAI_EVENTS_AUTH_TOKEN_COMMAND",
+            "gcloud auth print-identity-token",
+        )],
+    )
+    .unwrap();
+    let err = config.kintai_events.validate().unwrap_err();
+    assert!(err.contains("only one of"), "{err}");
+    assert!(err.contains("auth_token_metadata"), "{err}");
+}
+
+#[test]
+fn test_kintai_events_metadata_invalid_bool_is_loud() {
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_EVENTS_AUTH_TOKEN_METADATA", "yes")]).unwrap_err();
+    assert!(err.contains("KINTAI_EVENTS_AUTH_TOKEN_METADATA"), "{err}");
 }
 
 #[test]

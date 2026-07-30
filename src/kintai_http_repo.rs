@@ -204,8 +204,124 @@ impl KintaiTokenProvider for CommandTokenProvider {
     }
 }
 
-/// 設定から供給元を決める。`auth_token` が優先、次に `auth_token_command`、無ければ無し。
-/// (両方指定は `KintaiEventsConfig::validate` が起動時に弾く)
+/// GCE / Cloud Run の metadata server。**コンテナの中から** identity token を取る唯一の道。
+///
+/// `auth_token_command = "gcloud auth print-identity-token"` は**開発機から Cloud Run を
+/// 叩く**ための経路で、Cloud Run の中では動かない — `Dockerfile` が入れているのは
+/// `ca-certificates` だけで、`gcloud` も `curl` も存在しない。
+pub const METADATA_BASE_URL: &str = "http://metadata.google.internal";
+
+/// metadata server の identity token endpoint (audience を query で渡す)。
+const METADATA_IDENTITY_PATH: &str =
+    "/computeMetadata/v1/instance/service-accounts/default/identity";
+
+/// metadata server が要求する固定ヘッダー。付けないと 403 になる
+/// (ブラウザからの SSRF で token を抜かれないための Google 側の作り)。
+const METADATA_FLAVOR: (&str, &str) = ("Metadata-Flavor", "Google");
+
+/// Cloud Run IAM 用の identity token を metadata server から取る。
+///
+/// `audience` は**呼び先の Cloud Run service の URL**。Cloud Run IAM は
+/// 「この token は自分宛か」を audience で見るので、ここがずれると 401 になる。
+/// 既定では `base_url` をそのまま使う ([`build_token_provider`])。
+///
+/// token は 1 時間有効なので [`CommandTokenProvider`] と同じく TTL の間だけ使い回す。
+#[derive(Debug)]
+pub struct MetadataTokenProvider {
+    client: reqwest::Client,
+    /// `{base}{path}?audience=...`。**base をフィールドに持つ**のはテストが
+    /// wiremock を差し込めるようにするため。
+    url: String,
+    ttl: Duration,
+    cached: tokio::sync::Mutex<Option<(String, Instant)>>,
+}
+
+impl MetadataTokenProvider {
+    pub fn new(metadata_base: &str, audience: &str, ttl_secs: u64) -> Result<Self, String> {
+        let audience = audience.trim().trim_end_matches('/');
+        if audience.is_empty() {
+            return Err("metadata token provider needs an audience (base_url)".to_string());
+        }
+        let client = reqwest::Client::builder()
+            // metadata server は同一ホストなので、届かないなら待たずに落とす
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("metadata token client: {e}"))?;
+        Ok(Self {
+            client,
+            url: format!(
+                "{}{METADATA_IDENTITY_PATH}?audience={}",
+                metadata_base.trim_end_matches('/'),
+                urlencode(audience)
+            ),
+            ttl: Duration::from_secs(ttl_secs),
+            cached: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    async fn fetch(&self) -> Result<String, KintaiRepoError> {
+        let resp = self
+            .client
+            .get(&self.url)
+            .header(METADATA_FLAVOR.0, METADATA_FLAVOR.1)
+            .send()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("metadata identity: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("metadata identity body: {e}")))?;
+        if !status.is_success() {
+            let excerpt: String = body.chars().take(200).collect();
+            return Err(KintaiRepoError::QueryFailed(format!(
+                "metadata identity status {status}: {excerpt}"
+            )));
+        }
+        let token = body.trim().to_string();
+        if token.is_empty() {
+            return Err(KintaiRepoError::QueryFailed(
+                "metadata identity returned no token".to_string(),
+            ));
+        }
+        Ok(token)
+    }
+}
+
+/// query に載せる最小限の percent-encode。audience は URL なので `:` と `/` が出る。
+///
+/// `url` crate を足さないのは、encode したいのがこの 1 か所だけのため。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[async_trait]
+impl KintaiTokenProvider for MetadataTokenProvider {
+    async fn token(&self) -> Result<Option<String>, KintaiRepoError> {
+        let mut cached = self.cached.lock().await;
+        if let Some((token, at)) = cached.as_ref() {
+            if at.elapsed() < self.ttl {
+                return Ok(Some(token.clone()));
+            }
+        }
+        let token = self.fetch().await?;
+        *cached = Some((token.clone(), Instant::now()));
+        Ok(Some(token))
+    }
+}
+
+/// 設定から供給元を決める。`auth_token` → `auth_token_command` → `auth_token_metadata`
+/// の順に見て、どれも無ければ token 無し。
+/// (2 つ以上の指定は `KintaiEventsConfig::validate` が起動時に弾く)
 pub fn build_token_provider(
     cfg: &KintaiEventsConfig,
 ) -> Result<Arc<dyn KintaiTokenProvider>, String> {
@@ -214,6 +330,11 @@ pub fn build_token_provider(
     }
     if !cfg.auth_token_command.trim().is_empty() {
         let p = CommandTokenProvider::new(&cfg.auth_token_command, cfg.auth_token_ttl_secs)?;
+        return Ok(Arc::new(p));
+    }
+    if cfg.auth_token_metadata {
+        let p =
+            MetadataTokenProvider::new(METADATA_BASE_URL, &cfg.base_url, cfg.auth_token_ttl_secs)?;
         return Ok(Arc::new(p));
     }
     Ok(Arc::new(NoTokenProvider))
@@ -1031,5 +1152,115 @@ mod tests {
         assert!(build_token_provider(&cfg).is_ok());
         cfg.auth_token = "tok".to_string();
         assert!(build_token_provider(&cfg).is_ok());
+    }
+
+    // ── metadata server (Cloud Run の中で使える唯一の経路) ──
+
+    #[test]
+    fn urlencode_escapes_everything_outside_the_unreserved_set() {
+        // audience は URL なので `:` と `/` が必ず出る
+        assert_eq!(urlencode("https://x.run.app"), "https%3A%2F%2Fx.run.app");
+        // RFC 3986 の unreserved はそのまま
+        assert_eq!(urlencode("aZ0-_.~"), "aZ0-_.~");
+    }
+
+    #[test]
+    fn metadata_provider_needs_an_audience() {
+        // audience が無いと Cloud Run IAM が「自分宛か」を判定できず必ず 401 になる。
+        // 起動時に落とす
+        let err = MetadataTokenProvider::new(METADATA_BASE_URL, "   ", 60).unwrap_err();
+        assert!(err.contains("audience"), "{err}");
+        assert!(MetadataTokenProvider::new(METADATA_BASE_URL, "https://x", 60).is_ok());
+    }
+
+    #[test]
+    fn metadata_base_url_is_the_documented_host() {
+        assert_eq!(METADATA_BASE_URL, "http://metadata.google.internal");
+    }
+
+    #[tokio::test]
+    async fn metadata_provider_sends_the_flavor_header_and_caches() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(METADATA_IDENTITY_PATH))
+            // audience は base_url そのまま (末尾 `/` は落とす)
+            .and(query_param("audience", "https://alc.example"))
+            // これが無いと metadata server は 403 を返す
+            .and(header(METADATA_FLAVOR.0, METADATA_FLAVOR.1))
+            .respond_with(ResponseTemplate::new(200).set_body_string("  id-token-value\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = MetadataTokenProvider::new(&server.uri(), "https://alc.example/", 3600).unwrap();
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("id-token-value"));
+        // 2 回目は TTL 内なのでキャッシュから返る (expect(1) が保証)
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("id-token-value"));
+    }
+
+    #[tokio::test]
+    async fn metadata_provider_refetches_after_ttl() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("tok"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let p = MetadataTokenProvider::new(&server.uri(), "https://alc.example", 0).unwrap();
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("tok"));
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn metadata_provider_is_loud_about_failures() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 403 = Metadata-Flavor 忘れ / metadata server が居ない環境
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+        let p = MetadataTokenProvider::new(&server.uri(), "https://alc.example", 60).unwrap();
+        let err = p.token().await.unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+
+        // 200 だが空 — token 無しで叩いて 401 になるより先に落とす
+        let empty = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("  \n"))
+            .mount(&empty)
+            .await;
+        let p = MetadataTokenProvider::new(&empty.uri(), "https://alc.example", 60).unwrap();
+        let err = p.token().await.unwrap_err();
+        assert!(err.to_string().contains("no token"), "{err}");
+
+        // 繋がらない先
+        let p =
+            MetadataTokenProvider::new("http://127.0.0.1:1", "https://alc.example", 60).unwrap();
+        let err = p.token().await.unwrap_err();
+        assert!(err.to_string().contains("metadata identity"), "{err}");
+    }
+
+    #[test]
+    fn build_token_provider_uses_metadata_when_declared() {
+        let mut cfg = KintaiEventsConfig {
+            base_url: "https://alc.example".to_string(),
+            auth_token_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_token_provider(&cfg).is_ok());
+
+        // base_url が無いと audience が作れないので起動時に落ちる
+        cfg.base_url = String::new();
+        assert!(build_token_provider(&cfg).is_err());
     }
 }
