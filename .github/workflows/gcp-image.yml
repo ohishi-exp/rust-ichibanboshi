@@ -1,0 +1,219 @@
+name: GCP image
+
+# CI から GCP へ出す成果物は **コンテナイメージまで**。実行はオンプレ
+# (ohishi-data / systemd) のままで、この workflow は `gcloud run deploy` を
+# 一切実行しない。ci.yml の deploy job (CF Tunnel SSH → ohishi-data) が
+# 引き続き本番反映の唯一の経路で、この workflow はそこに手を触れない。
+#
+# ── なぜ「まだ」Cloud Run に traffic を向けないのか ─────────────────────────
+# rust-ichibanboshi はオンプレ (ohishi-data / systemd) と GCP (Cloud Run) の
+# **両方を一級の実行形態として恒久的に持つ**方針。ただし今の時点で GCP 側に
+# 向けられる traffic が無い。残っている理由は 2 つだけ:
+#
+# (a) 到達性 [未解決・今回の対象外]: 本体は tiberius でオンプレの SQL Server
+#     (CAPE#01、172.18.21.102\softec) を読む。MariaDB (127.0.0.1:3306) と CakePHP
+#     (127.0.0.1:120) も同一ホストの loopback。ohishi-exp/rust-ichibanboshi#205 の
+#     実装計画 04 が「push 方向のみ (GCP からオンプレへは到達できない)」と明記して
+#     おり、GCP 側からこれらへ到達する経路は無い。読み先が Supabase へ移る
+#     (#205 の 03〜05) までは GCP 側の instance が返せる内容が無い。
+#     ネットワークで到達性を作る (VPN / Interconnect / 逆トンネル) のは対象外。
+# (d) ローカル状態 [棚卸し済み・未着手]: SQLite (state.db / kyuyo_local /
+#     restraint_local / kintai_local) と raw NDJSON.gz が /opt/ichibanboshi の
+#     ローカルディスク前提。Cloud Run の FS はインスタンスごとに揮発するため、
+#     保存先を 2 つ持つか 1 つに寄せるかの判断が要る。
+#
+# ── アプリ側の阻害要因は解消済み ────────────────────────────────────────────
+# (b) 起動不能 [解決]: 「使うと宣言したバックエンドに繋がらなければ落ちる」形に
+#     した。`[database] enabled` (env: DATABASE_ENABLED) で宣言し、true なら従来
+#     どおり起動時に SELECT 1 を打って失敗すれば起動失敗 (オンプレの既定)。
+#     false なら pool を作らず SQL Server 依存ルートは 503 fail-closed、/health は
+#     200 + backends.sqlserver="disabled" を返す (静かな degraded を作らない)。
+# (c) 設定注入 [解決]: TOML と環境変数が対等な入力経路になった
+#     (src/config.rs の Config::apply_env_overrides)。優先順位は
+#     CLI 引数 > 環境変数 > TOML > 既定値。Secret Manager + secretKeyRef が
+#     入れる env var だけで起動でき、値をイメージに焼く必要が無い。
+#
+# ── よって今 GCP に置くのはイメージだけ ─────────────────────────────────────
+# #205 の 02 (生イベントの読み先を Cloud Run の rust-alc-api へ) と #199 の
+# Phase 7 (api を Cloud Run へ) はどちらも「GCP 側に実体を置く」前提で、その
+# 前提条件が SHA で固定された pull 可能なイメージ。(a)(d) が解けた時点で
+# `gcloud run deploy` (または rust-alc-api の cloudrun/render.sh 相当) を
+# 足すだけになる。
+#
+# ── イメージの置き場所 (rust-alc-api の流儀に合わせる) ──────────────────────
+# rust-alc-api は image を GHCR に push し、Cloud Run は Artifact Registry の
+# **remote repository** (pull-through cache、asia-northeast1-docker.pkg.dev/
+# cloudsql-sv/ghcr) 経由で pull している。ここも同じにする — GHCR に push し、
+# AR 側からその sha が解決できることを **読み取りだけ** で確認する。
+# AR に直接 push しないのは、そのために新しい standard repository と push 権限
+# (roles/artifactregistry.writer) を切る必要があり、alc と別流儀になるため。
+#
+# ── GCP 側が未整備のうちは verify job ごと skip する ─────────────────────────
+# vars.GCP_PROJECT / vars.GCP_AR_REMOTE_PREFIX が両方入るまで
+# verify-artifact-registry は起動しない (= main が赤にならない)。人間が用意する
+# ものの一覧は下の verify-artifact-registry job のコメントを読むこと。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+concurrency:
+  # 同一 ref の連続 push で無駄に並走させない。ただし cancel はしない —
+  # 途中で殺すと「sha に対応する image が無い」状態が残るため。
+  group: gcp-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # musl static binary → コンテナイメージ → GHCR
+  # ---------------------------------------------------------------------------
+  build-image:
+    name: Build and publish image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # ci.yml の deploy job が作る musl cache を **読むだけ** で使う。
+      # save-if: false にしてあるのは、同じ shared-key へ両方が save すると
+      # ci.yml の comment にある restore→save→restore の thrashing を再現して
+      # しまい、本番反映経路 (deploy job) の build を遅くするため。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ichibanboshi-musl
+          save-if: false
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # deploy job (ci.yml) と同一条件で build する。同じ commit から出る binary が
+      # 「オンプレに置かれたもの」と「イメージに入ったもの」で違うと、後で
+      # Cloud Run へ移したとき差分の切り分けができなくなる。
+      - name: Build musl release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl --locked
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          CC_x86_64_unknown_linux_musl: musl-gcc
+
+      # rust-alc-api の build-image job と同じ形 — build 済みバイナリと Dockerfile
+      # だけの小さい context を組む (repo 全体を docker daemon に送らない)。
+      - name: Prepare Docker context
+        run: |
+          set -euo pipefail
+          mkdir -p ctx
+          cp target/x86_64-unknown-linux-musl/release/ichibanboshi ctx/
+          chmod u+w ctx/ichibanboshi
+          cp Dockerfile ctx/Dockerfile
+          ls -l ctx/
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          # sha tag が正。branch/tag 名の移動 tag は人間向けの別名でしかない。
+          TAGS="${IMAGE}:${GITHUB_SHA}"
+          case "${GITHUB_REF}" in
+            refs/tags/*) TAGS="${TAGS},${IMAGE}:${GITHUB_REF#refs/tags/}" ;;
+            refs/heads/main) TAGS="${TAGS},${IMAGE}:main" ;;
+          esac
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "::notice::image tags = ${TAGS}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=ichibanboshi-image
+          cache-to: type=gha,mode=max,scope=ichibanboshi-image
+
+      # NOTE: コンテナの smoke test (docker run → curl /health) は **意図的に無い**。
+      # 設定なしで起動すると src/db.rs の起動時接続テストが localhost の SQL Server
+      # を探して失敗し、必ず異常終了する (Dockerfile のコメント参照)。
+      # 「動く smoke test」は設定層を env var 対応させた後に足すこと。
+
+  # ---------------------------------------------------------------------------
+  # GCP 側からこの sha の image が pull できるかを **読み取りだけ** で確認する
+  # ---------------------------------------------------------------------------
+  # この job が検査しているのは、将来 Cloud Run へ移すときに最初に壊れる場所 —
+  # 「AR の remote repository が GHCR の (private な) package を引けているか」。
+  # 引けていなければ deploy 時に image pull で落ちるので、先に CI で見ておく。
+  #
+  # 人間が用意する必要があるもの (全部そろうまでこの job は skip される):
+  #   - repo/org variable `GCP_PROJECT`            例: cloudsql-sv
+  #   - repo/org variable `GCP_AR_REMOTE_PREFIX`   例: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr
+  #     (rust-alc-api が使っている GHCR pull-through の remote repository。
+  #      ichibanboshi 用に別 repository を切るなら、その path をここに入れる)
+  #   - repo/org secret `GCP_SA_KEY` … rust-alc-api と同じ credentials_json 方式。
+  #     この job に要るのは読み取りだけなので roles/artifactregistry.reader で足りる
+  #     (alc の deploy 用 SA を流用せず、per-repo に read 専用を切るのが望ましい)
+  #   - GHCR の package `ghcr.io/ohishi-exp/rust-ichibanboshi` を AR remote repository が
+  #     引けること。private package のままなら AR 側に upstream credential
+  #     (GitHub PAT: read:packages) の登録が要る
+  verify-artifact-registry:
+    name: Verify image is pullable from GCP
+    needs: [build-image]
+    if: ${{ vars.GCP_PROJECT != '' && vars.GCP_AR_REMOTE_PREFIX != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Preflight — credentials present
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -z "${GCP_SA_KEY}" ]; then
+            echo "::error::secrets.GCP_SA_KEY is empty — vars.GCP_PROJECT is set so this job is expected to run. Configure the service account key (roles/artifactregistry.reader) or unset GCP_PROJECT/GCP_AR_REMOTE_PREFIX to skip this job." >&2
+            exit 1
+          fi
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # 読み取り専用。この workflow は gcloud の書き込み系 (run deploy / secrets
+      # create / iam / artifacts push) を一切実行しない。
+      - name: Describe image through Artifact Registry
+        env:
+          AR_PREFIX: ${{ vars.GCP_AR_REMOTE_PREFIX }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          set -euo pipefail
+          AR_IMAGE="${AR_PREFIX}/${IMAGE}:${GITHUB_SHA}"
+          echo "resolving ${AR_IMAGE}"
+          if ! gcloud artifacts docker images describe "${AR_IMAGE}" \
+                 --project "${GCP_PROJECT}"; then
+            echo "::error::${AR_IMAGE} is not resolvable from GCP. If the Artifact Registry remote repository is a GHCR pull-through, check that it has upstream credentials for the private package ${IMAGE}." >&2
+            exit 1
+          fi
+          echo "::notice::${AR_IMAGE} is pullable from GCP"

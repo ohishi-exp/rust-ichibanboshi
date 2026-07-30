@@ -27,6 +27,18 @@ pub struct AppArgs {
 /// Database configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
+    /// この instance が SQL Server (CAPE#01) を**使うと宣言するか**。
+    ///
+    /// 既定 `true` = オンプレ (ohishi-data / systemd) の形。宣言したものには
+    /// 起動時に必ず接続でき、繋がらなければ**起動失敗**する (早期に気付ける)。
+    ///
+    /// `false` = SQL Server を持たない実行形態 (Cloud Run 等) の形。pool を
+    /// 作らず、SQL Server 依存ルートは全て 503 fail-closed になり、`/health`
+    /// は `backends.sqlserver = "disabled"` と明示して 200 を返す。
+    /// 「起動はするが実は繋がっていない」という静かな degraded は作らない。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     #[serde(default = "default_db_host")]
     pub host: String,
 
@@ -429,6 +441,7 @@ impl Default for KyuyoConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host: default_db_host(),
             instance: default_db_instance(),
             database: default_db_name(),
@@ -474,12 +487,189 @@ impl Default for RawConfig {
     }
 }
 
+/// 環境変数の引き当て。`std::env::var` を直接呼ばずに関数で受けるのは、
+/// テストが**プロセス全体の環境変数を汚さずに済む**ようにするため
+/// (`cargo test` はスレッド並列なので `set_var` は他のテストとレースする)。
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// 環境変数が**在るかどうか**だけで上書きを決める (値が空でも空で上書きする)。
+///
+/// 空を「未設定」に落とすと、`secretKeyRef` の配線ミスで空が入ったときに
+/// TOML の値へ静かに戻ってしまい、どちらが効いているのか外から分からなくなる。
+/// 空で上書きすれば「password が空 → 起動時接続に失敗 → 起動失敗」と loud に出る。
+fn env_str(get: EnvLookup, key: &str) -> Option<String> {
+    get(key)
+}
+
+/// カンマ区切りのリスト。前後の空白は落とし、空要素は捨てる。
+/// `KEY=""` は「空リストを明示した」と解釈する (例: CORS 全拒否)。
+fn env_list(get: EnvLookup, key: &str) -> Option<Vec<String>> {
+    get(key).map(|raw| {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// 数値。壊れた値は**黙って無視せず起動を失敗させる** (静かな誤設定を作らない)。
+fn env_u16(get: EnvLookup, key: &str) -> Result<Option<u16>, String> {
+    match get(key) {
+        None => Ok(None),
+        Some(raw) => raw
+            .trim()
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|e| format!("{key}: invalid number {raw:?} ({e})")),
+    }
+}
+
+/// `Option<u16>` の項目 (`[database] port`) 用。空文字は「未指定に戻す」
+/// = 名前付きインスタンス経由に切り替える、という意味を持たせる。
+#[allow(clippy::type_complexity)]
+fn env_opt_u16(get: EnvLookup, key: &str) -> Result<Option<Option<u16>>, String> {
+    match get(key) {
+        None => Ok(None),
+        Some(raw) if raw.trim().is_empty() => Ok(Some(None)),
+        Some(raw) => raw
+            .trim()
+            .parse::<u16>()
+            .map(|v| Some(Some(v)))
+            .map_err(|e| format!("{key}: invalid number {raw:?} ({e})")),
+    }
+}
+
+/// 真偽値。`true` / `false` / `1` / `0` (大文字小文字を問わない) のみ受ける。
+fn env_bool(get: EnvLookup, key: &str) -> Result<Option<bool>, String> {
+    match get(key) {
+        None => Ok(None),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "1" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            "0" => Ok(Some(false)),
+            _ => Err(format!(
+                "{key}: invalid boolean {raw:?} (expected true/false/1/0)"
+            )),
+        },
+    }
+}
+
 impl Config {
     pub fn addr(&self) -> String {
         format!("{}:{}", self.bind_addr, self.port)
     }
 
-    /// Load config from file, then apply CLI overrides
+    /// 環境変数による上書き。
+    ///
+    /// TOML と環境変数は**対等な入力経路**で、どちらか片方だけで完結して起動できる
+    /// (オンプレ = TOML 主体 / Cloud Run = env 主体)。両方に値がある場合の優先順位は
+    /// **CLI 引数 > 環境変数 > TOML > 既定値**。環境変数を TOML より上に置くのは、
+    /// コンテナに焼かれた TOML が古いままでも、プラットフォームが注入した値
+    /// (Secret Manager → `secretKeyRef`) が必ず勝つようにするため。オンプレは
+    /// 環境変数を一切設定しないので TOML が完全に主導権を持ち、挙動は変わらない。
+    ///
+    /// 対象は**秘匿値と、実行形態の判別に要る項目**に絞ってある。SQLite のパスや
+    /// `[kosoku]` の就業規則パラメータは意図的に対象外 (理由は docs ではなく
+    /// 各フィールドのコメント、および `[kosoku]` は `kintai_version` の ETag に
+    /// 畳み込まれているので環境ごとに変わると意味が壊れる)。
+    pub fn apply_env_overrides(&mut self, get: EnvLookup) -> Result<(), String> {
+        // ── HTTP listener (Cloud Run は PORT を注入し、0.0.0.0 での listen を要求する) ──
+        if let Some(v) = env_u16(get, "PORT")? {
+            self.port = v;
+        }
+        if let Some(v) = env_str(get, "BIND_ADDR") {
+            self.bind_addr = v;
+        }
+
+        // ── SQL Server (CAPE#01) ──
+        // alc は DATABASE_URL 1 本だが、こちらは項目別にした。tiberius は
+        // 名前付きインスタンス (`using_named_connection()`) と暗号化レベルを
+        // 個別に組む必要があり、URL 1 本で表せる形になっていないため。
+        if let Some(v) = env_bool(get, "DATABASE_ENABLED")? {
+            self.database.enabled = v;
+        }
+        if let Some(v) = env_str(get, "DATABASE_HOST") {
+            self.database.host = v;
+        }
+        if let Some(v) = env_str(get, "DATABASE_INSTANCE") {
+            self.database.instance = v;
+        }
+        if let Some(v) = env_str(get, "DATABASE_NAME") {
+            self.database.database = v;
+        }
+        if let Some(v) = env_str(get, "DATABASE_USER") {
+            self.database.user = v;
+        }
+        if let Some(v) = env_str(get, "DATABASE_PASSWORD") {
+            self.database.password = v;
+        }
+        if let Some(v) = env_opt_u16(get, "DATABASE_PORT")? {
+            self.database.port = v;
+        }
+        if let Some(v) = env_bool(get, "DATABASE_TRUST_SERVER_CERTIFICATE")? {
+            self.database.trust_server_certificate = v;
+        }
+
+        // ── 勤怠の生イベント (社内 MariaDB、Refs #116) ──
+        if let Some(v) = env_str(get, "MARIADB_HOST") {
+            self.mariadb.host = v;
+        }
+        if let Some(v) = env_u16(get, "MARIADB_PORT")? {
+            self.mariadb.port = v;
+        }
+        if let Some(v) = env_str(get, "MARIADB_USER") {
+            self.mariadb.user = v;
+        }
+        if let Some(v) = env_str(get, "MARIADB_PASSWORD") {
+            self.mariadb.password = v;
+        }
+        if let Some(v) = env_str(get, "MARIADB_DATABASE") {
+            self.mariadb.database = v;
+        }
+
+        // ── 給与大臣 (OHKEN) + introspect 認可 (Refs #82) ──
+        if let Some(v) = env_str(get, "KYUYO_HOST") {
+            self.kyuyo.host = v;
+        }
+        if let Some(v) = env_u16(get, "KYUYO_PORT")? {
+            self.kyuyo.port = v;
+        }
+        if let Some(v) = env_str(get, "KYUYO_USER") {
+            self.kyuyo.user = v;
+        }
+        if let Some(v) = env_str(get, "KYUYO_PASSWORD") {
+            self.kyuyo.password = v;
+        }
+        if let Some(v) = env_str(get, "KYUYO_AUTH_WORKER_ORIGIN") {
+            self.kyuyo.auth_worker_origin = v;
+        }
+        if let Some(v) = env_str(get, "KYUYO_INTROSPECT_SECRET") {
+            self.kyuyo.introspect_secret = v;
+        }
+        if let Some(v) = env_str(get, "KYUYO_APP_ORIGIN") {
+            self.kyuyo.app_origin = v;
+        }
+        if let Some(v) = env_list(get, "KYUYO_ALLOWED_EMAILS") {
+            self.kyuyo.allowed_emails = v;
+        }
+
+        // ── その他の秘匿値 / 外部接続先 ──
+        // JWT_SECRET は持たない。到達不能だった HS256 自前検証は #207 で撤去済みで、
+        // 認可は Cloudflare Access (オンプレ) / Cloud Run IAM (GCP) が担う
+        if let Some(v) = env_str(get, "CAKEPHP_BASE_URL") {
+            self.cakephp.base_url = v;
+        }
+        if let Some(v) = env_list(get, "CORS_ALLOWED_ORIGINS") {
+            self.cors.allowed_origins = v;
+        }
+
+        Ok(())
+    }
+
+    /// Load config from file, then apply env var and CLI overrides
+    ///
+    /// 優先順位は **CLI 引数 > 環境変数 > TOML > 既定値** (`apply_env_overrides` 参照)。
     pub fn from_args_and_file(args: &AppArgs) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = if let Some(ref path) = args.config {
             let content = std::fs::read_to_string(path)?;
@@ -488,6 +678,9 @@ impl Config {
         } else {
             Self::load_default_locations()?
         };
+
+        // env overrides (TOML より上、CLI より下)
+        config.apply_env_overrides(&|k| std::env::var(k).ok())?;
 
         // CLI overrides
         if let Some(port) = args.port {
