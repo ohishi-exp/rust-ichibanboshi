@@ -40,6 +40,19 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # [restraint]
 # sqlite_path = "/opt/ichibanboshi/restraint_local.sqlite"
 
+# ローカル状態 (担当者別売上 summary + recalc_jobs + verify_jobs、Refs #205 の G4)。
+# 省略時 /opt/ichibanboshi/state.db、**空文字で無効** (/api/uriage/* が 503)。
+#
+# 上の 3 つと違ってキャッシュではない — uriage_person_* は SQL Server (CAPE#01) から
+# 作り直せるが、recalc_jobs は fingerprint と R2 同期状態の**唯一の記録**で、消えると
+# 差分再計算の基準が失われる。
+#
+# **GCP (Cloud Run) は空にする。** 揮発 FS に空の state.db が生えると
+# /api/uriage/* が「壊れている」ではなく「0 件」を返す。イメージに TOML は焼かない
+# 方針なので env で宣言する: SQLITE_PATH=""  (空でも上書きされる)
+# [sqlite]
+# path = "/opt/ichibanboshi/state.db"
+
 # 社内 MariaDB (勤怠の生イベント、Refs #116)。未設定なら /api/kintai/events は
 # 503 (fail-closed — 空配列を返して「0 件」に見せない)。
 # 接続先は同一ホストの docker `db` コンテナ (loopback 1 hop)。password / database の

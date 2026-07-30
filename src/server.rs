@@ -87,8 +87,16 @@ pub async fn run(
         Arc::new(TiberiusRepo::disabled())
     };
 
-    // SQLite local store (Phase 2、担当者別売上 summary 永続化)
-    let local_store: DynLocalStore = Arc::new(LocalStore::open(&config.sqlite.path)?);
+    // SQLite local store (Phase 2、担当者別売上 summary 永続化)。
+    // **path が空なら file を作らない** — Cloud Run の揮発 FS に空の state.db を
+    // 作ると `/api/uriage/*` が 0 件を返し、`recalc_jobs` (fingerprint と R2 同期
+    // 状態の唯一の記録) が毎回まっさらから始まる (Refs #205 の G4)
+    let local_store: DynLocalStore = if config.sqlite.path.trim().is_empty() {
+        tracing::info!("sqlite path is empty — local store disabled (/api/uriage/* returns 503)");
+        Arc::new(LocalStore::disabled())
+    } else {
+        Arc::new(LocalStore::open(&config.sqlite.path)?)
+    };
 
     // CakePHP fetch client (Phase 2、masters / editable-months pull)
     // base_url 空でも build は成功し、各 endpoint で is_enabled() を見て 503 を返す
