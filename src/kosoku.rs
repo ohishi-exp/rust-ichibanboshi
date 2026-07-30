@@ -2003,18 +2003,16 @@ pub(crate) fn shift_cover(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime
     merge_intervals(cover)
 }
 
+/// 時刻区間 (開始, 終了) の並び。
+pub(crate) type Spans = Vec<(NaiveDateTime, NaiveDateTime)>;
+
 /// 分割後の勤務から**拘束として残る区間**と、突合の個別 cause が既に実額を持つ
 /// **診断区間** (運行の継ぎ目・日跨ぎの頭尻尾) を返す (Refs #182 フォローアップ)。
 ///
 /// [`crate::kosoku_paper::ours_outside_by_date`] が「こちらだけが数える時間」を測る
 /// ときの土台。診断区間を別に返すのは、あちらを外に含めると cause `run-gap` /
 /// `punch-head` / `punch-tail` と二重説明になるため。
-pub(crate) fn restraint_spans_and_diagnostics(
-    events: &[Event],
-) -> (
-    Vec<(NaiveDateTime, NaiveDateTime)>,
-    Vec<(NaiveDateTime, NaiveDateTime)>,
-) {
+pub(crate) fn restraint_spans_and_diagnostics(events: &[Event]) -> (Spans, Spans) {
     let mut restraint_all: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
     let mut diags: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
     for s in final_shifts_aligned(events) {
@@ -2963,7 +2961,10 @@ mod tests {
             restraint_rounding: RestraintRounding::TruncateElapsed,
             ..KosokuParams::default()
         };
-        assert_eq!(daily_summary(&rows, "2026-06", &p)[0].restraint_minutes, 160);
+        assert_eq!(
+            daily_summary(&rows, "2026-06", &p)[0].restraint_minutes,
+            160
+        );
     }
 
     #[test]
@@ -3123,7 +3124,10 @@ mod tests {
                 restraint_rounding: rounding,
                 ..KosokuParams::default()
             };
-            assert!(daily_summary(&rows, "2026-06", &p)[0].over_24h, "{rounding:?}");
+            assert!(
+                daily_summary(&rows, "2026-06", &p)[0].over_24h,
+                "{rounding:?}"
+            );
         }
     }
 
@@ -3810,7 +3814,7 @@ mod tests {
         let rows = vec![
             tc("2026-03-02 06:00:00", "始業"),
             ev("2026-03-02 06:30:00", "2026-03-02 18:00:00", "休息"), // 690 分
-            dtako("2026-03-02 09:37:00", "運行開始"), // 休息の中で別車両が動き出す
+            dtako("2026-03-02 09:37:00", "運行開始"),                 // 休息の中で別車両が動き出す
             ev("2026-03-02 09:37:00", "2026-03-02 17:00:00", "運転"),
             tc("2026-03-02 20:00:00", "終業"),
         ];

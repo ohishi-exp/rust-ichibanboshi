@@ -416,7 +416,8 @@ mod tests {
         let sha = env!("KINTAI_OUTPUT_SHA");
         assert_eq!(sha.len(), 16, "KINTAI_OUTPUT_SHA={sha}");
         assert!(
-            sha.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            sha.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "KINTAI_OUTPUT_SHA={sha} (小文字 hex のはず)"
         );
     }

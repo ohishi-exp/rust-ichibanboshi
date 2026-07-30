@@ -1129,4 +1129,3 @@ pub fn error_repo() -> DynRepo {
 pub fn query_error_repo() -> DynRepo {
     Arc::new(QueryErrorRepo)
 }
-

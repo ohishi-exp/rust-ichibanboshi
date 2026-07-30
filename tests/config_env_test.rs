@@ -51,7 +51,10 @@ password = "kyuyo-secret"
     let mut config: Config = toml::from_str(toml_str).unwrap();
     apply(&mut config, &[]).unwrap();
 
-    assert!(config.database.enabled, "既定は SQL Server を使う (オンプレ)");
+    assert!(
+        config.database.enabled,
+        "既定は SQL Server を使う (オンプレ)"
+    );
     assert_eq!(config.database.host, "172.18.21.102");
     assert_eq!(config.database.password, "onprem-secret");
     assert_eq!(config.mariadb.password, "maria-secret");
@@ -91,7 +94,10 @@ fn test_env_overrides_every_supported_key() {
             ("KYUYO_APP_ORIGIN", "https://app.example"),
             ("KYUYO_ALLOWED_EMAILS", "a@example.com, b@example.com"),
             ("CAKEPHP_BASE_URL", "http://127.0.0.1:120"),
-            ("CORS_ALLOWED_ORIGINS", "https://x.example, https://y.example"),
+            (
+                "CORS_ALLOWED_ORIGINS",
+                "https://x.example, https://y.example",
+            ),
         ],
     )
     .unwrap();
@@ -230,7 +236,11 @@ fn test_from_args_and_file_env_beats_toml() {
     let dir = std::env::temp_dir().join(format!("ichibanboshi-env-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("env-beats-toml.toml");
-    std::fs::write(&path, "port = 3100\n\n[database]\npassword = \"from-toml\"\n").unwrap();
+    std::fs::write(
+        &path,
+        "port = 3100\n\n[database]\npassword = \"from-toml\"\n",
+    )
+    .unwrap();
 
     std::env::set_var("PORT", "8080");
     std::env::set_var("DATABASE_PASSWORD", "from-env");
