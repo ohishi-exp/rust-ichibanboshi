@@ -18,7 +18,6 @@ fn test_config_defaults_from_empty_toml() {
     assert!(config.database.user.is_empty());
     assert!(config.database.password.is_empty());
     assert!(config.database.port.is_none());
-    assert!(config.auth.jwt_secret.is_empty());
     assert_eq!(
         config.cors.allowed_origins,
         vec!["https://ichibanboshi.mtamaramu.com"]
@@ -56,7 +55,6 @@ allowed_origins = ["http://localhost:3000", "https://example.com"]
     assert_eq!(config.database.password, "secret");
     assert_eq!(config.database.port, Some(1433));
     assert!(!config.database.trust_server_certificate);
-    assert_eq!(config.auth.jwt_secret, "my-secret-key");
     assert_eq!(config.cors.allowed_origins.len(), 2);
 }
 
@@ -167,12 +165,6 @@ fn test_database_config_default() {
 }
 
 #[test]
-fn test_auth_config_default() {
-    let auth = rust_ichibanboshi::config::AuthConfig::default();
-    assert!(auth.jwt_secret.is_empty());
-}
-
-#[test]
 fn test_cors_config_default() {
     let cors = rust_ichibanboshi::config::CorsConfig::default();
     assert_eq!(cors.allowed_origins.len(), 1);
@@ -253,7 +245,6 @@ fn test_config_from_args_with_config_file() {
     let config = Config::from_args_and_file(&args).unwrap();
     assert_eq!(config.port, 7777);
     assert_eq!(config.bind_addr, "10.0.0.1");
-    assert_eq!(config.auth.jwt_secret, "file-secret");
 
     std::fs::remove_file(&config_path).ok();
 }
@@ -299,7 +290,6 @@ fn test_load_default_locations_exe_adjacent() {
 
     let config = Config::load_default_locations().unwrap();
     assert_eq!(config.port, 6666);
-    assert_eq!(config.auth.jwt_secret, "exe-adjacent");
 
     if !existed {
         std::fs::remove_file(&config_path).ok();

@@ -8,9 +8,6 @@
 # 確認: bash scripts/check_coverage_100.sh
 
 [[files]]
-path = "src/auth.rs"
-
-[[files]]
 path = "src/config.rs"
 
 [[files]]
