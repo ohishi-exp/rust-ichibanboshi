@@ -1,0 +1,43 @@
+[Unit]
+Description=Ichibanboshi kintai sync を 1 日 1 回起動する timer
+Documentation=https://github.com/ohishi-exp/rust-ichibanboshi/blob/main/docs/setup-kintai-sync-timer.md
+
+[Timer]
+# 起動対象。同名の .service が既定なので省略できるが、対応が一目で分かるよう明示する。
+Unit=ichibanboshi-sync.service
+
+# 毎日 04:15。この時刻を選んだ理由:
+#
+#   - 前日分の打刻が出そろうのを待つ。運行は日をまたぐので、0〜3 時台だと前日の
+#     退勤打刻がまだ入りきっていない可能性がある。
+#   - 【推測】デジタコ (theearth) の scrape と R2 への取り込みは
+#     dtako-scraper-relay が夜間に回している。本 repo からはその実行時刻を読めない
+#     ので「深夜のどこか」までしか分からないが、少なくともその後ろに置きたい。
+#     relay 側の時刻が判明したら、確実に後ろになるよう調整すること。
+#   - 04:00 / 03:00 のような丸い時刻は logrotate をはじめ他の cron / timer が集まる
+#     ので、意図的に 15 分ずらしている。
+#   - 業務時間 (朝の点呼〜) までに終わっていること。上流を叩くので日中は避けたい。
+#
+# 【重要 / TZ】OnCalendar= はホストの system timezone で解釈される。
+# ichibanboshi-sync.service の Environment=TZ=Asia/Tokyo は *service の中身* に
+# しか効かず、この起動時刻には効かない。ホストが UTC だと 04:15 UTC = 13:15 JST に
+# なって業務時間に走る。設置時に `timedatectl` で Asia/Tokyo を必ず確認すること
+# (docs/setup-kintai-sync-timer.md の手順に入れてある)。
+# systemd 252 以降なら `OnCalendar=*-*-* 04:15:00 Asia/Tokyo` と TZ を直接書けるが、
+# ohishi-data の systemd version が分からない (Ubuntu 22.04 の systemd 249 は非対応で、
+# 書くと unit が読めなくなる) ため、ここでは使わずホスト設定の確認に倒した。
+OnCalendar=*-*-* 04:15:00
+
+# ホストが止まっていた/寝ていた分を、起動後に 1 回だけ埋める。
+# 勤怠は「毎日必ず 1 回は追い付く」ことが要件なので必須。
+# 最終実行時刻は /var/lib/systemd/timers/ に記録される。
+Persistent=true
+
+# 上流 (社内 MariaDB / CakePHP / alc API / Supabase) に毎日同じ秒に当たりにいくのを
+# 避けるため、0〜5 分の範囲でばらす。この timer 単体では thundering herd は起きないが、
+# 下流に「04:15 に必ず終わっている」ことを期待する仕組みが無い以上ほぼ無料の保険。
+# なお Persistent=true の埋め合わせ起動にもこの遅延が乗る。
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
