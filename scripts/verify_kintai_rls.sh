@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# verify_kintai_rls.sh — migrations/001 が作る kintai スキーマの契約を実 PostgreSQL で assert する
+# verify_kintai_rls.sh — migrations/ が作る kintai スキーマの契約を実 PostgreSQL で assert する
 #
 # Refs ohishi-exp/rust-ichibanboshi#205 実装計画 03 / テスト計画。
 #
@@ -16,12 +16,18 @@
 #   - CHECK / 生成列 / FK CASCADE / 冪等キーが宣言どおり効く
 #     (end_at > start_at、day_parts の 0..1440、php_diff.cause の正規表現、
 #      diff_minutes の符号が php − rust、kintai_events の重複打刻が増えない)
+#   - day_summaries が **勤務 1 本 = 1 行** である (002)
+#     同じ暦日に複数の勤務が入る / PK が 4 列で date が shift_start_at より前 /
+#     shifts への FK が ON DELETE CASCADE / date が始業時刻の JST 日付と一致する
 #
 # 打刻 → 集計の一致 (指紋・再計算・差分ゼロ) は 04 / 05 の担当なのでここでは見ない。
 #
 # 使い方:
 #   # ローカル docker で使い捨てクラスタを立てて全部やる
 #   bash scripts/verify_kintai_rls.sh --docker
+#
+#   # 既定の 55432 が塞がっているとき (別の作業が使っている等) はポートを変える
+#   PGPORT_LOCAL=55433 bash scripts/verify_kintai_rls.sh --docker
 #
 #   # 既にある PostgreSQL に対して流す (superuser 相当の接続が必要)
 #   KINTAI_DATABASE_URL='postgres://postgres:pw@localhost:5432/postgres' bash scripts/verify_kintai_rls.sh
@@ -41,7 +47,7 @@ USE_DOCKER=0
 for arg in "$@"; do
   case "$arg" in
     --docker) USE_DOCKER=1 ;;
-    -h|--help) sed -n '1,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '1,39p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -155,8 +161,14 @@ psql "$SUPER_URL" -v ON_ERROR_STOP=1 -X -c \
      FROM _sqlx_migrations ORDER BY version;"
 
 echo "== 2 度目は skip する (冪等)"
+# skip 数は migrations/*.sql の本数。増やしたらここも増やす (数え漏れを黙らせない)
+MIGRATION_COUNT="$(ls -1 "$REPO_ROOT"/migrations/*.sql | wc -l | tr -d ' ')"
 out="$(bash "$REPO_ROOT/scripts/migrate_kintai.sh")"
-if [[ "$out" == *"0 applied, 1 skipped"* ]]; then ok "re-run applies nothing"; else bad "re-run: $out"; fi
+if [[ "$out" == *"0 applied, $MIGRATION_COUNT skipped"* ]]; then
+  ok "re-run applies nothing ($MIGRATION_COUNT skipped)"
+else
+  bad "re-run: $out"
+fi
 
 # ── 2. ロールの属性 ────────────────────────────────────────────────────
 echo "== roles"
@@ -249,17 +261,136 @@ expect_eq "各行 1440 分以内" \
 expect_eq "3 暦日の合計 = 2340 (39 時間)" \
   "$(as "$SUPER_URL" "SELECT sum(restraint_minutes) FROM kintai.day_parts WHERE driver_cd=1003")" "2340"
 expect_ok_sql "day_summaries に同額を置く (勤務単位 = 始業日へ寄せる)" "$WRITER_URL" "
-INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_source,
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
   restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
   within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
   night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
-VALUES ('$TENANT_A', 1003, '2026-07-01', 'rest',
+VALUES ('$TENANT_A', 1003, '2026-07-01', '2026-07-01T22:00:00+09:00', 'rest',
   2340, 1800, 540, 0, 480, 0, 1320, 0, 480, 480, 0, repeat('b',64), '0123456789abcdef');"
 expect_eq "day_parts の合計が day_summaries.restraint_minutes と一致" \
   "$(as "$SUPER_URL" "SELECT (SELECT sum(restraint_minutes) FROM kintai.day_parts WHERE driver_cd=1003)
        = (SELECT restraint_minutes FROM kintai.day_summaries WHERE driver_cd=1003)")" "t"
 expect_eq "over_24h 部分索引が 39 時間の行を拾う" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM kintai.day_summaries WHERE tenant_id='$TENANT_A' AND restraint_minutes > 1440")" "1"
+
+# ── 3b. day_summaries が勤務単位である (migrations/002) ─────────────────
+echo "== day_summaries の PK が勤務単位 (4 列。date は shift_start_at より前)"
+expect_eq "PK の列 (順序込み)" \
+  "$(as "$SUPER_URL" "SELECT string_agg(a.attname, ',' ORDER BY x.ord)
+       FROM pg_constraint c
+       CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord)
+       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
+      WHERE c.conrelid = 'kintai.day_summaries'::regclass AND c.contype = 'p'")" \
+  "tenant_id,driver_cd,date,shift_start_at"
+expect_eq "shift_start_at は NOT NULL (DEFAULT 無しで足した = 空表でしか通らない)" \
+  "$(as "$SUPER_URL" "SELECT attnotnull FROM pg_attribute
+      WHERE attrelid = 'kintai.day_summaries'::regclass AND attname = 'shift_start_at'")" "t"
+expect_eq "shift_start_at に DEFAULT は無い" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_attrdef d
+      JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+     WHERE d.adrelid = 'kintai.day_summaries'::regclass AND a.attname = 'shift_start_at'")" "0"
+
+echo "== shifts への FK が ON DELETE CASCADE で張られている"
+expect_eq "FK の参照先" \
+  "$(as "$SUPER_URL" "SELECT confrelid::regclass::text FROM pg_constraint
+      WHERE conrelid = 'kintai.day_summaries'::regclass AND contype = 'f'")" "kintai.shifts"
+expect_eq "FK の削除時動作 (c = CASCADE)" \
+  "$(as "$SUPER_URL" "SELECT confdeltype FROM pg_constraint
+      WHERE conrelid = 'kintai.day_summaries'::regclass AND contype = 'f'")" "c"
+
+echo "== 001 の索引 2 本は 002 でも触っていない"
+expect_eq "day_summaries の索引 (PK 以外)" \
+  "$(as "$SUPER_URL" "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes
+      WHERE schemaname = 'kintai' AND tablename = 'day_summaries'
+        AND indexname <> 'day_summaries_pkey'")" \
+  "day_summaries_month,day_summaries_over_24h"
+# 002 の眼目: over_24h が拾う行が「1 本の勤務」を指すようになった (暦日の合算ではない)
+expect_eq "over_24h の行が実在の勤務 1 本を指す" \
+  "$(as "$SUPER_URL" "SELECT (SELECT s.start_at FROM kintai.shifts s
+                               WHERE s.tenant_id = '$TENANT_A' AND s.driver_cd = 1003)
+                            = (SELECT d.shift_start_at FROM kintai.day_summaries d
+                               WHERE d.tenant_id = '$TENANT_A' AND d.restraint_minutes > 1440)")" "t"
+
+echo "== 同じ暦日に 4 勤務 (実データ: 乗務員 1726 / 2026-03-14、フェリー 2 本)"
+# kosoku.rs:1936-1942 の実測。001 の PK (tenant_id, driver_cd, date) では 1 行しか入らない
+expect_ok_sql "4 勤務ぶんの shifts" "$WRITER_URL" "
+INSERT INTO kintai.shifts (tenant_id, driver_cd, start_at, end_at, shift_source, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1726, '2026-03-14T06:00:00+09:00', '2026-03-14T06:01:00+09:00', 'rest', repeat('d',64), '0123456789abcdef'),
+       ('$TENANT_A', 1726, '2026-03-14T06:30:00+09:00', '2026-03-14T06:46:00+09:00', 'rest', repeat('d',64), '0123456789abcdef'),
+       ('$TENANT_A', 1726, '2026-03-14T08:00:00+09:00', '2026-03-14T09:22:00+09:00', 'rest', repeat('d',64), '0123456789abcdef'),
+       ('$TENANT_A', 1726, '2026-03-14T13:00:00+09:00', '2026-03-14T16:42:00+09:00', 'rest', repeat('d',64), '0123456789abcdef');"
+expect_ok_sql "同じ (tenant, driver, date) に 4 行入る" "$WRITER_URL" "
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
+  restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
+  within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
+  night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1726, '2026-03-14', '2026-03-14T06:00:00+09:00', 'rest',   1,   1, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('d',64), '0123456789abcdef'),
+       ('$TENANT_A', 1726, '2026-03-14', '2026-03-14T06:30:00+09:00', 'rest',  16,  16, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('d',64), '0123456789abcdef'),
+       ('$TENANT_A', 1726, '2026-03-14', '2026-03-14T08:00:00+09:00', 'rest',  82,  82, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('d',64), '0123456789abcdef'),
+       ('$TENANT_A', 1726, '2026-03-14', '2026-03-14T13:00:00+09:00', 'rest', 222, 222, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('d',64), '0123456789abcdef');"
+expect_eq "1 暦日に day_summaries が 4 行" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM kintai.day_summaries WHERE driver_cd=1726 AND date='2026-03-14'")" "4"
+expect_eq "拘束の合計 = 321 (1+16+82+222。潰れていない)" \
+  "$(as "$SUPER_URL" "SELECT sum(restraint_minutes) FROM kintai.day_summaries WHERE driver_cd=1726")" "321"
+expect_err "同じ勤務を 2 度書くと PK 違反 (冪等キーは勤務単位)" "$WRITER_URL" "
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
+  restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
+  within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
+  night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1726, '2026-03-14', '2026-03-14T08:00:00+09:00', 'rest', 82, 82, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('d',64), '0123456789abcdef');" \
+  "duplicate key value"
+
+echo "== date は始業時刻の JST 日付でなければならない (CHECK)"
+# 2026-03-15 05:00 JST = 2026-03-14 20:00 UTC。UTC 日付を書くと弾かれる = 9 時間ずれない
+expect_ok_sql "JST 早朝始業の勤務 (UTC では前日)" "$WRITER_URL" "
+INSERT INTO kintai.shifts (tenant_id, driver_cd, start_at, end_at, shift_source, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1727, '2026-03-15T05:00:00+09:00', '2026-03-15T14:00:00+09:00',
+        'timecard', repeat('e',64), '0123456789abcdef');"
+expect_eq "UTC で見ると前日 20:00" \
+  "$(as "$SUPER_URL" "SELECT to_char(start_at AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI') FROM kintai.shifts WHERE driver_cd=1727")" \
+  "2026-03-14 20:00"
+expect_ok_sql "date = 2026-03-15 (JST 日付) を通す" "$WRITER_URL" "
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
+  restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
+  within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
+  night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1727, '2026-03-15', '2026-03-15T05:00:00+09:00', 'timecard',
+  540, 480, 60, 0, 480, 0, 0, 0, 0, 0, 0, repeat('e',64), '0123456789abcdef');"
+expect_err "date = 2026-03-14 (UTC 日付) を拒否" "$WRITER_URL" "
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
+  restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
+  within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
+  night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1727, '2026-03-14', '2026-03-15T05:00:00+09:00', 'timecard',
+  540, 480, 60, 0, 480, 0, 0, 0, 0, 0, 0, repeat('e',64), '0123456789abcdef');" \
+  "violates check constraint"
+# day_parts (勤務を 0 時で切って配る) の 2 日目の日付を day_summaries に書く取り違え。
+# 1003 は 2026-07-01 22:00 JST 始業の 39 時間勤務なので、07-02 は day_parts 側の日付
+expect_err "day_parts の 2 日目の日付を書くと拒否" "$WRITER_URL" "
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
+  restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
+  within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
+  night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
+VALUES ('$TENANT_A', 1003, '2026-07-02', '2026-07-01T22:00:00+09:00', 'rest',
+  1440, 1000, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('b',64), '0123456789abcdef');" \
+  "violates check constraint"
+# date は整合させておく (CHECK ではなく FK が火を噴くことを確かめる)
+expect_err "存在しない勤務への day_summaries を拒否" "$WRITER_URL" "
+INSERT INTO kintai.day_summaries (tenant_id, driver_cd, date, shift_start_at, shift_source,
+  restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, statutory_minutes,
+  within_statutory_overtime_minutes, overtime_minutes, legal_holiday_minutes,
+  night_minutes, overtime_night_minutes, legal_holiday_night_minutes, fingerprint, logic_version)
+VALUES ('$TENANT_A', 7777, '2026-07-01', '2026-07-01T22:00:00+09:00', 'rest',
+  60, 60, 0, 0, 480, 0, 0, 0, 0, 0, 0, repeat('f',64), '0123456789abcdef');" \
+  "violates foreign key constraint"
+
+echo "== 勤務を 1 本消すと、その勤務のサマリだけが CASCADE で消える"
+as "$WRITER_URL" "DELETE FROM kintai.shifts
+   WHERE driver_cd=1726 AND start_at='2026-03-14T08:00:00+09:00'" >/dev/null
+expect_eq "同じ暦日の残り 3 勤務は残る" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM kintai.day_summaries WHERE driver_cd=1726")" "3"
+expect_eq "拘束の合計 = 239 (321 − 82)" \
+  "$(as "$SUPER_URL" "SELECT sum(restraint_minutes) FROM kintai.day_summaries WHERE driver_cd=1726")" "239"
 
 echo "== CHECK / FK が宣言どおり効く"
 expect_err "end_at <= start_at を拒否" "$WRITER_URL" "
@@ -287,6 +418,8 @@ VALUES ('$TENANT_A', 7777, '2026-07-01T22:00:00+09:00', '2026-07-01', 10, 10, 0)
 as "$WRITER_URL" "DELETE FROM kintai.shifts WHERE driver_cd=1003" >/dev/null
 expect_eq "勤務を消すと day_parts も CASCADE で消える" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM kintai.day_parts WHERE driver_cd=1003")" "0"
+expect_eq "勤務を消すと day_summaries も CASCADE で消える (002)" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM kintai.day_summaries WHERE driver_cd=1003")" "0"
 
 echo "== php_diff: 符号は php − rust / cause は複合ラベルを通す"
 expect_ok_sql "php_diff INSERT (原子 cause)" "$WRITER_URL" "

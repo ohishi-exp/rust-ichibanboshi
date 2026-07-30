@@ -1,0 +1,54 @@
+[Unit]
+Description=Ichibanboshi kintai sync - 打刻の push → 差分があれば再計算 (当月/前月)
+Documentation=https://github.com/ohishi-exp/rust-ichibanboshi/blob/main/docs/setup-kintai-sync-timer.md
+# 上流 (社内 MariaDB / CakePHP / alc API / Supabase) を叩くので network 待ち。
+After=network-online.target
+Wants=network-online.target
+# API 本体より後に回す。ただし Requires= は張らない — sync は自分で config を読んで
+# 上流に当たるだけの CLI なので、API が落ちていても走れて構わない。
+# 【推測】sync が /opt/ichibanboshi/data.db (SQLite) を直接触る実装になった場合は
+# 稼働中の ichibanboshi.service と書き込みが競合しうる。04〜06 の実装が固まった時点で
+# 排他 (WAL で足りるか、Conflicts=/ロックが要るか) を確認すること。
+After=ichibanboshi.service
+
+[Service]
+# oneshot。ExecStart= を複数書けるのは Type=oneshot だけで、上から順に実行し、
+# どれかが非 0 で終わるとそこで打ち切って unit を failed にする。
+Type=oneshot
+
+# ここから 3 つ (User / WorkingDirectory / バイナリ path) は ichibanboshi.service と揃える。
+User=root
+WorkingDirectory=/opt/ichibanboshi
+
+# 「当月」は JST の当月。ホストの TZ 設定に依存させないため明示する
+# (ラッパー側にも既定値があるが、二重に効かせて事故を減らす)。
+# 注意: この Environment= は timer の OnCalendar= には効かない — timer の解釈は
+# あくまでホストの system timezone。ichibanboshi-sync.timer 側のコメントを参照。
+Environment=TZ=Asia/Tokyo
+
+# 当月 → 前月 の順。前月は「月初に前月末の打刻が遅れて確定する」ための追い掛けで、
+# 毎日回っている当月のほうが優先度が高い。この順なら前月が失敗しても当月は済んでいる
+# (逆順だと前月の失敗で当月が丸ごとスキップされる)。
+# 前月の失敗を握り潰す `-` prefix は付けない — 失敗は unit を failed にして
+# journal に残すのが 07 の要件。
+ExecStart=/opt/ichibanboshi/ichibanboshi-sync.sh current --apply
+ExecStart=/opt/ichibanboshi/ichibanboshi-sync.sh previous --apply
+
+# oneshot の TimeoutStartSec 既定 (90 秒) は月まるごとの push には短すぎる。
+# ExecStart 2 本の合計に効くので、余裕をみて 30 分。ここに達したら SIGTERM で
+# 打ち切られ failed になる (= 上流が固まったまま次の起動を待たせない)。
+TimeoutStartSec=1800
+
+# Restart= は付けない (oneshot)。1 日 1 回の timer 起動が事実上のリトライで、
+# 失敗した回は次の起動が同じ月をやり直す。
+# stdout/stderr は既定で journal に落ちる (journalctl -u ichibanboshi-sync)。
+# API 本体の log_dir (/opt/ichibanboshi/logs) とは別経路。
+
+# ConditionPathExists= で config やバイナリの存在を確認する案もあるが、採らない。
+# Condition 不成立は "failed" ではなく "skipped" になり、静かに何もしない日が
+# できてしまう。存在しなければラッパー/バイナリが非 0 で落ちて loud fail させる。
+
+# [Install] は意図的に無い。この unit は timer から起動されるので enable する対象では
+# なく (enable するのは ichibanboshi-sync.timer)、WantedBy= を持たせると boot ごとに
+# 走ってしまう。単発の手動実行 (systemctl start ichibanboshi-sync) は [Install] 無しでも
+# いつでもできる。

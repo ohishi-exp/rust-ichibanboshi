@@ -102,6 +102,17 @@ fn test_env_overrides_every_supported_key() {
             ("KINTAI_EVENTS_TIMEOUT_SECS", "90"),
             ("KINTAI_EVENTS_AUTH_TOKEN", "id-token"),
             ("KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS", "600"),
+            ("KINTAI_PUSH_ENABLED", "true"),
+            (
+                "KINTAI_PUSH_DATABASE_URL",
+                "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres",
+            ),
+            (
+                "KINTAI_PUSH_TENANT_ID",
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            ("KINTAI_PUSH_CONNECT_TIMEOUT_SECS", "15"),
+            ("KINTAI_PUSH_STATEMENT_TIMEOUT_SECS", "600"),
             ("CAKEPHP_BASE_URL", "http://127.0.0.1:120"),
             (
                 "CORS_ALLOWED_ORIGINS",
@@ -155,8 +166,23 @@ fn test_env_overrides_every_supported_key() {
     assert_eq!(config.kintai_events.timeout_secs, 90);
     assert_eq!(config.kintai_events.auth_token, "id-token");
     assert_eq!(config.kintai_events.auth_token_ttl_secs, 600);
+    assert!(config.kintai_push.enabled);
+    assert_eq!(
+        config.kintai_push.database_url,
+        "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres"
+    );
+    assert_eq!(
+        config.kintai_push.tenant_id,
+        "11111111-2222-3333-4444-555555555555"
+    );
+    assert_eq!(config.kintai_push.connect_timeout_secs, 15);
+    assert_eq!(config.kintai_push.statement_timeout_secs, 600);
     // env だけで完結して起動できる = 宣言が揃っている
     config.kintai_events.validate().unwrap();
+    config
+        .kintai_push
+        .validate(&config.kintai_events.tenant_id)
+        .unwrap();
 }
 
 #[test]
@@ -275,6 +301,86 @@ auth_token = "from-toml"
     .unwrap();
     apply(&mut config, &[("KINTAI_EVENTS_AUTH_TOKEN", "")]).unwrap();
     assert_eq!(config.kintai_events.auth_token, "");
+}
+
+#[test]
+fn test_kintai_push_defaults_to_disabled() {
+    // オンプレでも既定は無効。TOML に [kintai_push] を書かなければ何も書きに行かない。
+    let config = base();
+    assert!(!config.kintai_push.enabled);
+    assert!(config.kintai_push.database_url.is_empty());
+    assert!(config.kintai_push.tenant_id.is_empty());
+    assert_eq!(config.kintai_push.connect_timeout_secs, 30);
+    // 月単位のバッチなので読み出し経路より長い
+    assert_eq!(config.kintai_push.statement_timeout_secs, 300);
+    // 無効なら接続先の宣言は要らない ([kintai_events] tenant_id も空)
+    config.kintai_push.validate("").unwrap();
+}
+
+#[test]
+fn test_kintai_push_from_toml() {
+    let config: Config = toml::from_str(
+        r#"
+[kintai_push]
+enabled = true
+database_url = "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres"
+tenant_id = "11111111-2222-3333-4444-555555555555"
+connect_timeout_secs = 10
+statement_timeout_secs = 900
+"#,
+    )
+    .unwrap();
+    assert!(config.kintai_push.enabled);
+    assert_eq!(
+        config.kintai_push.database_url,
+        "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres"
+    );
+    assert_eq!(config.kintai_push.connect_timeout_secs, 10);
+    assert_eq!(config.kintai_push.statement_timeout_secs, 900);
+    config
+        .kintai_push
+        .validate(&config.kintai_events.tenant_id)
+        .unwrap();
+}
+
+#[test]
+fn test_kintai_push_enabled_invalid_is_loud() {
+    // 打ち間違いが静かに false へ落ちると「push したつもりで何も書いていない」になる
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_PUSH_ENABLED", "maybe")]).unwrap_err();
+    assert!(err.contains("KINTAI_PUSH_ENABLED"), "{err}");
+    assert!(err.contains("invalid boolean"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_timeout_invalid_is_loud() {
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_PUSH_CONNECT_TIMEOUT_SECS", "soon")]).unwrap_err();
+    assert!(err.contains("KINTAI_PUSH_CONNECT_TIMEOUT_SECS"), "{err}");
+    assert!(err.contains("invalid number"), "{err}");
+
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_PUSH_STATEMENT_TIMEOUT_SECS", "-1")]).unwrap_err();
+    assert!(err.contains("KINTAI_PUSH_STATEMENT_TIMEOUT_SECS"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_env_empty_value_overwrites() {
+    // secretKeyRef の配線ミスで空が入ったとき TOML の接続文字列へ静かに戻らないこと。
+    // 空のまま validate → 起動失敗、と loud に倒れるのが狙い。
+    let mut config: Config = toml::from_str(
+        r#"
+[kintai_push]
+enabled = true
+database_url = "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres"
+tenant_id = "11111111-2222-3333-4444-555555555555"
+"#,
+    )
+    .unwrap();
+    apply(&mut config, &[("KINTAI_PUSH_DATABASE_URL", "")]).unwrap();
+    assert_eq!(config.kintai_push.database_url, "");
+    let err = config.kintai_push.validate("").unwrap_err();
+    assert!(err.contains("database_url"), "{err}");
 }
 
 #[test]

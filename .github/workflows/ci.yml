@@ -14,6 +14,27 @@ jobs:
     name: Test + Coverage regression check
     runs-on: ubuntu-latest
 
+    # kintai の push / fold は実 PostgreSQL 相手でしか意味のある検証にならない
+    # (生成列・CHECK・upsert の衝突・RLS)。service container が無いと
+    # tests/kintai_push_pg_test.rs と tests/kintai_fold_pg_test.rs は
+    # KINTAI_TEST_DATABASE_URL 未設定で**丸ごと skip** され、緑のまま何も
+    # 検証しない状態になる。migration job と同じ形の postgres を test job にも
+    # 持たせて毎 PR 走らせる。
+    # job ごとに別 runner (別 VM) なので、migration job も 5432 を publish して
+    # いるが衝突しない。
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: kintai-test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -53,17 +74,27 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
 
+      # migrations/*.sql はテスト側が自分で流すので psql は要らない。
+      # 与える接続文字列が superuser 相当なのも migration job と同じ理由 (DDL を
+      # 当て、ロールを作り直すため)。変数名が DATABASE_URL でないのは、この repo の
+      # DATABASE_* が売上の SQL Server の名前空間だから (src/config.rs、#208)。
       - name: Run tests
         run: cargo test --locked
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          KINTAI_TEST_DATABASE_URL: postgres://postgres:kintai-test@127.0.0.1:5432/postgres
 
+      # ここも同じ接続文字列を渡す。llvm-cov はテストを**もう一度**走らせるので、
+      # 渡さないと PG のテストだけ skip されて計測が「テストで通った範囲」と
+      # 食い違う。gate 対象に kintai_*.rs は入っていないので判定は変わらないが、
+      # artifact の数字が実態とずれるのは避ける
       - name: Coverage regression check
         run: bash scripts/check_coverage_100.sh
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          KINTAI_TEST_DATABASE_URL: postgres://postgres:kintai-test@127.0.0.1:5432/postgres
 
       - name: Upload coverage text (artifact)
         if: always()
