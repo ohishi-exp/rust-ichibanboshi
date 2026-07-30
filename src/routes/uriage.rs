@@ -786,7 +786,16 @@ pub struct RecalcResponse {
     pub jobs: Vec<RecalcJobResult>,
 }
 
+/// 宣言していない (503) と、壊れている (500) を分ける。
+///
+/// **`Disabled` を 500 にしない。** GCP (Cloud Run) の instance は SQL Server に
+/// 到達できず売上を持てないので、この口は「今は落ちている」ではなく「この形態には
+/// 無い」が正しい (Refs #205 の G4)。オンプレの既定は宣言済みなので変わらない。
 fn map_local_store_err(e: LocalStoreError) -> StatusCode {
+    if matches!(e, LocalStoreError::Disabled) {
+        tracing::info!("local store disabled");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     tracing::error!("local store error: {e}");
     StatusCode::INTERNAL_SERVER_ERROR
 }
@@ -2234,6 +2243,31 @@ fn is_php_ascii_whitespace_or_ideographic(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **宣言していない (503) と壊れている (500) を分ける** (Refs #205 の G4)。
+    ///
+    /// GCP (Cloud Run) の instance は SQL Server に到達できず売上を持てないので、
+    /// この口は「今は落ちている」ではなく「この形態には無い」。500 で返すと
+    /// 呼び出し側が retry する筋の話になってしまう。
+    #[test]
+    fn a_missing_local_store_is_unavailable_not_broken() {
+        assert_eq!(
+            map_local_store_err(LocalStoreError::Disabled),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            map_local_store_err(LocalStoreError::QueryError("boom".to_string())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            map_local_store_err(LocalStoreError::OpenFailed("boom".to_string())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            map_local_store_err(LocalStoreError::JoinError("boom".to_string())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn strip_uriage_prefix_removes_uriage_with_fullwidth_space() {

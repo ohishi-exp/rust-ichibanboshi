@@ -101,7 +101,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 SQL Server (CAPE#01、172.18.21.102)
     ↓ recalc 実行 (rust の POST /api/uriage/recalc)
 [ohishi-data:3100 (rust host)]
-  ├─ SQLite (/opt/ichibanboshi/data.db): uriage_person_daily / recalc_jobs / verify_jobs
+  ├─ SQLite (/opt/ichibanboshi/state.db): uriage_person_daily / recalc_jobs / verify_jobs
   └─ disk (/opt/ichibanboshi/raw/{month}/eigyosho-{id}.ndjson.gz): R2 投入用 raw NDJSON.gz
     ↓ R2 sync (nuxt の /api/uriage/r2-sync = rust から raw を fetch して R2 へ put)
 [Cloudflare R2 bucket]
@@ -109,6 +109,13 @@ SQL Server (CAPE#01、172.18.21.102)
     ↓ Worker から read
 [ブラウザ UI (nuxt /admin/*)]
 ```
+
+**`state.db` は 3 つの derived store とは別扱い** (`[sqlite] path`、Refs #205 の G4)。
+`uriage_person_*` は SQL Server から作り直せるが、`recalc_jobs` は fingerprint と
+R2 同期状態の**唯一の記録**で、消えると差分再計算の基準が失われる。**空文字で無効宣言**
+でき、その instance では `/api/uriage/*` が 503 になる — GCP (Cloud Run) は
+`SQLITE_PATH=""` を入れること。入れないと揮発 FS に空の `state.db` が生えて
+「壊れている」ではなく「0 件」を返す。オンプレは既定のままで挙動不変。
 
 `recalc_jobs.status` の意味:
 
