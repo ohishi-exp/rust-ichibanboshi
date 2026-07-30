@@ -1,0 +1,33 @@
+-- kintai_writer に資格情報を与える
+--
+-- Refs ohishi-exp/rust-ichibanboshi#205。
+--
+-- 001 は `CREATE ROLE kintai_writer ... LOGIN` までしかやっていない。パスワードを
+-- 付けなかったのは意図的で、001 のコメントがこう書いている:
+--
+--   > パスワードはここに書かない (migration はリポジトリに残るため)。作成直後は
+--   > 認証情報が無く接続できない = 資格情報を配るまで到達不能で fail-closed。
+--
+-- その「配る」を CI からやる。**値はここに書かない** — psql の変数として外から
+-- 渡す。git に残るのは下の 1 行の参照だけで、実値は GitHub org secret
+-- `KINTAI_WRITER_PASSWORD` (GCP Secret Manager が正、そこから sync) にある。
+--
+-- ## 未設定で流すと空パスワードが入る
+--
+-- `-v kintai_writer_password=` (空) のまま流すと `PASSWORD ''` が**成功**してしまい、
+-- 「ロールはあるが誰も認証できない」状態が静かに出来上がる。`scripts/migrate_kintai.sh`
+-- が**適用前に**空を弾く (この migration が変数を参照していることを見て判定する)。
+--
+-- ## ローテーションは 004 以降で
+--
+-- migration は version ごとに 1 回しか流れないので、この 003 はパスワードを
+-- **1 回だけ**設定する。差し替えたくなったら secret を更新したうえで
+-- `004_kintai_writer_password_rotate.sql` を足す。ledger が資格情報の履歴に
+-- なるのは承知のうえで、「どの時点で誰が変えたか」が追える方を採る。
+--
+-- ## 001 / 002 は書き換えない
+--
+-- 適用済み migration の改変は checksum 照合で loud fail する
+-- (`scripts/migrate_kintai.sh`)。追加は必ず新しい連番で行う。
+
+ALTER ROLE kintai_writer WITH PASSWORD :'kintai_writer_password';
