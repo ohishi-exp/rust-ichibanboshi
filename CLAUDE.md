@@ -38,5 +38,11 @@ test job) が毎 PR で `scripts/check_coverage_100.sh` を回し、1 行でも�
 - **登録簿にあるのに計測データに現れないファイルは fail する** (スキップしない)。
   実行行 0 の `mod.rs` や cfg(windows) の `src/service.rs` は登録できない
 
+## migration
+
+`migrations/` は **#205 の勤怠 (kintai) スキーマ専用**で相手は別 DB。適用済み
+migration は絶対に変更しない (checksum 照合で loud fail)。適用 `make kintai-migrate` /
+検証 `make kintai-rls-verify`。
+
 詳細 (担当者別売上のデータ流れ・燃料サーチャージ・集計ロジックの完全条件・SQL Server 接続・
 デプロイ手順・フロントエンド・ワークスペース構成) は `rust-ichibanboshi-map` skill を参照。
