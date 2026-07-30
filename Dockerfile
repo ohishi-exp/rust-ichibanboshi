@@ -1,11 +1,16 @@
 # rust-ichibanboshi 実行イメージ (GCP Artifact Registry へ publish する成果物)。
 #
-# ⚠️ このイメージは **Cloud Run では起動できない**。現時点では「オンプレで走る
-#    バイナリを、GCP から pull できる形で不変・SHA 付きに固めたもの」でしかない。
-#    理由は .github/workflows/gcp-image.yml の冒頭コメント (4 つの阻害要因) を読むこと。
-#    要約すると (1) 起動時に SQL Server へ `SELECT 1` を投げて失敗したら exit する
-#    (src/db.rs::create_pool)、(2) その SQL Server はオンプレ private で GCP から
+# ⚠️ このイメージは **Cloud Run で起動はできるが、まだ traffic を向ける先が無い**。
+#    起動できない問題 (起動時の SQL Server 接続テストで exit する) は #208 で解決済み
+#    (下の DATABASE_ENABLED の項を読むこと)。残っているのは到達性とローカル状態で、
+#    理由は .github/workflows/gcp-image.yml の冒頭コメント (a) (d) を読むこと。
+#    要約すると、読み先の SQL Server / MariaDB / CakePHP はオンプレ private で GCP から
 #    到達できない (ohishi-exp/rust-ichibanboshi#205 の 04「push 方向のみ」)。
+#
+# このファイルを変更したら **必ず `make smoke-image` を回すこと。** CI 側は
+# gcp-image.yml の smoke-both-forms job (#205 の G9) が同じ検証をするが、この
+# workflow は PR では走らない (main push / tag のみ)。ENV / CMD の 1 行が
+# GCP の形を壊す実例が #208 で既に 1 件出ている。
 #
 # build context は repo root ではなく、workflow が組み立てる ctx/ (musl static
 # binary + この Dockerfile だけ)。rust-alc-api の Dockerfile と同じ流儀 —

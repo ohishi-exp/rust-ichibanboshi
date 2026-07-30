@@ -5,7 +5,8 @@
 # cov-check-unit / cov-check-mock のような「DB 有無で分ける」ターゲットは無い。
 
 .PHONY: test test-file fmt clippy cov cov-check cov-dl cov-summary cov-not100 cov-file \
-	kintai-migrate kintai-migrate-dry kintai-migrate-status kintai-rls-verify
+	kintai-migrate kintai-migrate-dry kintai-migrate-status kintai-rls-verify \
+	image smoke-image
 
 # --- テスト (DB 不要) ---
 
@@ -36,6 +37,31 @@ kintai-migrate-status:
 # (CI の migration job と同じ検証。--docker を外せば DATABASE_URL 先に流す)。
 kintai-rls-verify:
 	bash scripts/verify_kintai_rls.sh --docker
+
+# --- コンテナ (GCP / オンプレ 両形態の smoke test。#205 の G9) ---
+
+# ローカルで CI と同じ検証を回すための土台。CI (.github/workflows/gcp-image.yml)
+# は GHCR に push 済みの :<sha> を pull して同じ scripts/smoke_container.sh を
+# 呼ぶので、ここで組むイメージは **同じ Dockerfile / 同じ context の形**にする。
+#
+# 既定は debug build (musl のリンクは release と同じで、検証対象は Dockerfile 層
+# なので debug で足りる)。CI と同一のバイナリで見たいときは PROFILE=release。
+PROFILE ?= debug
+SMOKE_IMAGE ?= ichibanboshi-smoke:local
+MUSL_TARGET := x86_64-unknown-linux-musl
+CARGO_PROFILE_FLAG := $(if $(filter release,$(PROFILE)),--release,)
+
+image:
+	CC_x86_64_unknown_linux_musl=musl-gcc \
+		cargo build --target $(MUSL_TARGET) --locked $(CARGO_PROFILE_FLAG)
+	rm -rf ctx && mkdir -p ctx
+	cp target/$(MUSL_TARGET)/$(PROFILE)/ichibanboshi ctx/
+	chmod u+w ctx/ichibanboshi
+	cp Dockerfile ctx/Dockerfile
+	docker build -t $(SMOKE_IMAGE) ctx
+
+smoke-image: image
+	bash scripts/smoke_container.sh $(SMOKE_IMAGE)
 
 # --- Lint ---
 

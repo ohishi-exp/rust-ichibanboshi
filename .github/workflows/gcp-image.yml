@@ -33,6 +33,10 @@ name: GCP image
 #     CLI 引数 > 環境変数 > TOML > 既定値。Secret Manager + secretKeyRef が
 #     入れる env var だけで起動でき、値をイメージに焼く必要が無い。
 #
+# この 2 つが解けたことは smoke-both-forms job (#205 の G9) が毎回検証している —
+# GCP の形なら起動して /health が backends.sqlserver="disabled" を返し、オンプレ
+# の形 (既定) なら SQL Server が居ないので起動を拒否する、を同じイメージで確認する。
+#
 # ── よって今 GCP に置くのはイメージだけ ─────────────────────────────────────
 # #205 の 02 (生イベントの読み先を Cloud Run の rust-alc-api へ) と #199 の
 # Phase 7 (api を Cloud Run へ) はどちらも「GCP 側に実体を置く」前提で、その
@@ -153,10 +157,69 @@ jobs:
           cache-from: type=gha,scope=ichibanboshi-image
           cache-to: type=gha,mode=max,scope=ichibanboshi-image
 
-      # NOTE: コンテナの smoke test (docker run → curl /health) は **意図的に無い**。
-      # 設定なしで起動すると src/db.rs の起動時接続テストが localhost の SQL Server
-      # を探して失敗し、必ず異常終了する (Dockerfile のコメント参照)。
-      # 「動く smoke test」は設定層を env var 対応させた後に足すこと。
+      # コンテナの smoke test は下の smoke-both-forms job が担当する
+      # (#208 で設定層が env var 対応したので「動く smoke test」が書けるようになった)。
+
+  # ---------------------------------------------------------------------------
+  # 両形態の smoke test (ohishi-exp/rust-ichibanboshi#205 の G9)
+  # ---------------------------------------------------------------------------
+  # #208 で実機確認した「同じイメージが設定だけで 2 つの実行形態になる」挙動を
+  # CI に固定する。判定内容は scripts/smoke_container.sh のヘッダに全部書いてある。
+  #
+  # ── build-image と別 job にした理由 ────────────────────────────────────────
+  # 検証対象を **GHCR に push されたイメージそのもの** にするため。build-image の
+  # 中で `load: true` したローカルイメージを叩くと「push された成果物は壊れている
+  # が smoke は緑」が起こり得る。pull し直せば、あとで Cloud Run が引くものと
+  # 同一の digest を検証したことになる。
+  #
+  # ── PR では走らないことの明示 ──────────────────────────────────────────────
+  # この workflow は main push / tag / workflow_dispatch のみ (上の `on:` 参照)。
+  # PR 時に musl release build + イメージ build を足すと全 PR が数分遅くなる一方、
+  # ここで見ているのは **Dockerfile 層だけ** (ENV PORT / ENV BIND_ADDR / CMD /
+  # base image で musl binary が exec できるか) で、変更頻度が極端に低い。
+  # アプリ側の挙動 (env override の優先順位、/health の backends、SQL Server
+  # 依存ルートの 503) は tests/config_env_test.rs / tests/health_backends_test.rs /
+  # tests/endpoint_error_test.rs が ci.yml で PR ごとに見ている。
+  # Dockerfile を触る PR は、merge 前に `make smoke-image` をローカルで回すこと。
+  smoke-both-forms:
+    name: Smoke test both run forms
+    needs: [build-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # build-image が push した sha tag を引き直す (ローカル build ではなく
+      # 「publish された成果物」を検証する)。push 直後の一時的な registry エラーで
+      # 赤くしないため数回だけ retry する — 恒久的に引けないなら 3 回目で落ちる。
+      - name: Pull published image
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if docker pull "${IMAGE}:${GITHUB_SHA}"; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              echo "::error::failed to pull ${IMAGE}:${GITHUB_SHA} after 3 attempts" >&2
+              exit 1
+            fi
+            echo "pull attempt ${attempt} failed — retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
+          docker image inspect "${IMAGE}:${GITHUB_SHA}" \
+            --format 'digest={{index .RepoDigests 0}}'
+
+      - name: Verify GCP form starts and on-prem form refuses to start
+        run: bash scripts/smoke_container.sh "${IMAGE}:${GITHUB_SHA}"
 
   # ---------------------------------------------------------------------------
   # GCP 側からこの sha の image が pull できるかを **読み取りだけ** で確認する
