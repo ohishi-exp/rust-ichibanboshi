@@ -1,0 +1,80 @@
+name: kintai migrate
+
+# kintai スキーマ (#205 の実装計画 03) を実際の Supabase へ適用する。
+#
+# ci.yml の migration job は「使い捨ての postgres に流して RLS を assert する」
+# 検証で、こちらは「本物に当てる」方。分けてあるのは走る条件がまったく違うため
+# (検証は毎 PR / 適用は意図したときだけ)。
+#
+# ── 冪等性 ────────────────────────────────────────────────────────────────
+# 適用済みかどうかは `_sqlx_migrations` 台帳で判定する (scripts/migrate_kintai.sh)。
+# 同じ migration を 2 度当てても何も起きない。逆に**適用済みファイルを書き換えて
+# いると checksum 照合で失敗する** ので、事故った状態のまま流れることはない。
+#
+# ── なぜ push で自動適用しないのか ────────────────────────────────────────
+# DDL は畳んだ 3 層の実体を作る操作で、間違えたときに戻すのが `cargo` の revert
+# ほど簡単ではない。まず workflow_dispatch で「いつ当てるか」を人が決める形に
+# する。運用が固まったら main push に寄せてよい (その場合 apply job の `if` を
+# 変えるだけで済むよう、環境の選択は input ではなく environment に持たせてある)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'status = 適用状況を見るだけ / dry-run = 計画だけ / apply = 実際に当てる'
+        required: true
+        type: choice
+        options:
+          - status
+          - dry-run
+          - apply
+        default: status
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同じ DB に 2 本同時に当てない
+  group: kintai-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: kintai migrate (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    # apply のときだけ承認を要求できるよう environment を噛ませる。
+    # GitHub 側で required reviewers を付ければ、ここで止まる。
+    environment: kintai-database
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      # secret 名は kintai-database-url (Secret Manager 側) に合わせる。
+      # DATABASE_URL にしないのは、この repo の DATABASE_* が売上の SQL Server の
+      # 名前空間だから (src/config.rs、#208)。
+      - name: Run migration
+        env:
+          KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KINTAI_DATABASE_URL}" ]; then
+            echo "::error::secret KINTAI_DATABASE_URL が environment 'kintai-database' に設定されていません" >&2
+            exit 1
+          fi
+          case "$MODE" in
+            status)  bash scripts/migrate_kintai.sh --status ;;
+            dry-run) bash scripts/migrate_kintai.sh --dry-run ;;
+            apply)   bash scripts/migrate_kintai.sh ;;
+            *) echo "::error::unknown mode: $MODE" >&2; exit 2 ;;
+          esac
+
+      # 当てた後に「何が入っているか」を必ず出す。apply が成功したのに台帳が
+      # 期待と違う、を見逃さないため。
+      - name: Show ledger
+        if: always()
+        env:
+          KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
+        run: bash scripts/migrate_kintai.sh --status
