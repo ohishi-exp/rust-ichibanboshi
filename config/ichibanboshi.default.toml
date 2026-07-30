@@ -142,6 +142,65 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # connect_timeout_secs = 30
 # statement_timeout_secs = 300
 
+# 打刻を GCP 側へ渡す経路は**設定を持たない** (Refs #205 の 04b)。
+#
+# オンプレは MariaDB から読んで返すだけで、**外へは出ない**。運ぶのは relay:
+#
+#   relay → オンプレ GET  /api/kintai/timecard/drivers   対象月の乗務員を 1 ページ
+#   relay → GCP    GET  /api/kintai/timecard/signatures  その乗務員ぶんの署名
+#   relay → オンプレ POST /api/kintai/timecard/diff       署名を渡し、差分を受け取る
+#   relay → GCP    POST /api/kintai/timecard             差分を渡す
+#
+# なので送り先 URL も相手の資格情報もオンプレには置かない。Cloudflare Tunnel の
+# 30 秒上限があるので drivers は max_drivers で区切られ、続きは応答の
+# next_after_driver_cd で返る。relay は null になるまで呼び直す。
+# auth_token_command = "gcloud auth print-identity-token"   # 開発機から
+# auth_token_metadata = true                                # Cloud Run の中から
+# auth_token_ttl_secs = 900
+
+# 畳んだ勤怠をどこへ書くか (Refs #205 実装計画 04〜06)。打刻の push と再計算の書き先。
+# 既定は enabled = false = 無効。宣言しない限り CLI (push / recalc / sync) は何もせず
+# 落ちる — 「設定を忘れたまま走って 0 件成功に見える」を作らない ([database] enabled と
+# 同じ流儀)。宣言したのに接続先や tenant_id が無ければ**起動を失敗させる**。
+#
+# **書くのは常にオンプレ側** (ohishi-data の rust-ichibanboshi)。GCP からオンプレへは
+# 到達できないので push 方向しか無い (#205 の決定 8)。読む側 (Cloud Run) はこの設定を
+# 持たず、畳んだ 3 層を kintai_reader で読むだけ。ここで使うロールは kintai_writer。
+#
+# **接続は session mode の pooler (5432) を使う。** transaction mode (6543) は prepared
+# statement の扱いが違い、sqlx の既定 (文を準備して使い回す) と噛み合わない —
+# 6543 を含む URL は起動時に弾く。direct connection (db.<ref>.supabase.co) は IPv6 のみ
+# なので、ここからは届かない。
+#
+# tenant_id は **rust-alc-api の alc_api.tenants.id をそのまま使う** (新規採番しない)。
+# 上の [kintai_events] tenant_id と一致していないと**起動しない** — ずれると生イベントの
+# 読みと畳んだ勤怠の書きが別テナントを指し、kintai.* の RLS (app.current_tenant_id) が
+# 静かに全件遮断するか別テナントへ書く。大文字小文字の違いは同一とみなす。
+#
+# **tenant_id は省略できる。** 打刻の受け口 (POST /api/kintai/timecard) は
+# X-Tenant-ID ヘッダで書き先を決める — relay が KV (dtako-relay-config の
+# dtako_accounts) に持っている値がテナントの正で、alc へも同じヘッダで渡している。
+# 設定に写すと同じ値を 2 か所で保つことになる。書いた場合は **pin** として働き、
+# ヘッダと食い違えば受け口が 403 を返す。
+# ただし CLI (push / recalc / sync) はヘッダを持たないので **必須**。
+#
+# 環境変数でも同じ項目を指定できる:
+#   KINTAI_PUSH_ENABLED / _DATABASE_URL / _TENANT_ID
+#   KINTAI_PUSH_CONNECT_TIMEOUT_SECS / _STATEMENT_TIMEOUT_SECS
+#
+# migration スクリプト (scripts/migrate_kintai.sh) が使う KINTAI_DATABASE_URL とは
+# **別物**。あちらは DDL を当てる所有者権限で、こちらは行を読み書きするだけの
+# kintai_writer。同じ値を使い回さない。
+#
+# database_url の実値は repo に置かず、デプロイ先の ichibanboshi.toml
+# (または systemd の EnvironmentFile) でのみ設定する。
+# [kintai_push]
+# enabled = true
+# database_url = "postgres://kintai_writer:<パスワード>@<pooler ホスト>:5432/postgres"
+# tenant_id = "<一番星のテナント UUID ([kintai_events] と同じ値)>"   # 任意
+# connect_timeout_secs = 30
+# statement_timeout_secs = 300
+
 # 打刻の転送先 (Refs #205 の 04b、送信側)。既定は無効。
 #
 # オンプレが MariaDB から読んだ打刻を、GCP 側の rust-ichibanboshi へ渡すための設定。
