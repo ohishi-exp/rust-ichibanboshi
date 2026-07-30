@@ -93,6 +93,13 @@ async fn store() -> Option<(KintaiPgStore, sqlx::PgPool)> {
     Some((KintaiPgStore::from_pool(pool.clone(), tenant), pool))
 }
 
+/// 受け口が読む `X-Tenant-ID`。relay が alc へ渡しているのと同じヘッダ。
+fn tenant_header(tenant: uuid::Uuid) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("X-Tenant-ID", tenant.to_string().parse().unwrap());
+    h
+}
+
 /// `KINTAI_TEST_DATABASE_URL` が無ければ早期 return するためのマクロ。
 macro_rules! require_db {
     () => {
@@ -600,18 +607,19 @@ async fn the_routes_answer_with_the_expected_json() {
     use rust_ichibanboshi::routes::kintai_timecard::{receive, signatures, SignaturesQuery};
 
     let (store, _pool) = require_db!();
+    let tenant = store.tenant_id();
     let pg = Some(std::sync::Arc::new(store));
-
-    // 空の相手 → signatures は空
-    let got = signatures(
+    let sig_query = || {
         Query(SignaturesQuery {
             month: Some("2026-07".to_string()),
             driver_cd: Some(1130),
-        }),
-        Extension(pg.clone()),
-    )
-    .await
-    .expect("signatures");
+        })
+    };
+
+    // 空の相手 → signatures は空
+    let got = signatures(tenant_header(tenant), sig_query(), Extension(pg.clone()))
+        .await
+        .expect("signatures");
     assert_eq!(got.0["month"], "2026-07");
     assert_eq!(got.0["driver_cd"], 1130);
     assert_eq!(got.0["signatures"].as_object().unwrap().len(), 0);
@@ -624,7 +632,7 @@ async fn the_routes_answer_with_the_expected_json() {
             punch("2026-07-01 18:00:00", "終業"),
         ],
     )]);
-    let got = receive(Extension(pg.clone()), axum::Json(b))
+    let got = receive(tenant_header(tenant), Extension(pg.clone()), axum::Json(b))
         .await
         .expect("receive");
     assert_eq!(got.0["days_written"], 1);
@@ -632,16 +640,75 @@ async fn the_routes_answer_with_the_expected_json() {
     assert_eq!(got.0["misplaced"], 0);
 
     // 署名が生えている
-    let got = signatures(
-        Query(SignaturesQuery {
-            month: Some("2026-07".to_string()),
-            driver_cd: Some(1130),
-        }),
-        Extension(pg),
-    )
-    .await
-    .expect("signatures");
+    let got = signatures(tenant_header(tenant), sig_query(), Extension(pg))
+        .await
+        .expect("signatures");
     let sigs = got.0["signatures"].as_object().unwrap();
     assert_eq!(sigs.len(), 1);
     assert_eq!(sigs["2026-07-01"].as_str().unwrap().len(), 64);
+}
+
+/// **`X-Tenant-ID` が書き先を決める。** `[kintai_push] tenant_id` を書いていない
+/// instance (= GCP 側の想定) では、relay が名乗ったテナントの行として積まれる。
+///
+/// 単体テストでは「ハンドラが 403 / 400 を返すか」までしか見られない。ここで
+/// 確かめるのは**実際に別テナントの行として書かれるか**で、`for_tenant` が
+/// pool だけ複製して tenant を差し替えられているかは Postgres 側でしか分からない。
+#[tokio::test]
+async fn the_header_decides_which_tenant_the_rows_land_in() {
+    use axum::extract::Query;
+    use axum::Extension;
+    use rust_ichibanboshi::routes::kintai_timecard::{receive, signatures, SignaturesQuery};
+
+    let (store, pool) = require_db!();
+    // pin 無し (tenant_id を設定していない instance)
+    let pg = Some(std::sync::Arc::new(KintaiPgStore::from_pool(
+        pool.clone(),
+        uuid::Uuid::nil(),
+    )));
+    let a = store.tenant_id();
+    let b = uuid::Uuid::new_v4();
+
+    let day = || {
+        batch_of(vec![(
+            d(2026, 7, 1),
+            vec![punch("2026-07-01 08:00:00", "始業")],
+        )])
+    };
+    for t in [a, b] {
+        let got = receive(tenant_header(t), Extension(pg.clone()), axum::Json(day()))
+            .await
+            .expect("receive");
+        assert_eq!(got.0["days_written"], 1, "tenant={t}");
+    }
+
+    // 同じ (乗務員, 暦日) が 2 テナントぶん立っている
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kintai.kintai_events
+          WHERE tenant_id = ANY($1) AND driver_cd = 1130",
+    )
+    .bind(vec![a, b])
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(n, 2);
+
+    // 名乗り分の署名しか見えない (別テナントの行は混ざらない)
+    let sigs = |t| {
+        signatures(
+            tenant_header(t),
+            Query(SignaturesQuery {
+                month: Some("2026-07".to_string()),
+                driver_cd: Some(1130),
+            }),
+            Extension(pg.clone()),
+        )
+    };
+    let (sa, sb) = (
+        sigs(a).await.expect("signatures a"),
+        sigs(b).await.expect("signatures b"),
+    );
+    assert_eq!(sa.0["signatures"].as_object().unwrap().len(), 1);
+    assert_eq!(sb.0["signatures"].as_object().unwrap().len(), 1);
+    assert_eq!(sa.0["signatures"], sb.0["signatures"]);
 }

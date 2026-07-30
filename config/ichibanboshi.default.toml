@@ -105,6 +105,13 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # 読みと畳んだ勤怠の書きが別テナントを指し、kintai.* の RLS (app.current_tenant_id) が
 # 静かに全件遮断するか別テナントへ書く。大文字小文字の違いは同一とみなす。
 #
+# **tenant_id は省略できる。** 打刻の受け口 (POST /api/kintai/timecard) は
+# X-Tenant-ID ヘッダで書き先を決める — relay が KV (dtako-relay-config の
+# dtako_accounts) に持っている値がテナントの正で、alc へも同じヘッダで渡している。
+# 設定に写すと同じ値を 2 か所で保つことになる。書いた場合は **pin** として働き、
+# ヘッダと食い違えば受け口が 403 を返す。
+# ただし CLI (push / recalc / sync) はヘッダを持たないので **必須**。
+#
 # 環境変数でも同じ項目を指定できる:
 #   KINTAI_PUSH_ENABLED / _DATABASE_URL / _TENANT_ID
 #   KINTAI_PUSH_CONNECT_TIMEOUT_SECS / _STATEMENT_TIMEOUT_SECS
@@ -118,7 +125,7 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # [kintai_push]
 # enabled = true
 # database_url = "postgres://kintai_writer:<パスワード>@<pooler ホスト>:5432/postgres"
-# tenant_id = "<一番星のテナント UUID ([kintai_events] と同じ値)>"
+# tenant_id = "<一番星のテナント UUID ([kintai_events] と同じ値)>"   # 任意
 # connect_timeout_secs = 30
 # statement_timeout_secs = 300
 
