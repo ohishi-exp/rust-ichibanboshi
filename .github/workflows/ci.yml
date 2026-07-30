@@ -58,6 +58,46 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # kintai スキーマの migration を実 PostgreSQL に流し、RLS を assert する
+  # (Refs #205 実装計画 03)。Rust build は不要 (適用も検証も psql) なので test job
+  # とは独立に並走させ、critical path を伸ばさない。
+  #
+  # rust-alc-api では migration の検証は staging DB / prod の Cloud Run job 側に
+  # 任せているが、こちらには Postgres を持つ deploy 経路がまだ無い (G7 未着手)。
+  # 「本番に流して初めて分かる」状態を作らないため、service container で毎 PR
+  # 検証する形にした。DDL の生成列や CHECK が immutable 要件を満たすかは実際に
+  # 流すまで分からない (実際 `AT TIME ZONE` の生成列がここで確認できた)。
+  migration:
+    name: kintai migration + RLS
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: verify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      # RLS は「superuser 以外で繋いで初めて検証になる」ので、verify スクリプトが
+      # kintai_reader / kintai_writer に検証用パスワードを付けて繋ぎ直す。そのため
+      # 与える接続文字列は superuser 相当である必要がある。
+      # 変数名が DATABASE_URL でないのは、この repo の DATABASE_* が売上の
+      # SQL Server の名前空間だから (src/config.rs、#208)。
+      - name: Apply migrations + assert RLS
+        env:
+          KINTAI_DATABASE_URL: postgres://postgres:verify@127.0.0.1:5432/postgres
+        run: bash scripts/verify_kintai_rls.sh
+
   # main への merge (push) で musl binary を build → Cloudflare Tunnel SSH 経由で
   # ohishi-data に自動 deploy する (Refs #14)。GitHub Actions runner は Tailscale
   # 網に居ないので、deploy.sh の Tailscale 経路ではなく cloudflared access ssh を
@@ -137,7 +177,10 @@ jobs:
   # auto-merge (PR run) とは排他、needs は test のみで良い。
   auto-merge:
     if: github.event_name == 'pull_request'
-    needs: [test]
+    # migration job も gate に入れる。ここに足さないと「CI green」の意味が
+    # migration の検証を含まなくなり、gate が広告する範囲が実際の検証範囲を
+    # 静かに超える (#206 で 100% gate について同じ判断をした)。
+    needs: [test, migration]
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     # deploy job は push (refs/heads/main) 限定 trigger なので PR run の auto-merge
     # とは排他で並走しない (= merge -> branch 削除で deploy が cancel される race は
