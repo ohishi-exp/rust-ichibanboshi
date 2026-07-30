@@ -48,8 +48,12 @@ use crate::kintai_repo::{exact_month_range, DynKintaiEventsRepo, KintaiRepoError
 
 /// 1 回の呼び出しで返す乗務員数の既定。
 ///
-/// 実測で 1 乗務員あたり 0.2 秒 (単一乗務員版の読み出し)。相手との往復が無くなった
-/// ぶん余裕はあるが、Tunnel の 30 秒に対する安全側の既定は変えない。
+/// **「1 乗務員あたり 0.2 秒」という以前の見積もりは本番で外れた。** 2026-07-30 の
+/// 初回 dry-run では 10 人ぶんの `POST /api/kintai/timecard/diff` が Cloudflare の
+/// 524 (100 秒) を超え、1 人なら通った。原因は乗務員ごとの読み出しが `dtako_events`
+/// と `dtako_cars` まで引いていたこと — [`crate::kintai_push::parse_row`] が
+/// `NotPushedSource` で全部捨てる行だった。読み口を打刻 2 表に絞って解消したが、
+/// **実測を取り直すまで既定は 10 のまま置く** (Tunnel の 30 秒に対する安全側)。
 pub const DEFAULT_MAX_DRIVERS: usize = 10;
 
 /// `max_drivers` の上限。呼び出し側が大きな値を入れて Tunnel を殺すのを防ぐ。
@@ -120,7 +124,15 @@ impl DiffReport {
     }
 }
 
-/// 対象月の乗務員を昇順で洗い出し、`after` の次から `max` 人だけ返す。
+/// 対象月に**打刻がある**乗務員を昇順で洗い出し、`after` の次から `max` 人だけ返す。
+///
+/// **全イベントを読んでから CD を拾わない。** 使うのは CD の集合だけなので、
+/// `dtako_events` まで JSON にして捨てるのは丸ごと無駄
+/// ([`fetch_timecard_driver_cds_between`])。ページごとに毎回払う費用なので、
+/// ページングしても減らなかった。
+///
+/// [`fetch_timecard_driver_cds_between`]:
+///     crate::kintai_repo::KintaiEventsApi::fetch_timecard_driver_cds_between
 pub async fn drivers_page(
     repo: &DynKintaiEventsRepo,
     month: &str,
@@ -130,11 +142,7 @@ pub async fn drivers_page(
     let (from, to) = exact_month_range(month)
         .ok_or_else(|| KintaiDiffError::BadRequest(format!("bad month: {month}")))?;
     let max = max.clamp(1, MAX_MAX_DRIVERS);
-    let rows = repo.fetch_all_events_between(&from, &to).await?;
-    let all: Vec<u64> = crate::kosoku::split_by_driver(rows)
-        .into_iter()
-        .map(|(d, _)| d)
-        .collect();
+    let all = repo.fetch_timecard_driver_cds_between(&from, &to).await?;
     let rest: Vec<u64> = match after {
         Some(a) => all.into_iter().filter(|d| *d > a).collect(),
         None => all,
@@ -252,6 +260,31 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// デジタコ生イベントしか無い乗務員は**運ぶ相手ではない**ので出てこない。
+    ///
+    /// 乗務員CD 0 も落ちる — 2026-06 の dry-run では、これが 1 ページ目を丸ごと
+    /// 食って `batchesSent: 0` になっていた。
+    #[tokio::test]
+    async fn drivers_without_a_punch_are_not_listed() {
+        let dtako_only = json!({
+            "datetime": "2026-07-01 08:00:00",
+            "driver_id": 9999,
+            "source": "dtako_events",
+            "state": "運行開始",
+        });
+        let mut no_driver = punch(0, "2026-07-01 08:00:00", "始業");
+        no_driver["driver_id"] = json!(null);
+        let repo = repo_of(vec![
+            punch(0, "2026-07-01 08:00:00", "始業"),
+            no_driver,
+            dtako_only,
+            punch(1130, "2026-07-01 08:00:00", "始業"),
+        ]);
+        let page = drivers_page(&repo, "2026-07", None, 10).await.unwrap();
+        assert_eq!(page.drivers, vec![1130]);
+        assert_eq!(page.next_after_driver_cd, None);
     }
 
     /// 乗務員はページで返り、続きが `next_after_driver_cd` に出る。
