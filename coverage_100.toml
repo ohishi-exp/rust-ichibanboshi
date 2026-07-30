@@ -41,9 +41,6 @@
 # --- 認証 / 設定 ---
 
 [[files]]
-path = "src/auth.rs"
-
-[[files]]
 path = "src/config.rs"
 
 # --- 拘束時間の純粋ロジック (DB も HTTP も触らない) ---
