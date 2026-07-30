@@ -156,6 +156,21 @@ pub async fn run(
             Arc::new(crate::kintai_version::DisabledKintaiVersionRepo)
         };
 
+    // 畳んだ勤怠の書き先 (Refs #205 の 04b)。**宣言したら起動時に必ず繋ぐ** —
+    // 「受け取ったがどこにも書いていない」を作らないため ([database] enabled と
+    // 同じ流儀)。宣言していなければ挿さらず、打刻の受け口は 503 で fail-closed
+    let kintai_pg_store: routes::kintai_timecard::DynKintaiPgStore = if config.kintai_push.enabled {
+        config
+            .kintai_push
+            .validate(&config.kintai_events.tenant_id)?;
+        Some(Arc::new(
+            crate::kintai_push::KintaiPgStore::connect(&config.kintai_push).await?,
+        ))
+    } else {
+        tracing::info!("kintai_push not enabled — /api/kintai/timecard returns 503");
+        None
+    };
+
     // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
     // 就業規則が変わったら TOML で追随できるよう config から取る。
     let kosoku_params = Arc::new(build_kosoku_params(&config));
@@ -292,6 +307,13 @@ pub async fn run(
         .route("/kintai/kosoku-daily", get(routes::kintai::kosoku_daily))
         .route("/kintai/pdf-json", get(routes::kintai::pdf_json))
         .route("/kintai/version", get(routes::kintai_version::version))
+        // 打刻の受け口 (Refs #205 の 04b)。GCP 側だけが使う — オンプレは
+        // [kintai_push] が無効なので両方 503 で fail-closed
+        .route("/kintai/timecard", post(routes::kintai_timecard::receive))
+        .route(
+            "/kintai/timecard/signatures",
+            get(routes::kintai_timecard::signatures),
+        )
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
@@ -334,6 +356,7 @@ pub async fn run(
         .layer(Extension(kintai_store))
         .layer(Extension(kintai_events_repo))
         .layer(Extension(kintai_version_repo))
+        .layer(Extension(kintai_pg_store))
         .layer(Extension(kosoku_params))
         .layer(Extension(restraint_store));
 

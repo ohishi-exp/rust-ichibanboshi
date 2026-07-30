@@ -443,3 +443,205 @@ async fn raw_keeps_the_original_row() {
     assert_eq!(raw["unko_no"], "OP-7");
     assert_eq!(raw["source"], "dtako");
 }
+
+// ── 04b: 打刻の受け口 (オンプレ → GCP) ──────────────────────────────────────
+
+use rust_ichibanboshi::kintai_push::{apply_timecard_batch, plan_batch, TimecardBatch};
+
+fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, m, day).unwrap()
+}
+
+fn batch_of(days: Vec<(NaiveDate, Vec<serde_json::Value>)>) -> TimecardBatch {
+    TimecardBatch {
+        month: "2026-07".to_string(),
+        driver_cd: 1130,
+        days: days.into_iter().collect(),
+        delete_dates: Vec::new(),
+    }
+}
+
+/// **送り主を信用しない。** 日のキーと中身が食い違う行は落として数える。
+/// 信用すると 1 リクエストで別の日・別の乗務員を静かに書き換えられる。
+#[tokio::test]
+async fn a_batch_rejects_rows_that_do_not_belong_to_their_key() {
+    let (store, pool) = require_db!();
+    let other_driver = json!({
+        "datetime": "2026-07-01 08:00:00", "driver_id": 9999,
+        "source": "timecard", "state": "始業", "unko_no": null,
+    });
+    let b = batch_of(vec![(
+        d(2026, 7, 1),
+        vec![
+            punch("2026-07-01 08:00:00", "始業"),
+            // 日のキーは 07-01 なのに中身は 07-02
+            punch("2026-07-02 08:00:00", "始業"),
+            other_driver,
+        ],
+    )]);
+    let r = apply_timecard_batch(&store, &b).await.expect("apply");
+    assert_eq!(r.misplaced, 2, "日違いと乗務員違いの 2 行");
+    assert_eq!(r.events_written, 1);
+    assert!(r.has_unexpected());
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 1);
+}
+
+/// 対象月から外れた日は丸ごと落とす。
+#[tokio::test]
+async fn a_batch_rejects_days_outside_its_month() {
+    let (store, pool) = require_db!();
+    let mut b = batch_of(vec![(
+        d(2026, 8, 1),
+        vec![punch("2026-08-01 08:00:00", "始業")],
+    )]);
+    b.delete_dates = vec![d(2026, 8, 5), d(2026, 7, 9)];
+    let r = apply_timecard_batch(&store, &b).await.expect("apply");
+    assert_eq!(r.misplaced, 1);
+    assert_eq!(r.days_written, 0);
+    assert_eq!(r.days_deleted, 1, "月内の削除だけ通る");
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 0);
+}
+
+/// 受け側でも PK 衝突を決着させる (送り側と同じ規則)。
+#[tokio::test]
+async fn a_batch_dedups_on_the_receiving_side() {
+    let (store, pool) = require_db!();
+    let b = batch_of(vec![(
+        d(2026, 7, 1),
+        vec![
+            json!({"datetime": "2026-07-01 08:00:00", "driver_id": 1130, "source": "dtako", "state": "始業", "unko_no": "OP-1"}),
+            punch("2026-07-01 08:00:00", "始業"),
+        ],
+    )]);
+    let r = apply_timecard_batch(&store, &b).await.expect("apply");
+    assert_eq!(r.deduped, 1);
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 1);
+    let source: String =
+        sqlx::query_scalar("SELECT source FROM kintai.kintai_events WHERE tenant_id = $1")
+            .bind(store.tenant_id())
+            .fetch_one(&pool)
+            .await
+            .expect("source");
+    assert_eq!(source, "timecard", "人が確定させた打刻を残す");
+}
+
+/// **送る → 相手の署名を引く → 差分ゼロ**。転送の往復が収束することの確認。
+#[tokio::test]
+async fn planning_against_the_remote_signatures_converges() {
+    let (store, _pool) = require_db!();
+    let rows = vec![
+        punch("2026-07-01 08:00:00", "始業"),
+        punch("2026-07-01 18:00:00", "終業"),
+        punch("2026-07-02 08:00:00", "始業"),
+    ];
+    let local = group_by_date(&dedup_events(parse_rows(&rows).events));
+
+    // 相手は空 → 全日が差分
+    let (from, to) = jst_day_bounds(d(2026, 7, 1));
+    let (_, to_end) = jst_day_bounds(d(2026, 7, 31));
+    let remote = store
+        .stored_day_signatures(1130, from, to_end.max(to))
+        .await
+        .expect("sigs");
+    let first = plan_batch("2026-07", 1130, &local, &remote);
+    assert_eq!(first.days.len(), 2);
+    assert!(first.delete_dates.is_empty());
+    assert!(!first.is_empty());
+
+    apply_timecard_batch(&store, &first).await.expect("apply");
+
+    // もう一度計画すると差分ゼロ
+    let remote = store
+        .stored_day_signatures(1130, from, to_end.max(to))
+        .await
+        .expect("sigs");
+    let second = plan_batch("2026-07", 1130, &local, &remote);
+    assert!(second.is_empty(), "2 回目に差分が出た: {second:?}");
+
+    // 手元から 1 日消すと、その日が delete に載る
+    let mut shrunk = local.clone();
+    shrunk.remove(&d(2026, 7, 2));
+    let third = plan_batch("2026-07", 1130, &shrunk, &remote);
+    assert_eq!(third.delete_dates, vec![d(2026, 7, 2)]);
+    assert!(third.days.is_empty());
+
+    apply_timecard_batch(&store, &third).await.expect("apply");
+    let left = store
+        .stored_day_signatures(1130, from, to_end.max(to))
+        .await
+        .expect("sigs");
+    assert_eq!(left.len(), 1, "消えた日は相手からも消える");
+}
+
+/// **ワイヤ形式が往復して壊れない。** relay を挟むので JSON で通る必要がある。
+#[test]
+fn the_wire_format_round_trips() {
+    let b = batch_of(vec![(
+        d(2026, 7, 1),
+        vec![punch("2026-07-01 08:00:00", "始業")],
+    )]);
+    let json = serde_json::to_string(&b).unwrap();
+    let back: TimecardBatch = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.month, "2026-07");
+    assert_eq!(back.driver_cd, 1130);
+    assert_eq!(back.days[&d(2026, 7, 1)].len(), 1);
+
+    // 省略可能なキーは既定で埋まる
+    let minimal: TimecardBatch =
+        serde_json::from_str(r#"{"month":"2026-07","driver_cd":1}"#).unwrap();
+    assert!(minimal.is_empty());
+}
+
+/// **ルート越しの往復。** ハンドラが返す JSON の形はここでしか固定できない。
+#[tokio::test]
+async fn the_routes_answer_with_the_expected_json() {
+    use axum::extract::Query;
+    use axum::Extension;
+    use rust_ichibanboshi::routes::kintai_timecard::{receive, signatures, SignaturesQuery};
+
+    let (store, _pool) = require_db!();
+    let pg = Some(std::sync::Arc::new(store));
+
+    // 空の相手 → signatures は空
+    let got = signatures(
+        Query(SignaturesQuery {
+            month: Some("2026-07".to_string()),
+            driver_cd: Some(1130),
+        }),
+        Extension(pg.clone()),
+    )
+    .await
+    .expect("signatures");
+    assert_eq!(got.0["month"], "2026-07");
+    assert_eq!(got.0["driver_cd"], 1130);
+    assert_eq!(got.0["signatures"].as_object().unwrap().len(), 0);
+
+    // 1 日送る
+    let b = batch_of(vec![(
+        d(2026, 7, 1),
+        vec![
+            punch("2026-07-01 08:00:00", "始業"),
+            punch("2026-07-01 18:00:00", "終業"),
+        ],
+    )]);
+    let got = receive(Extension(pg.clone()), axum::Json(b))
+        .await
+        .expect("receive");
+    assert_eq!(got.0["days_written"], 1);
+    assert_eq!(got.0["events_written"], 2);
+    assert_eq!(got.0["misplaced"], 0);
+
+    // 署名が生えている
+    let got = signatures(
+        Query(SignaturesQuery {
+            month: Some("2026-07".to_string()),
+            driver_cd: Some(1130),
+        }),
+        Extension(pg),
+    )
+    .await
+    .expect("signatures");
+    let sigs = got.0["signatures"].as_object().unwrap();
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(sigs["2026-07-01"].as_str().unwrap().len(), 64);
+}
