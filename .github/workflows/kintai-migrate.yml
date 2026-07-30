@@ -12,23 +12,15 @@ name: kintai migrate
 # いると checksum 照合で失敗する** ので、事故った状態のまま流れることはない。
 #
 # ── いつ走るか ────────────────────────────────────────────────────────────
-# main に migration が入ったら自動で当てる。「merge したのに当て忘れて、読み書き
-# する側だけ先に動いている」状態を作らないため。paths で絞ってあるので、
-# migration に無関係な push では走らない。
+# **自動適用はここではなく `ci.yml` の `kintai-migrate` job が担当する** (main
+# push、`needs: [test, migration]`)。使い捨ての postgres での検証が通ってから
+# 本物に当てる順序にするため、この workflow を push で走らせてはいけない
+# (単独 workflow は他 workflow の結果を待てず、test と並走してしまう)。
 #
-# 安全側の担保は environment (`kintai-database`) に寄せてある。GitHub 側で
-# required reviewers を付ければ、push 由来でも apply の手前で止まって承認待ちに
-# なる。止めたいときは workflow をいじるのではなくそちらで縛ること。
-#
-# 手で確かめたいときは workflow_dispatch で status / dry-run を選ぶ。
+# こちらは**手で確かめる口**。status で今の台帳を見る、dry-run で計画だけ見る、
+# 緊急時に apply を単独で回す、の 3 つ。
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'migrations/**'
-      - 'scripts/migrate_kintai.sh'
-      - '.github/workflows/kintai-migrate.yml'
   workflow_dispatch:
     inputs:
       mode:
@@ -51,11 +43,9 @@ concurrency:
 
 jobs:
   migrate:
-    # push 由来は mode という概念が無いので apply 固定。dispatch のときだけ選べる。
-    name: kintai migrate (${{ inputs.mode || 'apply' }})
+    name: kintai migrate (${{ inputs.mode }})
     runs-on: ubuntu-latest
-    # 承認を要求できるよう environment を噛ませる。GitHub 側で required reviewers
-    # を付ければ、push 由来でもここで止まる。
+    # 承認を要求できるよう environment を噛ませる (ci.yml の同名 job と共有)。
     environment: kintai-database
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +59,7 @@ jobs:
       - name: Run migration
         env:
           KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
-          MODE: ${{ inputs.mode || 'apply' }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           if [ -z "${KINTAI_DATABASE_URL}" ]; then
