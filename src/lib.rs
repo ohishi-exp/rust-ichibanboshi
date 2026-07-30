@@ -5,6 +5,7 @@ pub mod kintai_fold;
 pub mod kintai_http_repo;
 pub mod kintai_push;
 pub mod kintai_repo;
+pub mod kintai_send;
 pub mod kintai_store;
 pub mod kintai_version;
 pub mod kosoku;
