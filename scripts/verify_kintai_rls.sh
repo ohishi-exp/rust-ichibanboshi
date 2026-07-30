@@ -75,6 +75,12 @@ if [[ $USE_DOCKER -eq 1 ]]; then
   done
 fi
 
+# 003 が要求する psql 変数。**検証用の使い捨て DB なので固定値でよい** —
+# 本番の値 (GCP Secret Manager) をここへ持ち込む理由が無い。未設定なら
+# migrate_kintai.sh が 003 の適用を拒否して検証が始まらないので、既定を置く。
+: "${KINTAI_WRITER_PASSWORD:=verify-only-not-a-real-password}"
+export KINTAI_WRITER_PASSWORD
+
 if [[ -z "${KINTAI_DATABASE_URL:-}" ]]; then
   echo "ERROR: KINTAI_DATABASE_URL is not set (or pass --docker)" >&2
   exit 2

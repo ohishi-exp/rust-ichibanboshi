@@ -98,6 +98,22 @@ if ! command -v psql >/dev/null 2>&1; then
   exit 2
 fi
 
+# migration に渡す psql 変数 (Refs #205)。
+#
+# 003 が `ALTER ROLE kintai_writer WITH PASSWORD :'kintai_writer_password'` を
+# 打つ。**値は migration に書かない** — git に残るのは参照だけで、実値は
+# GitHub org secret `KINTAI_WRITER_PASSWORD` (GCP Secret Manager が正) から来る。
+#
+# 空のまま流すと `PASSWORD ''` が**成功**して「ロールはあるが誰も認証できない」
+# 状態が静かに出来上がるので、適用対象がこの変数を参照していたら空を弾く
+# (下の apply ループ)。参照していない migration しか無いときは要求しない —
+# 001 / 002 だけの環境や --status で無関係な secret を必須にしない。
+#
+# 値が psql の argv に載る (= ps で見える) 点は承知のうえ。CI runner は
+# 使い捨ての単独プロセスで、代替 (`\getenv`) は psql 16 以降にしか無い。
+KINTAI_WRITER_PASSWORD="${KINTAI_WRITER_PASSWORD:-}"
+PSQL_MIGRATION_VARS=(-v "kintai_writer_password=${KINTAI_WRITER_PASSWORD}")
+
 # psql は 1 引数だけの実行に使う小さなラッパ。ON_ERROR_STOP でエラーを必ず伝播。
 pq() {
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -qtAX "$@"
@@ -193,6 +209,14 @@ for file in "${files[@]}"; do
   fi
 
   echo "apply   $base (version $version)"
+  # 変数を参照する migration を空の値で流さない (上の説明を参照)
+  if grep -q "kintai_writer_password" "$file" && [[ -z "$KINTAI_WRITER_PASSWORD" ]]; then
+    echo "ERROR: $base は KINTAI_WRITER_PASSWORD を要求します (未設定)" >&2
+    echo "       空のまま流すと空パスワードが静かに設定され、誰も認証できなくなります。" >&2
+    echo "       GCP Secret Manager の KINTAI_WRITER_PASSWORD を env に入れてください。" >&2
+    exit 2
+  fi
+
   start_ns=$(date +%s%N)
 
   # migration 本体と ledger 行を 1 トランザクションに入れる。途中で死んでも
@@ -218,7 +242,7 @@ for file in "${files[@]}"; do
     printf "VALUES (%s, \$mig\$%s\$mig\$, TRUE, decode('%s','hex'), -1);\n" \
       "$version" "$description" "$checksum"
     printf 'COMMIT;\n'
-  } | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -qX -o /dev/null -f -
+  } | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 "${PSQL_MIGRATION_VARS[@]}" -qX -o /dev/null -f -
 
   elapsed_ns=$(( $(date +%s%N) - start_ns ))
   pq -c "UPDATE _sqlx_migrations SET execution_time = $elapsed_ns WHERE version = $version" >/dev/null
