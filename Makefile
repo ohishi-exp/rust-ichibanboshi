@@ -4,7 +4,8 @@
 # MariaDB も環境変数も要らない。したがって rust-alc-api にある db-up / itest /
 # cov-check-unit / cov-check-mock のような「DB 有無で分ける」ターゲットは無い。
 
-.PHONY: test test-file fmt clippy cov cov-check cov-dl cov-summary cov-not100 cov-file
+.PHONY: test test-file fmt clippy cov cov-check cov-dl cov-summary cov-not100 cov-file \
+	kintai-migrate kintai-migrate-dry kintai-migrate-status kintai-rls-verify
 
 # --- テスト (DB 不要) ---
 
@@ -14,6 +15,27 @@ test:
 # 特定テストファイル: make test-file T=kosoku_daily_test
 test-file:
 	cargo test --test $(T)
+
+# --- kintai スキーマの migration (Refs #205 実装計画 03) ---
+#
+# 適用先は専用の Supabase (secret kintai-database-url)。接続文字列は
+# KINTAI_DATABASE_URL で渡す — DATABASE_* は売上の SQL Server の名前空間なので
+# 使わない (src/config.rs)。
+# ledger は sqlx 互換なので、postgres client が入った後は sqlx migrate に引き継げる。
+
+kintai-migrate:
+	bash scripts/migrate_kintai.sh
+
+kintai-migrate-dry:
+	bash scripts/migrate_kintai.sh --dry-run
+
+kintai-migrate-status:
+	bash scripts/migrate_kintai.sh --status
+
+# 使い捨ての docker postgres を立てて DDL を流し、RLS を assert する
+# (CI の migration job と同じ検証。--docker を外せば DATABASE_URL 先に流す)。
+kintai-rls-verify:
+	bash scripts/verify_kintai_rls.sh --docker
 
 # --- Lint ---
 

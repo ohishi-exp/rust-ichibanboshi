@@ -23,6 +23,32 @@
 
 - CF Access Service Token (`CF-Access-Client-Id/Secret`) が無いリクエストは **403**。
 
+## migration (`migrations/` — kintai スキーマ / Supabase)
+
+売上は SQL Server で migration を持たない。`migrations/` は **#205 の勤怠 (kintai)
+スキーマ専用**で、相手は別 DB (専用 Supabase / secret `kintai-database-url`)。
+
+適用は `make kintai-migrate` (= `scripts/migrate_kintai.sh`、psql)。ledger は
+sqlx-postgres 0.8 と同形の `_sqlx_migrations` (version / description / SHA-384
+checksum) なので、postgres client を入れた後は `sqlx::migrate!` がそのまま
+引き継げる — **どちらで適用しても状態が割れない**。
+
+規範は `rust-alc-api` と同じ:
+
+- **適用済み migration は絶対に変更しない** (checksum 照合で loud fail)。修正は
+  新規ファイルの追加で行う。`make kintai-rls-verify` がこの fail も検証している
+- `SECURITY DEFINER` 関数を作るなら `SET search_path = kintai` を必須にする
+  (001 には該当する関数が無い)
+- RLS policy に `WITH CHECK (true)` を書かない。`FOR ALL` で `WITH CHECK` を
+  省略すれば `USING` 式がそのまま適用されるので、そちらに倒す
+- 既存データへの `INSERT` / `UPDATE` をハードコードしない (`WHERE EXISTS` で書く)
+- **パスワードを migration に書かない。** ロールは認証情報無しで作り、付与は
+  Supabase 側で `ALTER ROLE ... PASSWORD` → secret へ
+
+RLS は `postgres` では素通りするので、検証は必ず `kintai_reader`
+(`NOBYPASSRLS`) で繋いで行う。`make kintai-rls-verify` が使い捨ての docker
+postgres でこれをやり、CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
+
 ## カバレッジ 100% gate
 
 `coverage_100.toml` に登録したファイルは **100% 行カバレッジを維持**する。CI (ci.yml の
