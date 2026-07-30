@@ -37,6 +37,8 @@ use serde::Deserialize;
 use crate::kintai_push::{
     apply_timecard_batch, jst_day_bounds, KintaiPgStore, KintaiPushError, TimecardBatch,
 };
+use crate::kintai_repo::DynKintaiEventsRepo;
+use crate::kintai_send::{send_month, DynTimecardTarget, KintaiSendError, DEFAULT_MAX_DRIVERS};
 use crate::routes::kintai::is_valid_month;
 
 /// `[kintai_push]` が無効な instance では挿さらない。
@@ -85,6 +87,61 @@ fn month_bounds(
         chrono::NaiveDate::from_ymd_opt(year, mm + 1, 1)?
     };
     Some((jst_day_bounds(first).0, jst_day_bounds(next).0))
+}
+
+/// `POST /api/kintai/timecard/send` の本体。
+#[derive(Debug, Deserialize)]
+pub struct SendRequest {
+    pub month: String,
+    /// 続きから回す位置。前回の応答の `next_after_driver_cd` を渡す。
+    #[serde(default)]
+    pub after_driver_cd: Option<u64>,
+    /// 1 回で回す乗務員数。Tunnel の 30 秒に収める。
+    #[serde(default)]
+    pub max_drivers: Option<usize>,
+    /// **`false` なら 1 件も送らない** (既定)。計画だけ立てて件数を返す。
+    #[serde(default)]
+    pub apply: bool,
+}
+
+fn map_send_err(e: KintaiSendError) -> (StatusCode, String) {
+    match e {
+        KintaiSendError::NotConfigured(m) => (StatusCode::BAD_REQUEST, m),
+        other => (StatusCode::BAD_GATEWAY, other.to_string()),
+    }
+}
+
+/// POST /api/kintai/timecard/send — 手元の打刻を相手へ送る (**送信側**)。
+///
+/// **乗務員数で区切って同期で返す。** この口は Cloudflare Tunnel (30 秒上限) を
+/// 通って起動されるので、全乗務員を 1 回で回すと必ず 502 になる。応答の
+/// `next_after_driver_cd` が `null` になるまで呼び出し側が呼び直す。
+pub async fn send(
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+    Extension(target): Extension<Option<DynTimecardTarget>>,
+    Json(req): Json<SendRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_valid_month(&req.month) {
+        return Err(bad_request("month は YYYY-MM で指定してください"));
+    }
+    let target = target.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "[kintai_send] が無効です (送り先がありません)".to_string(),
+    ))?;
+    let report = send_month(
+        &repo,
+        &target,
+        &req.month,
+        req.after_driver_cd,
+        req.max_drivers.unwrap_or(DEFAULT_MAX_DRIVERS),
+        req.apply,
+    )
+    .await
+    .map_err(map_send_err)?;
+    // マクロは 1 行に収める (CLAUDE.md)
+    let (n, s) = (report.drivers, report.days_sent);
+    tracing::info!(n, s, "timecard sent");
+    Ok(Json(serde_json::json!(report)))
 }
 
 /// GET /api/kintai/timecard/signatures?month=&driver_cd= — 相手が持っている日別署名。
@@ -204,6 +261,40 @@ mod tests {
         assert!(month_bounds("2026-13").is_none());
         assert!(month_bounds("nope").is_none());
         assert!(month_bounds("20xx-07").is_none());
+    }
+
+    /// **送り先が無い instance では 503。**
+    #[tokio::test]
+    async fn send_fails_closed_without_a_target() {
+        let repo: DynKintaiEventsRepo =
+            std::sync::Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo);
+        let body = |m: &str| {
+            Json(SendRequest {
+                month: m.to_string(),
+                after_driver_cd: None,
+                max_drivers: None,
+                apply: false,
+            })
+        };
+        let (code, msg) = send(Extension(repo.clone()), Extension(None), body("2026-07"))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("kintai_send"), "{msg}");
+
+        // month は送り先を見に行く前に検査する
+        let (code, _) = send(Extension(repo), Extension(None), body("nope"))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn send_errors_separate_the_caller_from_the_remote() {
+        let (code, _) = map_send_err(KintaiSendError::NotConfigured("bad month".to_string()));
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _) = map_send_err(KintaiSendError::Remote("status 503".to_string()));
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
     }
 
     /// 宣言していない (503) と、繋がらない (502) を分ける。
