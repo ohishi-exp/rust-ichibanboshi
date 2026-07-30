@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::auth::JwtSecret;
 use crate::cakephp::CakephpClient;
 use crate::config::{Config, RawConfig};
 use crate::db;
@@ -137,8 +136,6 @@ pub async fn run(
         }
     };
 
-    let jwt_secret = JwtSecret(config.auth.jwt_secret.clone());
-
     let origins: Vec<_> = config
         .cors
         .allowed_origins
@@ -264,7 +261,6 @@ pub async fn run(
         .layer(Extension(local_store))
         .layer(Extension(cakephp_client))
         .layer(Extension(raw_cfg))
-        .layer(Extension(jwt_secret))
         .layer(Extension(kyuyo_repo))
         .layer(Extension(kyuyo_auth))
         .layer(Extension(kyuyo_limiter))

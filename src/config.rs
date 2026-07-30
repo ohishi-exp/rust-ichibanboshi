@@ -49,14 +49,6 @@ pub struct DatabaseConfig {
     pub trust_server_certificate: bool,
 }
 
-/// Auth configuration
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct AuthConfig {
-    /// JWT secret — must match rust-alc-api's JWT_SECRET
-    #[serde(default)]
-    pub jwt_secret: String,
-}
-
 /// CORS configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct CorsConfig {
@@ -234,9 +226,6 @@ pub struct Config {
 
     #[serde(default)]
     pub database: DatabaseConfig,
-
-    #[serde(default)]
-    pub auth: AuthConfig,
 
     #[serde(default)]
     pub cors: CorsConfig,
@@ -529,7 +518,6 @@ impl Config {
             bind_addr: default_bind_addr(),
             log_dir: String::new(),
             database: DatabaseConfig::default(),
-            auth: AuthConfig::default(),
             cors: CorsConfig::default(),
             sqlite: SqliteConfig::default(),
             cakephp: CakephpConfig::default(),
