@@ -181,19 +181,6 @@ pub async fn run(
 
     // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
     // 就業規則が変わったら TOML で追随できるよう config から取る。
-    // 打刻の転送先 (Refs #205 の 04b、送信側)。宣言していなければ挿さらず
-    // `/api/kintai/timecard/send` は 503 で fail-closed
-    config.kintai_send.validate()?;
-    let kintai_send_target: Option<crate::kintai_send::DynTimecardTarget> =
-        if config.kintai_send.enabled {
-            Some(Arc::new(crate::kintai_send::HttpTimecardTarget::new(
-                &config.kintai_send,
-            )?))
-        } else {
-            tracing::info!("kintai_send not enabled — /api/kintai/timecard/send returns 503");
-            None
-        };
-
     let kosoku_params = Arc::new(build_kosoku_params(&config));
 
     // 拘束サマリ store (Refs #106 Phase 3)。open 失敗は Disabled (route が 503) —
@@ -335,8 +322,13 @@ pub async fn run(
             "/kintai/timecard/signatures",
             get(routes::kintai_timecard::signatures),
         )
-        // 送信側 (オンプレが GCP へ渡す)。relay が起動する
-        .route("/kintai/timecard/send", post(routes::kintai_timecard::send))
+        // 差分を返す側 (オンプレ)。**relay が起動し、relay が GCP へ渡す** —
+        // オンプレは外へ出ない (Refs #205 の 04b)
+        .route(
+            "/kintai/timecard/drivers",
+            get(routes::kintai_timecard::drivers),
+        )
+        .route("/kintai/timecard/diff", post(routes::kintai_timecard::diff))
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
@@ -380,7 +372,6 @@ pub async fn run(
         .layer(Extension(kintai_events_repo))
         .layer(Extension(kintai_version_repo))
         .layer(Extension(kintai_pg_store))
-        .layer(Extension(kintai_send_target))
         .layer(Extension(kosoku_params))
         .layer(Extension(restraint_store));
 

@@ -103,10 +103,6 @@ fn test_env_overrides_every_supported_key() {
             ("KINTAI_EVENTS_AUTH_TOKEN", "id-token"),
             ("KINTAI_EVENTS_AUTH_TOKEN_METADATA", "false"),
             ("KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS", "600"),
-            ("KINTAI_SEND_ENABLED", "true"),
-            ("KINTAI_SEND_TARGET_URL", "https://relay.example"),
-            ("KINTAI_SEND_AUTH_TOKEN", "send-tok"),
-            ("KINTAI_SEND_TIMEOUT_SECS", "45"),
             ("KINTAI_PUSH_ENABLED", "true"),
             (
                 "KINTAI_PUSH_DATABASE_URL",
@@ -594,33 +590,6 @@ fn test_from_args_and_file_invalid_env_fails_startup() {
     std::fs::remove_file(&path).ok();
 
     assert!(result.is_err(), "壊れた env は起動を失敗させる");
-}
-
-#[test]
-fn test_kintai_send_invalid_env_is_loud() {
-    let mut config = base();
-    let err = apply(&mut config, &[("KINTAI_SEND_ENABLED", "maybe")]).unwrap_err();
-    assert!(err.contains("KINTAI_SEND_ENABLED"), "{err}");
-
-    let mut config = base();
-    let err = apply(&mut config, &[("KINTAI_SEND_TIMEOUT_SECS", "soon")]).unwrap_err();
-    assert!(err.contains("KINTAI_SEND_TIMEOUT_SECS"), "{err}");
-}
-
-#[test]
-fn test_kintai_send_env_empty_value_overwrites() {
-    let mut config: Config = toml::from_str(
-        r#"
-[kintai_send]
-enabled = true
-target_url = "https://relay.example"
-"#,
-    )
-    .unwrap();
-    // 空で潰したら「宣言したのに送り先が無い」で起動失敗する (静かに戻らない)
-    apply(&mut config, &[("KINTAI_SEND_TARGET_URL", "")]).unwrap();
-    assert_eq!(config.kintai_send.target_url, "");
-    assert!(config.kintai_send.validate().is_err());
 }
 
 /// **`SQLITE_PATH=""` で「ローカル状態の置き場を持たない」と宣言できる**

@@ -599,10 +599,30 @@ CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
 設定は `[kintai_push]` (env は `KINTAI_PUSH_*`)。
 
 **畳む場所は GCP 側へ移す (2026-07-30 の方針変更、#205)。** オンプレは MariaDB から
-打刻を読んで relay 経由で渡すだけにする — `POST /api/kintai/timecard/send` (送信側) と
-`POST /api/kintai/timecard` (受け側) の対が 04b。両端が同じバイナリなので `kosoku.rs` は
-1 実装のまま (決定 3 に触れない)。前提の G7 (Cloud Run service) が入るまでは、
-オンプレ直書き (`sync --apply`) が唯一動く経路。
+打刻を読んで返すだけにする。両端が同じバイナリなので `kosoku.rs` は 1 実装のまま
+(決定 3 に触れない)。
+
+**運ぶのは relay で、オンプレは外へ出ない。** relay が起動する側なので折り返さない —
+オンプレは送り先 URL も相手の資格情報も持たない (`[kintai_send]` は無い)。
+
+| # | 呼ぶ先 | |
+|---|---|---|
+| 1 | オンプレ `GET /api/kintai/timecard/drivers` | 対象月の乗務員を 1 ページ |
+| 2 | GCP `GET /api/kintai/timecard/signatures` | その乗務員ぶんの署名 |
+| 3 | オンプレ `POST /api/kintai/timecard/diff` | 署名を渡し、差分を受け取る |
+| 4 | GCP `POST /api/kintai/timecard` | 差分を渡す |
+
+**署名の突き合わせは Rust 側** (`kintai_push::plan_batch`)。relay に持たせると
+`day_signature` が 2 実装になり、式のずれが「中身は同じなのに毎回全日が違う」に化ける。
+relay が渡すのは GCP から引いた署名そのもの。
+
+GCP → Cloud Run の hop は auth-worker の `/ichibanboshi-proxy/*` (OIDC mint、
+allowlist は打刻の 2 本だけ)。**あそこに読み出し経路を足さないこと** — 受け口は
+`X-Tenant-ID` を素直に信用する ingest なので、読み出しを同じ関門に通すと shared secret
+だけで他テナントを引ける。
+
+オンプレ直書き (`sync --apply`) の経路も残してある (経路 1 本だと落ちた瞬間に静かに
+古くなる)。CLI は `[kintai_push]` を要求する。
 
 ### 落とし穴
 
