@@ -6,7 +6,7 @@
 //! 実際に `std::env` を読む経路 (`from_args_and_file`) だけは、この
 //! テストバイナリ**専用のプロセス**で mutex を取って直列に検証する。
 
-use rust_ichibanboshi::config::{AppArgs, Config};
+use rust_ichibanboshi::config::{AppArgs, Config, KintaiEventsSource};
 use std::collections::HashMap;
 
 /// `std::env` を触るテストの直列化 (このテストバイナリ内でのみ有効)。
@@ -51,7 +51,10 @@ password = "kyuyo-secret"
     let mut config: Config = toml::from_str(toml_str).unwrap();
     apply(&mut config, &[]).unwrap();
 
-    assert!(config.database.enabled, "既定は SQL Server を使う (オンプレ)");
+    assert!(
+        config.database.enabled,
+        "既定は SQL Server を使う (オンプレ)"
+    );
     assert_eq!(config.database.host, "172.18.21.102");
     assert_eq!(config.database.password, "onprem-secret");
     assert_eq!(config.mariadb.password, "maria-secret");
@@ -90,8 +93,20 @@ fn test_env_overrides_every_supported_key() {
             ("KYUYO_INTROSPECT_SECRET", "introspect-secret"),
             ("KYUYO_APP_ORIGIN", "https://app.example"),
             ("KYUYO_ALLOWED_EMAILS", "a@example.com, b@example.com"),
+            ("KINTAI_EVENTS_SOURCE", "http"),
+            ("KINTAI_EVENTS_BASE_URL", "https://alc.example"),
+            (
+                "KINTAI_EVENTS_TENANT_ID",
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            ("KINTAI_EVENTS_TIMEOUT_SECS", "90"),
+            ("KINTAI_EVENTS_AUTH_TOKEN", "id-token"),
+            ("KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS", "600"),
             ("CAKEPHP_BASE_URL", "http://127.0.0.1:120"),
-            ("CORS_ALLOWED_ORIGINS", "https://x.example, https://y.example"),
+            (
+                "CORS_ALLOWED_ORIGINS",
+                "https://x.example, https://y.example",
+            ),
         ],
     )
     .unwrap();
@@ -130,6 +145,136 @@ fn test_env_overrides_every_supported_key() {
         config.cors.allowed_origins,
         vec!["https://x.example", "https://y.example"]
     );
+    assert_eq!(config.kintai_events.source, KintaiEventsSource::Http);
+    assert!(config.kintai_events.http_enabled());
+    assert_eq!(config.kintai_events.base_url, "https://alc.example");
+    assert_eq!(
+        config.kintai_events.tenant_id,
+        "11111111-2222-3333-4444-555555555555"
+    );
+    assert_eq!(config.kintai_events.timeout_secs, 90);
+    assert_eq!(config.kintai_events.auth_token, "id-token");
+    assert_eq!(config.kintai_events.auth_token_ttl_secs, 600);
+    // env だけで完結して起動できる = 宣言が揃っている
+    config.kintai_events.validate().unwrap();
+}
+
+#[test]
+fn test_kintai_events_defaults_to_mariadb() {
+    // オンプレの既定。TOML に [kintai_events] を書かなければ挙動は変わらない。
+    let config = base();
+    assert_eq!(config.kintai_events.source, KintaiEventsSource::Mariadb);
+    assert!(!config.kintai_events.http_enabled());
+    assert_eq!(config.kintai_events.timeout_secs, 120);
+    assert_eq!(config.kintai_events.auth_token_ttl_secs, 900);
+    // MariaDB 読みなら接続先の宣言は要らない
+    config.kintai_events.validate().unwrap();
+}
+
+#[test]
+fn test_kintai_events_source_from_toml() {
+    let config: Config = toml::from_str(
+        r#"
+[kintai_events]
+source = "http"
+base_url = "https://alc.example"
+tenant_id = "11111111-2222-3333-4444-555555555555"
+auth_token_command = "gcloud auth print-identity-token"
+"#,
+    )
+    .unwrap();
+    assert!(config.kintai_events.http_enabled());
+    assert_eq!(
+        config.kintai_events.auth_token_command,
+        "gcloud auth print-identity-token"
+    );
+    config.kintai_events.validate().unwrap();
+}
+
+#[test]
+fn test_kintai_events_source_invalid_is_loud() {
+    // 打ち間違いが静かに MariaDB 読みへ落ちると、読み先を取り違えたまま動く
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_EVENTS_SOURCE", "htpp")]).unwrap_err();
+    assert!(err.contains("KINTAI_EVENTS_SOURCE"), "{err}");
+    assert!(err.contains("invalid source"), "{err}");
+
+    // 大文字小文字は問わない
+    let mut config = base();
+    apply(&mut config, &[("KINTAI_EVENTS_SOURCE", "HTTP")]).unwrap();
+    assert_eq!(config.kintai_events.source, KintaiEventsSource::Http);
+    let mut config = base();
+    apply(&mut config, &[("KINTAI_EVENTS_SOURCE", "MariaDB")]).unwrap();
+    assert_eq!(config.kintai_events.source, KintaiEventsSource::Mariadb);
+}
+
+#[test]
+fn test_kintai_events_timeout_invalid_is_loud() {
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_EVENTS_TIMEOUT_SECS", "soon")]).unwrap_err();
+    assert!(err.contains("KINTAI_EVENTS_TIMEOUT_SECS"), "{err}");
+    assert!(err.contains("invalid number"), "{err}");
+
+    let mut config = base();
+    let err = apply(&mut config, &[("KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS", "-1")]).unwrap_err();
+    assert!(err.contains("KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS"), "{err}");
+}
+
+#[test]
+fn test_kintai_events_http_without_target_fails_startup() {
+    // 「使うと宣言したのに接続先が無い」を黙って既定へ落とさない
+    // ([database] enabled と同じ流儀)。
+    let mut config = base();
+    apply(&mut config, &[("KINTAI_EVENTS_SOURCE", "http")]).unwrap();
+    let err = config.kintai_events.validate().unwrap_err();
+    assert!(err.contains("base_url"), "{err}");
+
+    let mut config = base();
+    apply(
+        &mut config,
+        &[
+            ("KINTAI_EVENTS_SOURCE", "http"),
+            ("KINTAI_EVENTS_BASE_URL", "https://alc.example"),
+        ],
+    )
+    .unwrap();
+    let err = config.kintai_events.validate().unwrap_err();
+    assert!(err.contains("tenant_id"), "{err}");
+}
+
+#[test]
+fn test_kintai_events_two_token_routes_at_once_fails_startup() {
+    // どちらが効いているか外から分からない状態を作らない
+    let mut config = base();
+    apply(
+        &mut config,
+        &[
+            ("KINTAI_EVENTS_SOURCE", "http"),
+            ("KINTAI_EVENTS_BASE_URL", "https://alc.example"),
+            ("KINTAI_EVENTS_TENANT_ID", "t"),
+            ("KINTAI_EVENTS_AUTH_TOKEN", "static"),
+            (
+                "KINTAI_EVENTS_AUTH_TOKEN_COMMAND",
+                "gcloud auth print-identity-token",
+            ),
+        ],
+    )
+    .unwrap();
+    let err = config.kintai_events.validate().unwrap_err();
+    assert!(err.contains("only one of"), "{err}");
+}
+
+#[test]
+fn test_kintai_events_env_empty_value_overwrites() {
+    let mut config: Config = toml::from_str(
+        r#"
+[kintai_events]
+auth_token = "from-toml"
+"#,
+    )
+    .unwrap();
+    apply(&mut config, &[("KINTAI_EVENTS_AUTH_TOKEN", "")]).unwrap();
+    assert_eq!(config.kintai_events.auth_token, "");
 }
 
 #[test]
@@ -230,7 +375,11 @@ fn test_from_args_and_file_env_beats_toml() {
     let dir = std::env::temp_dir().join(format!("ichibanboshi-env-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("env-beats-toml.toml");
-    std::fs::write(&path, "port = 3100\n\n[database]\npassword = \"from-toml\"\n").unwrap();
+    std::fs::write(
+        &path,
+        "port = 3100\n\n[database]\npassword = \"from-toml\"\n",
+    )
+    .unwrap();
 
     std::env::set_var("PORT", "8080");
     std::env::set_var("DATABASE_PASSWORD", "from-env");

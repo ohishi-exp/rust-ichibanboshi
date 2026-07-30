@@ -83,16 +83,44 @@ pub async fn run(
         }
     };
 
-    // 勤怠の生イベント読み取り (社内 MariaDB 直読み、Refs #116)。未設定なら
-    // Disabled を挿して `/api/kintai/events` だけ 503 — 空配列を返して「0 件」に
-    // 見せない。pool は lazy なので DB 停止中でも起動は失敗しない
-    let kintai_events_repo: crate::kintai_repo::DynKintaiEventsRepo = if config.mariadb.enabled() {
-        Arc::new(crate::kintai_repo::MariadbKintaiEventsRepo::new(
-            &config.mariadb,
-        ))
+    // 勤怠の生イベント読み取り。読み先は宣言で決まる (Refs #116 / #205 実装計画 02)。
+    //
+    //   [kintai_events] source = "mariadb"  → 社内 MariaDB 直読み (既定 = オンプレ)
+    //   [kintai_events] source = "http"     → rust-alc-api の /api/dtako/events (GCP)
+    //
+    // 宣言が足りなければ**黙って既定へ落とさず起動を失敗させる** ([database] enabled
+    // と同じ流儀)。MariaDB も無い形態では Disabled を挿して `/api/kintai/events` だけ
+    // 503 — 空配列を返して「0 件」に見せない。pool は lazy なので DB 停止中でも
+    // 起動は失敗しない
+    config.kintai_events.validate()?;
+    let mariadb_events: Option<crate::kintai_repo::DynKintaiEventsRepo> =
+        if config.mariadb.enabled() {
+            Some(Arc::new(crate::kintai_repo::MariadbKintaiEventsRepo::new(
+                &config.mariadb,
+            )))
+        } else {
+            None
+        };
+    let (kintai_events_repo, kintai_events_backend): (
+        crate::kintai_repo::DynKintaiEventsRepo,
+        &'static str,
+    ) = if config.kintai_events.http_enabled() {
+        if mariadb_events.is_none() {
+            tracing::warn!("kintai events via HTTP without mariadb — 打刻とフェリーは読めない");
+        }
+        let repo = crate::kintai_http_repo::HttpKintaiEventsRepo::new(
+            &config.kintai_events,
+            mariadb_events,
+        )?;
+        (Arc::new(repo), "http")
+    } else if let Some(repo) = mariadb_events {
+        (repo, "mariadb")
     } else {
         tracing::info!("mariadb not configured — /api/kintai/events returns 503");
-        Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo)
+        (
+            Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo),
+            "disabled",
+        )
     };
 
     // 勤怠の月別バージョン (ETag) 読み取り (Refs #184)。events と同じ MariaDB を
@@ -154,6 +182,7 @@ pub async fn run(
         sqlserver: config.database.enabled,
         mariadb: config.mariadb.enabled(),
         kyuyo: config.kyuyo.db_enabled(),
+        kintai_events: kintai_events_backend,
     };
 
     let origins: Vec<_> = config
