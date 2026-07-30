@@ -534,6 +534,40 @@ Service Auth ポリシーで保護 (CI 専用 token のみ許可) → deploy ユ
 - **ビルド**: musl スタティックリンク（GLIBC バージョン不一致回避）
 - `deploy.sh` / `scripts/deploy-remote.sh` の流れ: `cargo build --release --target x86_64-unknown-linux-musl` → `scp /tmp` → `mv`（アトミック） → PathModified で自動 restart → `/health` 疎通確認
 
+## migration (`migrations/` — kintai スキーマ / Supabase)
+
+売上は SQL Server で migration を持たない。`migrations/` は **#205 の勤怠 (kintai)
+スキーマ専用**で、相手は別 DB (専用 Supabase / secret `kintai-database-url`)。
+
+適用は `make kintai-migrate` (= `scripts/migrate_kintai.sh`、psql)。**ledger は
+sqlx-postgres 0.8 と同形の `_sqlx_migrations`** (version / description / SHA-384
+checksum) なので、postgres client を入れた後は `sqlx::migrate!` がそのまま引き継げる
+— どちらで適用しても状態が割れない。捨てクレートで `sqlx migrate run` を走らせて
+checksum 一致・無再適用を実証済み。
+
+env var は `DATABASE_URL` ではなく **`KINTAI_DATABASE_URL`**。`DATABASE_*` は
+`src/config.rs` で既に SQL Server の名前空間 (`DATABASE_ENABLED` / `DATABASE_HOST` …)
+なので、そこに `DATABASE_URL` を置くと「売上 SQL Server の URL」と読める。
+
+規範は `rust-alc-api` と同じ:
+
+- **適用済み migration は絶対に変更しない** (checksum 照合で loud fail)。修正は
+  新規ファイルの追加で行う。`make kintai-rls-verify` がこの fail も検証している
+- `SECURITY DEFINER` 関数を作るなら `SET search_path = kintai` を必須にする
+- RLS policy に `WITH CHECK (true)` を書かない。`FOR ALL` で `WITH CHECK` を省略すれば
+  `USING` 式がそのまま適用されるので、そちらに倒す
+- 既存データへの `INSERT` / `UPDATE` をハードコードしない (`WHERE EXISTS` で書く)
+- **パスワードを migration に書かない。** ロールは認証情報無しで作り、付与は Supabase
+  側で `ALTER ROLE ... PASSWORD` → secret へ
+
+**RLS は `postgres` では素通りする**ので、検証は必ず `kintai_reader` (`NOBYPASSRLS`)
+で繋いで行う。`make kintai-rls-verify` が使い捨ての docker postgres でこれをやり、
+CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
+
+未解決 (002 以降の候補): `GRANT ... ON ALL TABLES` はその時点の表しか対象にしないので
+`ALTER DEFAULT PRIVILEGES` に寄せるべき / `CREATE ROLE` は cluster-scoped で
+`IF NOT EXISTS` が無い / Supabase の automatic RLS が独自 policy を足さないか未確認。
+
 ## Cloudflare Access
 
 - **トンネル**: `rust-ichiban.mtamaramu.com` → `http://172.18.21.35:3100`
