@@ -443,14 +443,28 @@ tenant_id = \"11111111-2222-3333-4444-555555555555\"
 }
 
 #[test]
-fn test_kintai_push_enabled_without_tenant_id_fails_startup() {
+fn test_kintai_push_enabled_without_tenant_id_starts() {
+    // tenant_id は任意 — 打刻の受け口が X-Tenant-ID で名乗らせる。ここで必須に
+    // すると relay が KV で持っている値を設定にも写すことになり二重管理になる
+    // (CLI の push/recalc/sync はヘッダを持たないので main.rs 側で弾く)。
     let config = push_config(
         "enabled = true
 database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
 ",
     );
-    let err = config.kintai_push.validate("").unwrap_err();
-    assert!(err.contains("tenant_id"), "{err}");
+    config.kintai_push.validate("").unwrap();
+
+    // 空白だけも「書いていない」扱い ([kintai_events] との照合まで飛ばす)
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
+tenant_id = \"   \"
+",
+    );
+    config
+        .kintai_push
+        .validate("11111111-2222-3333-4444-555555555555")
+        .unwrap();
 }
 
 #[test]

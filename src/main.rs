@@ -123,6 +123,13 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
     config
         .kintai_push
         .validate(&config.kintai_events.tenant_id)?;
+    // 受け口は X-Tenant-ID から取るので tenant_id は任意だが、CLI にヘッダは無い。
+    // 既定のテナントへ落とさず、ここで止める
+    if config.kintai_push.tenant_id.trim().is_empty() {
+        return Err("[kintai_push] tenant_id は push/recalc/sync に必須です \
+                    (受け口だけなら X-Tenant-ID から取るので省略できます)"
+            .into());
+    }
 
     let batch = match &command {
         Command::Push(b) | Command::Recalc(b) | Command::Sync(b) => b.clone(),

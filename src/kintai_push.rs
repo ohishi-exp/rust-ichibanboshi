@@ -442,8 +442,15 @@ impl KintaiPgStore {
                 "[kintai_push] enabled = false".to_string(),
             ));
         }
-        let tenant_id = uuid::Uuid::parse_str(cfg.tenant_id.trim())
-            .map_err(|e| KintaiPushError::NotConfigured(format!("tenant_id: {e}")))?;
+        // 空なら nil = **pin 無し**。書き先のテナントはリクエストが名乗り、
+        // 受け口が [`Self::for_tenant`] で差し替える。ヘッダを持たない CLI 経路は
+        // nil のまま走らせない (`main.rs` が起動前に弾く)
+        let tenant_id = if cfg.tenant_id.trim().is_empty() {
+            uuid::Uuid::nil()
+        } else {
+            uuid::Uuid::parse_str(cfg.tenant_id.trim())
+                .map_err(|e| KintaiPushError::NotConfigured(format!("tenant_id: {e}")))?
+        };
         let statement_timeout_ms = cfg.statement_timeout_secs.saturating_mul(1000);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -466,6 +473,20 @@ impl KintaiPgStore {
     /// テスト用。既に張った pool から作る。
     pub fn from_pool(pool: sqlx::PgPool, tenant_id: uuid::Uuid) -> Self {
         Self { pool, tenant_id }
+    }
+
+    /// テナントだけ差し替えた複製。**受け口が 1 リクエストごとに呼ぶ。**
+    ///
+    /// `PgPool` は内部が `Arc` なので複製しても接続は張り直されない
+    /// (`max_connections = 1` の同じ pool を共有する)。テナントを
+    /// `KintaiPgStore` の外に出して引数で回す形にしないのは、`kintai_fold` まで
+    /// 含めた全ての SQL が `store.tenant_id()` を bind しており、渡し忘れが
+    /// 「別テナントへ書く」になるため。
+    pub fn for_tenant(&self, tenant_id: uuid::Uuid) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            tenant_id,
+        }
     }
 
     pub fn tenant_id(&self) -> uuid::Uuid {
