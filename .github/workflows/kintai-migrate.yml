@@ -11,13 +11,24 @@ name: kintai migrate
 # 同じ migration を 2 度当てても何も起きない。逆に**適用済みファイルを書き換えて
 # いると checksum 照合で失敗する** ので、事故った状態のまま流れることはない。
 #
-# ── なぜ push で自動適用しないのか ────────────────────────────────────────
-# DDL は畳んだ 3 層の実体を作る操作で、間違えたときに戻すのが `cargo` の revert
-# ほど簡単ではない。まず workflow_dispatch で「いつ当てるか」を人が決める形に
-# する。運用が固まったら main push に寄せてよい (その場合 apply job の `if` を
-# 変えるだけで済むよう、環境の選択は input ではなく environment に持たせてある)。
+# ── いつ走るか ────────────────────────────────────────────────────────────
+# main に migration が入ったら自動で当てる。「merge したのに当て忘れて、読み書き
+# する側だけ先に動いている」状態を作らないため。paths で絞ってあるので、
+# migration に無関係な push では走らない。
+#
+# 安全側の担保は environment (`kintai-database`) に寄せてある。GitHub 側で
+# required reviewers を付ければ、push 由来でも apply の手前で止まって承認待ちに
+# なる。止めたいときは workflow をいじるのではなくそちらで縛ること。
+#
+# 手で確かめたいときは workflow_dispatch で status / dry-run を選ぶ。
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+      - 'scripts/migrate_kintai.sh'
+      - '.github/workflows/kintai-migrate.yml'
   workflow_dispatch:
     inputs:
       mode:
@@ -40,10 +51,11 @@ concurrency:
 
 jobs:
   migrate:
-    name: kintai migrate (${{ inputs.mode }})
+    # push 由来は mode という概念が無いので apply 固定。dispatch のときだけ選べる。
+    name: kintai migrate (${{ inputs.mode || 'apply' }})
     runs-on: ubuntu-latest
-    # apply のときだけ承認を要求できるよう environment を噛ませる。
-    # GitHub 側で required reviewers を付ければ、ここで止まる。
+    # 承認を要求できるよう environment を噛ませる。GitHub 側で required reviewers
+    # を付ければ、push 由来でもここで止まる。
     environment: kintai-database
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +69,7 @@ jobs:
       - name: Run migration
         env:
           KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
-          MODE: ${{ inputs.mode }}
+          MODE: ${{ inputs.mode || 'apply' }}
         run: |
           set -euo pipefail
           if [ -z "${KINTAI_DATABASE_URL}" ]; then
