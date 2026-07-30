@@ -22,6 +22,12 @@ fn test_config_defaults_from_empty_toml() {
         config.cors.allowed_origins,
         vec!["https://ichibanboshi.mtamaramu.com"]
     );
+    // 畳んだ勤怠の書き先 (#205 の 04〜06) は宣言するまで無効
+    assert!(!config.kintai_push.enabled);
+    assert!(config.kintai_push.database_url.is_empty());
+    assert!(config.kintai_push.tenant_id.is_empty());
+    assert_eq!(config.kintai_push.connect_timeout_secs, 30);
+    assert_eq!(config.kintai_push.statement_timeout_secs, 300);
 }
 
 #[test]
@@ -384,6 +390,155 @@ fn test_mariadb_config_partial_is_disabled() {
     let config: Config =
         toml::from_str("[mariadb]\nhost = \"\"\npassword = \"s\"\ndatabase = \"d\"\n").unwrap();
     assert!(!config.mariadb.enabled());
+}
+
+// ══════════════════════════════════════════════════════════════
+// [kintai_push] (畳んだ勤怠の書き先、Refs #205 実装計画 04〜06)
+// ══════════════════════════════════════════════════════════════
+
+/// `[kintai_push]` だけを書いた TOML を組み立てる補助。
+fn push_config(body: &str) -> Config {
+    toml::from_str(&format!("[kintai_push]\n{body}")).unwrap()
+}
+
+#[test]
+fn test_kintai_push_disabled_requires_nothing() {
+    // 宣言していない = 何も書きに行かないので、接続先も tenant_id も要らない。
+    let config: Config = toml::from_str("").unwrap();
+    config.kintai_push.validate("").unwrap();
+    // 揃っていない値が残っていても、無効なら起動を止めない
+    let config = push_config("enabled = false\ndatabase_url = \"\"\ntenant_id = \"\"\n");
+    config
+        .kintai_push
+        .validate("11111111-2222-3333-4444-555555555555")
+        .unwrap();
+}
+
+#[test]
+fn test_kintai_push_enabled_without_database_url_fails_startup() {
+    // 「使うと宣言したのに書き先が無い」を黙って既定へ落とさない
+    // ([database] enabled と同じ流儀)。
+    let config = push_config("enabled = true\n");
+    let err = config.kintai_push.validate("").unwrap_err();
+    assert!(err.contains("database_url"), "{err}");
+
+    // 空白だけも「無い」扱い
+    let config = push_config("enabled = true\ndatabase_url = \"   \"\n");
+    let err = config.kintai_push.validate("").unwrap_err();
+    assert!(err.contains("database_url"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_transaction_pooler_fails_startup() {
+    // transaction mode (6543) は prepared statement の扱いが sqlx の既定と噛み合わない。
+    // 繋がってしまうので、実行時に散発的に壊れる前に起動で止める。
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:6543/postgres\"
+tenant_id = \"11111111-2222-3333-4444-555555555555\"
+",
+    );
+    let err = config.kintai_push.validate("").unwrap_err();
+    assert!(err.contains("6543") || err.contains("session"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_enabled_without_tenant_id_fails_startup() {
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
+",
+    );
+    let err = config.kintai_push.validate("").unwrap_err();
+    assert!(err.contains("tenant_id"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_tenant_id_must_be_a_uuid() {
+    // alc_api.tenants.id をそのまま使う (新規採番しない) ので UUID 以外は打ち間違い。
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
+tenant_id = \"ichibanboshi\"
+",
+    );
+    let err = config.kintai_push.validate("").unwrap_err();
+    assert!(err.contains("UUID"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_tenant_id_must_match_kintai_events() {
+    // テナントが 2 つの値に割れると、読み (alc) と書き (kintai) が別テナントを指す。
+    // RLS が静かに全件遮断するか、別テナントへ書く。
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
+tenant_id = \"11111111-2222-3333-4444-555555555555\"
+",
+    );
+    let err = config
+        .kintai_push
+        .validate("99999999-8888-7777-6666-555555555555")
+        .unwrap_err();
+    assert!(err.contains("match"), "{err}");
+}
+
+#[test]
+fn test_kintai_push_tenant_id_matching_is_case_insensitive() {
+    // UUID の大文字小文字は同じ値。表記揺れで起動を落とさない。
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
+tenant_id = \"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\"
+",
+    );
+    config
+        .kintai_push
+        .validate("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        .unwrap();
+}
+
+#[test]
+fn test_kintai_push_skips_matching_when_events_tenant_is_empty() {
+    // [kintai_events] が MariaDB 直読み (= tenant_id 空) のオンプレでも push はできる。
+    let config = push_config(
+        "enabled = true
+database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
+tenant_id = \"11111111-2222-3333-4444-555555555555\"
+",
+    );
+    config.kintai_push.validate("").unwrap();
+    // 空白だけの [kintai_events] tenant_id も「未設定」扱い
+    config.kintai_push.validate("  ").unwrap();
+}
+
+#[test]
+fn test_kintai_push_fully_configured_is_ok() {
+    let toml_str = r#"
+[kintai_events]
+source = "http"
+base_url = "https://alc.example"
+tenant_id = "11111111-2222-3333-4444-555555555555"
+
+[kintai_push]
+enabled = true
+database_url = "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres"
+tenant_id = "11111111-2222-3333-4444-555555555555"
+connect_timeout_secs = 10
+statement_timeout_secs = 900
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.kintai_push.enabled);
+    assert_eq!(config.kintai_push.connect_timeout_secs, 10);
+    assert_eq!(config.kintai_push.statement_timeout_secs, 900);
+    config.kintai_events.validate().unwrap();
+    config
+        .kintai_push
+        .validate(&config.kintai_events.tenant_id)
+        .unwrap();
+    // Debug / Clone を通しておく
+    let cloned = config.kintai_push.clone();
+    assert!(format!("{cloned:?}").contains("kintai_writer"));
 }
 
 #[test]

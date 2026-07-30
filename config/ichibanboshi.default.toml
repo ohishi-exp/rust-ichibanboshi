@@ -80,3 +80,39 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # timeout_secs = 120
 # auth_token_command = "gcloud auth print-identity-token"
 # auth_token_ttl_secs = 900
+
+# 畳んだ勤怠をどこへ書くか (Refs #205 実装計画 04〜06)。打刻の push と再計算の書き先。
+# 既定は enabled = false = 無効。宣言しない限り CLI (push / recalc / sync) は何もせず
+# 落ちる — 「設定を忘れたまま走って 0 件成功に見える」を作らない ([database] enabled と
+# 同じ流儀)。宣言したのに接続先や tenant_id が無ければ**起動を失敗させる**。
+#
+# **書くのは常にオンプレ側** (ohishi-data の rust-ichibanboshi)。GCP からオンプレへは
+# 到達できないので push 方向しか無い (#205 の決定 8)。読む側 (Cloud Run) はこの設定を
+# 持たず、畳んだ 3 層を kintai_reader で読むだけ。ここで使うロールは kintai_writer。
+#
+# **接続は session mode の pooler (5432) を使う。** transaction mode (6543) は prepared
+# statement の扱いが違い、sqlx の既定 (文を準備して使い回す) と噛み合わない —
+# 6543 を含む URL は起動時に弾く。direct connection (db.<ref>.supabase.co) は IPv6 のみ
+# なので、ここからは届かない。
+#
+# tenant_id は **rust-alc-api の alc_api.tenants.id をそのまま使う** (新規採番しない)。
+# 上の [kintai_events] tenant_id と一致していないと**起動しない** — ずれると生イベントの
+# 読みと畳んだ勤怠の書きが別テナントを指し、kintai.* の RLS (app.current_tenant_id) が
+# 静かに全件遮断するか別テナントへ書く。大文字小文字の違いは同一とみなす。
+#
+# 環境変数でも同じ項目を指定できる:
+#   KINTAI_PUSH_ENABLED / _DATABASE_URL / _TENANT_ID
+#   KINTAI_PUSH_CONNECT_TIMEOUT_SECS / _STATEMENT_TIMEOUT_SECS
+#
+# migration スクリプト (scripts/migrate_kintai.sh) が使う KINTAI_DATABASE_URL とは
+# **別物**。あちらは DDL を当てる所有者権限で、こちらは行を読み書きするだけの
+# kintai_writer。同じ値を使い回さない。
+#
+# database_url の実値は repo に置かず、デプロイ先の ichibanboshi.toml
+# (または systemd の EnvironmentFile) でのみ設定する。
+# [kintai_push]
+# enabled = true
+# database_url = "postgres://kintai_writer:<パスワード>@<pooler ホスト>:5432/postgres"
+# tenant_id = "<一番星のテナント UUID ([kintai_events] と同じ値)>"
+# connect_timeout_secs = 30
+# statement_timeout_secs = 300
