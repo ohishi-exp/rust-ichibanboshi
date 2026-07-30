@@ -4,16 +4,25 @@
 //! 02 のモジュール docs が「#205 の 04 / 05 が埋める穴」と書いていたものを、
 //! 穴の定義どおりに埋める — **オンプレが読んで、ここへ渡す**。
 //!
-//! | | |
-//! |---|---|
-//! | `GET /api/kintai/timecard/signatures` | 相手が持っている (乗務員, 暦日) の署名 |
-//! | `POST /api/kintai/timecard` | 差分の日だけを反映する |
+//! | | どちら側 | |
+//! |---|---|---|
+//! | `GET /api/kintai/timecard/signatures` | GCP | 持っている (乗務員, 暦日) の署名 |
+//! | `POST /api/kintai/timecard` | GCP | 差分の日だけを反映する |
+//! | `GET /api/kintai/timecard/drivers` | オンプレ | 対象月の乗務員を 1 ページ |
+//! | `POST /api/kintai/timecard/diff` | オンプレ | 署名を受け取り、差分を返す |
+//!
+//! ## 運ぶのは relay。オンプレは外へ出ない
+//!
+//! **relay が起動する側なので、オンプレから折り返さない。** relay が署名を GCP から
+//! 引いてオンプレへ渡し、返ってきた差分を GCP へ渡す。オンプレは request / response
+//! だけで、送り先 URL も相手の資格情報も持たない。順序は [`crate::kintai_diff`]。
 //!
 //! ## 全量を送らない
 //!
-//! 送り側はまず署名を引き、手元の署名と突き合わせて**違う日と消えた日だけ**を送る。
-//! 1 か月・全乗務員の打刻は数万行あるので、毎回全部送ると転送も書き込みも無駄になる。
-//! 署名の作り方は [`crate::kintai_push`] のモジュール docs。
+//! 署名を突き合わせて**違う日と消えた日だけ**を運ぶ。1 か月・全乗務員の打刻は数万行
+//! あるので、毎回全部送ると転送も書き込みも無駄になる。突き合わせは Rust 側
+//! ([`crate::kintai_push::plan_batch`]) で、relay は署名を計算しない — 2 実装になると
+//! 式のずれが「毎回全日が違う」に化ける。署名の作り方は [`crate::kintai_push`]。
 //!
 //! ## 認可は網層が持つ
 //!
@@ -43,11 +52,11 @@ use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::kintai_diff::{diff_month, drivers_page, KintaiDiffError, DEFAULT_MAX_DRIVERS};
 use crate::kintai_push::{
     apply_timecard_batch, jst_day_bounds, KintaiPgStore, KintaiPushError, TimecardBatch,
 };
 use crate::kintai_repo::DynKintaiEventsRepo;
-use crate::kintai_send::{send_month, DynTimecardTarget, KintaiSendError, DEFAULT_MAX_DRIVERS};
 use crate::routes::kintai::is_valid_month;
 
 /// `[kintai_push]` が無効な instance では挿さらない。
@@ -142,58 +151,88 @@ fn month_bounds(
     Some((jst_day_bounds(first).0, jst_day_bounds(next).0))
 }
 
-/// `POST /api/kintai/timecard/send` の本体。
+/// `?month=YYYY-MM&after_driver_cd=&max_drivers=`。
 #[derive(Debug, Deserialize)]
-pub struct SendRequest {
-    pub month: String,
+pub struct DriversQuery {
+    pub month: Option<String>,
     /// 続きから回す位置。前回の応答の `next_after_driver_cd` を渡す。
     #[serde(default)]
     pub after_driver_cd: Option<u64>,
-    /// 1 回で回す乗務員数。Tunnel の 30 秒に収める。
+    /// 1 回で返す乗務員数。Tunnel の 30 秒に収める。
     #[serde(default)]
     pub max_drivers: Option<usize>,
-    /// **`false` なら 1 件も送らない** (既定)。計画だけ立てて件数を返す。
-    #[serde(default)]
-    pub apply: bool,
 }
 
-fn map_send_err(e: KintaiSendError) -> (StatusCode, String) {
+/// `POST /api/kintai/timecard/diff` の本体。
+#[derive(Debug, Deserialize)]
+pub struct DiffRequest {
+    pub month: String,
+    /// **相手 (GCP) が持っている署名。** relay が
+    /// `GET /api/kintai/timecard/signatures` から集めて渡す。
+    /// キーが対象の乗務員CD で、値が `{暦日: 署名}`。
+    #[serde(default)]
+    pub remote:
+        std::collections::BTreeMap<u64, std::collections::BTreeMap<chrono::NaiveDate, String>>,
+}
+
+/// 呼び方が悪い (400) と、読み先が落ちている (502) を分ける。
+fn map_diff_err(e: KintaiDiffError) -> (StatusCode, String) {
     match e {
-        KintaiSendError::NotConfigured(m) => (StatusCode::BAD_REQUEST, m),
+        KintaiDiffError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
         other => (StatusCode::BAD_GATEWAY, other.to_string()),
     }
 }
 
-/// POST /api/kintai/timecard/send — 手元の打刻を相手へ送る (**送信側**)。
+/// GET /api/kintai/timecard/drivers?month=&after_driver_cd=&max_drivers=
+/// — 対象月の乗務員を 1 ページ返す。
 ///
-/// **乗務員数で区切って同期で返す。** この口は Cloudflare Tunnel (30 秒上限) を
-/// 通って起動されるので、全乗務員を 1 回で回すと必ず 502 になる。応答の
-/// `next_after_driver_cd` が `null` になるまで呼び出し側が呼び直す。
-pub async fn send(
+/// **乗務員数で区切る。** この口は Cloudflare Tunnel (30 秒上限) を通って叩かれる
+/// ので、全乗務員を 1 回で返すと必ず 502 になる。応答の `next_after_driver_cd` が
+/// `null` になるまで relay が呼び直す。
+pub async fn drivers(
+    Query(params): Query<DriversQuery>,
     Extension(repo): Extension<DynKintaiEventsRepo>,
-    Extension(target): Extension<Option<DynTimecardTarget>>,
-    Json(req): Json<SendRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    if !is_valid_month(&month) {
+        return Err(bad_request("month は YYYY-MM で指定してください"));
+    }
+    let page = drivers_page(
+        &repo,
+        &month,
+        params.after_driver_cd,
+        params.max_drivers.unwrap_or(DEFAULT_MAX_DRIVERS),
+    )
+    .await
+    .map_err(map_diff_err)?;
+    Ok(Json(serde_json::json!({
+        "month": month,
+        "drivers": page.drivers,
+        "next_after_driver_cd": page.next_after_driver_cd,
+    })))
+}
+
+/// POST /api/kintai/timecard/diff — 相手の署名と突き合わせて**渡すべき差分を返す**。
+///
+/// **何も書かないし、どこへも送らない。** relay が受け取った `batches` をそのまま
+/// GCP の `POST /api/kintai/timecard` へ渡す。オンプレから外へ出る経路を作らない
+/// ため、送信はこちらの責務にしない ([`crate::kintai_diff`] のモジュール docs)。
+pub async fn diff(
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+    Json(req): Json<DiffRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !is_valid_month(&req.month) {
         return Err(bad_request("month は YYYY-MM で指定してください"));
     }
-    let target = target.ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "[kintai_send] が無効です (送り先がありません)".to_string(),
-    ))?;
-    let report = send_month(
-        &repo,
-        &target,
-        &req.month,
-        req.after_driver_cd,
-        req.max_drivers.unwrap_or(DEFAULT_MAX_DRIVERS),
-        req.apply,
-    )
-    .await
-    .map_err(map_send_err)?;
+    let report = diff_month(&repo, &req.month, &req.remote)
+        .await
+        .map_err(map_diff_err)?;
     // マクロは 1 行に収める (CLAUDE.md)
-    let (n, s) = (report.drivers, report.days_sent);
-    tracing::info!(n, s, "timecard sent");
+    let (n, c, d) = (report.drivers, report.days_changed, report.days_deleted);
+    tracing::info!(n, c, d, "timecard diffed");
+    if report.has_unexpected() {
+        tracing::warn!(n, "timecard had odd rows");
+    }
     Ok(Json(serde_json::json!(report)))
 }
 
@@ -334,37 +373,45 @@ mod tests {
         assert!(month_bounds("20xx-07").is_none());
     }
 
-    /// **送り先が無い instance では 503。**
+    /// 壊れた月は**読みに行く前に** 400 で落とす (両方の口で)。
     #[tokio::test]
-    async fn send_fails_closed_without_a_target() {
+    async fn the_month_is_validated_before_the_repo() {
         let repo: DynKintaiEventsRepo =
             std::sync::Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo);
-        let body = |m: &str| {
-            Json(SendRequest {
-                month: m.to_string(),
-                after_driver_cd: None,
-                max_drivers: None,
-                apply: false,
-            })
-        };
-        let (code, msg) = send(Extension(repo.clone()), Extension(None), body("2026-07"))
+        for m in [None, Some(""), Some("2026-7"), Some("nope")] {
+            let (code, _) = drivers(
+                Query(DriversQuery {
+                    month: m.map(str::to_string),
+                    after_driver_cd: None,
+                    max_drivers: None,
+                }),
+                Extension(repo.clone()),
+            )
             .await
             .unwrap_err();
-        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(msg.contains("kintai_send"), "{msg}");
+            assert_eq!(code, StatusCode::BAD_REQUEST, "month={m:?}");
+        }
 
-        // month は送り先を見に行く前に検査する
-        let (code, _) = send(Extension(repo), Extension(None), body("nope"))
-            .await
-            .unwrap_err();
+        let (code, _) = diff(
+            Extension(repo),
+            Json(DiffRequest {
+                month: "nope".to_string(),
+                remote: Default::default(),
+            }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
+    /// 呼び方が悪い (400) と、読み先が落ちている (502) を分ける。
     #[test]
-    fn send_errors_separate_the_caller_from_the_remote() {
-        let (code, _) = map_send_err(KintaiSendError::NotConfigured("bad month".to_string()));
+    fn diff_errors_separate_the_caller_from_the_source() {
+        let (code, _) = map_diff_err(KintaiDiffError::BadRequest("bad month".to_string()));
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        let (code, _) = map_send_err(KintaiSendError::Remote("status 503".to_string()));
+        let (code, _) = map_diff_err(KintaiDiffError::Read(
+            crate::kintai_repo::KintaiRepoError::NotConfigured,
+        ));
         assert_eq!(code, StatusCode::BAD_GATEWAY);
     }
 

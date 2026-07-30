@@ -455,66 +455,6 @@ impl Default for KintaiPushConfig {
     }
 }
 
-/// 打刻を**別の instance へ送る**ための設定 (Refs #205 の 04b、送信側)。
-///
-/// オンプレが MariaDB から読んだ打刻を、GCP 側の `rust-ichibanboshi` へ渡す。
-/// 相手は `POST /api/kintai/timecard` (受け側は [`KintaiPushConfig`] を持つ)。
-///
-/// **`[kintai_push]` とは別**。あちらは「自分で Supabase に書く」、こちらは
-/// 「書ける相手に渡す」。両方を同時に宣言してもよい (オンプレ直書きを残したまま
-/// GCP にも送る) が、通常はどちらか片方。
-#[derive(Debug, Clone, Deserialize)]
-pub struct KintaiSendConfig {
-    /// 打刻の転送を**使うと宣言するか**。既定 `false`。
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// 送り先の origin。relay の中継口、または GCP の Cloud Run URL。
-    /// 末尾の `/` は付けても付けなくてもよい。
-    #[serde(default)]
-    pub target_url: String,
-
-    /// 相手に付ける `Authorization: Bearer`。空ならヘッダーを付けない
-    /// (網層だけで守る構成)。
-    #[serde(default)]
-    pub auth_token: String,
-
-    /// HTTP request timeout (秒)。
-    #[serde(default = "default_kintai_send_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-impl KintaiSendConfig {
-    /// 宣言の整合性検査。**足りない設定を黙って既定へ落とさず起動を失敗させる。**
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-        if self.target_url.trim().is_empty() {
-            return Err("[kintai_send] enabled = true requires target_url".to_string());
-        }
-        if !self.target_url.starts_with("http://") && !self.target_url.starts_with("https://") {
-            return Err("[kintai_send] target_url must start with http:// or https://".to_string());
-        }
-        Ok(())
-    }
-}
-
-impl Default for KintaiSendConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            target_url: String::new(),
-            auth_token: String::new(),
-            timeout_secs: default_kintai_send_timeout_secs(),
-        }
-    }
-}
-
-fn default_kintai_send_timeout_secs() -> u64 {
-    120
-}
-
 fn default_kintai_push_connect_timeout_secs() -> u64 {
     30
 }
@@ -567,10 +507,6 @@ pub struct Config {
     /// 畳んだ勤怠の書き先の宣言 (Refs #205 実装計画 04〜06)。既定は無効。
     #[serde(default)]
     pub kintai_push: KintaiPushConfig,
-
-    /// 打刻の転送先の宣言 (Refs #205 の 04b、送信側)。既定は無効。
-    #[serde(default)]
-    pub kintai_send: KintaiSendConfig,
 
     #[serde(default)]
     pub kosoku: KosokuConfigToml,
@@ -1027,20 +963,6 @@ impl Config {
             self.kintai_push.statement_timeout_secs = v;
         }
 
-        // ── 打刻の転送先 (Refs #205 の 04b、送信側) ──
-        if let Some(v) = env_bool(get, "KINTAI_SEND_ENABLED")? {
-            self.kintai_send.enabled = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_SEND_TARGET_URL") {
-            self.kintai_send.target_url = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_SEND_AUTH_TOKEN") {
-            self.kintai_send.auth_token = v;
-        }
-        if let Some(v) = env_u64(get, "KINTAI_SEND_TIMEOUT_SECS")? {
-            self.kintai_send.timeout_secs = v;
-        }
-
         // ── 給与大臣 (OHKEN) + introspect 認可 (Refs #82) ──
         if let Some(v) = env_str(get, "KYUYO_HOST") {
             self.kyuyo.host = v;
@@ -1133,7 +1055,6 @@ impl Config {
             mariadb: MariadbConfig::default(),
             kintai_events: KintaiEventsConfig::default(),
             kintai_push: KintaiPushConfig::default(),
-            kintai_send: KintaiSendConfig::default(),
             kosoku: KosokuConfigToml::default(),
         })
     }
