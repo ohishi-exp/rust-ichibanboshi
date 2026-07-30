@@ -63,6 +63,9 @@ FAIL_TIMEOUT_SECS="${SMOKE_FAIL_TIMEOUT_SECS:-90}"
 readonly DUMMY_MARIADB_HOST="mariadb.invalid"
 readonly DUMMY_MARIADB_DATABASE="kintai_smoke"
 readonly DUMMY_MARIADB_PASSWORD="not-a-real-password"
+# HTTP 読み先も実接続はしない (client は lazy)。到達しない host で足りる
+readonly DUMMY_KINTAI_BASE_URL="http://alc-api.invalid"
+readonly DUMMY_KINTAI_TENANT_ID="00000000-0000-0000-0000-000000000000"
 
 CONTAINERS=()
 cleanup() {
@@ -167,6 +170,9 @@ docker run -d --name "$C_A" \
   -e MARIADB_HOST="$DUMMY_MARIADB_HOST" \
   -e MARIADB_DATABASE="$DUMMY_MARIADB_DATABASE" \
   -e MARIADB_PASSWORD="$DUMMY_MARIADB_PASSWORD" \
+  -e KINTAI_EVENTS_SOURCE=http \
+  -e KINTAI_EVENTS_BASE_URL="$DUMMY_KINTAI_BASE_URL" \
+  -e KINTAI_EVENTS_TENANT_ID="$DUMMY_KINTAI_TENANT_ID" \
   -p 127.0.0.1::"$CASE_A_PORT" \
   "$IMAGE" >/dev/null || fail "case A: docker run failed"
 
@@ -184,6 +190,9 @@ assert_json "$BODY_A" '.backends.sqlserver' 'disabled'
 assert_json "$BODY_A" '.backends.mariadb' 'declared'
 # 給与大臣は env を与えていないので disabled
 assert_json "$BODY_A" '.backends.kyuyo' 'disabled'
+# 生イベントの読み先 (Refs #211)。宣言ではなく**実際に注入された実装**が出るので、
+# ここが "mariadb" のままなら GCP の形なのにオンプレの読み先を掴んでいる
+assert_json "$BODY_A" '.backends.kintai_events' 'http'
 
 # SQL Server 依存ルートは fail-closed。空配列を返して「0 件」に見せない。
 CODE_A_SALES="$(http_code "${BASE_A}/api/sales/monthly")"
@@ -285,8 +294,61 @@ note "ok: no listener (last /health code = ${CODE_C_AFTER})"
 
 docker rm -f "$C_C" >/dev/null
 
+# ---------------------------------------------------------------------------
+# case D — 宣言したのに設定が欠けていたら **起動しない** (Refs #211)
+# ---------------------------------------------------------------------------
+# KINTAI_EVENTS_SOURCE=http と言いながら base_url / tenant_id を与えない。
+# ここで黙って MariaDB 読みに落ちると、GCP で「動いているが読み先が違う」= 遅く
+# ならず静かに間違う状態になる。case C と同じ「宣言したら loud に倒れる」規則。
+C_D="$(name_for kintai-misconfig)"
+CONTAINERS+=("$C_D")
+note "case D: KINTAI_EVENTS_SOURCE=http without base_url / tenant_id"
+docker run -d --name "$C_D" \
+  -e DATABASE_ENABLED=false \
+  -e KINTAI_EVENTS_SOURCE=http \
+  -p 127.0.0.1::8080 \
+  "$IMAGE" >/dev/null || fail "case D: docker run failed"
+
+BASE_D="http://$(host_addr "$C_D" 8080)"
+DEADLINE_D=$(( $(date +%s) + FAIL_TIMEOUT_SECS ))
+EXITED_D=0
+while [ "$(date +%s)" -lt "$DEADLINE_D" ]; do
+  if ! container_running "$C_D"; then
+    EXITED_D=1
+    break
+  fi
+  CODE_D="$(http_code "${BASE_D}/health")"
+  if [ "$CODE_D" = "200" ]; then
+    dump_logs "$C_D"
+    fail "case D: /health returned 200 — declaring kintai_events=http without base_url \
+must fail startup. A silent fall back to MariaDB reads is exactly the 'not slow, just \
+quietly wrong' failure mode this declaration style exists to prevent."
+  fi
+  sleep 0.25
+done
+
+[ "$EXITED_D" = "1" ] \
+  || { dump_logs "$C_D"; fail "case D: container was still running after ${FAIL_TIMEOUT_SECS}s — expected it to exit non-zero"; }
+
+EXIT_D="$(docker inspect -f '{{.State.ExitCode}}' "$C_D")"
+note "case D: exit code = ${EXIT_D}"
+[ "$EXIT_D" != "0" ] \
+  || { dump_logs "$C_D"; fail "case D: exited 0 — declaring http without base_url must fail startup, not fall back to MariaDB"; }
+case "$EXIT_D" in
+  125|126|127) dump_logs "$C_D"; fail "case D: exit ${EXIT_D} = docker/image level failure, not the config validation we are testing" ;;
+esac
+LOGS_D="$(docker logs "$C_D" 2>&1 || true)"
+if ! printf '%s' "$LOGS_D" | grep -qiE 'kintai_events|base_url|tenant_id'; then
+  dump_logs "$C_D"
+  fail "case D: exited ${EXIT_D} but the logs do not name the missing kintai_events setting — it died for some other reason"
+fi
+note "ok: exited ${EXIT_D} naming the missing kintai_events setting"
+
+docker rm -f "$C_D" >/dev/null
+
 echo
 echo "SMOKE OK — both forms behave as declared:"
-echo "  GCP form     : starts, /health 200, sqlserver=disabled, mariadb=declared, sales 503, injected PORT honored"
+echo "  GCP form     : starts, /health 200, sqlserver=disabled, mariadb=declared, kintai_events=http, sales 503, injected PORT honored"
 echo "  ENV defaults : reachable on 8080 from outside the container (ENV PORT / BIND_ADDR in effect)"
 echo "  on-prem form : refuses to start without SQL Server (exit ${EXIT_CODE}, no listener)"
+echo "  misconfig    : refuses to start when a declared backend is missing its settings (exit ${EXIT_D})"
