@@ -36,7 +36,9 @@ fn kintai_output_sha() -> String {
     for (dir, prefix) in KINTAI_OUTPUT_GLOBS {
         let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
         for entry in entries {
-            let path = entry.unwrap_or_else(|e| panic!("read_dir {dir}: {e}")).path();
+            let path = entry
+                .unwrap_or_else(|e| panic!("read_dir {dir}: {e}"))
+                .path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if path.is_file() && name.starts_with(prefix) && name.ends_with(".rs") {
                 files.push(path);
@@ -68,7 +70,10 @@ fn kintai_output_sha() -> String {
         hasher.update(&body);
         hasher.update([0u8]);
     }
-    format!("{:x}", hasher.finalize()).chars().take(16).collect()
+    format!("{:x}", hasher.finalize())
+        .chars()
+        .take(16)
+        .collect()
 }
 
 // build 時に commit SHA と build 時刻を rustc-env として焼き込む。

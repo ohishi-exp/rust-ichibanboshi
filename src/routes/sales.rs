@@ -461,7 +461,7 @@ pub fn split_and_sort_yoy(
         .filter(|e| e.yoy_percent > 0.0)
         .cloned()
         .collect();
-    pos.sort_by(|a, b| b.prev_total.cmp(&a.prev_total));
+    pos.sort_by_key(|p| std::cmp::Reverse(p.prev_total));
     let mut neg: Vec<_> = entries
         .iter()
         .filter(|e| e.yoy_percent < 0.0)
@@ -573,7 +573,7 @@ pub fn build_customer_trend(
     }
     let mut month_ranks: HashMap<String, HashMap<String, (i64, i32)>> = HashMap::new();
     for (ym, entries) in &mut month_data {
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
         month_ranks.insert(
             ym.clone(),
             entries
@@ -884,7 +884,7 @@ pub fn split_and_sort_yoy_with_dept(
         .filter(|e| e.yoy_percent > 0.0)
         .cloned()
         .collect();
-    pos.sort_by(|a, b| b.prev_total.cmp(&a.prev_total));
+    pos.sort_by_key(|p| std::cmp::Reverse(p.prev_total));
     let mut neg: Vec<_> = entries
         .iter()
         .filter(|e| e.yoy_percent < 0.0)

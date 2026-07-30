@@ -1,0 +1,15 @@
+# ツールチェーンを固定する。浮かせない理由が 2 つある。
+#
+# 1. rustfmt の整形結果は版で変わる。`cargo fmt --all` が「触っていないファイル」を
+#    書き換えると、そのうち kosoku.rs / kosoku_paper.rs / kintai_version.rs /
+#    routes/kintai.rs は build.rs の KINTAI_OUTPUT_REQUIRED に入っているため
+#    KINTAI_OUTPUT_SHA が回転し、relay の上流キャッシュと畳んだ出力が全部 stale に
+#    なる。ロジックを 1 行も変えていないのに、である。
+# 2. clippy の lint は版で増える。浮かせたまま `-D warnings` を CI に入れると、
+#    無関係な PR が stable の更新だけで赤くなる。
+#
+# 版を上げるときは、上げる PR 単体で `cargo fmt --all` と `cargo clippy --fix` を
+# 走らせ、KINTAI_OUTPUT_SHA の回転を承知の上で入れること。
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
