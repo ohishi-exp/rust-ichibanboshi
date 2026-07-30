@@ -217,15 +217,33 @@ pub enum RepoError {
 
 // ── TiberiusRepo: 本番用実装 ──
 
-use crate::db::DbPool;
+use crate::db::{DbConn, DbPool};
 
 pub struct TiberiusRepo {
-    pool: DbPool,
+    /// `None` = この instance は SQL Server (CAPE#01) を使うと宣言していない
+    /// (`[database] enabled = false`)。Cloud Run のように SQL Server へ到達できない
+    /// 実行形態で使う。全メソッドが `RepoError::PoolError` を返し、routes は既存の
+    /// マッピングどおり **503 fail-closed** になる (空の結果を返して「0 件」に
+    /// 見せることは無い)。
+    pool: Option<DbPool>,
 }
 
 impl TiberiusRepo {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self { pool: Some(pool) }
+    }
+
+    /// SQL Server を使わないと宣言した実行形態向けの repo。
+    ///
+    /// 「繋ぎに行って失敗する」のではなく「そもそも宣言していない」ことを型で
+    /// 表すのが要点 — 接続待ちの timeout を各リクエストで払わずに即 503 を返す。
+    pub fn disabled() -> Self {
+        Self { pool: None }
+    }
+
+    async fn conn(&self) -> Result<DbConn<'_>, RepoError> {
+        let pool = self.pool.as_ref().ok_or(RepoError::PoolError)?;
+        pool.get().await.map_err(|_| RepoError::PoolError)
     }
 }
 
@@ -278,7 +296,7 @@ fn get_f64(row: &tiberius::Row, idx: usize) -> f64 {
 #[async_trait]
 impl AppRepo for TiberiusRepo {
     async fn health_check(&self) -> Result<(), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         conn.simple_query("SELECT 1")
             .await
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
@@ -286,7 +304,7 @@ impl AppRepo for TiberiusRepo {
     }
 
     async fn list_tables(&self) -> Result<Vec<TableInfo>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let stream = conn
             .simple_query(
                 "SELECT TABLE_SCHEMA, TABLE_NAME \
@@ -310,7 +328,7 @@ impl AppRepo for TiberiusRepo {
     }
 
     async fn list_columns(&self, table: &str) -> Result<Vec<ColumnInfo>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let stream = conn
             .query(
                 "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH \
@@ -337,7 +355,7 @@ impl AppRepo for TiberiusRepo {
     }
 
     async fn sample_data(&self, table: &str, limit: i32) -> Result<SampleRow, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let col_stream = conn
             .query(
                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
@@ -390,7 +408,7 @@ impl AppRepo for TiberiusRepo {
         exclude_dept: Option<&str>,
         include_dept: Option<&str>,
     ) -> Result<(String, Vec<RawMonthlyRow>, Vec<RawMonthlyRow>), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         if let Some(code) = include_dept {
             // 指定された営業所コードで絞り込み（部門別月計）
@@ -503,7 +521,7 @@ impl AppRepo for TiberiusRepo {
         from: &str,
         to: &str,
     ) -> Result<Vec<RawDepartmentRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let stream = conn.query(
             "SELECT m.[部門C], ISNULL(d.[部門N], ''), \
              SUM(ISNULL(m.[自車売上], 0)), SUM(ISNULL(m.[傭車売上], 0)), SUM(ISNULL(m.[輸送回数], 0)) \
@@ -536,7 +554,7 @@ impl AppRepo for TiberiusRepo {
         to: &str,
         limit: i32,
     ) -> Result<Vec<RawCustomerRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let query = format!(
             "SELECT TOP {} m.[得意先C], ISNULL(c.[得意先N], ''), \
              SUM(ISNULL(m.[自車売上], 0)), SUM(ISNULL(m.[傭車売上], 0)), SUM(ISNULL(m.[輸送回数], 0)) \
@@ -574,7 +592,7 @@ impl AppRepo for TiberiusRepo {
         prev_from: &str,
         prev_to: &str,
     ) -> Result<(CodeTotalMap, CodeTotalMap), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let sql = "SELECT m.[得意先C], ISNULL(c.[得意先N], ''), \
                    SUM(ISNULL(m.[自車売上], 0)) + SUM(ISNULL(m.[傭車売上], 0)) \
                    FROM [得意先別月計] m \
@@ -609,7 +627,7 @@ impl AppRepo for TiberiusRepo {
         &self,
         year: i32,
     ) -> Result<(Vec<RawMonthTotalRow>, Vec<RawMonthTotalRow>), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let current_from = format!("{}-01-01", year);
         let current_to = format!("{}-12-01", year);
         let prev_from = format!("{}-01-01", year - 1);
@@ -665,7 +683,7 @@ impl AppRepo for TiberiusRepo {
         dept_filter: &str,
         exclude_pattern: &str,
     ) -> Result<(Vec<RawDailyRow>, Vec<RawDailyPrevRow>), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         let query = format!(
             "SELECT [売上年月日], \
@@ -763,7 +781,7 @@ impl AppRepo for TiberiusRepo {
         to: &str,
         limit: i32,
     ) -> Result<(Vec<(String, String)>, Vec<RawCustomerMonthlyRow>), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let top_query = format!(
             "SELECT TOP {} m.[得意先C], ISNULL(c.[得意先N], '') \
              FROM [得意先別月計] m \
@@ -824,7 +842,7 @@ impl AppRepo for TiberiusRepo {
         &self,
         code: &str,
     ) -> Result<(String, Vec<RawCustomerDetailRow>), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let name_stream = conn
             .query(
                 "SELECT TOP 1 ISNULL(c.[得意先N], '') FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = @P1",
@@ -876,7 +894,7 @@ impl AppRepo for TiberiusRepo {
         prev_to: &str,
         department_code: Option<&str>,
     ) -> Result<(Vec<RawCustomerDeptRow>, Vec<RawCustomerDeptRow>), RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 月計テーブルとの完全一致条件: 請求K IN ('0','2')、自車/傭車の売上計算
         // 運転日報明細から [受注部門] でグルーピングして営業所×得意先の売上を算出
@@ -938,7 +956,7 @@ impl AppRepo for TiberiusRepo {
     }
 
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let stream = conn
             .simple_query("SELECT [部門C], ISNULL([部門N], '') FROM [部門ﾏｽﾀ] ORDER BY [部門C]")
             .await
@@ -954,7 +972,7 @@ impl AppRepo for TiberiusRepo {
     }
 
     async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         let stream = conn
             .simple_query("SELECT [車種C], ISNULL([車種N], '') FROM [車種ﾏｽﾀ] ORDER BY [車種C]")
             .await
@@ -970,7 +988,7 @@ impl AppRepo for TiberiusRepo {
     }
 
     async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
         // 社員C は数値型の可能性があるため CONVERT で varchar に寄せる。
         // 同一 社員C の複数行は GROUP BY で 1 行に潰す (MAX は NULL を無視するので
         // 外側の ISNULL で空文字に落とす)。
@@ -1006,7 +1024,7 @@ impl AppRepo for TiberiusRepo {
         kind_filter: &str,
         limit: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 調査 #12 で実機検証した SELECT。請求対象行を県・車種付きで取り出す。
         // 県正規化 (地域N → 都道府県) はロジック層 (normalize_prefecture) に任せ、
@@ -1076,7 +1094,7 @@ impl AppRepo for TiberiusRepo {
         dest: Option<&str>,
         limit: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 積地・卸地は 2 系統返す (#12 実機調査): 発地域C/着地域C → 地域ﾏｽﾀ.地域N は
         // 市区町村レベルまで届くマスタ由来値 (surcharge_base と違い県へ丸めない)。
@@ -1160,7 +1178,7 @@ impl AppRepo for TiberiusRepo {
         if bumon_codes.is_empty() {
             return Ok(vec![]);
         }
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 受注部門 IN (...) を動的に組む。bumon_codes は呼び出し側で whitelist 済み
         // (営業所マスタから引いた `'010'`,`'011'` 等の固定形式) のため SQL injection
@@ -1342,7 +1360,7 @@ impl AppRepo for TiberiusRepo {
         partner_type: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // #57 実機調査で確定した抽出ロジック:
         // - 取引先は C+H の複合キー必須 (H は固定値ではなく変動する)
@@ -1426,7 +1444,7 @@ impl AppRepo for TiberiusRepo {
         partner_type: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinSummaryRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 得意先 (or 傭車先) ごとに SUM/GROUP BY で集計する。結果行数 = 取引先数なので
         // raw 行 TOP-N 方式と違い一部の取引先が行数を食い潰して他が消える問題が起きない。
@@ -1487,7 +1505,7 @@ impl AppRepo for TiberiusRepo {
         to: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinSubcontractorNetRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 傭車先C-傭車先H ごとに GROUP BY し、同一行にある得意先側金額
         // (金額+割増+実費) と傭車先側金額 (傭車金額+傭車割増+傭車実費) を
@@ -1535,7 +1553,7 @@ impl AppRepo for TiberiusRepo {
         h: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinSubcontractorNetDetailRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // unchin_subcontractor_net のドリルダウン。特定の傭車先C+H に絞り込み、
         // 集計せず運行 (行) 単位で 得意先側金額 と 傭車先側金額 を両方読む。
@@ -1582,7 +1600,7 @@ impl AppRepo for TiberiusRepo {
         to: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinCustomerNetRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // 得意先C-得意先H ごとに GROUP BY し、請求合計 (金額+割増+実費) と
         // 傭車支払合計 (傭車金額+傭車割増+傭車実費) を同時に SUM する
@@ -1630,7 +1648,7 @@ impl AppRepo for TiberiusRepo {
         h: &str,
         kind_filter: &str,
     ) -> Result<Vec<RawUnchinCustomerNetDetailRow>, RepoError> {
-        let mut conn = self.pool.get().await.map_err(|_| RepoError::PoolError)?;
+        let mut conn = self.conn().await?;
 
         // unchin_customer_net のドリルダウン。特定の得意先C+H に絞り込み、
         // 集計せず運行 (行) 単位で 得意先側金額 と 傭車先側金額 を両方読む。

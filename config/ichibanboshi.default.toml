@@ -2,7 +2,13 @@ port = 3100
 bind_addr = "127.0.0.1"
 log_dir = ""
 
+# SQL Server (CAPE#01) を**使うと宣言するか**。既定 true = オンプレ (ohishi-data) の形。
+# 宣言したものに起動時に繋がらなければ**起動失敗**する (静かな degraded を作らない)。
+# SQL Server を持たない実行形態 (Cloud Run 等) は enabled = false を宣言する。その場合
+# pool を作らず SQL Server 依存ルートは 503 fail-closed、/health は
+# backends.sqlserver = "disabled" を返す。環境変数 DATABASE_ENABLED でも指定できる。
 [database]
+enabled = true
 host = "localhost"
 instance = "softec"
 database = "CAPE#01"

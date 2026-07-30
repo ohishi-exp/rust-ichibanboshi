@@ -1007,6 +1007,17 @@ pub fn disabled_cakephp() -> Arc<CakephpClient> {
     Arc::new(CakephpClient::new(String::new(), 30).expect("cakephp client build"))
 }
 
+/// 既定はオンプレの形 (SQL Server を使うと宣言済み) — 既存の /health テストの
+/// 意味を変えないため。GCP 側の形 (`sqlserver = false`) は
+/// `tests/health_backends_test.rs` が明示的に組む。
+pub fn health_state() -> routes::health::HealthState {
+    routes::health::HealthState {
+        sqlserver: true,
+        mariadb: false,
+        kyuyo: false,
+    }
+}
+
 pub fn build_app(repo: DynRepo) -> Router {
     build_app_full(repo, local_store(), disabled_cakephp(), temp_raw_dir())
 }
@@ -1102,6 +1113,7 @@ pub fn build_app_full(
         .route("/health", get(routes::health::health))
         .nest("/api", api_routes)
         .nest("/api", schema_routes)
+        .layer(Extension(health_state()))
         .layer(Extension(repo))
         .layer(Extension(store))
         .layer(Extension(cakephp))
