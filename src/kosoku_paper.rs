@@ -426,9 +426,7 @@ pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMa
             gap_outside += (x - s).num_seconds() / 60;
         }
         if gap_outside > 0 {
-            *out
-                .entry(nt.at.format("%Y-%m-%d").to_string())
-                .or_default() += gap_outside;
+            *out.entry(nt.at.format("%Y-%m-%d").to_string()).or_default() += gap_outside;
         }
     }
     // 紙の**二重計上** (`time_card_dtako` の運行行が欠けた日、Refs #182 フォローアップ)。
@@ -473,9 +471,7 @@ pub fn paper_outside_by_date(rows: &[serde_json::Value], month: &str) -> BTreeMa
         } else {
             0
         };
-        *out
-            .entry(nt.at.format("%Y-%m-%d").to_string())
-            .or_default() -= ded.min(added);
+        *out.entry(nt.at.format("%Y-%m-%d").to_string()).or_default() -= ded.min(added);
     }
     // 昼休の控除で 0 に落ちた日は載せない。行データの端 (翌月頭の margin) は
     // 勤務が組めず全部が「外」に見えるので、対象月の日だけ返す

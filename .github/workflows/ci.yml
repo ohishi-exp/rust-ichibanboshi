@@ -17,9 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # 版は rust-toolchain.toml が持つ (rustfmt / clippy / llvm-tools-preview も
+      # そちらで指定)。@stable のまま浮かせると、stable が上がるだけで fmt の
+      # 整形結果が変わり KINTAI_OUTPUT_SHA が回転する
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: llvm-tools-preview
+          toolchain: "1.97.1"
+          components: rustfmt, clippy, llvm-tools-preview
 
       # native target (= test job) と musl target (= deploy job) は target/ が
       # 別物なので shared-key を分離する必要がある。同 key で奪い合うと restore→
@@ -36,6 +40,18 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      # fmt / clippy を CI に入れる。Makefile には元からターゲットがあったが
+      # CI で走っていなかったため、main で `cargo fmt --check` が 7 ファイル落ち、
+      # `make clippy` (-D warnings) が exit 2 で失敗する状態が放置されていた
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       - name: Run tests
         run: cargo test --locked
