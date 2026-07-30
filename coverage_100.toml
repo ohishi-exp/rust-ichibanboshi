@@ -1,11 +1,44 @@
 # 100% カバレッジ達成済みファイルの登録簿
 #
-# ここに登録されたファイルは CI で 100% を維持しているか検証される。
-# カバレッジが落ちた場合 CI が fail する。
+# ここに登録されたファイルは CI (ci.yml の test job) で 100% 行カバレッジを
+# 維持しているか検証される。1 行でも落ちたら CI が fail する。
 #
-# DB 不要 — 全て MockRepo / 純粋関数テストでカバー
+#   確認: make cov-check   (= bash scripts/check_coverage_100.sh)
 #
-# 確認: bash scripts/check_coverage_100.sh
+# 実測は `cargo llvm-cov --text` 1 本。本 repo のテストは lib unit test も
+# tests/ の統合テストも全て MockRepo / wiremock / 純粋関数で完結しており、
+# SQL Server も MariaDB も環境変数も要らない (= DB 起動の要否で分ける軸が無い)。
+#
+# ## なぜ rust-alc-api にある `type` (unit / mock / combined) が無いのか
+#
+# 先例 (rust-alc-api) の `type` は「どの cargo 呼び出しだけで 100% に届くか」を
+# 表す。あちらは複数 crate の workspace (`--lib` が root package しか見ない) で、
+# かつ統合テストが生きた PostgreSQL を要求するため「DB 無しで回せる部分集合」に
+# 名前を付ける必要があった。本 repo はどちらの前提も持たない — 単一 package で、
+# 全テストが外部サービス不要。したがって `type` は全行同じ値にしかならず、
+# 区分として意味を持たないので持ち込まない。
+# (先例からのコピーで復活させないこと。分ける必要が生まれたら、まず「どの
+#  cargo 呼び出しが増えたのか」を書いてから足す)
+#
+# ## 登録の規約
+#
+# - **実測して 100% のファイルだけを入れる。** 未達を入れると gate が常時赤になる
+# - **計測データに現れないファイルを入れない。** 現れなかったら gate はスキップ
+#   せず fail する (先例はここを WARN で握り潰しており、登録済みなのに一度も
+#   検証されていないファイルが実在した)。
+#   `src/lib.rs` / `src/routes/mod.rs` / `src/kyuyo/mod.rs` は re-export だけで
+#   実行行が 0 なので登録できない。`src/service.rs` は cfg(windows) で Linux CI
+#   ではコンパイルすらされないため同様
+# - 100% に到達したファイルは登録漏れさせない (登録漏れ = gate が守っていない)
+#
+# ## 落とし穴
+#
+# 対象ファイルで `tracing` マクロを複数行に折り返さないこと。フォーマット文字列が
+# 独立行になると (手書きでも rustfmt の折り返しでも) その行が行カバレッジに乗らず
+# 100% gate が落ちる。メッセージを短くして 1 行に収める。
+# (rust-alc-api で PR #399 / #400 の 2 回発生した実績のある罠)
+
+# --- 認証 / 設定 ---
 
 [[files]]
 path = "src/auth.rs"
@@ -13,17 +46,23 @@ path = "src/auth.rs"
 [[files]]
 path = "src/config.rs"
 
+# --- 拘束時間の純粋ロジック (DB も HTTP も触らない) ---
+
 [[files]]
 path = "src/kosoku.rs"
 
 [[files]]
 path = "src/kosoku_paper.rs"
 
+# --- 給与 (給与大臣) ---
+
 [[files]]
 path = "src/kyuyo/introspect.rs"
 
 [[files]]
 path = "src/kyuyo/logic.rs"
+
+# --- routes (全て MockRepo / wiremock でカバー) ---
 
 [[files]]
 path = "src/routes/employees.rs"
@@ -33,6 +72,10 @@ path = "src/routes/health.rs"
 
 [[files]]
 path = "src/routes/kintai.rs"
+
+# 実測 25/25 で 100% だが未登録だった (2026-07-30 の棚卸しで追加)
+[[files]]
+path = "src/routes/kintai_version.rs"
 
 [[files]]
 path = "src/routes/kyuyo.rs"
@@ -54,3 +97,21 @@ path = "src/routes/unchin.rs"
 
 [[files]]
 path = "src/routes/vehicle_daily.rs"
+
+# --- 未登録 (2026-07-30 実測、100% 未達) ---
+#
+# 到達したら登録すること。`make cov-not100` で最新の未達一覧が出る。
+#
+#   src/cakephp.rs            220/223  98.7%  (miss 3)
+#   src/sqlite.rs            1798/1823 98.6%  (miss 25)
+#   src/kyuyo/store.rs        257/285  90.2%  (miss 28)
+#   src/restraint_store.rs    163/189  86.2%  (miss 26)
+#   src/kintai_version.rs     122/145  84.1%  (miss 23)
+#   src/routes/uriage.rs     1106/1334 82.9%  (miss 228)
+#   src/kintai_repo.rs        134/168  79.8%  (miss 34)
+#   src/kintai_store.rs        67/92   72.8%  (miss 25)
+#   src/kyuyo/repo.rs          20/144  13.9%  (miss 124)  DB 層
+#   src/db.rs                   0/36    0.0%              DB 層
+#   src/main.rs                 0/25    0.0%              entrypoint
+#   src/repo.rs                 0/456   0.0%              DB 層 (tiberius 直叩き)
+#   src/server.rs               0/193   0.0%              pool 生成 + bind
