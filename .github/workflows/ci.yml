@@ -189,6 +189,53 @@ jobs:
           export DEPLOY_SSH_KEY_FILE="$HOME/.ssh/deploy_key"
           bash scripts/deploy-remote.sh
 
+  # kintai スキーマ (#205 の 03) を実際の Supabase へ当てる。
+  #
+  # **test と migration の両方が通ってから**しか走らない。migration job は同じ
+  # DDL を使い捨ての postgres に流して RLS を assert する検証なので、そこが赤い
+  # まま本物に当たることはない。
+  #
+  # 台帳 (_sqlx_migrations) で冪等。migration が無い push でも走るが、その場合は
+  # `skip` になるだけ — 逆に「当たっているはずのものが当たっていない」ずれを毎回
+  # 検出できる。適用済みファイルが書き換わっていれば checksum 不一致で落ちる。
+  #
+  # 承認を挟みたいときは GitHub 側で environment `kintai-database` に required
+  # reviewers を付ける (workflow は変えない)。
+  kintai-migrate:
+    name: Apply kintai schema (Supabase)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, migration]
+    runs-on: ubuntu-latest
+    environment: kintai-database
+    concurrency:
+      group: kintai-migrate
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      # secret 名を DATABASE_URL にしないのは、この repo の DATABASE_* が売上の
+      # SQL Server の名前空間だから (src/config.rs、#208)。
+      - name: Apply
+        env:
+          KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KINTAI_DATABASE_URL}" ]; then
+            echo "::error::secret KINTAI_DATABASE_URL が environment 'kintai-database' に未設定" >&2
+            exit 1
+          fi
+          bash scripts/migrate_kintai.sh
+
+      # 当てた後に台帳を必ず出す。成功したのに中身が期待と違う、を見逃さないため。
+      - name: Show ledger
+        if: always()
+        env:
+          KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
+        run: bash scripts/migrate_kintai.sh --status
+
   # CI green 後に squash auto-merge を queue する (org 標準の caller-composed
   # pattern、go-cloudrun-proxy / rust-flickr と同形)。ohishi-exp org に
   # CI_APP_ID / CI_APP_PRIVATE_KEY が投入されたため self-contained job から

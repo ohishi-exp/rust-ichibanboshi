@@ -11,11 +11,14 @@ name: kintai migrate
 # 同じ migration を 2 度当てても何も起きない。逆に**適用済みファイルを書き換えて
 # いると checksum 照合で失敗する** ので、事故った状態のまま流れることはない。
 #
-# ── なぜ push で自動適用しないのか ────────────────────────────────────────
-# DDL は畳んだ 3 層の実体を作る操作で、間違えたときに戻すのが `cargo` の revert
-# ほど簡単ではない。まず workflow_dispatch で「いつ当てるか」を人が決める形に
-# する。運用が固まったら main push に寄せてよい (その場合 apply job の `if` を
-# 変えるだけで済むよう、環境の選択は input ではなく environment に持たせてある)。
+# ── いつ走るか ────────────────────────────────────────────────────────────
+# **自動適用はここではなく `ci.yml` の `kintai-migrate` job が担当する** (main
+# push、`needs: [test, migration]`)。使い捨ての postgres での検証が通ってから
+# 本物に当てる順序にするため、この workflow を push で走らせてはいけない
+# (単独 workflow は他 workflow の結果を待てず、test と並走してしまう)。
+#
+# こちらは**手で確かめる口**。status で今の台帳を見る、dry-run で計画だけ見る、
+# 緊急時に apply を単独で回す、の 3 つ。
 
 on:
   workflow_dispatch:
@@ -42,8 +45,7 @@ jobs:
   migrate:
     name: kintai migrate (${{ inputs.mode }})
     runs-on: ubuntu-latest
-    # apply のときだけ承認を要求できるよう environment を噛ませる。
-    # GitHub 側で required reviewers を付ければ、ここで止まる。
+    # 承認を要求できるよう environment を噛ませる (ci.yml の同名 job と共有)。
     environment: kintai-database
     steps:
       - uses: actions/checkout@v4
