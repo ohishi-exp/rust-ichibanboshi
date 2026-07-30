@@ -1,0 +1,87 @@
+name: Coverage Check
+
+# 手動実行のカバレッジ調査用。100% gate 自体は ci.yml の test job が毎 PR で
+# 回しているので、こちらは「次にどのファイルを埋めるか」を調べるための読み取り
+# 専用レポート (Job Summary に出る)。
+#
+# rust-alc-api の同名 workflow から postgres service と init_local_db.sql を
+# 落としてある — 本 repo のテストは MockRepo / wiremock / 純粋関数で完結し、
+# DB も環境変数も要らないため。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Output mode'
+        required: true
+        type: choice
+        options:
+          - summary
+          - not-100
+          - file
+        default: not-100
+      file_pattern:
+        description: 'File pattern (mode=file only, e.g. "kosoku" or "uriage")'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Coverage (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      # ci.yml の test job と同じ native target なので shared-key を揃えて
+      # cache を共有する。save-if を付けないのは、この workflow が
+      # workflow_dispatch 限定 = main の cache を汚す経路になり得るため
+      # (読むだけで save しない)。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ichibanboshi-native
+          save-if: 'false'
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run cargo llvm-cov
+        run: |
+          cargo llvm-cov --text --locked \
+            > /tmp/llvm-cov-output.txt 2>/tmp/llvm-cov-stderr.txt || {
+            echo "::error::cargo llvm-cov failed"
+            tail -30 /tmp/llvm-cov-stderr.txt
+            exit 1
+          }
+          echo "=== Test results ==="
+          grep "test result:" /tmp/llvm-cov-stderr.txt || true
+
+      # inputs は env 経由で渡す。run に ${{ }} を直に埋めると file_pattern の
+      # 中身がシェルとして評価される (script injection)。
+      - name: Parse coverage -> Job Summary
+        env:
+          COV_MODE: ${{ inputs.mode }}
+          COV_FILE_PATTERN: ${{ inputs.file_pattern }}
+        run: |
+          bash scripts/parse_coverage.sh \
+            "$COV_MODE" "$COV_FILE_PATTERN" /tmp/llvm-cov-output.txt
+
+      - name: Coverage 100% regression check
+        run: bash scripts/check_coverage_100.sh --use-cache /tmp/llvm-cov-output.txt
+
+      - name: Upload coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-text
+          path: /tmp/llvm-cov-output.txt
+          retention-days: 30
