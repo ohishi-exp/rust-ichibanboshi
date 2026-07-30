@@ -5,9 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use chrono::{NaiveDate, Utc};
-use jsonwebtoken::{encode, EncodingKey, Header};
-use rust_ichibanboshi::auth::{AppClaims, JwtSecret};
+use chrono::NaiveDate;
 use rust_ichibanboshi::cakephp::CakephpClient;
 use rust_ichibanboshi::config::RawConfig;
 use rust_ichibanboshi::repo::{AppRepo, DynRepo, RepoError};
@@ -1023,7 +1021,6 @@ pub fn build_app_full(
     cakephp: Arc<CakephpClient>,
     raw_cfg: Arc<RawConfig>,
 ) -> Router {
-    let jwt_secret = JwtSecret(TEST_JWT_SECRET.to_string());
     let api_routes = Router::new()
         .route("/sales/monthly", get(routes::sales::monthly))
         .route("/sales/by-department", get(routes::sales::by_department))
@@ -1109,7 +1106,6 @@ pub fn build_app_full(
         .layer(Extension(store))
         .layer(Extension(cakephp))
         .layer(Extension(raw_cfg))
-        .layer(Extension(jwt_secret))
 }
 
 pub fn mock_repo() -> DynRepo {
@@ -1122,22 +1118,3 @@ pub fn query_error_repo() -> DynRepo {
     Arc::new(QueryErrorRepo)
 }
 
-pub fn create_test_jwt(tenant_id: Uuid, role: &str) -> String {
-    let claims = AppClaims {
-        sub: Uuid::new_v4(),
-        email: "test@example.com".into(),
-        name: "Test User".into(),
-        tenant_id,
-        role: role.into(),
-        org_slug: None,
-        env: None,
-        iat: Utc::now().timestamp(),
-        exp: Utc::now().timestamp() + 3600,
-    };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
-    )
-    .unwrap()
-}
