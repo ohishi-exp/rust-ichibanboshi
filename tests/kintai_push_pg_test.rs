@@ -57,6 +57,11 @@ async fn ensure_schema(pool: &sqlx::PgPool) {
     if !exists {
         for entry in sorted_migrations() {
             let sql = std::fs::read_to_string(&entry).expect("read migration");
+            if needs_psql_variables(&sql) {
+                // **黙って飛ばさない** — 何を流していないかはログに出す
+                eprintln!("skip {} (psql の変数を使う migration)", entry.display());
+                continue;
+            }
             sqlx::raw_sql(&sql)
                 .execute(pool)
                 .await
@@ -68,6 +73,23 @@ async fn ensure_schema(pool: &sqlx::PgPool) {
         .execute(pool)
         .await
         .expect("advisory unlock");
+}
+
+/// psql の**クライアント側変数** (`:'name'`) を使う migration か。
+///
+/// `sqlx::raw_sql` は psql ではないので `:'…'` がそのままサーバへ行き
+/// `syntax error at or near ":"` になる。003
+/// (`ALTER ROLE kintai_writer WITH PASSWORD :'kintai_writer_password'`) がこれ。
+///
+/// **この harness では飛ばしてよい。** ここが用意するのは `kintai` スキーマで、
+/// テストは `KINTAI_TEST_DATABASE_URL` の所有者として繋ぐ (`kintai_writer` では
+/// 繋がない) — 資格情報はスキーマではない。実適用は
+/// `scripts/migrate_kintai.sh` が `-v kintai_writer_password=…` を渡して行い、
+/// 空のまま流れないよう適用前に弾く。
+///
+/// `::` の型キャストとは衝突しない (psql の変数参照は `:` の直後が引用符)。
+fn needs_psql_variables(sql: &str) -> bool {
+    sql.contains(":'") || sql.contains(":\"")
 }
 
 fn sorted_migrations() -> Vec<std::path::PathBuf> {
