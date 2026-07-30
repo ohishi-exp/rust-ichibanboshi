@@ -685,6 +685,169 @@ pub async fn push_month(
     Ok(report)
 }
 
+// ── 04b: オンプレ → GCP の打刻転送 ─────────────────────────────────────────
+//
+// GCP 側には MariaDB が無いので打刻が読めない (`shifts_from_timecard` が空になる)。
+// #205 の 02 が「04 / 05 が埋める穴」と書いていたものを、穴の定義どおりに埋める:
+// **オンプレが読んで GCP へ渡す。**
+//
+// 送るのは**差分の日だけ**。オンプレが (乗務員, 暦日) の署名を作り、GCP 側の署名を
+// [`STORED_SIGNATURES_SQL`] で引いて突き合わせ、違う日と消えた日だけを載せる。
+// 全量を送ると 1 か月・全乗務員で数万行になる。
+//
+// **生行のまま送る。** 受け側が [`parse_rows`] → [`dedup_events`] → [`replace_days`]
+// を回すので、写しと重複解決の実装は 1 つのまま。オンプレ側で畳んでから送ると
+// 両側に parser が要る。
+
+/// 転送 1 回ぶんの本体。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TimecardBatch {
+    /// 対象月 (`YYYY-MM`)。受け側が範囲外の日を弾くのに使う。
+    pub month: String,
+    pub driver_cd: i64,
+    /// 送る日ごとの**生行**。キーは JST の暦日。
+    #[serde(default)]
+    pub days: BTreeMap<NaiveDate, Vec<serde_json::Value>>,
+    /// こちらに無く相手にある日。元が消えたので相手からも消す。
+    #[serde(default)]
+    pub delete_dates: Vec<NaiveDate>,
+}
+
+impl TimecardBatch {
+    /// 書き込みが起きるか。空の batch を送っても害は無いが、往復を省ける。
+    pub fn is_empty(&self) -> bool {
+        self.days.is_empty() && self.delete_dates.is_empty()
+    }
+}
+
+/// 受け側が返す結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TimecardBatchResult {
+    pub days_written: usize,
+    pub days_deleted: usize,
+    pub events_written: usize,
+    pub deduped: usize,
+    /// 受け側で弾いた行の理由と件数 (`Debug` 名で返す — 送り側のログに残すため)。
+    #[serde(default)]
+    pub rejected: BTreeMap<String, usize>,
+    /// DDL の CHECK に無かった `state` の実値。
+    #[serde(default)]
+    pub unknown_states: BTreeSet<String>,
+    /// 日のキーと中身が食い違っていた行の数。**0 でないなら送り側が壊れている**。
+    pub misplaced: usize,
+}
+
+impl TimecardBatchResult {
+    pub fn has_unexpected(&self) -> bool {
+        !self.unknown_states.is_empty() || self.misplaced > 0
+    }
+}
+
+/// 受け取った batch を `kintai_events` に反映する (GCP 側で走る)。
+///
+/// **送り主を信用しない。** 日のキーと行の中身が食い違う行、対象の乗務員でない行、
+/// 対象月から外れた日は落として数える。信用すると、1 リクエストで別の乗務員や
+/// 別の月を静かに書き換えられる口になる。
+pub async fn apply_timecard_batch(
+    store: &KintaiPgStore,
+    batch: &TimecardBatch,
+) -> Result<TimecardBatchResult, KintaiPushError> {
+    let (m0, m1) = month_date_bounds(&batch.month)
+        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {}", batch.month)))?;
+    let mut result = TimecardBatchResult::default();
+    let mut changed: BTreeMap<NaiveDate, Vec<PushEvent>> = BTreeMap::new();
+
+    for (date, rows) in &batch.days {
+        if *date < m0 || *date >= m1 {
+            result.misplaced += rows.len();
+            continue;
+        }
+        let parsed = parse_rows(rows);
+        for (reason, n) in &parsed.rejected {
+            *result.rejected.entry(format!("{reason:?}")).or_default() += n;
+        }
+        for s in &parsed.unknown_states {
+            if result.unknown_states.len() < MAX_REPORTED_STATES {
+                result.unknown_states.insert(s.clone());
+            }
+        }
+        // 日のキーと中身、乗務員の一致を確かめる
+        let before = parsed.events.len();
+        let kept: Vec<PushEvent> = parsed
+            .events
+            .into_iter()
+            .filter(|e| e.date() == *date && e.driver_cd == batch.driver_cd)
+            .collect();
+        result.misplaced += before - kept.len();
+
+        let deduped = dedup_events(kept);
+        result.deduped += before - result.misplaced - deduped.len();
+        result.events_written += deduped.len();
+        changed.insert(*date, deduped);
+    }
+
+    let deleted: Vec<NaiveDate> = batch
+        .delete_dates
+        .iter()
+        .copied()
+        .filter(|d| *d >= m0 && *d < m1)
+        .collect();
+    result.days_written = changed.len();
+    result.days_deleted = deleted.len();
+
+    if !changed.is_empty() || !deleted.is_empty() {
+        store
+            .replace_days(batch.driver_cd, &changed, &deleted)
+            .await?;
+    }
+    Ok(result)
+}
+
+/// 対象月の `[月初, 翌月初)` を `DATE` の境界で返す。
+fn month_date_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let year: i32 = month.get(..4)?.parse().ok()?;
+    let mm: u32 = month.get(5..7)?.parse().ok()?;
+    let first = NaiveDate::from_ymd_opt(year, mm, 1)?;
+    let next = if mm == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(year, mm + 1, 1)?
+    };
+    Some((first, next))
+}
+
+/// 送り側が「何を送るか」を決める。相手の署名と手元の署名を突き合わせるだけ。
+pub fn plan_batch(
+    month: &str,
+    driver_cd: i64,
+    local: &BTreeMap<NaiveDate, Vec<PushEvent>>,
+    remote: &BTreeMap<NaiveDate, String>,
+) -> TimecardBatch {
+    let local_sigs: BTreeMap<NaiveDate, String> = local
+        .iter()
+        .map(|(d, evs)| (*d, day_signature(evs)))
+        .collect();
+    let mut days = BTreeMap::new();
+    let mut delete_dates = Vec::new();
+    for diff in diff_days(&local_sigs, remote) {
+        match diff.kind {
+            DayDiffKind::Unchanged => {}
+            DayDiffKind::Changed => {
+                // 生行のまま送る (受け側が同じ parser を回す)
+                let rows = local[&diff.date].iter().map(|e| e.raw.clone()).collect();
+                days.insert(diff.date, rows);
+            }
+            DayDiffKind::Deleted => delete_dates.push(diff.date),
+        }
+    }
+    TimecardBatch {
+        month: month.to_string(),
+        driver_cd,
+        days,
+        delete_dates,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
