@@ -1,0 +1,1035 @@
+//! 勤怠の生イベントを `rust-alc-api` の HTTP 経由で読む実装 (Refs #205 実装計画 02)。
+//!
+//! [`crate::kintai_repo::MariadbKintaiEventsRepo`] の 3 つ目の兄弟。社内 MariaDB に
+//! 到達できない実行形態 (GCP / Cloud Run) から同じ形の生イベントを読むための経路で、
+//! `GET /api/dtako/events` (ippoan/rust-alc-api#578) を叩く。
+//!
+//! ## 上流は生 CSV 行を返す — 写すのはこちらの責務
+//!
+//! 上流は**畳まない**。イベント種別の分類・状態への写像・時刻のパースや TZ 変換・
+//! 勤務境界の判定を一切せず、R2 の per-運行 `KUDGIVT.csv` を `{headers, rows}` の
+//! まま返す (勤怠計算は一番星固有でマルチテナント基盤に置かないという #205 の決定 3)。
+//! よって「生 CSV 行 → [`KintaiEventsApi`] の戻り値」の変換がこのモジュールの仕事で、
+//! **`kosoku.rs` / `kosoku_paper.rs` には一切手を入れない**。
+//!
+//! ## MariaDB の `dtako_events` ブランチと 1 対 1 に写す
+//!
+//! `EVENTS_SQL` の 3 番目・4 番目の `UNION ALL` ブランチが写し先:
+//!
+//! | 戻り値のキー | MariaDB | KUDGIVT.csv の列 |
+//! |---|---|---|
+//! | `datetime` | `DATE_FORMAT(開始日時)` | `開始日時` (`YYYY/MM/DD` → `YYYY-MM-DD`) |
+//! | `end_datetime` | `DATE_FORMAT(終了日時)` | `終了日時` (無い CSV は `null`) |
+//! | `driver_id` | `対象乗務員CD` | **`対象乗務員CD` → 無ければ `乗務員CD1`** |
+//! | `source` | `'dtako_events'` | 固定 |
+//! | `state` | `イベント名` | `イベント名` |
+//! | `unko_no` | `運行NO` | `運行NO` |
+//! | `vehicle` | `dtako_cars` を JOIN した `車輌名` | `車輌名` (無い CSV は `null`) |
+//!
+//! **`対象乗務員CD` を優先し無ければ `乗務員CD1` にフォールバックする** のは、
+//! `乗務員CD1` が運行の主運転者で全行同じ値になるため。2 名乗務の運行では副運転手の
+//! 行まで主運転者に付き、引かれた側は丸ごと落ちる (上流の parser も
+//! ippoan/rust-alc-api#580 で同じ規則に揃えたところ)。列の有無は**運行ごと**に見る —
+//! `headers` がトップレベルに畳まれていないのは、`対象乗務員CD` のように一部の
+//! ファイルにしか無い列が実在するから。
+//!
+//! ## MariaDB 実装との差異 (このモジュールが埋められないもの)
+//!
+//! 上流が返すのは KUDGIVT = MariaDB の `dtako_events` に相当する 1 種類だけ。
+//! `EVENTS_SQL` が `UNION ALL` している残り 2 つには上流に口が無い:
+//!
+//! | source | 元テーブル | HTTP 経路 |
+//! |---|---|---|
+//! | `dtako_events` | `dtako_events` | **上流から取る** |
+//! | `timecard` | `time_card_dstate` (始業 / 終業の打刻) | 口が無い → `fallback` へ委譲 |
+//! | `dtako` | `time_card_dtako` (運行開始 / 終了 / 休息) | 口が無い → `fallback` へ委譲 |
+//! | (フェリー) | `dtako_ferry_rows` | 口が無い → `fallback` へ委譲 |
+//!
+//! そこで `fallback` (通常は MariaDB 実装) を持ち、**上流に口が無いものだけ**そちらへ
+//! 委譲する。オンプレでは両方揃うので HTTP 経路の出力を MariaDB と突き合わせて
+//! 検証できる。`fallback` が無い実行形態 (GCP) では打刻が読めないため
+//! `shifts_from_timecard` が空になる — これは #205 の 04 / 05 (打刻の push) が
+//! 埋める穴で、起動時に warn を出して静かな欠損にしない。
+//!
+//! ## 期間の写し方
+//!
+//! trait の期間は `[from, to)` の `YYYY-MM-DD HH:MM:SS`、上流は**日付の閉区間**
+//! `date_from..=date_to`。粒度が違うので上流には広めに投げ、**返ってきた行を
+//! `EVENTS_SQL` と同じ 2 条件で絞り直す** (期間内に始まる区間 + 期間内に終わる区間)。
+//!
+//! - 上流の期間上限が単一乗務員 366 日 / 全乗務員 31 日なので、超える期間は
+//!   [`date_chunks`] で分割して複数回叩く (`month_range` は 32〜34 日になるため
+//!   全乗務員版では必ず分割が要る)
+//! - 全乗務員版は `page_size` / `after_driver_cd` の keyset ページングを回しきる
+//! - 同じ運行が複数の chunk / 複数の乗務員グループに現れるので `運行NO` で重複排除する。
+//!   **CSV の中の重複行は落とさない** — 取り込みが 2 回走った重複は `kosoku.rs` 側が
+//!   扱う話で、ここで消すと MariaDB 経路と値が割れる
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use chrono::{NaiveDate, NaiveDateTime};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+
+use crate::config::KintaiEventsConfig;
+use crate::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
+
+/// 上流の endpoint path。
+const EVENTS_PATH: &str = "/api/dtako/events";
+
+/// 上流の期間上限 (単一乗務員、閉区間の日数)。`MAX_RANGE_DAYS_SINGLE` と同値。
+const MAX_RANGE_DAYS_SINGLE: i64 = 366;
+
+/// 上流の期間上限 (全乗務員)。`MAX_RANGE_DAYS_ALL` と同値。
+const MAX_RANGE_DAYS_ALL: i64 = 31;
+
+/// 全乗務員版の 1 ページあたり乗務員数。上流の上限 (50) に合わせて往復を減らす。
+const PAGE_SIZE: i64 = 50;
+
+/// ページングの打ち切り。無限ループを黙って回さず error にする。
+const MAX_PAGES: usize = 200;
+
+/// 上流に投げる期間を何日前から始めるか。
+///
+/// `EVENTS_SQL` の 4 番目のブランチ (期間内に終わる区間、開始は期間より前) を
+/// 拾うために要る。区間の長さで一番長いのは休息 (実測 1,123 分 ≒ 19 時間) なので
+/// 2 日あれば足りる — #205 の再計算が「差分日 ± 2 日」を対象にしているのと同じ幅。
+const LOOKBACK_DAYS: i64 = 2;
+
+/// CSV の日時形式 (`2026/02/24 14:40:56`)。
+const CSV_DATETIME_FORMATS: [&str; 2] = ["%Y/%m/%d %H:%M:%S", "%Y/%m/%d %k:%M:%S"];
+
+/// 戻り値の日時形式 (`DATE_FORMAT(..., '%Y-%m-%d %H:%i:%s')` と同じ)。
+const OUT_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// この経路が名乗る `source`。MariaDB の 3 / 4 番目のブランチと同じ値。
+const SOURCE_DTAKO_EVENTS: &str = "dtako_events";
+
+// ── 認証 token の取り方 (設定で与える。コードに焼かない) ────────────────────
+
+/// 上流に付ける Bearer token の供給元。
+///
+/// 当面は Google 認証 (`gcloud auth print-identity-token` → Cloud Run IAM)、07 で
+/// device JWT に差し替える。**どちらもコードに焼かず設定から来る**ため、実装は
+/// 「静的な値」「コマンドの出力」「無し」の 3 つだけを知っている。
+#[async_trait]
+pub trait KintaiTokenProvider: Send + Sync {
+    /// `Authorization: Bearer` に載せる値。`None` ならヘッダーを付けない。
+    async fn token(&self) -> Result<Option<String>, KintaiRepoError>;
+}
+
+/// token 無し (社内 LAN や、網層だけで守る構成)。
+pub struct NoTokenProvider;
+
+#[async_trait]
+impl KintaiTokenProvider for NoTokenProvider {
+    async fn token(&self) -> Result<Option<String>, KintaiRepoError> {
+        Ok(None)
+    }
+}
+
+/// 設定に直接書かれた token (device JWT を注入する 07 の受け皿)。
+pub struct StaticTokenProvider(pub String);
+
+#[async_trait]
+impl KintaiTokenProvider for StaticTokenProvider {
+    async fn token(&self) -> Result<Option<String>, KintaiRepoError> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+/// コマンドの標準出力を token として使う (`gcloud auth print-identity-token`)。
+///
+/// **シェルを経由しない。** 設定文字列を空白で argv に分割して直接 exec するので、
+/// 設定がシェル注入の経路にならない。Google の identity token は 1 時間有効なので
+/// TTL の間だけ使い回し、毎リクエストで `gcloud` を起こさない。
+pub struct CommandTokenProvider {
+    argv: Vec<String>,
+    ttl: Duration,
+    cached: tokio::sync::Mutex<Option<(String, Instant)>>,
+}
+
+impl CommandTokenProvider {
+    /// `command` を空白で分割して argv にする。空なら `Err`。
+    pub fn new(command: &str, ttl_secs: u64) -> Result<Self, String> {
+        let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+        if argv.is_empty() {
+            return Err("auth_token_command is empty".to_string());
+        }
+        Ok(Self {
+            argv,
+            ttl: Duration::from_secs(ttl_secs),
+            cached: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    async fn run(&self) -> Result<String, KintaiRepoError> {
+        let out = tokio::process::Command::new(&self.argv[0])
+            .args(&self.argv[1..])
+            .output()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("auth token command: {e}")))?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(KintaiRepoError::QueryFailed(format!(
+                "auth token command failed: {} ({msg})",
+                out.status
+            )));
+        }
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if token.is_empty() {
+            return Err(KintaiRepoError::QueryFailed(
+                "auth token command produced no output".to_string(),
+            ));
+        }
+        Ok(token)
+    }
+}
+
+#[async_trait]
+impl KintaiTokenProvider for CommandTokenProvider {
+    async fn token(&self) -> Result<Option<String>, KintaiRepoError> {
+        let mut cached = self.cached.lock().await;
+        if let Some((token, at)) = cached.as_ref() {
+            if at.elapsed() < self.ttl {
+                return Ok(Some(token.clone()));
+            }
+        }
+        let token = self.run().await?;
+        *cached = Some((token.clone(), Instant::now()));
+        Ok(Some(token))
+    }
+}
+
+/// 設定から供給元を決める。`auth_token` が優先、次に `auth_token_command`、無ければ無し。
+/// (両方指定は `KintaiEventsConfig::validate` が起動時に弾く)
+pub fn build_token_provider(
+    cfg: &KintaiEventsConfig,
+) -> Result<Arc<dyn KintaiTokenProvider>, String> {
+    if !cfg.auth_token.is_empty() {
+        return Ok(Arc::new(StaticTokenProvider(cfg.auth_token.clone())));
+    }
+    if !cfg.auth_token_command.trim().is_empty() {
+        let p = CommandTokenProvider::new(&cfg.auth_token_command, cfg.auth_token_ttl_secs)?;
+        return Ok(Arc::new(p));
+    }
+    Ok(Arc::new(NoTokenProvider))
+}
+
+// ── 上流の応答 (要る部分だけ deserialize する) ──────────────────────────────
+
+/// 1 運行分の生 CSV。`headers` を運行ごとに持つ形をそのまま受ける。
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamOperation {
+    #[serde(default)]
+    unko_no: String,
+    #[serde(default)]
+    headers: Vec<String>,
+    #[serde(default)]
+    rows: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamSingle {
+    #[serde(default)]
+    operations: Vec<UpstreamOperation>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamDriverGroup {
+    #[serde(default)]
+    operations: Vec<UpstreamOperation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamAll {
+    #[serde(default)]
+    drivers: Vec<UpstreamDriverGroup>,
+    #[serde(default)]
+    next_after_driver_cd: Option<String>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+// ── 列の解決 ──────────────────────────────────────────────────────────────
+
+/// 1 運行の `headers` から要る列の位置を引く。
+///
+/// `KUDGIVT.csv` は upload 時点のデジタコ出力に依存し、列の並びも有無も運行ごとに
+/// 違い得る。だから毎運行ごとに引き直す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventCols {
+    unko_no: Option<usize>,
+    driver_cd: Option<usize>,
+    start_at: usize,
+    end_at: Option<usize>,
+    event_name: usize,
+    vehicle: Option<usize>,
+}
+
+fn find_col(headers: &[String], name: &str) -> Option<usize> {
+    headers.iter().position(|h| h.trim() == name)
+}
+
+impl EventCols {
+    /// 必須列 (`開始日時` / `イベント名`) が無ければ `None`。
+    ///
+    /// `driver_cd` は `対象乗務員CD` を優先し、無ければ `乗務員CD1` に落とす
+    /// (どちらも無ければ `None` = `driver_id` が `null` になる)。
+    fn resolve(headers: &[String]) -> Option<Self> {
+        Some(Self {
+            unko_no: find_col(headers, "運行NO"),
+            driver_cd: find_col(headers, "対象乗務員CD").or_else(|| find_col(headers, "乗務員CD1")),
+            start_at: find_col(headers, "開始日時")?,
+            end_at: find_col(headers, "終了日時"),
+            event_name: find_col(headers, "イベント名")?,
+            vehicle: find_col(headers, "車輌名"),
+        })
+    }
+}
+
+fn field(row: &[String], idx: usize) -> Option<&str> {
+    row.get(idx).map(|s| s.trim()).filter(|s| !s.is_empty())
+}
+
+fn opt_field(row: &[String], idx: Option<usize>) -> Option<&str> {
+    idx.and_then(|i| field(row, i))
+}
+
+fn parse_csv_datetime(s: &str) -> Option<NaiveDateTime> {
+    CSV_DATETIME_FORMATS
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
+}
+
+// ── 生 CSV 行 → 戻り値 ─────────────────────────────────────────────────────
+
+/// MariaDB の `dtako_events` ブランチ 1 行に相当する中間表現。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawEvent {
+    start: NaiveDateTime,
+    end: Option<NaiveDateTime>,
+    driver_id: Option<i64>,
+    /// `イベント名`。空欄は `null` にする (MariaDB の `NULL` と同じ扱い)。
+    state: Option<String>,
+    unko_no: Option<String>,
+    vehicle: Option<String>,
+}
+
+/// CSV 1 行を写す。`開始日時` が読めない行は捨てる (MariaDB では NOT NULL の列で、
+/// 上流の parser も同じ行を落としている)。
+fn row_to_event(cols: &EventCols, row: &[String], op_unko_no: &str) -> Option<RawEvent> {
+    let start = parse_csv_datetime(field(row, cols.start_at)?)?;
+    let unko_no = opt_field(row, cols.unko_no)
+        .map(str::to_string)
+        .or_else(|| Some(op_unko_no.to_string()).filter(|s| !s.is_empty()));
+    Some(RawEvent {
+        start,
+        end: opt_field(row, cols.end_at).and_then(parse_csv_datetime),
+        driver_id: opt_field(row, cols.driver_cd).and_then(|s| s.parse::<i64>().ok()),
+        state: field(row, cols.event_name).map(str::to_string),
+        unko_no,
+        vehicle: opt_field(row, cols.vehicle).map(str::to_string),
+    })
+}
+
+/// `EVENTS_SQL` の 3 / 4 番目のブランチと同じ絞り込み。
+///
+/// - 期間内に**始まる**区間 (`開始日時 >= from AND < to`)
+/// - 期間内に**終わる**区間で開始が期間より前 (`終了日時 >= from AND < to AND 開始日時 < from`)
+///
+/// 2 つは `開始日時` の条件で排他なので重複しない。
+fn in_window(ev: &RawEvent, from: NaiveDateTime, to: NaiveDateTime) -> bool {
+    if ev.start >= from && ev.start < to {
+        return true;
+    }
+    match ev.end {
+        Some(end) => ev.start < from && end >= from && end < to,
+        None => false,
+    }
+}
+
+fn fmt_dt(dt: NaiveDateTime) -> String {
+    dt.format(OUT_DATETIME_FORMAT).to_string()
+}
+
+/// 単一乗務員版の 1 行 (`row_to_json` と同じキー構成)。
+fn event_to_json(ev: RawEvent) -> serde_json::Value {
+    serde_json::json!({
+        "datetime": fmt_dt(ev.start),
+        "end_datetime": ev.end.map(fmt_dt),
+        "driver_id": ev.driver_id,
+        "source": SOURCE_DTAKO_EVENTS,
+        "state": ev.state,
+        "unko_no": ev.unko_no,
+        "vehicle": ev.vehicle,
+    })
+}
+
+/// 全乗務員版の 1 行。`unko_no` / `vehicle` を**キーごと出さない** —
+/// `all_row_to_json` が「読んでいない列は `null` にしない」としているのに揃える。
+fn event_to_all_json(ev: RawEvent) -> serde_json::Value {
+    serde_json::json!({
+        "datetime": fmt_dt(ev.start),
+        "end_datetime": ev.end.map(fmt_dt),
+        "driver_id": ev.driver_id,
+        "source": SOURCE_DTAKO_EVENTS,
+        "state": ev.state,
+    })
+}
+
+/// `ORDER BY datetime, source` 相当。
+fn sort_rows(rows: &mut [serde_json::Value]) {
+    rows.sort_by_key(key_dt_source);
+}
+
+/// `ORDER BY driver_id, datetime, source` 相当 (`driver_id` の NULL は先頭)。
+fn sort_rows_by_driver(rows: &mut [serde_json::Value]) {
+    rows.sort_by(|a, b| {
+        (a["driver_id"].as_i64(), key_dt_source(a))
+            .cmp(&(b["driver_id"].as_i64(), key_dt_source(b)))
+    });
+}
+
+fn key_dt_source(v: &serde_json::Value) -> (String, String) {
+    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    (s("datetime"), s("source"))
+}
+
+/// `fallback` から借りるのは**上流に口が無い source だけ** (打刻と運行の確定イベント)。
+/// `dtako_events` を混ぜると HTTP 経路の行と二重になる。
+fn is_borrowed_source(v: &serde_json::Value) -> bool {
+    v["source"].as_str() != Some(SOURCE_DTAKO_EVENTS)
+}
+
+// ── 期間の分割 ────────────────────────────────────────────────────────────
+
+/// 日付の閉区間 `from..=to` を `max_days` 日以内の閉区間へ割る。`from > to` なら空。
+fn date_chunks(from: NaiveDate, to: NaiveDate, max_days: i64) -> Vec<(NaiveDate, NaiveDate)> {
+    let mut out = Vec::new();
+    let mut start = from;
+    while start <= to {
+        let end = (start + chrono::Duration::days(max_days - 1)).min(to);
+        out.push((start, end));
+        start = end + chrono::Duration::days(1);
+    }
+    out
+}
+
+/// trait の `[from, to)` (`YYYY-MM-DD HH:MM:SS`) を、上流に投げる日付の閉区間へ。
+fn query_dates(from: NaiveDateTime, to: NaiveDateTime) -> (NaiveDate, NaiveDate) {
+    (
+        from.date() - chrono::Duration::days(LOOKBACK_DAYS),
+        (to - chrono::Duration::seconds(1)).date(),
+    )
+}
+
+fn parse_window(from: &str, to: &str) -> Result<(NaiveDateTime, NaiveDateTime), KintaiRepoError> {
+    let p = |s: &str| {
+        NaiveDateTime::parse_from_str(s, OUT_DATETIME_FORMAT)
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("bad range {s:?}: {e}")))
+    };
+    Ok((p(from)?, p(to)?))
+}
+
+// ── repo 本体 ─────────────────────────────────────────────────────────────
+
+/// `rust-alc-api` 経由の生イベント読み取り。
+pub struct HttpKintaiEventsRepo {
+    client: reqwest::Client,
+    /// `{base_url}/api/dtako/events`。**const にせず struct フィールドに持つ** —
+    /// テストが wiremock の URL を差し込めるようにするため。
+    url: String,
+    tenant_id: String,
+    token: Arc<dyn KintaiTokenProvider>,
+    /// 上流に口が無い読み出し (打刻 / 運行の確定イベント / フェリー) の委譲先。
+    /// 通常は MariaDB 実装。無い実行形態では該当分が欠ける (module docs 参照)。
+    fallback: Option<DynKintaiEventsRepo>,
+}
+
+impl HttpKintaiEventsRepo {
+    pub fn new(
+        cfg: &KintaiEventsConfig,
+        fallback: Option<DynKintaiEventsRepo>,
+    ) -> Result<Self, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(cfg.timeout_secs))
+            .build()
+            .map_err(|e| format!("kintai events http client: {e}"))?;
+        Ok(Self {
+            client,
+            url: format!("{}{EVENTS_PATH}", cfg.base_url.trim_end_matches('/')),
+            tenant_id: cfg.tenant_id.clone(),
+            token: build_token_provider(cfg)?,
+            fallback,
+        })
+    }
+
+    /// 1 往復。`params` は query string にそのまま載る。
+    async fn get<T: DeserializeOwned>(
+        &self,
+        params: &[(&str, String)],
+    ) -> Result<T, KintaiRepoError> {
+        let mut req = self
+            .client
+            .get(&self.url)
+            .query(params)
+            .header("X-Tenant-ID", &self.tenant_id);
+        if let Some(token) = self.token.token().await? {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-events request: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-events body: {e}")))?;
+        if !status.is_success() {
+            let excerpt: String = body.chars().take(200).collect();
+            return Err(KintaiRepoError::QueryFailed(format!(
+                "alc dtako-events status {status}: {excerpt}"
+            )));
+        }
+        serde_json::from_str(&body)
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-events parse: {e}")))
+    }
+
+    /// 上流から取った運行を写して `[from, to)` で絞る。`運行NO` で重複排除する。
+    fn collect(
+        &self,
+        ops: Vec<UpstreamOperation>,
+        seen: &mut HashSet<String>,
+        window: (NaiveDateTime, NaiveDateTime),
+        out: &mut Vec<RawEvent>,
+    ) {
+        for op in ops {
+            if !op.unko_no.is_empty() && !seen.insert(op.unko_no.clone()) {
+                continue;
+            }
+            let Some(cols) = EventCols::resolve(&op.headers) else {
+                tracing::warn!(unko_no = %op.unko_no, "KUDGIVT に開始日時/イベント名が無い");
+                continue;
+            };
+            for row in &op.rows {
+                if let Some(ev) = row_to_event(&cols, row, &op.unko_no) {
+                    if in_window(&ev, window.0, window.1) {
+                        out.push(ev);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 上流の warnings を握り潰さない (R2 の分割遅れで一部の運行が欠けたことが分かる)。
+    fn log_warnings(warnings: &[String]) {
+        for w in warnings {
+            tracing::warn!(warning = %w, "alc dtako-events warning");
+        }
+    }
+
+    /// 単一乗務員。上流は運行に相乗りした 2 名分の行を返すので `driver` で絞る
+    /// (MariaDB の `WHERE e.対象乗務員CD = :driver` と同じ)。
+    async fn fetch_one(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<RawEvent>, KintaiRepoError> {
+        let window = parse_window(from, to)?;
+        let (qf, qt) = query_dates(window.0, window.1);
+        let want = driver as i64;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (cf, ct) in date_chunks(qf, qt, MAX_RANGE_DAYS_SINGLE) {
+            let resp: UpstreamSingle = self
+                .get(&[
+                    ("driver_cd", driver.to_string()),
+                    ("date_from", cf.to_string()),
+                    ("date_to", ct.to_string()),
+                ])
+                .await?;
+            Self::log_warnings(&resp.warnings);
+            self.collect(resp.operations, &mut seen, window, &mut out);
+        }
+        out.retain(|ev| ev.driver_id == Some(want));
+        Ok(out)
+    }
+
+    /// 全乗務員。chunk × keyset ページングを回しきる。
+    async fn fetch_all(&self, from: &str, to: &str) -> Result<Vec<RawEvent>, KintaiRepoError> {
+        let window = parse_window(from, to)?;
+        let (qf, qt) = query_dates(window.0, window.1);
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (cf, ct) in date_chunks(qf, qt, MAX_RANGE_DAYS_ALL) {
+            let mut after: Option<String> = None;
+            for page in 0..=MAX_PAGES {
+                if page == MAX_PAGES {
+                    return Err(KintaiRepoError::QueryFailed(
+                        "alc dtako-events paging did not terminate".to_string(),
+                    ));
+                }
+                let mut params = vec![
+                    ("date_from", cf.to_string()),
+                    ("date_to", ct.to_string()),
+                    ("page_size", PAGE_SIZE.to_string()),
+                ];
+                if let Some(ref a) = after {
+                    params.push(("after_driver_cd", a.clone()));
+                }
+                let resp: UpstreamAll = self.get(&params).await?;
+                Self::log_warnings(&resp.warnings);
+                for group in resp.drivers {
+                    self.collect(group.operations, &mut seen, window, &mut out);
+                }
+                match resp.next_after_driver_cd {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl KintaiEventsApi for HttpKintaiEventsRepo {
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let events = self.fetch_one(from, to, driver).await?;
+        let mut rows: Vec<serde_json::Value> = events.into_iter().map(event_to_json).collect();
+        if let Some(fb) = &self.fallback {
+            let borrowed = fb.fetch_events_between(from, to, driver).await?;
+            rows.extend(borrowed.into_iter().filter(is_borrowed_source));
+        }
+        sort_rows(&mut rows);
+        Ok(rows)
+    }
+
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let events = self.fetch_all(from, to).await?;
+        let mut rows: Vec<serde_json::Value> = events.into_iter().map(event_to_all_json).collect();
+        if let Some(fb) = &self.fallback {
+            let borrowed = fb.fetch_all_events_between(from, to).await?;
+            rows.extend(borrowed.into_iter().filter(is_borrowed_source));
+        }
+        sort_rows_by_driver(&mut rows);
+        Ok(rows)
+    }
+
+    /// フェリー区間は上流に口が無い。突合はオンプレ専用 (#205 の決定 8) なので、
+    /// `fallback` が無ければ `NotConfigured` = 503 で fail-closed にする。
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        match &self.fallback {
+            Some(fb) => fb.fetch_ferry_between(from, to, driver).await,
+            None => Err(KintaiRepoError::NotConfigured),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn dt(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, OUT_DATETIME_FORMAT).unwrap()
+    }
+
+    fn headers(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn row(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_prefers_taisho_driver_cd() {
+        // 乗務員CD1 は運行の主運転者で全行同じ値。優先すると 2 名乗務で取り違える
+        let h = headers(&[
+            "運行NO",
+            "乗務員CD1",
+            "対象乗務員CD",
+            "開始日時",
+            "イベント名",
+        ]);
+        let cols = EventCols::resolve(&h).unwrap();
+        assert_eq!(cols.driver_cd, Some(2), "対象乗務員CD (index 2) を採る");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_driver_cd1() {
+        let h = headers(&["運行NO", "乗務員CD1", "開始日時", "イベント名"]);
+        let cols = EventCols::resolve(&h).unwrap();
+        assert_eq!(cols.driver_cd, Some(1));
+        assert_eq!(cols.end_at, None);
+        assert_eq!(cols.vehicle, None);
+    }
+
+    #[test]
+    fn resolve_allows_missing_driver_columns() {
+        let h = headers(&["開始日時", "イベント名"]);
+        let cols = EventCols::resolve(&h).unwrap();
+        assert_eq!(cols.driver_cd, None);
+        assert_eq!(cols.unko_no, None);
+    }
+
+    #[test]
+    fn resolve_requires_start_and_event_name() {
+        assert!(EventCols::resolve(&headers(&["運行NO", "イベント名"])).is_none());
+        assert!(EventCols::resolve(&headers(&["運行NO", "開始日時"])).is_none());
+    }
+
+    #[test]
+    fn resolve_trims_header_whitespace() {
+        let h = headers(&[" 開始日時 ", " イベント名"]);
+        assert!(EventCols::resolve(&h).is_some());
+    }
+
+    #[test]
+    fn row_to_event_maps_every_column() {
+        let h = headers(&[
+            "運行NO",
+            "車輌名",
+            "対象乗務員CD",
+            "開始日時",
+            "終了日時",
+            "イベント名",
+        ]);
+        let cols = EventCols::resolve(&h).unwrap();
+        let ev = row_to_event(
+            &cols,
+            &row(&[
+                "2602241025060000000272",
+                "帯広100け272",
+                "1130",
+                "2026/02/24 14:40:56",
+                "2026/02/25 09:23:56",
+                "休息",
+            ]),
+            "ignored",
+        )
+        .unwrap();
+        assert_eq!(ev.start, dt("2026-02-24 14:40:56"));
+        assert_eq!(ev.end, Some(dt("2026-02-25 09:23:56")));
+        assert_eq!(ev.driver_id, Some(1130));
+        assert_eq!(ev.state.as_deref(), Some("休息"));
+        assert_eq!(ev.unko_no.as_deref(), Some("2602241025060000000272"));
+        assert_eq!(ev.vehicle.as_deref(), Some("帯広100け272"));
+    }
+
+    #[test]
+    fn row_to_event_accepts_space_padded_hour() {
+        let cols = EventCols::resolve(&headers(&["開始日時", "イベント名"])).unwrap();
+        let ev = row_to_event(&cols, &row(&["2026/03/01  9:05:00", "運転"]), "").unwrap();
+        assert_eq!(ev.start, dt("2026-03-01 09:05:00"));
+    }
+
+    #[test]
+    fn row_to_event_drops_rows_without_usable_start() {
+        let cols = EventCols::resolve(&headers(&["開始日時", "イベント名"])).unwrap();
+        assert!(row_to_event(&cols, &row(&["", "運転"]), "").is_none());
+        assert!(row_to_event(&cols, &row(&["INVALID", "運転"]), "").is_none());
+        // 列が足りない短い行も落とす
+        assert!(row_to_event(&cols, &row(&[]), "").is_none());
+    }
+
+    #[test]
+    fn row_to_event_keeps_nulls_and_borrows_unko_no() {
+        let h = headers(&[
+            "対象乗務員CD",
+            "開始日時",
+            "終了日時",
+            "イベント名",
+            "車輌名",
+        ]);
+        let cols = EventCols::resolve(&h).unwrap();
+        // 空欄・壊れた値は 0 や空文字に化かさず null にする
+        let ev = row_to_event(
+            &cols,
+            &row(&["", "2026/03/01 08:00:00", "bad", "", ""]),
+            "OP-1",
+        )
+        .unwrap();
+        assert_eq!(ev.driver_id, None);
+        assert_eq!(ev.end, None);
+        assert_eq!(ev.state, None);
+        assert_eq!(ev.vehicle, None);
+        // 運行NO 列が無い CSV は運行のメタデータから借りる
+        assert_eq!(ev.unko_no.as_deref(), Some("OP-1"));
+    }
+
+    #[test]
+    fn row_to_event_leaves_unko_no_null_when_unknown() {
+        let cols = EventCols::resolve(&headers(&["開始日時", "イベント名"])).unwrap();
+        let ev = row_to_event(&cols, &row(&["2026/03/01 08:00:00", "運転"]), "").unwrap();
+        assert_eq!(ev.unko_no, None);
+    }
+
+    #[test]
+    fn row_to_event_ignores_non_numeric_driver_cd() {
+        let h = headers(&["乗務員CD1", "開始日時", "イベント名"]);
+        let cols = EventCols::resolve(&h).unwrap();
+        let ev = row_to_event(&cols, &row(&["DR01", "2026/03/01 08:00:00", "運転"]), "").unwrap();
+        assert_eq!(ev.driver_id, None, "数値でない CD は null (0 に化かさない)");
+    }
+
+    fn ev(start: &str, end: Option<&str>) -> RawEvent {
+        RawEvent {
+            start: dt(start),
+            end: end.map(dt),
+            driver_id: Some(1),
+            state: Some("休息".to_string()),
+            unko_no: None,
+            vehicle: None,
+        }
+    }
+
+    #[test]
+    fn in_window_matches_the_two_sql_branches() {
+        let (f, t) = (dt("2026-07-01 00:00:00"), dt("2026-08-02 00:00:00"));
+        // 期間内に始まる
+        assert!(in_window(&ev("2026-07-01 00:00:00", None), f, t));
+        assert!(in_window(&ev("2026-08-01 23:59:59", None), f, t));
+        // 期間内に終わる (開始は期間より前) — 月初の勤務を組むのに要る
+        assert!(in_window(
+            &ev("2026-06-30 22:00:00", Some("2026-07-01 06:00:00")),
+            f,
+            t
+        ));
+        // 外
+        assert!(!in_window(&ev("2026-08-02 00:00:00", None), f, t));
+        assert!(!in_window(&ev("2026-06-30 22:00:00", None), f, t));
+        assert!(!in_window(
+            &ev("2026-06-01 00:00:00", Some("2026-06-02 00:00:00")),
+            f,
+            t
+        ));
+        // 終了が期間の外
+        assert!(!in_window(
+            &ev("2026-06-30 22:00:00", Some("2026-08-02 00:00:00")),
+            f,
+            t
+        ));
+    }
+
+    #[test]
+    fn json_shapes_match_the_mariadb_rows() {
+        let e = RawEvent {
+            start: dt("2026-06-02 06:00:00"),
+            end: Some(dt("2026-06-02 06:20:00")),
+            driver_id: Some(1119),
+            state: Some("休憩".to_string()),
+            unko_no: Some("OP-1".to_string()),
+            vehicle: Some("帯広100け272".to_string()),
+        };
+        let single = event_to_json(e.clone());
+        assert_eq!(single["datetime"], "2026-06-02 06:00:00");
+        assert_eq!(single["end_datetime"], "2026-06-02 06:20:00");
+        assert_eq!(single["driver_id"], 1119);
+        assert_eq!(single["source"], "dtako_events");
+        assert_eq!(single["state"], "休憩");
+        assert_eq!(single["unko_no"], "OP-1");
+        assert_eq!(single["vehicle"], "帯広100け272");
+
+        // 全乗務員版は読んでいない列をキーごと出さない
+        let all = event_to_all_json(e);
+        assert!(all.get("unko_no").is_none());
+        assert!(all.get("vehicle").is_none());
+        assert_eq!(all["state"], "休憩");
+    }
+
+    #[test]
+    fn json_keeps_nulls() {
+        let v = event_to_json(RawEvent {
+            start: dt("2026-06-02 06:00:00"),
+            end: None,
+            driver_id: None,
+            state: None,
+            unko_no: None,
+            vehicle: None,
+        });
+        assert!(v["end_datetime"].is_null());
+        assert!(v["driver_id"].is_null());
+        assert!(v["state"].is_null());
+        assert!(v["unko_no"].is_null());
+        assert!(v["vehicle"].is_null());
+    }
+
+    #[test]
+    fn sorting_matches_the_sql_order_by() {
+        let mut rows = vec![
+            serde_json::json!({"datetime": "2026-06-02 08:00:00", "source": "timecard", "driver_id": 2}),
+            serde_json::json!({"datetime": "2026-06-02 07:00:00", "source": "dtako_events", "driver_id": 2}),
+            serde_json::json!({"datetime": "2026-06-02 08:00:00", "source": "dtako_events", "driver_id": 1}),
+        ];
+        sort_rows(&mut rows);
+        assert_eq!(rows[0]["datetime"], "2026-06-02 07:00:00");
+        assert_eq!(rows[1]["source"], "dtako_events", "同時刻は source 順");
+        assert_eq!(rows[2]["source"], "timecard");
+
+        sort_rows_by_driver(&mut rows);
+        assert_eq!(rows[0]["driver_id"], 1, "全乗務員版は driver_id が先");
+        assert_eq!(rows[1]["datetime"], "2026-06-02 07:00:00");
+        assert_eq!(rows[2]["datetime"], "2026-06-02 08:00:00");
+    }
+
+    #[test]
+    fn sorting_puts_null_driver_first() {
+        let mut rows = vec![
+            serde_json::json!({"datetime": "2026-06-02 08:00:00", "source": "dtako_events", "driver_id": 1}),
+            serde_json::json!({"datetime": "2026-06-02 07:00:00", "source": "dtako_events"}),
+        ];
+        sort_rows_by_driver(&mut rows);
+        assert!(rows[0]["driver_id"].is_null());
+    }
+
+    #[test]
+    fn borrowed_source_excludes_dtako_events() {
+        assert!(is_borrowed_source(
+            &serde_json::json!({"source": "timecard"})
+        ));
+        assert!(is_borrowed_source(&serde_json::json!({"source": "dtako"})));
+        assert!(is_borrowed_source(&serde_json::json!({})));
+        assert!(!is_borrowed_source(
+            &serde_json::json!({"source": "dtako_events"})
+        ));
+    }
+
+    #[test]
+    fn date_chunks_splits_at_the_upstream_limit() {
+        // 全乗務員版の上限 31 日。month_range は 32〜34 日になるので必ず割れる
+        let chunks = date_chunks(d(2026, 6, 29), d(2026, 8, 1), MAX_RANGE_DAYS_ALL);
+        assert_eq!(
+            chunks,
+            vec![
+                (d(2026, 6, 29), d(2026, 7, 29)),
+                (d(2026, 7, 30), d(2026, 8, 1)),
+            ]
+        );
+        // ちょうど上限なら 1 本
+        assert_eq!(date_chunks(d(2026, 7, 1), d(2026, 7, 31), 31).len(), 1);
+        // 単一乗務員の上限では 1 か月は割れない
+        assert_eq!(
+            date_chunks(d(2026, 6, 29), d(2026, 8, 1), MAX_RANGE_DAYS_SINGLE).len(),
+            1
+        );
+        // 逆転は空
+        assert!(date_chunks(d(2026, 7, 2), d(2026, 7, 1), 31).is_empty());
+    }
+
+    #[test]
+    fn query_dates_widens_backwards_and_excludes_the_upper_bound() {
+        let (f, t) = query_dates(dt("2026-07-01 00:00:00"), dt("2026-08-02 00:00:00"));
+        // 期間内に終わる区間 (開始は期間より前) を拾うため 2 日遡る
+        assert_eq!(f, d(2026, 6, 29));
+        // 上端は排他なので 08-02 00:00:00 は 08-01 まで
+        assert_eq!(t, d(2026, 8, 1));
+    }
+
+    #[test]
+    fn parse_window_rejects_garbage() {
+        assert!(parse_window("2026-07-01 00:00:00", "2026-08-02 00:00:00").is_ok());
+        let err = parse_window("nope", "2026-08-02 00:00:00").unwrap_err();
+        assert!(err.to_string().contains("bad range"), "{err}");
+        assert!(parse_window("2026-07-01 00:00:00", "nope").is_err());
+    }
+
+    #[test]
+    fn find_col_trims() {
+        assert_eq!(find_col(&headers(&["a", " b "]), "b"), Some(1));
+        assert_eq!(find_col(&headers(&["a"]), "z"), None);
+    }
+
+    // ── token provider ──
+
+    #[tokio::test]
+    async fn no_token_provider_returns_none() {
+        assert_eq!(NoTokenProvider.token().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn static_token_provider_returns_the_value() {
+        let p = StaticTokenProvider("tok".to_string());
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn command_token_provider_runs_and_caches() {
+        let p = CommandTokenProvider::new("echo id-token-value", 3600).unwrap();
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("id-token-value"));
+        // 2 回目は TTL 内なのでキャッシュから返る
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("id-token-value"));
+    }
+
+    #[tokio::test]
+    async fn command_token_provider_refetches_after_ttl() {
+        let p = CommandTokenProvider::new("echo tok", 0).unwrap();
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("tok"));
+        assert_eq!(p.token().await.unwrap().as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn command_token_provider_is_loud_about_failures() {
+        // 起動できないコマンド
+        let err = CommandTokenProvider::new("/nonexistent/token-cmd", 60)
+            .unwrap()
+            .token()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("auth token command"), "{err}");
+
+        // 非 0 終了
+        let err = CommandTokenProvider::new("false", 60)
+            .unwrap()
+            .token()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("failed"), "{err}");
+
+        // 何も出さない = token 無しで叩いて 401 になるより先に落とす
+        let err = CommandTokenProvider::new("true", 60)
+            .unwrap()
+            .token()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no output"), "{err}");
+
+        assert!(CommandTokenProvider::new("   ", 60).is_err());
+    }
+
+    #[test]
+    fn build_token_provider_picks_the_configured_route() {
+        let mut cfg = KintaiEventsConfig::default();
+        assert!(build_token_provider(&cfg).is_ok());
+        cfg.auth_token_command = "gcloud auth print-identity-token".to_string();
+        assert!(build_token_provider(&cfg).is_ok());
+        cfg.auth_token = "tok".to_string();
+        assert!(build_token_provider(&cfg).is_ok());
+    }
+}
