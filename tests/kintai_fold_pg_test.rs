@@ -33,6 +33,18 @@ async fn store() -> Option<(KintaiPgStore, sqlx::PgPool)> {
     ))
 }
 
+/// psql の**クライアント側変数** (`:'name'`) を使う migration か。
+///
+/// `sqlx::raw_sql` は psql ではないので `:'…'` がそのままサーバへ行き
+/// `syntax error at or near ":"` になる。003
+/// (`ALTER ROLE kintai_writer WITH PASSWORD :'kintai_writer_password'`) がこれ。
+///
+/// **この harness では飛ばしてよい** — 用意するのは `kintai` スキーマで、資格情報は
+/// スキーマではない。詳細は `kintai_push_pg_test.rs` の同名関数。
+fn needs_psql_variables(sql: &str) -> bool {
+    sql.contains(":'") || sql.contains(":\"")
+}
+
 async fn ensure_schema(pool: &sqlx::PgPool) {
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(205_050_001_i64)
@@ -53,6 +65,11 @@ async fn ensure_schema(pool: &sqlx::PgPool) {
         files.sort();
         for f in files {
             let sql = std::fs::read_to_string(&f).expect("read");
+            if needs_psql_variables(&sql) {
+                // **黙って飛ばさない** — 何を流していないかはログに出す
+                eprintln!("skip {} (psql の変数を使う migration)", f.display());
+                continue;
+            }
             sqlx::raw_sql(&sql)
                 .execute(pool)
                 .await

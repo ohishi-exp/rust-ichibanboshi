@@ -143,6 +143,9 @@ jobs:
       - name: Apply migrations + assert RLS
         env:
           KINTAI_DATABASE_URL: postgres://postgres:verify@127.0.0.1:5432/postgres
+          # 003 が要求する psql 変数。使い捨て postgres なので固定値でよい
+          # (本番の値は kintai-migrate job 側で secret から渡す)
+          KINTAI_WRITER_PASSWORD: verify-only-not-a-real-password
         run: bash scripts/verify_kintai_rls.sh
 
   # main への merge (push) で musl binary を build → Cloudflare Tunnel SSH 経由で
@@ -252,6 +255,11 @@ jobs:
       - name: Apply
         env:
           KINTAI_DATABASE_URL: ${{ secrets.KINTAI_DATABASE_URL }}
+          # 003 (kintai_writer の資格情報) が要求する。GCP Secret Manager が正で、
+          # そこから GitHub org secret へ sync してある。空のまま流すと
+          # migrate_kintai.sh が 003 の適用を拒否する (空パスワードが静かに入るのを
+          # 防ぐため) ので、ここで欠落は loud に落ちる
+          KINTAI_WRITER_PASSWORD: ${{ secrets.KINTAI_WRITER_PASSWORD }}
         run: |
           set -euo pipefail
           if [ -z "${KINTAI_DATABASE_URL}" ]; then
