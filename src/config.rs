@@ -272,8 +272,17 @@ pub struct KintaiEventsConfig {
     #[serde(default)]
     pub auth_token_command: String,
 
-    /// `auth_token_command` の結果をキャッシュする秒数。Google の identity token は
-    /// 1 時間有効なので、既定 900 秒なら毎リクエストで `gcloud` を起こさずに済む。
+    /// GCE / Cloud Run の metadata server から identity token を取る (Refs #205 の G7)。
+    ///
+    /// **Cloud Run の中ではこれしか選べない。** `auth_token_command` に指定していた
+    /// `gcloud auth print-identity-token` は開発機から叩くための経路で、コンテナには
+    /// `gcloud` も `curl` も入っていない (`Dockerfile` は `ca-certificates` だけ)。
+    /// audience は `base_url` をそのまま使う。
+    #[serde(default)]
+    pub auth_token_metadata: bool,
+
+    /// token をキャッシュする秒数。Google の identity token は 1 時間有効なので、
+    /// 既定 900 秒なら毎リクエストで `gcloud` / metadata server を叩かずに済む。
     #[serde(default = "default_kintai_events_token_ttl_secs")]
     pub auth_token_ttl_secs: u64,
 }
@@ -307,10 +316,11 @@ impl KintaiEventsConfig {
         if self.tenant_id.trim().is_empty() {
             return Err("[kintai_events] source = \"http\" requires tenant_id".to_string());
         }
-        if !self.auth_token.is_empty() && !self.auth_token_command.is_empty() {
-            return Err(
-                "[kintai_events] set only one of auth_token / auth_token_command".to_string(),
-            );
+        let routes = usize::from(!self.auth_token.is_empty())
+            + usize::from(!self.auth_token_command.trim().is_empty())
+            + usize::from(self.auth_token_metadata);
+        if routes > 1 {
+            return Err("[kintai_events] set only one of auth_token / auth_token_command / auth_token_metadata".to_string());
         }
         Ok(())
     }
@@ -325,6 +335,7 @@ impl Default for KintaiEventsConfig {
             timeout_secs: default_kintai_events_timeout_secs(),
             auth_token: String::new(),
             auth_token_command: String::new(),
+            auth_token_metadata: false,
             auth_token_ttl_secs: default_kintai_events_token_ttl_secs(),
         }
     }
@@ -898,6 +909,9 @@ impl Config {
         }
         if let Some(v) = env_str(get, "KINTAI_EVENTS_AUTH_TOKEN_COMMAND") {
             self.kintai_events.auth_token_command = v;
+        }
+        if let Some(v) = env_bool(get, "KINTAI_EVENTS_AUTH_TOKEN_METADATA")? {
+            self.kintai_events.auth_token_metadata = v;
         }
         if let Some(v) = env_u64(get, "KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS")? {
             self.kintai_events.auth_token_ttl_secs = v;
