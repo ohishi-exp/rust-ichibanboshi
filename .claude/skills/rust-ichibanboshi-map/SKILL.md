@@ -564,9 +564,71 @@ env var は `DATABASE_URL` ではなく **`KINTAI_DATABASE_URL`**。`DATABASE_*`
 で繋いで行う。`make kintai-rls-verify` が使い捨ての docker postgres でこれをやり、
 CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
 
-未解決 (002 以降の候補): `GRANT ... ON ALL TABLES` はその時点の表しか対象にしないので
+**002 (`day_summaries_per_shift`)**: `day_summaries` の PK に `shift_start_at` を足して
+勤務 1 本 = 1 行にした。`daily_summary()` は同じ暦日に複数の勤務行を返す (フェリーが
+休息イベントなので勤務が割れる。実測 1726 / 2026-03-14 は 4 勤務) ため、001 の
+`(tenant_id, driver_cd, date)` では潰れる。`shifts` への FK は `ON DELETE CASCADE`。
+
+未解決 (003 以降の候補): `GRANT ... ON ALL TABLES` はその時点の表しか対象にしないので
 `ALTER DEFAULT PRIVILEGES` に寄せるべき / `CREATE ROLE` は cluster-scoped で
 `IF NOT EXISTS` が無い / Supabase の automatic RLS が独自 policy を足さないか未確認。
+
+## 勤怠のバッチ — `push` / `recalc` / `sync` (Refs #205 の 04〜06)
+
+サブコマンドを付けると HTTP サーバーではなく一度きりのバッチになる。**省略時は
+従来どおりサーバー起動**なので `ichibanboshi --console` の起動は 1 バイトも変わらない
+(`deploy/ichibanboshi.service` / `Dockerfile` の `CMD` はそのまま)。
+
+| コマンド | 何をするか | 実装 |
+|---|---|---|
+| `push --month YYYY-MM` | 打刻を `kintai.kintai_events` へ (04) | `src/kintai_push.rs` |
+| `recalc --month YYYY-MM` | `daily_summary()` の出力を 3 表へ (05) | `src/kintai_fold.rs` |
+| `sync --month YYYY-MM` | 上の 2 つを 1 回で (06) | `kintai_fold::sync_month` |
+
+`--driver` で 1 名に絞れる。**既定は dry-run で、`--apply` を付けない限り 1 行も
+書かない。** 想定外の入力 (DDL の CHECK に無い `state` 等) があると exit 3 で終わる —
+「落ちた」のか「走ったが上流に知らない値が来た」のかを journal で区別するため。
+
+設定は `[kintai_push]` (env は `KINTAI_PUSH_*`)。**書くのは常にオンプレ側**で、GCP から
+オンプレへは到達できない (#205 の決定 8)。GCP 側は畳んだ 3 表を読むだけ。
+
+### 落とし穴
+
+- **`kosoku.rs` を写さない。** 畳むのは `daily_summary()` を呼ぶだけ。写すと 2 実装に
+  なり、出力が食い違ったときに原因が追えない (#205 の決定 3、必須条件)
+- **接続は session mode の pooler (5432)。** transaction mode (6543) は prepared
+  statement の扱いが違うので `validate()` が起動時に弾く。direct connection は IPv6 のみ
+- **`[kintai_push] tenant_id` は `[kintai_events] tenant_id` と一致必須** (起動時に検査)。
+  値は `rust-alc-api` の `alc_api.tenants.id`。揃えないとアクセス権が二重管理になる
+- **署名の並べ替えは `COLLATE "C"`。** Postgres の既定 collation は locale 依存で、
+  日本語のイベント名では Rust の `str` の順と一致しない。揃えないと中身が同じでも
+  署名が毎回割れ、静かに全日を書き直し続ける
+- **`kintai_events` の PK は `source` を含まない。** 同じ秒・同じ state が
+  `time_card_dstate` と `time_card_dtako` の両方にあると衝突するので、`ON CONFLICT` に
+  任せず挿入前に Rust 側で決着させる (`timecard` を残す)
+- **指紋の材料に `KosokuParams` を入れる。** `restraint_rounding` などは TOML で再ビルド
+  無しに変えられて出力を変えるため。`KINTAI_OUTPUT_SHA` は `build.rs` が焼く内容
+  ハッシュなので「上げ忘れ」は原理的に存在しない
+- 再計算の単位は **(乗務員, 月)**。勤務が日を跨ぐので日単独では計算できない
+- `src/kintai*.rs` は `build.rs` の glob に自動で入るため、この 2 モジュールを触ると
+  `KINTAI_OUTPUT_SHA` が回転して relay の上流キャッシュが全月 stale になる
+
+### テスト
+
+`tests/kintai_{push,fold}_pg_test.rs` が**実 Postgres** に対して 22 件。`ci.yml` の
+test job に postgres service があるので毎 PR 走る。`KINTAI_TEST_DATABASE_URL` が
+無ければ丸ごと skip。手元では:
+
+```
+docker run -d --name kintai-test -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17-alpine
+KINTAI_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres cargo test
+```
+
+この 2 モジュールは `coverage_100.toml` に**登録しない** — 100% に実 Postgres が要り、
+CLAUDE.md の「テストは DB も環境変数も不要」と両立しないため。
+
+無人化 (07) は `deploy/ichibanboshi-sync.{service,timer,sh}`。設置手順は
+`docs/setup-kintai-sync-timer.md`。
 
 ## Cloudflare Access
 

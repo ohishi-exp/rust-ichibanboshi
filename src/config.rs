@@ -12,7 +12,11 @@ pub struct AppArgs {
     pub console: bool,
 
     /// Path to config file (TOML)
-    #[arg(long)]
+    // `global = true` なのは、`ichibanboshi sync --month 2026-07 --config ...` の
+    // ようにサブコマンドの**後ろ**にも書けるようにするため (systemd の
+    // `deploy/ichibanboshi-sync.sh` がこの順で渡す)。doc コメントにすると
+    // `--help` の説明欄にそのまま出るので通常のコメントで書く。
+    #[arg(long, global = true)]
     pub config: Option<String>,
 
     /// HTTP server port (overrides config file)
@@ -334,6 +338,103 @@ fn default_kintai_events_token_ttl_secs() -> u64 {
     900
 }
 
+/// 畳んだ勤怠を書く先 (Supabase の `kintai` スキーマ、Refs #205 実装計画 04〜06)。
+///
+/// **書くのは常にオンプレ側** (`ohishi-data` の `rust-ichibanboshi`)。GCP からオンプレへは
+/// 到達できないので push 方向しか無い (#205 の決定 8)。読む側 (Cloud Run) はこの設定を
+/// 持たず、畳んだ 3 層を `kintai_reader` で読むだけ。
+///
+/// 既定は `enabled = false` = 無効。宣言しない限り CLI (`push` / `recalc` / `sync`) は
+/// 何もせずに落ちる — 「設定を忘れたまま走って 0 件成功に見える」を作らない
+/// (`[database] enabled` と同じ流儀)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct KintaiPushConfig {
+    /// 畳んだ勤怠の書き込みを**使うと宣言するか**。既定 `false`。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// `kintai` スキーマへの接続文字列。ロールは `kintai_writer` (BYPASSRLS)。
+    ///
+    /// **session mode の pooler (5432) を使う。** transaction mode (6543) は
+    /// prepared statement の扱いが違い、`sqlx` の既定 (文を準備して使い回す) と
+    /// 噛み合わない。direct connection (`db.<ref>.supabase.co`) は IPv6 のみ。
+    #[serde(default)]
+    pub database_url: String,
+
+    /// 書き込む `tenant_id`。**`rust-alc-api` の `alc_api.tenants.id` をそのまま使う。**
+    ///
+    /// 新規に採番しない (#205「決着済み」)。揃えないとアクセス権が二重管理になる —
+    /// 生イベントの読み出しは既に alc の tenant_id で認可されており、`kintai.*` 6 表の
+    /// RLS policy も `app.current_tenant_id` に依存するので、ずれると静かに全件遮断するか
+    /// 別テナントへ書く。[`KintaiPushConfig::validate`] が `[kintai_events]` との一致を
+    /// 起動時に検査する。
+    #[serde(default)]
+    pub tenant_id: String,
+
+    /// 接続の待ち時間 (秒)。
+    #[serde(default = "default_kintai_push_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+
+    /// 1 文あたりの上限 (秒)。`SET statement_timeout` に渡す。
+    ///
+    /// 走るのは月単位のバッチなので、読み出し経路 (#184 の convoy 対策) より長い。
+    #[serde(default = "default_kintai_push_statement_timeout_secs")]
+    pub statement_timeout_secs: u64,
+}
+
+/// transaction mode の pooler の port。ここに繋ぐと prepared statement が壊れる。
+const SUPABASE_TRANSACTION_POOLER_PORT: &str = ":6543";
+
+impl KintaiPushConfig {
+    /// 宣言の整合性検査。`events_tenant_id` は `[kintai_events] tenant_id`。
+    ///
+    /// **足りない設定を黙って既定へ落とさず起動を失敗させる。**
+    pub fn validate(&self, events_tenant_id: &str) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.database_url.trim().is_empty() {
+            return Err("[kintai_push] enabled = true requires database_url".to_string());
+        }
+        if self.database_url.contains(SUPABASE_TRANSACTION_POOLER_PORT) {
+            return Err("[kintai_push] database_url uses the transaction pooler (6543); use session mode (5432)".to_string());
+        }
+        if self.tenant_id.trim().is_empty() {
+            return Err("[kintai_push] enabled = true requires tenant_id".to_string());
+        }
+        if uuid::Uuid::parse_str(self.tenant_id.trim()).is_err() {
+            return Err("[kintai_push] tenant_id must be the alc_api.tenants.id UUID".to_string());
+        }
+        // テナントが 2 つの値に割れたまま動くと、alc 側では見えて kintai 側では
+        // 見えない (あるいは別テナントへ書く) 状態を人手で保つことになる
+        let events = events_tenant_id.trim();
+        if !events.is_empty() && !events.eq_ignore_ascii_case(self.tenant_id.trim()) {
+            return Err("[kintai_push] tenant_id must match [kintai_events] tenant_id".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for KintaiPushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database_url: String::new(),
+            tenant_id: String::new(),
+            connect_timeout_secs: default_kintai_push_connect_timeout_secs(),
+            statement_timeout_secs: default_kintai_push_statement_timeout_secs(),
+        }
+    }
+}
+
+fn default_kintai_push_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_kintai_push_statement_timeout_secs() -> u64 {
+    300
+}
+
 /// Runtime configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -374,6 +475,10 @@ pub struct Config {
     /// 生イベントの読み先の宣言 (Refs #205 実装計画 02)。既定は MariaDB 直読み。
     #[serde(default)]
     pub kintai_events: KintaiEventsConfig,
+
+    /// 畳んだ勤怠の書き先の宣言 (Refs #205 実装計画 04〜06)。既定は無効。
+    #[serde(default)]
+    pub kintai_push: KintaiPushConfig,
 
     #[serde(default)]
     pub kosoku: KosokuConfigToml,
@@ -798,6 +903,25 @@ impl Config {
             self.kintai_events.auth_token_ttl_secs = v;
         }
 
+        // ── 畳んだ勤怠の書き先 (Refs #205 実装計画 04〜06) ──
+        // 接続文字列は `KINTAI_DATABASE_URL` (migration スクリプトが使う所有者権限の
+        // 方) とは**別物**。あちらは DDL を当てる口で、こちらは `kintai_writer`
+        if let Some(v) = env_bool(get, "KINTAI_PUSH_ENABLED")? {
+            self.kintai_push.enabled = v;
+        }
+        if let Some(v) = env_str(get, "KINTAI_PUSH_DATABASE_URL") {
+            self.kintai_push.database_url = v;
+        }
+        if let Some(v) = env_str(get, "KINTAI_PUSH_TENANT_ID") {
+            self.kintai_push.tenant_id = v;
+        }
+        if let Some(v) = env_u64(get, "KINTAI_PUSH_CONNECT_TIMEOUT_SECS")? {
+            self.kintai_push.connect_timeout_secs = v;
+        }
+        if let Some(v) = env_u64(get, "KINTAI_PUSH_STATEMENT_TIMEOUT_SECS")? {
+            self.kintai_push.statement_timeout_secs = v;
+        }
+
         // ── 給与大臣 (OHKEN) + introspect 認可 (Refs #82) ──
         if let Some(v) = env_str(get, "KYUYO_HOST") {
             self.kyuyo.host = v;
@@ -889,6 +1013,7 @@ impl Config {
             restraint: RestraintConfig::default(),
             mariadb: MariadbConfig::default(),
             kintai_events: KintaiEventsConfig::default(),
+            kintai_push: KintaiPushConfig::default(),
             kosoku: KosokuConfigToml::default(),
         })
     }

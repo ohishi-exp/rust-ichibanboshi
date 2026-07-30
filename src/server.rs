@@ -16,6 +16,56 @@ use crate::repo::TiberiusRepo;
 use crate::routes;
 use crate::sqlite::{DynLocalStore, LocalStore};
 
+/// 生イベントの読み先を宣言から組み立てる。
+///
+/// **HTTP サーバーと CLI (`push` / `recalc` / `sync`) の共有点。** どちらから来ても
+/// 同じ宣言で同じ読み先になるので、「画面では MariaDB を読んでいるのにバッチは
+/// HTTP を読んでいた」という食い違いが構造的に起きない。
+///
+/// 戻り値の `&'static str` は `/health` の `backends.kintai_events` に出す名前。
+/// pool は lazy なので、ここでは DB 接続は張られない。
+pub fn build_kintai_events_repo(
+    config: &Config,
+) -> Result<(crate::kintai_repo::DynKintaiEventsRepo, &'static str), Box<dyn std::error::Error>> {
+    config.kintai_events.validate()?;
+    let mariadb_events: Option<crate::kintai_repo::DynKintaiEventsRepo> =
+        if config.mariadb.enabled() {
+            Some(Arc::new(crate::kintai_repo::MariadbKintaiEventsRepo::new(
+                &config.mariadb,
+            )))
+        } else {
+            None
+        };
+    if config.kintai_events.http_enabled() {
+        if mariadb_events.is_none() {
+            tracing::warn!("kintai events via HTTP without mariadb — 打刻とフェリーは読めない");
+        }
+        let repo = crate::kintai_http_repo::HttpKintaiEventsRepo::new(
+            &config.kintai_events,
+            mariadb_events,
+        )?;
+        return Ok((Arc::new(repo), "http"));
+    }
+    if let Some(repo) = mariadb_events {
+        return Ok((repo, "mariadb"));
+    }
+    tracing::info!("mariadb not configured — /api/kintai/events returns 503");
+    Ok((
+        Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo),
+        "disabled",
+    ))
+}
+
+/// 拘束サマリの計算パラメータを設定から作る。サーバーと CLI の共有点。
+pub fn build_kosoku_params(config: &Config) -> crate::kosoku::KosokuParams {
+    crate::kosoku::KosokuParams {
+        break_threshold_minutes: config.kosoku.break_threshold_minutes,
+        prescribed_minutes: config.kosoku.prescribed_minutes,
+        legal_minutes: config.kosoku.legal_minutes,
+        restraint_rounding: config.kosoku.restraint_rounding.into(),
+    }
+}
+
 /// HTTP サーバーを起動し、shutdown token が cancel されるまでブロック
 pub async fn run(
     config: Config,
@@ -92,36 +142,7 @@ pub async fn run(
     // と同じ流儀)。MariaDB も無い形態では Disabled を挿して `/api/kintai/events` だけ
     // 503 — 空配列を返して「0 件」に見せない。pool は lazy なので DB 停止中でも
     // 起動は失敗しない
-    config.kintai_events.validate()?;
-    let mariadb_events: Option<crate::kintai_repo::DynKintaiEventsRepo> =
-        if config.mariadb.enabled() {
-            Some(Arc::new(crate::kintai_repo::MariadbKintaiEventsRepo::new(
-                &config.mariadb,
-            )))
-        } else {
-            None
-        };
-    let (kintai_events_repo, kintai_events_backend): (
-        crate::kintai_repo::DynKintaiEventsRepo,
-        &'static str,
-    ) = if config.kintai_events.http_enabled() {
-        if mariadb_events.is_none() {
-            tracing::warn!("kintai events via HTTP without mariadb — 打刻とフェリーは読めない");
-        }
-        let repo = crate::kintai_http_repo::HttpKintaiEventsRepo::new(
-            &config.kintai_events,
-            mariadb_events,
-        )?;
-        (Arc::new(repo), "http")
-    } else if let Some(repo) = mariadb_events {
-        (repo, "mariadb")
-    } else {
-        tracing::info!("mariadb not configured — /api/kintai/events returns 503");
-        (
-            Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo),
-            "disabled",
-        )
-    };
+    let (kintai_events_repo, kintai_events_backend) = build_kintai_events_repo(&config)?;
 
     // 勤怠の月別バージョン (ETag) 読み取り (Refs #184)。events と同じ MariaDB を
     // 読むが trait / pool は分離 — 未設定なら Disabled で 503 fail-closed
@@ -137,12 +158,7 @@ pub async fn run(
 
     // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
     // 就業規則が変わったら TOML で追随できるよう config から取る。
-    let kosoku_params = Arc::new(crate::kosoku::KosokuParams {
-        break_threshold_minutes: config.kosoku.break_threshold_minutes,
-        prescribed_minutes: config.kosoku.prescribed_minutes,
-        legal_minutes: config.kosoku.legal_minutes,
-        restraint_rounding: config.kosoku.restraint_rounding.into(),
-    });
+    let kosoku_params = Arc::new(build_kosoku_params(&config));
 
     // 拘束サマリ store (Refs #106 Phase 3)。open 失敗は Disabled (route が 503) —
     // このストアはキャッシュではなく relay push の一次置き場のため fail-closed
