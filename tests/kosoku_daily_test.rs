@@ -1154,7 +1154,11 @@ async fn compare_view_carries_the_ours_outside_map() {
     };
     let rows = vec![
         with_driver(ev("2026-06-01 20:00:00", "2026-06-02 06:00:00", "休息")),
-        with_driver(ev("2026-06-02 06:00:00", "2026-06-02 16:30:00", "アイドリング")),
+        with_driver(ev(
+            "2026-06-02 06:00:00",
+            "2026-06-02 16:30:00",
+            "アイドリング",
+        )),
         with_driver(dtako("2026-06-02 17:00:00", "運行開始", "u1")),
         with_driver(ev("2026-06-02 17:00:00", "2026-06-02 17:30:00", "運転")),
         with_driver(tc("2026-06-02 18:00:00", "始業")),
@@ -1169,7 +1173,10 @@ async fn compare_view_carries_the_ours_outside_map() {
     assert_eq!(body["ours_outside_by_date"]["2026-06-02"], 690);
     let (status, body) = serve(rows, "/api/kintai/kosoku-daily?month=2026-06&view=compare").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["drivers"][0]["ours_outside_by_date"]["2026-06-02"], 690);
+    assert_eq!(
+        body["drivers"][0]["ours_outside_by_date"]["2026-06-02"],
+        690
+    );
 }
 
 #[tokio::test]

@@ -712,21 +712,29 @@ async fn kosoku_daily_all(
             // 紙は重複行を二重計上する)。突合経路だけで計算する
             let paper = (view == ResponseView::Compare).then(|| paper_daily_minutes(&rows, month));
             // 紙が勤務の外で数えている分 (cause `paper-outside` の実額、Refs #182)
-            let outside = (view == ResponseView::Compare)
-                .then(|| paper_outside_by_date(&rows, month))
-                .unwrap_or_default();
+            let outside = if view == ResponseView::Compare {
+                paper_outside_by_date(&rows, month)
+            } else {
+                Default::default()
+            };
             // こちらだけが数える時間 (cause `ours-outside` の実額、鏡像)
-            let ours_only = (view == ResponseView::Compare)
-                .then(|| ours_outside_by_date(&rows, month))
-                .unwrap_or_default();
+            let ours_only = if view == ResponseView::Compare {
+                ours_outside_by_date(&rows, month)
+            } else {
+                Default::default()
+            };
             // 紙が引く 運行開始 → 始業 (cause `minus-unko` の実額、Refs #546)
-            let minus_unko = (view == ResponseView::Compare)
-                .then(|| minus_unko_by_date(&rows, month))
-                .unwrap_or_default();
+            let minus_unko = if view == ResponseView::Compare {
+                minus_unko_by_date(&rows, month)
+            } else {
+                Default::default()
+            };
             // 深夜を跨ぐ継ぎ目の暦日配分の差 (cause `gap-midnight` の実額、Refs #546)
-            let gap_midnight = (view == ResponseView::Compare)
-                .then(|| gap_midnight_by_date(&rows, month))
-                .unwrap_or_default();
+            let gap_midnight = if view == ResponseView::Compare {
+                gap_midnight_by_date(&rows, month)
+            } else {
+                Default::default()
+            };
             // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
             let (rows, duplicate_rows) = drop_duplicate_rows(rows);
             let mut days = daily_summary(&rows, month, params_cfg);
