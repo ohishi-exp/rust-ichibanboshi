@@ -19,8 +19,17 @@
 //!
 //! オンプレは Cloudflare Access Service Token (Tunnel の手前)、GCP は Cloud Run IAM。
 //! アプリ層で認証を持たないのはこのリポジトリ全体の方針で、`/api/kintai/*` の
-//! 既存ルートと同じ。**テナントだけはアプリが決める** — 書き込み先の `tenant_id` は
-//! `[kintai_push]` の設定から来るので、呼び出し側は他テナントへ書けない。
+//! 既存ルートと同じ。
+//!
+//! ## テナントは `X-Tenant-ID` で名乗る
+//!
+//! 書き込み先の `tenant_id` は**リクエストから**取る。relay が KV
+//! (`dtako-relay-config` の `dtako_accounts`) に持っている値がテナントの正で、
+//! alc へも同じヘッダで渡している — 設定に写すと同じ値を 2 か所で保つことになる。
+//!
+//! `[kintai_push] tenant_id` は書いてあれば **pin** として働き、ヘッダと食い違えば
+//! 403。単一テナントの instance を設定で固定したいときに使う。pin もヘッダも
+//! 無ければ 400 — 書き先が決まらないまま受け取らない。
 //!
 //! ## 書き先が無ければ 503
 //!
@@ -29,7 +38,7 @@
 //! どこにも書いていない」を作らない。
 
 use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
@@ -69,6 +78,50 @@ fn store(store: &DynKintaiPgStore) -> Result<&KintaiPgStore, (StatusCode, String
         StatusCode::SERVICE_UNAVAILABLE,
         "[kintai_push] が無効です (書き先がありません)".to_string(),
     ))
+}
+
+/// relay が alc へ渡しているのと同じヘッダ名 ([`crate::kintai_http_repo`] の送信側)。
+const TENANT_HEADER: &str = "X-Tenant-ID";
+
+/// **書き先のテナントを決める。** ヘッダが正、設定の `tenant_id` は pin。
+///
+/// 決まらなければ書かない — 既定のテナントへ落とすと、名乗り忘れた relay の打刻が
+/// 静かに別テナントの `kintai.*` に積まれる。
+fn tenant_of(headers: &HeaderMap, pin: uuid::Uuid) -> Result<uuid::Uuid, (StatusCode, String)> {
+    let raw = headers
+        .get(TENANT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        // pin だけで動かす構成 (単一テナントの instance) は許す
+        return match pin.is_nil() {
+            true => Err(bad_request("X-Tenant-ID が必要です")),
+            false => Ok(pin),
+        };
+    }
+    let tenant = uuid::Uuid::parse_str(raw)
+        .map_err(|_| bad_request("X-Tenant-ID は alc_api.tenants.id の UUID です"))?;
+    if tenant.is_nil() {
+        return Err(bad_request("X-Tenant-ID が nil UUID です"));
+    }
+    if !pin.is_nil() && tenant != pin {
+        // 設定で固定した instance に別テナントを名乗られた = 経路違い
+        return Err((
+            StatusCode::FORBIDDEN,
+            "X-Tenant-ID が [kintai_push] tenant_id と一致しません".to_string(),
+        ));
+    }
+    Ok(tenant)
+}
+
+/// 書き先を解決して、そのテナント向けの store を返す。
+fn store_for(
+    pg: &DynKintaiPgStore,
+    headers: &HeaderMap,
+) -> Result<KintaiPgStore, (StatusCode, String)> {
+    let st = store(pg)?;
+    Ok(st.for_tenant(tenant_of(headers, st.tenant_id())?))
 }
 
 /// 月の JST 境界を `TIMESTAMPTZ` の対で返す。
@@ -146,6 +199,7 @@ pub async fn send(
 
 /// GET /api/kintai/timecard/signatures?month=&driver_cd= — 相手が持っている日別署名。
 pub async fn signatures(
+    headers: HeaderMap,
     Query(params): Query<SignaturesQuery>,
     Extension(pg): Extension<DynKintaiPgStore>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -157,7 +211,7 @@ pub async fn signatures(
         .driver_cd
         .ok_or_else(|| bad_request("driver_cd は必須です"))?;
     let (from, to) = month_bounds(&month).ok_or_else(|| bad_request("month が不正です"))?;
-    let st = store(&pg)?;
+    let st = store_for(&pg, &headers)?;
     let sigs = st
         .stored_day_signatures(driver_cd, from, to)
         .await
@@ -171,14 +225,15 @@ pub async fn signatures(
 
 /// POST /api/kintai/timecard — 差分の日だけを反映する。
 pub async fn receive(
+    headers: HeaderMap,
     Extension(pg): Extension<DynKintaiPgStore>,
     Json(batch): Json<TimecardBatch>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !is_valid_month(&batch.month) {
         return Err(bad_request("month は YYYY-MM で指定してください"));
     }
-    let st = store(&pg)?;
-    let result = apply_timecard_batch(st, &batch)
+    let st = store_for(&pg, &headers)?;
+    let result = apply_timecard_batch(&st, &batch)
         .await
         .map_err(map_push_err)?;
     // 件数は先に出す (tracing の引数は購読者が居ないと評価されない)。
@@ -212,17 +267,33 @@ mod tests {
         }
     }
 
+    /// `X-Tenant-ID: <uuid>` の付いたヘッダ。
+    fn hdr(tenant: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if !tenant.is_empty() {
+            h.insert(TENANT_HEADER, tenant.parse().unwrap());
+        }
+        h
+    }
+
+    fn uuid(s: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(s).unwrap()
+    }
+
+    const T1: &str = "11111111-2222-3333-4444-555555555555";
+    const T2: &str = "99999999-8888-7777-6666-555555555555";
+
     /// **書き先が無い instance では 503。** オンプレの既定がこれ。
     /// 200 で空を返すと「受け取ったがどこにも書いていない」が作れてしまう。
     #[tokio::test]
     async fn both_routes_fail_closed_without_a_store() {
-        let (code, msg) = signatures(q(Some("2026-07"), Some(1130)), Extension(None))
+        let (code, msg) = signatures(hdr(T1), q(Some("2026-07"), Some(1130)), Extension(None))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(msg.contains("kintai_push"), "{msg}");
 
-        let (code, _) = receive(Extension(None), Json(batch("2026-07")))
+        let (code, _) = receive(hdr(T1), Extension(None), Json(batch("2026-07")))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -232,19 +303,19 @@ mod tests {
     #[tokio::test]
     async fn parameters_are_validated_before_the_store() {
         for m in [None, Some(""), Some("2026-7"), Some("nope")] {
-            let (code, _) = signatures(q(m, Some(1130)), Extension(None))
+            let (code, _) = signatures(hdr(T1), q(m, Some(1130)), Extension(None))
                 .await
                 .unwrap_err();
             assert_eq!(code, StatusCode::BAD_REQUEST, "month={m:?}");
         }
         // driver_cd 省略
-        let (code, msg) = signatures(q(Some("2026-07"), None), Extension(None))
+        let (code, msg) = signatures(hdr(T1), q(Some("2026-07"), None), Extension(None))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(msg.contains("driver_cd"), "{msg}");
 
-        let (code, _) = receive(Extension(None), Json(batch("nope")))
+        let (code, _) = receive(hdr(T1), Extension(None), Json(batch("nope")))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -295,6 +366,59 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         let (code, _) = map_send_err(KintaiSendError::Remote("status 503".to_string()));
         assert_eq!(code, StatusCode::BAD_GATEWAY);
+    }
+
+    /// **ヘッダが正。** relay が KV から持ってくる値がそのまま書き先になる。
+    #[test]
+    fn the_request_names_the_tenant() {
+        assert_eq!(tenant_of(&hdr(T1), uuid::Uuid::nil()).unwrap(), uuid(T1));
+        // 前後の空白は relay 側の整形ゆれなので受ける
+        let mut h = HeaderMap::new();
+        h.insert(TENANT_HEADER, format!("  {T1}  ").parse().unwrap());
+        assert_eq!(tenant_of(&h, uuid::Uuid::nil()).unwrap(), uuid(T1));
+    }
+
+    /// **名乗りが無く pin も無ければ 400。** 既定のテナントへ落とすと、
+    /// 名乗り忘れた打刻が静かに別テナントへ積まれる。
+    #[test]
+    fn an_unnamed_tenant_is_refused_when_nothing_pins_it() {
+        let (code, msg) = tenant_of(&hdr(""), uuid::Uuid::nil()).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("X-Tenant-ID"), "{msg}");
+
+        // 空白だけ / nil UUID も「名乗っていない」扱い
+        let mut h = HeaderMap::new();
+        h.insert(TENANT_HEADER, "   ".parse().unwrap());
+        let (code, _) = tenant_of(&h, uuid::Uuid::nil()).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        let (code, _) = tenant_of(&hdr(&uuid::Uuid::nil().to_string()), uuid(T1)).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // UUID でなければ打ち間違い
+        let (code, _) = tenant_of(&hdr("ichibanboshi"), uuid::Uuid::nil()).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    /// `[kintai_push] tenant_id` は **pin**。ヘッダが無ければ代わりに使い、
+    /// 食い違えば 403 — 設定で固定した instance は他テナントを受けない。
+    #[test]
+    fn the_configured_tenant_pins_the_header() {
+        assert_eq!(tenant_of(&hdr(""), uuid(T1)).unwrap(), uuid(T1));
+        assert_eq!(tenant_of(&hdr(T1), uuid(T1)).unwrap(), uuid(T1));
+
+        let (code, msg) = tenant_of(&hdr(T2), uuid(T1)).unwrap_err();
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert!(msg.contains("tenant_id"), "{msg}");
+    }
+
+    /// テナントは**書き先を確かめてから**見る (503 が 400 に化けない)。
+    #[tokio::test]
+    async fn the_missing_store_is_reported_before_the_tenant() {
+        let (code, _) = receive(hdr(""), Extension(None), Json(batch("2026-07")))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// 宣言していない (503) と、繋がらない (502) を分ける。

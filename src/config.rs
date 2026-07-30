@@ -379,6 +379,12 @@ pub struct KintaiPushConfig {
     /// RLS policy も `app.current_tenant_id` に依存するので、ずれると静かに全件遮断するか
     /// 別テナントへ書く。[`KintaiPushConfig::validate`] が `[kintai_events]` との一致を
     /// 起動時に検査する。
+    ///
+    /// **空でよい。** 打刻の受け口 (`POST /api/kintai/timecard`) は `X-Tenant-ID` を
+    /// 読んで書き先を決める — relay が KV (`dtako-relay-config` の `dtako_accounts`)
+    /// から持ってくる値がそれで、設定に写すと同じ値を 2 か所で保つことになる。
+    /// 書いた場合は **pin** として働き、ヘッダと食い違えば受け口が 403 を返す。
+    /// `push` / `recalc` / `sync` の CLI はヘッダを持たないので**必須**。
     #[serde(default)]
     pub tenant_id: String,
 
@@ -410,16 +416,20 @@ impl KintaiPushConfig {
         if self.database_url.contains(SUPABASE_TRANSACTION_POOLER_PORT) {
             return Err("[kintai_push] database_url uses the transaction pooler (6543); use session mode (5432)".to_string());
         }
-        if self.tenant_id.trim().is_empty() {
-            return Err("[kintai_push] enabled = true requires tenant_id".to_string());
+        // tenant_id は任意。空なら**リクエストが名乗る** (受け口が `X-Tenant-ID` を
+        // 読む)。ここで必須にすると relay が KV で持っている値を設定にも写すことに
+        // なり、同じ値の二重管理になる
+        let pin = self.tenant_id.trim();
+        if pin.is_empty() {
+            return Ok(());
         }
-        if uuid::Uuid::parse_str(self.tenant_id.trim()).is_err() {
+        if uuid::Uuid::parse_str(pin).is_err() {
             return Err("[kintai_push] tenant_id must be the alc_api.tenants.id UUID".to_string());
         }
         // テナントが 2 つの値に割れたまま動くと、alc 側では見えて kintai 側では
         // 見えない (あるいは別テナントへ書く) 状態を人手で保つことになる
         let events = events_tenant_id.trim();
-        if !events.is_empty() && !events.eq_ignore_ascii_case(self.tenant_id.trim()) {
+        if !events.is_empty() && !events.eq_ignore_ascii_case(pin) {
             return Err("[kintai_push] tenant_id must match [kintai_events] tenant_id".to_string());
         }
         Ok(())
