@@ -661,3 +661,63 @@ restraint_rounding = \"nearest\"
         "unexpected error: {err}"
     );
 }
+
+// ── [kintai_send] (Refs #205 の 04b、送信側) ──
+
+#[test]
+fn test_kintai_send_disabled_requires_nothing() {
+    let c: Config = toml::from_str("").unwrap();
+    assert!(!c.kintai_send.enabled);
+    assert_eq!(c.kintai_send.target_url, "");
+    assert_eq!(c.kintai_send.auth_token, "");
+    assert_eq!(c.kintai_send.timeout_secs, 120);
+    c.kintai_send.validate().unwrap();
+}
+
+#[test]
+fn test_kintai_send_enabled_requires_a_target() {
+    let c: Config = toml::from_str("[kintai_send]\nenabled = true\n").unwrap();
+    let err = c.kintai_send.validate().unwrap_err();
+    assert!(err.contains("target_url"), "{err}");
+
+    // 空白だけも空扱い
+    let c: Config =
+        toml::from_str("[kintai_send]\nenabled = true\ntarget_url = \"   \"\n").unwrap();
+    assert!(c.kintai_send.validate().is_err());
+}
+
+#[test]
+fn test_kintai_send_target_must_be_an_http_url() {
+    // ホスト名だけ渡すと reqwest が実行時に落ちる。起動時に弾く
+    for bad in ["relay.example", "ftp://relay.example", "/api/kintai"] {
+        let toml_s = format!("[kintai_send]\nenabled = true\ntarget_url = \"{bad}\"\n");
+        let c: Config = toml::from_str(&toml_s).unwrap();
+        let err = c.kintai_send.validate().unwrap_err();
+        assert!(err.contains("http"), "{bad}: {err}");
+    }
+    for ok in ["http://relay.example", "https://relay.example/"] {
+        let toml_s = format!("[kintai_send]\nenabled = true\ntarget_url = \"{ok}\"\n");
+        let c: Config = toml::from_str(&toml_s).unwrap();
+        c.kintai_send.validate().unwrap();
+    }
+}
+
+#[test]
+fn test_kintai_send_full_config() {
+    let c: Config = toml::from_str(
+        r#"
+[kintai_send]
+enabled = true
+target_url = "https://relay.example"
+auth_token = "tok"
+timeout_secs = 60
+"#,
+    )
+    .unwrap();
+    assert!(c.kintai_send.enabled);
+    assert_eq!(c.kintai_send.auth_token, "tok");
+    assert_eq!(c.kintai_send.timeout_secs, 60);
+    c.kintai_send.validate().unwrap();
+    // Debug / Clone も通る (Config が要求する)
+    let _ = format!("{:?}", c.kintai_send.clone());
+}

@@ -121,3 +121,24 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # tenant_id = "<一番星のテナント UUID ([kintai_events] と同じ値)>"
 # connect_timeout_secs = 30
 # statement_timeout_secs = 300
+
+# 打刻の転送先 (Refs #205 の 04b、送信側)。既定は無効。
+#
+# オンプレが MariaDB から読んだ打刻を、GCP 側の rust-ichibanboshi へ渡すための設定。
+# 相手の POST /api/kintai/timecard が受ける。**[kintai_push] とは別**で、
+# あちらは「自分で Supabase に書く」、こちらは「書ける相手に渡す」。
+#
+# 起動は relay から POST /api/kintai/timecard/send。**Cloudflare Tunnel の 30 秒
+# 上限があるので 1 回の呼び出しは max_drivers で区切られ、続きは応答の
+# next_after_driver_cd で返る**。呼び出し側は null になるまで呼び直す。
+#
+# target_url は relay の中継口、または GCP の Cloud Run URL。http(s) 必須。
+# auth_token は相手に付ける Bearer (空なら付けない = 網層だけで守る構成)。
+#
+# 環境変数でも同じ項目を指定できる:
+#   KINTAI_SEND_ENABLED / _TARGET_URL / _AUTH_TOKEN / _TIMEOUT_SECS
+# [kintai_send]
+# enabled = true
+# target_url = "https://<relay または GCP の URL>"
+# auth_token = "<相手に付ける Bearer>"
+# timeout_secs = 120
