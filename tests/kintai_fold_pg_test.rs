@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_ichibanboshi::kintai_fold::{
-    fold_driver_month, recalc_driver_page, recalc_drivers, recalc_month, stale_state, sync_month,
-    write_unit, DayPartRow, DaySummaryRow, FoldUnit, ShiftRow,
+    fold_driver_month, fold_month, recalc_driver_page, recalc_drivers, recalc_month, stale_state,
+    sync_month, write_unit, DayPartRow, DaySummaryRow, FoldUnit, ShiftRow,
 };
 use rust_ichibanboshi::kintai_push::{KintaiPgStore, PushOptions, TimecardWindow};
 use rust_ichibanboshi::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
@@ -442,9 +442,11 @@ async fn changing_the_rounding_shows_up_in_the_stored_logic_version() {
     );
 }
 
-/// **全量再計算のページングが Postgres だけで母集団を決める。**
+/// **全量再計算のページングは既に畳んである乗務員を Postgres 側だけで拾える。**
 ///
-/// 乗務員を数えるためだけに月ぶんの生イベントを読み直さない。
+/// `extra` を空で渡しても、一度でも畳んだ乗務員 (`day_summaries` に行がある)
+/// は母集団に残る。rest-only 乗務員のための `extra` の埋め方は
+/// [`the_recalc_page_pulls_in_rest_only_drivers_via_extra`] が確かめる。
 #[tokio::test]
 async fn the_recalc_page_walks_drivers_from_postgres() {
     let (store, _pool) = require_db!();
@@ -456,13 +458,14 @@ async fn the_recalc_page_walks_drivers_from_postgres() {
         .await
         .expect("recalc");
 
-    let all = recalc_driver_page(&store, "2026-07", &params(), None, false, 50)
+    let none = std::collections::BTreeSet::new();
+    let all = recalc_driver_page(&store, "2026-07", &params(), &none, None, false, 50)
         .await
         .expect("page");
     assert_eq!(all, vec![DRIVER as i64], "畳んだ乗務員が母集団に居る");
 
     // 現行版で畳んであるので stale_only では出てこない
-    let stale = recalc_driver_page(&store, "2026-07", &params(), None, true, 50)
+    let stale = recalc_driver_page(&store, "2026-07", &params(), &none, None, true, 50)
         .await
         .expect("stale page");
     assert!(stale.is_empty(), "{stale:?}");
@@ -472,16 +475,80 @@ async fn the_recalc_page_walks_drivers_from_postgres() {
         restraint_rounding: RestraintRounding::TruncateElapsed,
         ..params()
     };
-    let stale = recalc_driver_page(&store, "2026-07", &other, None, true, 50)
+    let stale = recalc_driver_page(&store, "2026-07", &other, &none, None, true, 50)
         .await
         .expect("stale page");
     assert_eq!(stale, vec![DRIVER as i64]);
 
     // after_driver_cd は「その先」だけ
-    let after = recalc_driver_page(&store, "2026-07", &params(), Some(DRIVER as i64), false, 50)
-        .await
-        .expect("after");
+    let after = recalc_driver_page(
+        &store,
+        "2026-07",
+        &params(),
+        &none,
+        Some(DRIVER as i64),
+        false,
+        50,
+    )
+    .await
+    .expect("after");
     assert!(after.is_empty(), "{after:?}");
+}
+
+/// **打刻ゼロ・rest-only 乗務員は Postgres だけでは母集団に入らず、`extra` で拾う** (#205-12)。
+///
+/// `kintai_events` (打刻由来) にも `day_summaries` (畳んだ結果) にも 1 行も無い
+/// 乗務員は、月次バッチが「まだ一度も見たことが無い」乗務員そのもの。休息イベント
+/// だけで勤務が立つ乗務員 (長距離・日跨ぎ) がこれに当たる
+/// ([`rest_events_still_produce_shifts_after_the_fold`] と同じ入力の形)。
+#[tokio::test]
+async fn the_recalc_page_pulls_in_rest_only_drivers_via_extra() {
+    let (store, _pool) = require_db!();
+    const REST_ONLY: u64 = 1777;
+    let rest_of = |driver: u64, start: &str, end: &str| json!({"datetime": start, "end_datetime": end, "driver_id": driver, "source": "dtako_events", "state": "休息", "unko_no": null});
+    let repo = repo(vec![
+        rest_of(REST_ONLY, "2026-07-01 16:19:00", "2026-07-02 04:42:00"),
+        rest_of(REST_ONLY, "2026-07-02 16:18:00", "2026-07-03 06:01:00"),
+    ]);
+    let units = fold_month(&repo, &params(), "2026-07", None)
+        .await
+        .expect("fold_month");
+    assert!(
+        units.iter().any(|(cd, _, _)| *cd == REST_ONLY),
+        "前提: rest-only 乗務員は fold_month の split_by_driver には出る"
+    );
+
+    // Postgres 側だけ (extra 空) では、まだ 1 度も畳んでいないので漏れる — 修正前の回帰
+    let none = std::collections::BTreeSet::new();
+    let missing = recalc_driver_page(&store, "2026-07", &params(), &none, None, false, 50)
+        .await
+        .expect("page without extra");
+    assert!(
+        !missing.contains(&(REST_ONLY as i64)),
+        "Postgres だけでは rest-only 乗務員は母集団に無い: {missing:?}"
+    );
+
+    // extra に split_by_driver のキーを渡すと拾える
+    let extra: std::collections::BTreeSet<i64> =
+        units.iter().map(|(cd, _, _)| *cd as i64).collect();
+    let page = recalc_driver_page(&store, "2026-07", &params(), &extra, None, false, 50)
+        .await
+        .expect("page with extra");
+    assert!(
+        page.contains(&(REST_ONLY as i64)),
+        "extra で rest-only 乗務員が母集団に入る: {page:?}"
+    );
+}
+
+/// **driver_cd 0 は `extra` に混ぜても母集団に出ない** (push 経路と同じ「0 以下は捨てる」)。
+#[tokio::test]
+async fn driver_cd_zero_is_dropped_even_via_extra() {
+    let (store, _pool) = require_db!();
+    let extra: std::collections::BTreeSet<i64> = [0_i64].into_iter().collect();
+    let page = recalc_driver_page(&store, "2026-07", &params(), &extra, None, false, 50)
+        .await
+        .expect("page");
+    assert!(!page.contains(&0), "{page:?}");
 }
 
 /// **名指しした乗務員だけを畳む。** 窓の受け口が apply 後に呼ぶ形。
