@@ -316,6 +316,28 @@ SELECT (occurred_at AT TIME ZONE 'Asia/Tokyo')::date AS d,
  GROUP BY 1
 "#;
 
+/// [`STORED_SIGNATURES_SQL`] の**複数乗務員版**。式は 1 文字も変えない。
+///
+/// 署名の突き合わせを**受け側の中**でやるための口 (Refs #205 の 04b)。送り側が
+/// 乗務員ごとに `GET /signatures` を叩いていた頃は 94 名で 33.6 秒かかっていた —
+/// 往復の回数が費用で、突き合わせそのものは同じ DB の中なら実質ただ。
+///
+/// `driver_cd` を先頭に足しただけなので `kintai_events_driver_time` の索引順に
+/// 乗る。**式を写し間違えると「中身は同じなのに毎回全日が違う」**ので、
+/// 2 つが同じであることはテストで縛る。
+pub const STORED_WINDOW_SIGNATURES_SQL: &str = r#"
+SELECT driver_cd,
+       (occurred_at AT TIME ZONE 'Asia/Tokyo')::date AS d,
+       encode(sha256(convert_to(string_agg(
+           to_char(occurred_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
+             || '|' || state || '|' || source || '|' || coalesce(unko_no, ''),
+           E'\n' ORDER BY occurred_at, state COLLATE "C", source COLLATE "C"), 'UTF8')), 'hex') AS sig
+  FROM kintai.kintai_events
+ WHERE tenant_id = $1 AND driver_cd = ANY($2)
+   AND occurred_at >= $3 AND occurred_at < $4
+ GROUP BY 1, 2
+"#;
+
 /// 差分の判定結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DayDiff {
@@ -530,6 +552,35 @@ impl KintaiPgStore {
             .into_iter()
             .map(|r| (r.get::<NaiveDate, _>("d"), r.get::<String, _>("sig")))
             .collect())
+    }
+
+    /// [`stored_day_signatures`] の複数乗務員版。`(乗務員, 暦日) → 署名`。
+    ///
+    /// 引くのは**送り主が名乗った乗務員だけ**。全乗務員を引くと、送り主が知らない
+    /// 乗務員の日まで「相手に無い日」と見なして消しにいく。
+    ///
+    /// [`stored_day_signatures`]: KintaiPgStore::stored_day_signatures
+    pub async fn stored_window_signatures(
+        &self,
+        drivers: &[i64],
+        from: DateTime<FixedOffset>,
+        to: DateTime<FixedOffset>,
+    ) -> Result<BTreeMap<i64, BTreeMap<NaiveDate, String>>, KintaiPushError> {
+        use sqlx::Row;
+        let rows = sqlx::query(STORED_WINDOW_SIGNATURES_SQL)
+            .bind(self.tenant_id)
+            .bind(drivers)
+            .bind(from)
+            .bind(to)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out: BTreeMap<i64, BTreeMap<NaiveDate, String>> = BTreeMap::new();
+        for r in rows {
+            out.entry(r.get::<i64, _>("driver_cd"))
+                .or_default()
+                .insert(r.get::<NaiveDate, _>("d"), r.get::<String, _>("sig"));
+        }
+        Ok(out)
     }
 
     /// 差分のあった日だけを delete-then-insert する。**1 トランザクション**。
@@ -837,6 +888,193 @@ pub async fn apply_timecard_batch(
             .await?;
     }
     Ok(result)
+}
+
+/// 窓ぶんの打刻を**まるごと**受け取る本体 (Refs #205 の 04b)。
+///
+/// 送り主は乗務員でも日でも刻まない。理由は実測 — 乗務員ごとに署名を引いていた
+/// レグが 94 名で **33.6 秒 / 全体の 94%** を占めていた一方、同じ月の全打刻の転送は
+/// **1.3 秒**で済んでいた。費用は往復の回数であって転送量ではない。
+///
+/// ## なぜ「新しいぶんだけ」にしないのか
+///
+/// **始業 / 終業は後から直る。** 積み増しだけにすると、直された打刻が永久に
+/// 反映されない。よって窓 (既定は当月 + 前月) を毎回まるごと送り直す。
+/// 書き込みが無駄にならないのは日単位署名が守るから — **変わった日しか書かない**。
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct TimecardWindow {
+    /// 覆う月 (`YYYY-MM`)。**送り主はこの月ぶんを漏れなく送っていること** —
+    /// 受け側はこの範囲の内側でしか書かないし、消さない。
+    pub months: Vec<String>,
+    /// 送り主が見つけた乗務員CD。**消してよい範囲を決めるのはこれ。**
+    ///
+    /// 全乗務員を対象にすると、送り主が知らない乗務員の日まで「元が消えた」と
+    /// 見なして消しにいく。名乗った範囲だけに閉じる。
+    #[serde(default)]
+    pub drivers: Vec<i64>,
+    /// 生行。乗務員も日も混ざったまま。束ねるのは受け側。
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+}
+
+/// [`apply_timecard_window`] の結果。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TimecardWindowResult {
+    /// 送り主が名乗った乗務員数。
+    pub drivers: usize,
+    /// 実際に書き換えた乗務員数。**大半は 0 のはず** (打刻はほとんど戻らない)。
+    pub drivers_written: usize,
+    pub days_written: usize,
+    pub days_deleted: usize,
+    pub events_written: usize,
+    pub deduped: usize,
+    #[serde(default)]
+    pub rejected: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub unknown_states: BTreeSet<String>,
+    /// 窓の外 / 名乗っていない乗務員の行。**0 でないなら送り側が壊れている**。
+    pub misplaced: usize,
+    pub elapsed_ms: u64,
+}
+
+impl TimecardWindowResult {
+    pub fn has_unexpected(&self) -> bool {
+        self.misplaced > 0 || !self.unknown_states.is_empty()
+    }
+}
+
+/// 窓ぶんを受けて、**変わった日だけ**を反映する (GCP 側で走る)。
+///
+/// 突き合わせはここ — 送り主に署名を引かせない。同じ DB の中なので往復がゼロ、
+/// かつ [`day_signature`] と [`STORED_WINDOW_SIGNATURES_SQL`] は既に同値が
+/// 検証済みなので、新しい実装は増えない。
+///
+/// **送り主を信用しない。** 窓の外の日と、名乗っていない乗務員の行は落として数える。
+pub async fn apply_timecard_window(
+    store: &KintaiPgStore,
+    window: &TimecardWindow,
+) -> Result<TimecardWindowResult, KintaiPushError> {
+    let started = std::time::Instant::now();
+    if window.months.is_empty() {
+        return Err(KintaiPushError::NotConfigured(
+            "months が空です".to_string(),
+        ));
+    }
+    let mut spans: Vec<(NaiveDate, NaiveDate)> = Vec::new();
+    for m in &window.months {
+        spans.push(
+            month_date_bounds(m)
+                .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {m}")))?,
+        );
+    }
+    // 署名の引き当ては 1 クエリで済ませたいので端から端まで。月が飛んでいると
+    // 隙間ぶんが混ざるが、書く / 消すの判定は [`plan_window`] が月ごとに閉じる
+    let lo = spans.iter().map(|s| s.0).min().unwrap_or_default();
+    let hi = spans.iter().map(|s| s.1).max().unwrap_or_default();
+
+    let declared: BTreeSet<i64> = window.drivers.iter().copied().collect();
+    let drivers: Vec<i64> = declared.iter().copied().collect();
+    let remote = store
+        .stored_window_signatures(&drivers, jst_day_bounds(lo).0, jst_day_bounds(hi).0)
+        .await?;
+
+    let (plans, mut result) = plan_window(&spans, &declared, &window.events, &remote);
+    for (driver, plan) in &plans {
+        store
+            .replace_days(*driver, &plan.changed, &plan.deleted)
+            .await?;
+    }
+    result.elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(result)
+}
+
+/// 1 乗務員ぶんの書き換え計画。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriverPlan {
+    /// 書き直す日 (delete-then-insert)。
+    pub changed: BTreeMap<NaiveDate, Vec<PushEvent>>,
+    /// 消す日。**窓の内側だけ。**
+    pub deleted: Vec<NaiveDate>,
+}
+
+/// 受け取った窓と、既に持っている署名から、**書き換える日だけ**を決める。
+///
+/// DB を触らない — [`apply_timecard_window`] が前後で読み書きする。`plan_batch` を
+/// 純粋にしてあるのと同じ理由で、判定そのものはテストで縛れるようにする。
+///
+/// **変化の無い乗務員は返さない。** 打刻はほとんど戻らないので、大半はここで落ちる。
+pub fn plan_window(
+    spans: &[(NaiveDate, NaiveDate)],
+    declared: &BTreeSet<i64>,
+    events: &[serde_json::Value],
+    remote: &BTreeMap<i64, BTreeMap<NaiveDate, String>>,
+) -> (BTreeMap<i64, DriverPlan>, TimecardWindowResult) {
+    let in_window = |d: NaiveDate| spans.iter().any(|(a, b)| d >= *a && d < *b);
+    let mut result = TimecardWindowResult {
+        drivers: declared.len(),
+        ..Default::default()
+    };
+
+    let parsed = parse_rows(events);
+    for (reason, n) in &parsed.rejected {
+        *result.rejected.entry(format!("{reason:?}")).or_default() += n;
+    }
+    for s in &parsed.unknown_states {
+        if result.unknown_states.len() < MAX_REPORTED_STATES {
+            result.unknown_states.insert(s.clone());
+        }
+    }
+    let before = parsed.events.len();
+    let kept: Vec<PushEvent> = parsed
+        .events
+        .into_iter()
+        .filter(|e| in_window(e.date()) && declared.contains(&e.driver_cd))
+        .collect();
+    result.misplaced = before - kept.len();
+    let deduped = dedup_events(kept);
+    result.deduped = before - result.misplaced - deduped.len();
+
+    let mut local: BTreeMap<i64, BTreeMap<NaiveDate, Vec<PushEvent>>> = BTreeMap::new();
+    for ev in deduped {
+        local
+            .entry(ev.driver_cd)
+            .or_default()
+            .entry(ev.date())
+            .or_default()
+            .push(ev);
+    }
+
+    let mut plans: BTreeMap<i64, DriverPlan> = BTreeMap::new();
+    for driver in declared {
+        let mine = local.remove(driver).unwrap_or_default();
+        let theirs = remote.get(driver).cloned().unwrap_or_default();
+        let local_sigs: BTreeMap<NaiveDate, String> = mine
+            .iter()
+            .map(|(d, evs)| (*d, day_signature(evs)))
+            .collect();
+        let mut plan = DriverPlan::default();
+        for diff in diff_days(&local_sigs, &theirs) {
+            match diff.kind {
+                DayDiffKind::Unchanged => {}
+                DayDiffKind::Changed => {
+                    plan.changed.insert(diff.date, mine[&diff.date].clone());
+                }
+                // 署名の引き当ては `lo..hi` なので、月が飛んでいると隙間ぶんが
+                // 混ざる。**窓の外は消さない** — 送り主が覆っていない範囲だから
+                DayDiffKind::Deleted if in_window(diff.date) => plan.deleted.push(diff.date),
+                DayDiffKind::Deleted => {}
+            }
+        }
+        if plan.changed.is_empty() && plan.deleted.is_empty() {
+            continue;
+        }
+        result.drivers_written += 1;
+        result.days_written += plan.changed.len();
+        result.days_deleted += plan.deleted.len();
+        result.events_written += plan.changed.values().map(Vec::len).sum::<usize>();
+        plans.insert(*driver, plan);
+    }
+    (plans, result)
 }
 
 /// 対象月の `[月初, 翌月初)` を `DATE` の境界で返す。
@@ -1293,6 +1531,160 @@ mod tests {
                 .await
                 .unwrap(),
             vec![1130]
+        );
+    }
+
+    // ── 窓ぶんをまるごと受ける (Refs #205 の 04b) ────────────────────────────
+
+    /// 生行 1 つ。`parse_rows` が読む形。
+    fn raw(driver: i64, at: &str, state: &str) -> serde_json::Value {
+        json!({
+            "datetime": at,
+            "end_datetime": null,
+            "driver_id": driver,
+            "source": "timecard",
+            "state": state,
+            "unko_no": null,
+            "vehicle": null,
+        })
+    }
+
+    fn spans_of(months: &[&str]) -> Vec<(NaiveDate, NaiveDate)> {
+        months
+            .iter()
+            .map(|m| month_date_bounds(m).unwrap())
+            .collect()
+    }
+
+    fn declared_of(ids: &[i64]) -> BTreeSet<i64> {
+        ids.iter().copied().collect()
+    }
+
+    /// 署名が一致する乗務員は**計画に現れない**。打刻はほとんど戻らないので、
+    /// 窓を毎回送り直しても書き込みは出ない。
+    #[test]
+    fn plan_window_skips_drivers_that_did_not_change() {
+        let events = vec![raw(1130, "2026-06-01 08:00:00", "始業")];
+        let sig = day_signature(&parse_rows(&events).events);
+        let remote = BTreeMap::from([(1130, BTreeMap::from([(d(2026, 6, 1), sig)]))]);
+        let (plans, result) = plan_window(
+            &spans_of(&["2026-06"]),
+            &declared_of(&[1130]),
+            &events,
+            &remote,
+        );
+        assert!(plans.is_empty(), "{plans:?}");
+        assert_eq!(result.drivers, 1);
+        assert_eq!(result.drivers_written, 0);
+        assert_eq!(result.days_written, 0);
+    }
+
+    /// 始業が直されたら**その日だけ**書き直す。他の日は触らない。
+    #[test]
+    fn plan_window_rewrites_only_the_edited_day() {
+        let events = vec![
+            raw(1130, "2026-06-01 08:00:00", "始業"),
+            raw(1130, "2026-06-02 07:30:00", "始業"),
+        ];
+        let parsed = parse_rows(&events);
+        let by_day = group_by_date(&dedup_events(parsed.events));
+        // 1 日は一致、2 日は相手が古い値を持っている
+        let remote = BTreeMap::from([(
+            1130,
+            BTreeMap::from([
+                (d(2026, 6, 1), day_signature(&by_day[&d(2026, 6, 1)])),
+                (d(2026, 6, 2), "stale".to_string()),
+            ]),
+        )]);
+        let (plans, result) = plan_window(
+            &spans_of(&["2026-06"]),
+            &declared_of(&[1130]),
+            &events,
+            &remote,
+        );
+        assert_eq!(
+            plans[&1130].changed.keys().copied().collect::<Vec<_>>(),
+            vec![d(2026, 6, 2)]
+        );
+        assert!(plans[&1130].deleted.is_empty());
+        assert_eq!(result.days_written, 1);
+        assert_eq!(result.drivers_written, 1);
+    }
+
+    /// 相手にあってこちらに無い日は消す (元の打刻が消えた)。
+    #[test]
+    fn plan_window_deletes_days_the_source_no_longer_has() {
+        let remote = BTreeMap::from([(
+            1130,
+            BTreeMap::from([(d(2026, 6, 10), "whatever".to_string())]),
+        )]);
+        let (plans, result) =
+            plan_window(&spans_of(&["2026-06"]), &declared_of(&[1130]), &[], &remote);
+        assert_eq!(plans[&1130].deleted, vec![d(2026, 6, 10)]);
+        assert_eq!(result.days_deleted, 1);
+    }
+
+    /// **窓の外は消さない。** 月が飛んでいると署名の引き当てに隙間月が混ざるが、
+    /// 送り主が覆っていない範囲なので触ってはいけない。
+    #[test]
+    fn plan_window_never_deletes_outside_the_window() {
+        let remote = BTreeMap::from([(
+            1130,
+            BTreeMap::from([
+                (d(2026, 6, 10), "in".to_string()),
+                // 隙間の 7 月。送り主は覆っていない
+                (d(2026, 7, 10), "gap".to_string()),
+                (d(2026, 8, 10), "in".to_string()),
+            ]),
+        )]);
+        let (plans, _) = plan_window(
+            &spans_of(&["2026-06", "2026-08"]),
+            &declared_of(&[1130]),
+            &[],
+            &remote,
+        );
+        assert_eq!(plans[&1130].deleted, vec![d(2026, 6, 10), d(2026, 8, 10)]);
+    }
+
+    /// **名乗っていない乗務員・窓の外の日は書かない。** 数えて報告する。
+    #[test]
+    fn plan_window_refuses_rows_outside_what_the_sender_declared() {
+        let events = vec![
+            // 名乗っていない乗務員
+            raw(9999, "2026-06-01 08:00:00", "始業"),
+            // 窓の外の月
+            raw(1130, "2026-05-01 08:00:00", "始業"),
+            raw(1130, "2026-06-01 08:00:00", "始業"),
+        ];
+        let (plans, result) = plan_window(
+            &spans_of(&["2026-06"]),
+            &declared_of(&[1130]),
+            &events,
+            &BTreeMap::new(),
+        );
+        assert_eq!(result.misplaced, 2);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[&1130].changed.keys().copied().collect::<Vec<_>>(),
+            vec![d(2026, 6, 1)]
+        );
+    }
+
+    /// 窓の SQL は 1 名版と**式が 1 文字も違わない**。写し間違えると
+    /// 「中身は同じなのに毎回全日が違う」になる。
+    #[test]
+    fn the_window_signature_sql_matches_the_single_driver_one() {
+        let normalise = |s: &str| {
+            s.replace("driver_cd = ANY($2)", "driver_cd = $2")
+                .replace(
+                    "SELECT driver_cd,\n       (occurred_at",
+                    "SELECT (occurred_at",
+                )
+                .replace("GROUP BY 1, 2", "GROUP BY 1")
+        };
+        assert_eq!(
+            normalise(STORED_WINDOW_SIGNATURES_SQL).replace([' ', '\n'], ""),
+            STORED_SIGNATURES_SQL.replace([' ', '\n'], "")
         );
     }
 
