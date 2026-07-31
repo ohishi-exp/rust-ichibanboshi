@@ -77,6 +77,11 @@ path = "src/routes/health.rs"
 [[files]]
 path = "src/routes/kintai.rs"
 
+# 実測 112/112 で 100% (Refs #205 の 18)。CI の Coverage regression check は
+# postgres service 込みで cov-check を回すので、pg テストが要る形のまま登録できる
+[[files]]
+path = "src/routes/kintai_day_summaries.rs"
+
 # 実測 25/25 で 100% だが未登録だった (2026-07-30 の棚卸しで追加)
 [[files]]
 path = "src/routes/kintai_version.rs"

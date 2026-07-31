@@ -356,6 +356,11 @@ pub async fn run(
         .route("/kintai/events", get(routes::kintai::events))
         .route("/kintai/kosoku-daily", get(routes::kintai::kosoku_daily))
         .route("/kintai/pdf-json", get(routes::kintai::pdf_json))
+        // 畳んだ結果の読み出し (Refs #205 の 18)。読むだけ。POST は無い
+        .route(
+            "/kintai/day-summaries",
+            get(routes::kintai_day_summaries::day_summaries),
+        )
         .route("/kintai/version", get(routes::kintai_version::version))
         // 打刻の受け口 (Refs #205 の 04b)。GCP 側だけが使う — オンプレは
         // [kintai_push] が無効なので両方 503 で fail-closed
