@@ -70,7 +70,7 @@
 //!   **CSV の中の重複行は落とさない** — 取り込みが 2 回走った重複は `kosoku.rs` 側が
 //!   扱う話で、ここで消すと MariaDB 経路と値が割れる
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -292,10 +292,119 @@ impl UnkoSample {
     }
 }
 
+/// 突合キーの**形**の実測 (Refs #205 の 37)。片側 10 件の標本では「たまたまその
+/// 10 件がそうだった」を排除できないので、月ぶん全件の分布を返す。
+///
+/// - `len_counts` … **桁が固定かどうか。** 先頭 N 桁で比較してよいかは、桁が
+///   揃っていて初めて言える (`unko_no` の末尾の長さは可変という実測メモがある)
+/// - `last_char_counts` … 余分な 1 文字が何なのか。全部同じ値なら定数、
+///   複数の値を取るなら**意味を持つ桁**なので落としてよいか別途考える必要がある
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct UnkoShape {
+    pub len_counts: BTreeMap<usize, usize>,
+    pub last_char_counts: BTreeMap<String, usize>,
+}
+
+impl UnkoShape {
+    fn measure<'a>(keys: impl Iterator<Item = &'a str>) -> Self {
+        let mut out = Self::default();
+        for k in keys {
+            *out.len_counts.entry(k.chars().count()).or_default() += 1;
+            if let Some(c) = k.chars().last() {
+                *out.last_char_counts.entry(c.to_string()).or_default() += 1;
+            }
+        }
+        out
+    }
+}
+
+/// 突合キーの候補と、その候補で切り替えたときに何が起きるかの**試算**
+/// (Refs #205 の 37)。**突合そのものは `raw` のまま — 試算は判定に一切入らない。**
+///
+/// 「先頭 22 桁で本当に重なるか」は推測ではなく数で答えるべきなので、候補ごとに
+/// 一致数を出して並べる。`collisions` があるのは、**桁を落とすと別の運行が同じ
+/// キーに潰れうる**ため — 実測で 1740 の 2026-06-11 は同じ車輌・同じ秒に始まる
+/// 2 本 (`...39751` / `...39752`) があり、先頭 22 桁では 1 本に潰れる。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct UnkoKeyTrial {
+    /// 候補の名前 ([`KEY_CANDIDATES`])。
+    pub key: String,
+    /// その候補でオンプレ側が GCP 側と一致した件数。
+    pub matched: usize,
+    /// 一致しなかった件数 (= その候補を採ったときの `unko_diff_total`)。
+    pub unmatched: usize,
+    /// 逆方向 (GCP 側にあってオンプレ側に無い) のキー数。
+    pub gcp_only: usize,
+    /// **同じ乗務員の別の運行が同じキーに潰れる件数。** 0 でなければ情報が落ちる。
+    pub collisions: usize,
+}
+
+/// 試算する突合キーの候補。`None` = そのまま、`Some(n)` = 先頭 n 文字。
+///
+/// `22` は「オンプレ 23 桁 − 余分な 1 文字」、`12` は `YYMMDDHHMMSS`
+/// (乗務員 47 名 × 4 か月 / 966 運行で不一致 0・パース不能 0 の実測がある)。
+const KEY_CANDIDATES: [(&str, Option<usize>); 3] = [
+    ("raw", None),
+    ("prefix22", Some(22)),
+    ("prefix12", Some(12)),
+];
+
+/// 候補キーへ写す。短すぎる値はそのまま返す (切らない = 一致しないだけ)。
+fn normalize_key(unko_no: &str, prefix: Option<usize>) -> &str {
+    match prefix {
+        None => unko_no,
+        Some(n) => unko_no.get(..n).unwrap_or(unko_no),
+    }
+}
+
+/// 候補 1 つぶんの試算。
+fn key_trial(
+    name: &str,
+    prefix: Option<usize>,
+    onprem: &[OnpremOperation],
+    gcp: &HashSet<String>,
+) -> UnkoKeyTrial {
+    let theirs: HashSet<&str> = gcp.iter().map(|u| normalize_key(u, prefix)).collect();
+    let matched = onprem
+        .iter()
+        .filter(|o| theirs.contains(normalize_key(&o.unko_no, prefix)))
+        .count();
+    let mine: HashSet<&str> = onprem
+        .iter()
+        .map(|o| normalize_key(&o.unko_no, prefix))
+        .collect();
+    let gcp_only = theirs.iter().filter(|k| !mine.contains(*k)).count();
+    let mut grouped: std::collections::HashMap<(i64, &str), HashSet<&str>> =
+        std::collections::HashMap::new();
+    for o in onprem {
+        grouped
+            .entry((o.driver_cd, normalize_key(&o.unko_no, prefix)))
+            .or_default()
+            .insert(o.unko_no.as_str());
+    }
+    let collisions = grouped
+        .values()
+        .filter(|v| v.len() > 1)
+        .map(HashSet::len)
+        .sum();
+    UnkoKeyTrial {
+        key: name.to_string(),
+        matched,
+        unmatched: onprem.len() - matched,
+        gcp_only,
+        collisions,
+    }
+}
+
 /// 運行の突合の結果 (Refs #205 の 37)。**判定には使わない — 応答に載せるだけ。**
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UnkoDiff {
     /// オンプレに在って GCP に無い運行 (先頭 [`MAX_UNKO_DIFF`] 件)。
+    ///
+    /// **並びはオンプレ側の `ORDER BY driver_cd, unko_no` のまま**なので、
+    /// 切られるのは**乗務員CD の大きい側**。`total` がこれを超えているときに
+    /// 「ある乗務員が 1 件も出ていない」のは、欠けていないのではなく**切られた**
+    /// 可能性がある (本番 2026-06 の 683 件で 1688 が 0 件に見えたのがこれ)。
     pub items: Vec<UnkoDiffItem>,
     /// 切る前の総数。
     pub total: usize,
@@ -306,6 +415,11 @@ pub struct UnkoDiff {
     /// **突き合わせた相手側**の実物 (オンプレの `unko_no`、同じく辞書順の先頭)。
     /// 片側だけ見ても違いは分からないので、必ず対で返す。
     pub onprem_sample: Vec<UnkoSample>,
+    /// 両側の**形**の実測 ([`UnkoShape`]) — 標本 10 件では言い切れない部分。
+    pub onprem_shape: UnkoShape,
+    pub gcp_shape: UnkoShape,
+    /// 突合キーの候補ごとの試算 ([`UnkoKeyTrial`])。**採用はしていない。**
+    pub trials: Vec<UnkoKeyTrial>,
 }
 
 /// **オンプレの `(乗務員CD, unko_no)` 集合と etags の `unko_no` 集合を突き合わせる**
@@ -356,6 +470,12 @@ fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
         gcp_only: only.len(),
         gcp_only_sample: sample(&only),
         onprem_sample: sample(&mine),
+        onprem_shape: UnkoShape::measure(onprem.iter().map(|o| o.unko_no.as_str())),
+        gcp_shape: UnkoShape::measure(gcp.iter().map(String::as_str)),
+        trials: KEY_CANDIDATES
+            .iter()
+            .map(|(name, prefix)| key_trial(name, *prefix, onprem, gcp))
+            .collect(),
     }
 }
 
@@ -2554,6 +2674,81 @@ mod tests {
         );
         assert_eq!(diff.onprem_sample[0].len, 23);
         assert_eq!(diff.gcp_only_sample[0].len, 24, "前後の空白を数える");
+    }
+
+    /// **本番の実物で形を測る** (Refs #205 の 37)。オンプレ 23 桁 = `YYMMDDHHMMSS`
+    /// (12) + ゼロ埋めの車番 (10) + 余分な 1 文字、GCP 22 桁 = 前 22 桁だけ。
+    ///
+    /// 値は `/api/kintai/events` から引いた実データ (乗務員 1021 / 1078 / 1517 /
+    /// 1688 / 1740 の 2026-06、31 運行) と、本番の etags 応答の標本そのもの。
+    #[test]
+    fn the_shape_of_both_sides_is_measured_over_the_whole_month() {
+        let onprem = vec![
+            // 1517 / 長崎100か4229 と 1688 / 帯広100か6654 の実物
+            op(1517, "26052106075900000042291"),
+            op(1688, "26062809112500000066541"),
+            // 1740 は同じ車輌・同じ秒に始まる 2 本があり、末尾だけが 1 / 2 で違う
+            op(1740, "26061105351800000039751"),
+            op(1740, "26061105351800000039752"),
+        ];
+        let diff = diff_unko(&onprem, &gcp_set(&["2604202128500000002536"]));
+        assert_eq!(diff.onprem_shape.len_counts, BTreeMap::from([(23, 4)]));
+        assert_eq!(diff.gcp_shape.len_counts, BTreeMap::from([(22, 1)]));
+        let last = &diff.onprem_shape.last_char_counts;
+        let want = BTreeMap::from([("1".to_string(), 3), ("2".to_string(), 1)]);
+        assert_eq!(*last, want, "余分な 1 文字は定数ではない");
+    }
+
+    /// **「先頭 22 桁で本当に重なるか」を推測ではなく数で返す** (Refs #205 の 37)。
+    /// `raw` では 1 件も一致せず、`prefix22` で全件一致する — 本番で疑っている形。
+    #[test]
+    fn the_key_trials_measure_each_candidate_without_adopting_it() {
+        let onprem = vec![
+            op(1078, "26062411400600000023021"),
+            op(1517, "26062606141000000042291"),
+        ];
+        let gcp = gcp_set(&["2606241140060000002302", "2606260614100000004229"]);
+        let diff = diff_unko(&onprem, &gcp);
+        assert_eq!(diff.total, 2, "突合そのものは raw のまま = 全件不一致");
+
+        let by = |k: &str| {
+            diff.trials
+                .iter()
+                .find(|t| t.key == k)
+                .expect("候補が並んでいる")
+                .clone()
+        };
+        assert_eq!((by("raw").matched, by("raw").unmatched), (0, 2));
+        assert_eq!(by("raw").gcp_only, 2);
+        assert_eq!((by("prefix22").matched, by("prefix22").unmatched), (2, 0));
+        assert_eq!(by("prefix22").gcp_only, 0, "逆方向も消える");
+        assert_eq!(by("prefix12").matched, 2, "日時 12 桁でも一致する");
+    }
+
+    /// **桁を落とすと別の運行が潰れることまで数える。** 1740 の 2026-06-11 は
+    /// 同じ車輌・同じ秒に始まる 2 本があり、先頭 22 桁では 1 本になる。
+    #[test]
+    fn the_key_trials_count_operations_that_collapse_into_one_key() {
+        let onprem = vec![
+            op(1740, "26061105351800000039751"),
+            op(1740, "26061105351800000039752"),
+            op(1517, "26052106075900000042291"),
+        ];
+        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        let by = |k: &str| diff.trials.iter().find(|t| t.key == k).unwrap().clone();
+        assert_eq!(by("raw").collisions, 0, "生のキーは潰れない");
+        assert_eq!(by("prefix22").collisions, 2, "1740 の 2 本が 1 つになる");
+        assert_eq!(by("prefix12").collisions, 2, "12 桁でも同じ 2 本が潰れる");
+    }
+
+    /// 候補キーより短い値は切らずにそのまま比べる (一致しないだけ)。
+    #[test]
+    fn a_key_shorter_than_the_candidate_is_left_alone() {
+        assert_eq!(normalize_key("U1", Some(22)), "U1");
+        assert_eq!(
+            normalize_key("26062411400600000023021", None),
+            "26062411400600000023021"
+        );
     }
 
     /// 標本は 10 件で切る (実物の形が分かればよく、全量は `total` で足りる)。
