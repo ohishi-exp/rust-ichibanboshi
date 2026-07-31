@@ -1191,3 +1191,126 @@ async fn a_key_collision_with_another_source_fails_loudly() {
     assert_eq!(ours, 0, "衝突したのに一部だけ書けている");
     assert_eq!(count_events(&pool, tenant).await, 1);
 }
+
+// ── 13: 月ゲートの打刻側材料 (stored_month_punch_digest) ─────────────────────
+
+/// 月全体の窓 (`fold_month` / `month_range` と同じ `[月初, 翌月2日)` 相当) の
+/// `TIMESTAMPTZ` 境界。テストではフェッチ側の複雑な変換を経由せず、そのまま
+/// `jst_day_bounds` で組む。
+fn month_window(
+    from: NaiveDate,
+    to_exclusive: NaiveDate,
+) -> (
+    chrono::DateTime<chrono::FixedOffset>,
+    chrono::DateTime<chrono::FixedOffset>,
+) {
+    (jst_day_bounds(from).0, jst_day_bounds(to_exclusive).0)
+}
+
+/// **打刻が 1 件も無い月でも固定値を返す。** `string_agg` は行が無いと `NULL` に
+/// なり `sha256(NULL)` も `NULL` — `fold_gate.punch_digest` は `NOT NULL` なので
+/// `coalesce(..., '')` で潰していることの検証。
+#[tokio::test]
+async fn punch_digest_of_an_empty_month_is_a_fixed_value() {
+    let (store, _pool) = require_db!();
+    let (from, to) = month_window(
+        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+    );
+    let digest = store
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("empty month digest");
+    // sha256('') の既知値。coalesce の効果そのものを固定する
+    assert_eq!(
+        digest,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+/// **打刻が増えると digest が変わる。**
+#[tokio::test]
+async fn punch_digest_changes_when_an_event_is_pushed() {
+    let (store, _pool) = require_db!();
+    let (from, to) = month_window(
+        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+    );
+    let before = store
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("before");
+
+    let repo: DynKintaiEventsRepo =
+        std::sync::Arc::new(StubRepo::new(vec![punch("2026-07-10 08:00:00", "始業")]));
+    push_month(&repo, &store, &july()).await.expect("push");
+
+    let after = store
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("after");
+    assert_ne!(before, after, "打刻が増えたら digest も変わる");
+}
+
+/// **同じ打刻をもう一度 push しても digest は変わらない** (冪等)。月ゲートが
+/// 「変わっていない」と正しく判定できるための前提。
+#[tokio::test]
+async fn punch_digest_is_stable_across_idempotent_pushes() {
+    let (store, _pool) = require_db!();
+    let repo: DynKintaiEventsRepo = std::sync::Arc::new(StubRepo::new(vec![
+        punch("2026-07-11 08:00:00", "始業"),
+        punch("2026-07-11 18:00:00", "終業"),
+    ]));
+    push_month(&repo, &store, &july()).await.expect("1st push");
+
+    let (from, to) = month_window(
+        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+    );
+    let first = store
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("1st digest");
+
+    push_month(&repo, &store, &july()).await.expect("2nd push");
+    let second = store
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("2nd digest");
+    assert_eq!(first, second, "同じ入力を 2 回 push しても変わらない");
+}
+
+/// **他テナントの打刻を混ぜない。** 索引は `tenant_id` が先頭キーだが、
+/// 集計そのものが RLS 相当のテナント絞りを正しく効かせているかの検証
+/// (このクエリは `store.tenant_id()` を直接 bind するので RLS 自体は経由しないが、
+/// 絞り条件そのものが正しいことは確かめられる)。
+#[tokio::test]
+async fn punch_digest_does_not_leak_across_tenants() {
+    let (store_a, _pool) = require_db!();
+    let (store_b, pool) = require_db!();
+    let repo: DynKintaiEventsRepo =
+        std::sync::Arc::new(StubRepo::new(vec![punch("2026-07-12 08:00:00", "始業")]));
+    push_month(&repo, &store_a, &july()).await.expect("push a");
+
+    let (from, to) = month_window(
+        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+    );
+    let a = store_a
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("a");
+    let b = store_b
+        .stored_month_punch_digest(from, to)
+        .await
+        .expect("b");
+    assert_ne!(
+        a, b,
+        "テナント b には何も入っていないので空月の固定値のまま"
+    );
+    assert_eq!(
+        b,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    let _ = pool;
+}

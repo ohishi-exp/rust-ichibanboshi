@@ -239,6 +239,23 @@ pub trait KintaiEventsApi: Send + Sync {
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         self.fetch_ferry_between(&from, &to, driver).await
     }
+
+    /// 対象月の dtako 側 (alc) 指紋材料 (Refs #205 実装計画 13、月ゲート)。
+    ///
+    /// `fetch_all_events_between` を実際に読まなくても「前回 fold したときと入力が
+    /// 変わっていないか」を安く判定するための材料。**既定は `Ok(None)`** — 月ゲートは
+    /// これを「使えない」と読み、安全側 (従来どおり全量読み) に倒す。
+    ///
+    /// [`crate::kintai_http_repo::HttpKintaiEventsRepo`] だけがこれを上書きして、alc の
+    /// `GET /api/dtako/events/etags` (R2 の LIST だけで済む、CSV は読まない) を呼ぶ。
+    /// MariaDB 直読み (`MariadbKintaiEventsRepo`) はそもそも R2 を経由しないので既定の
+    /// ままでよい — 直読みは元から速く、ゲートで削る費用が無い。
+    async fn fetch_dtako_month_digest(
+        &self,
+        _month: &str,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        Ok(None)
+    }
 }
 
 pub type DynKintaiEventsRepo = Arc<dyn KintaiEventsApi>;
