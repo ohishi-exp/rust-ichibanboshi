@@ -209,6 +209,7 @@ pub async fn drivers(
         "month": month,
         "drivers": page.drivers,
         "next_after_driver_cd": page.next_after_driver_cd,
+        "elapsed_ms": page.elapsed_ms,
     })))
 }
 
