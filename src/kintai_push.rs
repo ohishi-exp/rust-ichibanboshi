@@ -588,12 +588,47 @@ impl KintaiPgStore {
     /// 途中で落ちたら 1 日も書かれていない状態に戻る。日ごとにコミットすると
     /// 「一部の日だけ新しい」状態が残り、再計算の指紋がその日だけ進んで
     /// 静かな不整合になる。
-    pub async fn replace_days(
+    /// 差分のあった日だけを delete-then-insert する。**窓ぜんたいで 1 トランザクション**。
+    ///
+    /// 途中で落ちたら 1 日も書かれていない状態に戻る。日ごと / 乗務員ごとにコミット
+    /// すると「一部だけ新しい」状態が残り、再計算の指紋がそこだけ進んで静かな
+    /// 不整合になる。
+    ///
+    /// ## 行ごとに往復しない
+    ///
+    /// 2026-07-31 に踏んだ: 1 日 1 DELETE・1 イベント 1 INSERT で往復していて、
+    /// 2 か月・95 名の初回投入が **10,157 往復**になり Cloudflare の 524 (100 秒) を
+    /// 超えた。supavisor 越しの 1 往復が数 ms でも、回数が効く。
+    ///
+    /// `unnest` で畳んで **DELETE 1 文 + INSERT 数文**にする。INSERT だけ
+    /// [`INSERT_CHUNK`] 行で刻むのは、`raw` を積むと 1 文の本文が数 MB に育つため
+    /// (同じトランザクションの中なので、刻んでも全か無かは変わらない)。
+    ///
+    /// **DELETE をやめて UPSERT にはできない。** 上流から消えた行がその日に残る。
+    /// 日単位で「丸ごと置き換える」のが署名と対になっている。
+    pub async fn replace_window(
         &self,
-        driver_cd: i64,
-        changed: &BTreeMap<NaiveDate, Vec<PushEvent>>,
-        deleted: &[NaiveDate],
+        plans: &BTreeMap<i64, DriverPlan>,
     ) -> Result<(), KintaiPushError> {
+        // 消す日 (乗務員, 日の境界) を 1 本の配列に畳む
+        let (mut d_drivers, mut d_from, mut d_to) = (Vec::new(), Vec::new(), Vec::new());
+        for (driver, plan) in plans {
+            for date in plan.deleted.iter().chain(plan.changed.keys()) {
+                let (from, to) = jst_day_bounds(*date);
+                d_drivers.push(*driver);
+                d_from.push(from);
+                d_to.push(to);
+            }
+        }
+        if d_drivers.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<&PushEvent> = plans
+            .values()
+            .flat_map(|p| p.changed.values())
+            .flatten()
+            .collect();
+
         let mut tx = self.pool.begin().await?;
         // BYPASSRLS の kintai_writer では不要だが、RLS の効くロールで動かしても
         // 同じ結果になるように必ず名乗る
@@ -602,44 +637,80 @@ impl KintaiPgStore {
             .execute(&mut *tx)
             .await?;
 
-        for date in deleted.iter().chain(changed.keys()) {
-            let (from, to) = jst_day_bounds(*date);
-            sqlx::query(DELETE_DAY_SQL)
+        sqlx::query(DELETE_DAYS_SQL)
+            .bind(self.tenant_id)
+            .bind(&d_drivers)
+            .bind(&d_from)
+            .bind(&d_to)
+            .execute(&mut *tx)
+            .await?;
+
+        for chunk in rows.chunks(INSERT_CHUNK) {
+            let drivers: Vec<i64> = chunk.iter().map(|e| e.driver_cd).collect();
+            let at: Vec<DateTime<FixedOffset>> = chunk.iter().map(|e| e.occurred_at_tz()).collect();
+            let state: Vec<&str> = chunk.iter().map(|e| e.state.as_str()).collect();
+            let source: Vec<&str> = chunk.iter().map(|e| e.source.as_str()).collect();
+            let unko: Vec<Option<&str>> = chunk.iter().map(|e| e.unko_no.as_deref()).collect();
+            let raw: Vec<serde_json::Value> = chunk.iter().map(|e| e.raw.clone()).collect();
+            sqlx::query(INSERT_EVENTS_SQL)
                 .bind(self.tenant_id)
-                .bind(driver_cd)
-                .bind(from)
-                .bind(to)
+                .bind(&drivers)
+                .bind(&at)
+                .bind(&state)
+                .bind(&source)
+                .bind(&unko)
+                .bind(&raw)
                 .execute(&mut *tx)
                 .await?;
-        }
-        for events in changed.values() {
-            for ev in events {
-                sqlx::query(INSERT_EVENT_SQL)
-                    .bind(self.tenant_id)
-                    .bind(ev.driver_cd)
-                    .bind(ev.occurred_at_tz())
-                    .bind(&ev.state)
-                    .bind(&ev.source)
-                    .bind(ev.unko_no.as_deref())
-                    .bind(&ev.raw)
-                    .execute(&mut *tx)
-                    .await?;
-            }
         }
         tx.commit().await?;
         Ok(())
     }
+
+    /// 1 乗務員ぶん。[`replace_window`] に畳んで渡すだけ — 実装を 2 つ持たない。
+    ///
+    /// [`replace_window`]: KintaiPgStore::replace_window
+    pub async fn replace_days(
+        &self,
+        driver_cd: i64,
+        changed: &BTreeMap<NaiveDate, Vec<PushEvent>>,
+        deleted: &[NaiveDate],
+    ) -> Result<(), KintaiPushError> {
+        self.replace_window(&BTreeMap::from([(
+            driver_cd,
+            DriverPlan {
+                changed: changed.clone(),
+                deleted: deleted.to_vec(),
+            },
+        )]))
+        .await
+    }
 }
 
-const DELETE_DAY_SQL: &str = r#"
-DELETE FROM kintai.kintai_events
- WHERE tenant_id = $1 AND driver_cd = $2 AND occurred_at >= $3 AND occurred_at < $4
+/// 1 文に載せる INSERT の行数。`raw` を積むので本文サイズで刻む。
+const INSERT_CHUNK: usize = 2000;
+
+/// 消す日を **1 文で**。`unnest` で (乗務員, 日の境界) の並びを行に開く。
+///
+/// 範囲比較のままなので `kintai_events_driver_time` の索引に乗る。
+/// `(occurred_at AT TIME ZONE 'Asia/Tokyo')::date = ANY(...)` と書くと関数適用で
+/// 索引が効かなくなる (`kintai_repo` の `COALESCE` で同じ罠を踏んでいる)。
+const DELETE_DAYS_SQL: &str = r#"
+DELETE FROM kintai.kintai_events e
+ USING unnest($2::int8[], $3::timestamptz[], $4::timestamptz[]) AS d(driver_cd, from_ts, to_ts)
+ WHERE e.tenant_id = $1
+   AND e.driver_cd = d.driver_cd
+   AND e.occurred_at >= d.from_ts
+   AND e.occurred_at < d.to_ts
 "#;
 
-const INSERT_EVENT_SQL: &str = r#"
+/// 入れる行を **1 文で**。列ごとの配列を `unnest` で行に開く。
+const INSERT_EVENTS_SQL: &str = r#"
 INSERT INTO kintai.kintai_events
        (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+SELECT $1, d.driver_cd, d.occurred_at, d.state, d.source, d.unko_no, d.raw
+  FROM unnest($2::int8[], $3::timestamptz[], $4::text[], $5::text[], $6::text[], $7::jsonb[])
+       AS d(driver_cd, occurred_at, state, source, unko_no, raw)
 "#;
 
 /// JST の暦日 1 日ぶんの `[00:00, 翌 00:00)`。
@@ -993,11 +1064,8 @@ pub async fn apply_timecard_window(
     let (plans, mut result) = plan_window(&spans, &declared, &window.events, &remote);
     result.dry_run = window.dry_run;
     if !window.dry_run {
-        for (driver, plan) in &plans {
-            store
-                .replace_days(*driver, &plan.changed, &plan.deleted)
-                .await?;
-        }
+        // **乗務員ごとに往復しない。** 窓ぜんたいで 1 トランザクション
+        store.replace_window(&plans).await?;
     }
     result.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(result)
