@@ -134,6 +134,7 @@ print()
 
 failed = 0
 checked = 0
+missing = 0
 
 for path in sorted(registered):
     status, payload = lookup(path)
@@ -145,6 +146,7 @@ for path in sorted(registered):
         print("        - 実行行が 0 (mod.rs 等の re-export のみ) → 登録簿から外す")
         print("        - cfg で当該プラットフォームのコンパイル対象外 → 登録簿から外す")
         failed += 1
+        missing += 1
         continue
 
     if status == "ambiguous":
@@ -180,6 +182,11 @@ print(f"Checked: {checked} / Registered: {len(registered)}")
 
 if failed:
     print()
+    if registered and missing == len(registered):
+        print("ERROR: 登録簿の全ファイルがカバレッジデータで見つかりませんでした。")
+        print("       これは「カバレッジ不足」ではなく、十中八九スクリプトが")
+        print("       llvm-cov の出力を読めていない (ヘッダ行のパス判定ミス /")
+        print(f"       cargo llvm-cov の失敗など)。{cov_path} の中身を確認すること。")
     print(f"FAILED: {failed} 件。カバレッジ回帰、または登録簿と実体のズレ。")
     sys.exit(1)
 
