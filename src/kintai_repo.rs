@@ -81,6 +81,21 @@ fn is_pushed_source(row: &serde_json::Value) -> bool {
         .is_some_and(|s| crate::kintai_push::PUSHED_SOURCES.contains(&s))
 }
 
+/// この経路で運ぶ行か。push 対象の `source` で、かつ運ばないと決めた `state`
+/// ([`crate::kintai_push::NOT_CARRIED_STATES`]) でないもの。
+///
+/// MariaDB 実装は [`TIMECARD_EVENTS_SQL`] が同じものを SQL で落とすのでここを
+/// 通らない。両方に置いているのは HTTP 版 (GCP 側) と結果を揃えるため。
+fn is_carried(row: &serde_json::Value) -> bool {
+    if !is_pushed_source(row) {
+        return false;
+    }
+    !row.get("state")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .is_some_and(|s| crate::kintai_push::NOT_CARRIED_STATES.contains(&s))
+}
+
 /// 打刻の行から乗務員CD を昇順・重複無しで拾う。
 ///
 /// **0 以下は捨てる。** 乗務員CD ではない — 空の乗務員が 0 として出てきて、
@@ -162,7 +177,7 @@ pub trait KintaiEventsApi: Send + Sync {
         driver: u64,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         let rows = self.fetch_events_between(from, to, driver).await?;
-        Ok(rows.into_iter().filter(is_pushed_source).collect())
+        Ok(rows.into_iter().filter(is_carried).collect())
     }
 
     /// 対象期間に**打刻がある**乗務員CD を昇順で返す (Refs #205 の 04b)。
@@ -424,6 +439,14 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
 ///
 /// `unko_no` は残す — `time_card_dtako.unko_no` から取れるので、
 /// 「どの運行のイベントか」は失われない。
+///
+/// **`休息` も読まない** ([`crate::kintai_push::NOT_CARRIED_STATES`])。開始 (20) と
+/// 終了 (21) が同じ名前で来るため、`dtako_events` を運ばないこの経路では読み分けが
+/// できない。畳むのに要る休息区間は GCP が alc から直接引く。
+///
+/// 落とすのは**解決後の名前**であって `state` の番号ではない。`event_name` は
+/// 自由記述なので、番号で落とすと「state 20 だが別の名前」の行まで消える。
+/// 名前で落とせば、知らない値が来たときは今までどおり `unknown_states` に出る。
 const TIMECARD_EVENTS_SQL: &str = r#"
 SELECT DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
        NULL                                         AS end_datetime,
@@ -446,6 +469,7 @@ SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'),
   FROM time_card_dtako t
   LEFT JOIN time_card_dtako_state s ON s.id = t.state
  WHERE t.driver_id = :driver AND t.datetime >= :from AND t.datetime < :to
+   AND COALESCE(t.event_name, s.name) <> '休息'
  ORDER BY datetime, source
 "#;
 
@@ -829,6 +853,38 @@ mod tests {
             v["driver_id"] = serde_json::json!(d);
         }
         v
+    }
+
+    /// 運ばないと決めた `state` は**そもそも読まない** — SQL に落とし込まれている。
+    ///
+    /// 定数と SQL が 2 実装になると、片方だけ直して静かに運び始める。
+    #[test]
+    fn the_sql_drops_what_we_do_not_carry() {
+        for s in crate::kintai_push::NOT_CARRIED_STATES {
+            assert!(
+                TIMECARD_EVENTS_SQL.contains(&format!("<> '{s}'")),
+                "{s} が SQL で落とされていない"
+            );
+        }
+        // 番号ではなく解決後の名前で落とす (event_name が自由記述のため)
+        assert!(TIMECARD_EVENTS_SQL.contains("COALESCE(t.event_name, s.name) <>"));
+    }
+
+    /// 既定実装も同じものを落とす (HTTP 版と MariaDB 版で結果を揃える)。
+    #[test]
+    fn the_default_filter_drops_what_we_do_not_carry() {
+        let mut rest = row(Some(1130), "dtako");
+        rest["state"] = serde_json::json!("休息");
+        assert!(!is_carried(&rest));
+        // 前後の空白は上流の整形なのでこちらで吸う
+        rest["state"] = serde_json::json!("  休息  ");
+        assert!(!is_carried(&rest));
+        // 読み替え済みの開始 / 終了は運ぶ
+        rest["state"] = serde_json::json!("休息開始");
+        assert!(is_carried(&rest));
+        // state を持たない行は state 以外の理由で落ちるので、ここでは通す
+        assert!(is_carried(&row(Some(1130), "timecard")));
+        assert!(!is_carried(&row(Some(1130), "dtako_events")));
     }
 
     /// push する 2 つの `source` だけを通す。
