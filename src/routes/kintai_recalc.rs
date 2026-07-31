@@ -109,13 +109,15 @@
 //! | キー | 中身 |
 //! |---|---|
 //! | `unsplit` / `unsplit_total` | alc 側で `has_kudgivt = FALSE` の運行 (#205 の 32) |
-//! | `unko_diff` / `unko_diff_total` | **オンプレに在って GCP に無い運行** (#205 の 37) |
-//! | `unko_diff_gcp_only` | 逆方向 (GCP に在ってオンプレに無い) の件数 |
+//! | `unko_diff` / `unko_diff_total` | **押し込み済み (`kintai.kintai_events`) に在って GCP に無い運行** (#205 の 37) |
+//! | `unko_diff_gcp_only` | 逆方向 (GCP に在ってオンプレに無い) の件数。窓ぜんたい |
+//! | `unko_diff_gcp_only_in_month` / `..._by_month` | **対象月に始まった運行だけ**の逆方向と、月別の内訳 |
 //! | `unko_diff_gcp_only_sample` / `unko_diff_onprem_sample` | **突合キーの実物**を両側 10 件ずつ |
 //!
 //! `unko_diff` の突合は「押し込み済みの `kintai.kintai_events` の
-//! `(乗務員CD, unko_no)`」対「etags の `unko_no`」。142 行差の復旧対象リストが
-//! そのまま得られる。**空でなければ `warnings` に 1 行立つ**ので、上の 5 条件の
+//! `(乗務員CD, unko_no)`」対「etags の `unko_no`」。**左辺は「オンプレ全部」では
+//! ない** — `dtako_events` にしか出てこない運行は push されないので射程外
+//! ([`crate::kintai_http_repo::OnpremOperation`] の docs)。**空でなければ `warnings` に 1 行立つ**ので、上の 5 条件の
 //! `warnings.is_empty()` が外れて月ゲートは封をしない — 運行が欠けたままの月を
 //! 「最新」と刻まないための意図した挙動 (欠けが埋まれば静かになる)。
 //!
@@ -291,6 +293,8 @@ async fn run(
                 "unko_diff": unko_diff.items,
                 "unko_diff_total": unko_diff.total,
                 "unko_diff_gcp_only": unko_diff.gcp_only,
+                "unko_diff_gcp_only_in_month": unko_diff.gcp_only_in_month,
+                "unko_diff_gcp_only_by_month": unko_diff.gcp_only_by_month,
                 "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
                 "unko_diff_onprem_sample": unko_diff.onprem_sample,
                 "unko_diff_onprem_shape": unko_diff.onprem_shape,
@@ -388,6 +392,8 @@ async fn run(
         "unko_diff": unko_diff.items,
         "unko_diff_total": unko_diff.total,
         "unko_diff_gcp_only": unko_diff.gcp_only,
+        "unko_diff_gcp_only_in_month": unko_diff.gcp_only_in_month,
+        "unko_diff_gcp_only_by_month": unko_diff.gcp_only_by_month,
         "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
         "unko_diff_onprem_sample": unko_diff.onprem_sample,
         "unko_diff_onprem_shape": unko_diff.onprem_shape,

@@ -1205,9 +1205,20 @@ async fn measure_unko_diff(
             }
         })
         .collect();
-    let diff = crate::kintai_http_repo::record_unko_diff(&onprem, &gcp);
-    let (n, r) = (diff.total, diff.gcp_only);
+    // 逆方向を「対象月に始まった運行だけ」でも数えるために月を渡す (Refs #205 の 37)。
+    // etags は読取日で引くので窓の中に前月以前に始まった運行が混ざり、それは
+    // オンプレの当月分と一致しなくて当然 — 異常かどうかは月で絞ってから見る
+    let ym = month_ym(month);
+    let diff = crate::kintai_http_repo::record_unko_diff(&onprem, &gcp, ym);
+    let (n, r) = (diff.total, diff.gcp_only_in_month);
     tracing::info!(n, r, "kintai unko diff");
+}
+
+/// `YYYY-MM` を `(年, 月)` へ。壊れていれば `None` (月で絞る観測を諦めるだけ)。
+fn month_ym(month: &str) -> Option<(i32, u32)> {
+    let y = month.get(..4)?.parse().ok()?;
+    let m = month.get(5..7)?.parse().ok()?;
+    Some((y, m))
 }
 
 /// 保存済みの指紋がいまの指紋と一致するか (= 読み・畳みを省いてよいか)。

@@ -1435,26 +1435,30 @@ async fn test_unko_diff_names_the_operations_missing_from_the_real_etags_respons
         let onprem = vec![
             rust_ichibanboshi::kintai_http_repo::OnpremOperation {
                 driver_cd: 1078,
-                unko_no: "26013110000000000023021".to_string(),
+                unko_no: "260131100000000000230211".to_string(),
                 first_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
                 last_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
             },
             rust_ichibanboshi::kintai_http_repo::OnpremOperation {
                 driver_cd: 1517,
-                unko_no: "26012410055500000023022".to_string(),
+                unko_no: "260124100555000000230221".to_string(),
                 first_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 24).unwrap(),
                 last_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
             },
         ];
-        rust_ichibanboshi::kintai_http_repo::record_unko_diff(&onprem, &gcp);
+        rust_ichibanboshi::kintai_http_repo::record_unko_diff(&onprem, &gcp, Some((2026, 1)));
         d
     })
     .await;
     assert!(digest.unwrap().is_some(), "月ゲートの指紋は従来どおり");
     assert_eq!(diff.total, 1, "{diff:?}");
     assert_eq!(diff.items[0].driver_cd, 1517);
-    assert_eq!(diff.items[0].unko_no, "26012410055500000023022");
+    assert_eq!(diff.items[0].unko_no, "260124100555000000230221", "生の値");
     assert_eq!(diff.items[0].start_date.as_deref(), Some("2026-01-24"));
+    assert_eq!(
+        diff.gcp_only_in_month, 0,
+        "GCP 側は 1 月ぶんが全部一致している"
+    );
     assert_eq!(diff.items[0].first_date, "2026-01-24");
     assert_eq!(diff.items[0].last_date, "2026-01-26");
     assert_eq!(diff.gcp_only, 0);
