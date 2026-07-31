@@ -214,6 +214,13 @@ pub async fn run(
             Arc::new(crate::kintai_version::DisabledKintaiVersionRepo)
         };
 
+    // 生イベントの読み先が名乗るテナント (Refs #205 の 06)。畳むときに書き先と
+    // 突き合わせる — 割れたまま畳むと別テナントのデジタコで組んだ勤務を書き込む。
+    // MariaDB 直読みの形では空 = 突き合わせる相手が無いので None
+    let read_tenant = routes::kintai_timecard::ReadTenant(
+        uuid::Uuid::parse_str(config.kintai_events.tenant_id.trim()).ok(),
+    );
+
     // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
     // 就業規則が変わったら TOML で追随できるよう config から取る。
     let kosoku_params = Arc::new(build_kosoku_params(&config));
@@ -374,6 +381,13 @@ pub async fn run(
             "/kintai/timecard/window",
             post(routes::kintai_timecard::receive_window),
         )
+        // 全量再計算 (Refs #205 の 06)。deploy / TOML 変更で全単位が stale に
+        // なったときだけ回す。窓の受け口が畳むのは「変わった乗務員」だけなので、
+        // 全量はページングするこちらに分ける。**GET は書かない**
+        .route(
+            "/kintai/recalc",
+            get(routes::kintai_recalc::preview).post(routes::kintai_recalc::recalc),
+        )
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
@@ -417,6 +431,7 @@ pub async fn run(
         .layer(Extension(kintai_events_repo))
         .layer(Extension(kintai_version_repo))
         .layer(Extension(kintai_pg_store))
+        .layer(Extension(read_tenant))
         .layer(Extension(kosoku_params))
         .layer(Extension(restraint_store));
 

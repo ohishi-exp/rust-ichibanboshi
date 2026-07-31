@@ -765,6 +765,8 @@ fn window_of(months: &[&str], drivers: &[i64], events: Vec<serde_json::Value>) -
         drivers: drivers.to_vec(),
         events,
         dry_run: false,
+        // 畳むのは route 側の仕事。ここで確かめるのは打刻の反映だけ
+        fold: false,
     }
 }
 
