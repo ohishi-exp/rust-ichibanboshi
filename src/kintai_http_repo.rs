@@ -649,6 +649,95 @@ fn month_etags_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
     Some((first, next_first))
 }
 
+// ── 入力 (dtako_events) の欠けの検知 (Refs #205 の 21) ─────────────────────
+
+/// `unko_no` の先頭に埋まっている運行開始日時の桁数 (`YYMMDDHHMMSS`)。
+const UNKO_NO_DATE_DIGITS: usize = 6;
+
+/// etags の窓の末尾がこれより長く空いていたら「入力が欠けている」と見なす (日)。
+///
+/// **実測で決めた値。** オンプレの生イベント口 (`/api/kintai/events`) から乗務員
+/// 47 名 (全 141 名の 1/3) × 4 か月の 966 運行を引いて、窓 `[月初, 翌月初]` の
+/// 日ごとの運行開始件数を数えると:
+///
+/// | 月 | 運行開始が 0 件の日 (窓の途中) | 窓の末尾の空き |
+/// |---|---|---|
+/// | 2025-12 (年末) | 無し | 1 日 |
+/// | 2026-01 (年始) | 無し | 0 日 |
+/// | 2026-05 | 2 日 (05-03 / 05-23) | 0 日 |
+/// | 2026-06 | 1 日 (06-13) | 0 日 |
+///
+/// **年末年始でも運行開始は途切れない** (12/27〜12/31 も毎日 4〜10 件、01/01 も
+/// 2 件)。1/3 の抽出でこれなので、全乗務員なら空き日はさらに減る方向にしか動かない
+/// (部分集合のゼロ日 ⊇ 全体のゼロ日)。実測の最大 1 日に 1 日ぶんの余裕を足して
+/// 「3 日以上空いたら立てる」にしてある。
+const MAX_TAIL_GAP_DAYS: i64 = 2;
+
+/// `unko_no` の先頭 6 桁 (`YYMMDD`) = **運行開始日**。
+///
+/// 定義を書いた場所は alc にも本リポにも無い (`運行NO` はデジタコ由来の不透明な
+/// キーとして通されているだけ) ので、実データで裏を取った値。上記 966 運行で
+/// `unko_no[..12]` を `YYMMDDHHMMSS` として読むと、**不一致 0 / パース不能 0** で、
+/// うち 922 件はその運行の `運行開始` の点イベントと**秒まで一致**した
+/// (例: `26060610055500000023021` → `2026-06-06 10:05:55`)。
+///
+/// 末尾 (車輌コード) の長さは可変 (実データは 23 桁、22 桁の実物も居る) なので、
+/// **先頭だけを見て後ろは一切見ない**。
+fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(unko_no.get(..UNKO_NO_DATE_DIGITS)?, "%y%m%d").ok()
+}
+
+/// **入力の欠けを etags の一覧から見つける** (Refs #205 の 21)。
+///
+/// `fetch_etags` は月ゲートのために毎回引いているので、**追加の往復ゼロ・alc の
+/// 改修ゼロ**で日別のカバー状況が作れる。見るのは 2 つ:
+///
+/// 1. `etag` が `None` = alc の DB に運行はあるのに R2 に `KUDGIVT.csv` が無い。
+///    閾値の要らない確実な欠け (upload / split 未完了)
+/// 2. 窓の末尾の空き。#205-19 が実証した「末尾の `dtako_events` が欠けると打刻の
+///    無い勤務が黙って消える」形は、**運行そのものが alc の索引に無い**ので上流は
+///    警告を出せない。こちらで「運行開始日が窓の端まで届いているか」を見るしかない
+///
+/// **進行中の月**は末尾に運行が無くて当然なので、期待する末尾は `today - 1 日`
+/// までに切り下げる (`today` 当日は読み取りがまだ上がっていないのが普通)。
+///
+/// 誤検知は**安全側**に倒れる — warning が立つと月ゲートが封をしないので、最悪でも
+/// 「毎回全量読みに戻る (遅いが正しい)」で済む。逆 (見逃し) は静かに間違う。
+fn missing_input_warnings(
+    pairs: &[(String, Option<String>)],
+    window_end: NaiveDate,
+    today: NaiveDate,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let no_etag = pairs.iter().filter(|(_, etag)| etag.is_none()).count();
+    if no_etag > 0 {
+        out.push(format!("dtako 入力欠け: R2 に CSV の無い運行 {no_etag} 件"));
+    }
+    let expected = window_end.min(today - chrono::Duration::days(1));
+    match pairs
+        .iter()
+        .filter_map(|(u, _)| unko_no_start_date(u))
+        .max()
+    {
+        None => out.push("dtako 入力欠け: 運行開始日を読めた運行が 0 件".to_string()),
+        Some(last) if (expected - last).num_days() > MAX_TAIL_GAP_DAYS => {
+            // マクロは 1 行に収める (CLAUDE.md — 折り返すと行カバレッジに乗らない)
+            let m = format!("dtako 入力欠け: 運行が {last} まで (期待 {expected})");
+            out.push(m);
+        }
+        Some(_) => {}
+    }
+    out
+}
+
+/// いまの日付 (JST)。窓の末尾の期待値を「進行中の月」で切り下げるためだけに使う。
+fn today_jst() -> NaiveDate {
+    let jst = chrono::FixedOffset::east_opt(crate::kintai_push::JST_OFFSET_SECONDS);
+    chrono::Utc::now()
+        .with_timezone(&jst.expect("JST offset is in range"))
+        .date_naive()
+}
+
 /// `(unko_no, etag)` の一覧から月ゲートの dtako 側 digest を作る。
 ///
 /// `etag` が `None` (R2 に無い / upload 未完了) の運行は空文字として畳む —
@@ -973,6 +1062,15 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
         let (from, to) = month_etags_bounds(month)
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         let pairs = self.fetch_etags(from, to).await?;
+        // 入力の欠けは alc からは見えない (索引に無い運行は warnings に出ない) ので、
+        // 引いてきた一覧の形から自分で見つけて `record_warning` へ流す (Refs #205 の 21)
+        // `None` (alc に口が無い) は「欠けている」ではなく「判定できない」— 検知しない
+        if let Some(p) = pairs.as_deref() {
+            for w in missing_input_warnings(p, to, today_jst()) {
+                tracing::warn!(warning = %w, "kintai dtako input gap");
+                record_warning(&w);
+            }
+        }
         Ok(pairs.map(|p| digest_from_pairs(&p)))
     }
 }
@@ -1590,6 +1688,102 @@ mod tests {
         })
         .await;
         assert_eq!(seen_some, Some(true));
+    }
+
+    // ── 入力欠けの検知 (Refs #205 の 21) ──────────────────────────────────
+
+    /// `unko_no` の実物 (23 桁) / テスト fixture の 22 桁 / 読めない形。
+    #[test]
+    fn unko_no_start_date_reads_the_leading_yymmdd_only() {
+        let real = unko_no_start_date("26060610055500000023021");
+        assert_eq!(real, Some(d(2026, 6, 6)), "実物 23 桁");
+        let short_tail = unko_no_start_date("2602241025060000000272");
+        assert_eq!(short_tail, Some(d(2026, 2, 24)), "車輌コードが短い 22 桁");
+        assert_eq!(unko_no_start_date("U1"), None, "6 桁に満たない");
+        assert_eq!(unko_no_start_date("269999123456"), None, "日付として不正");
+        assert_eq!(unko_no_start_date("26060X10055500"), None, "数字でない");
+    }
+
+    fn pair(unko_no: &str, etag: Option<&str>) -> (String, Option<String>) {
+        (unko_no.to_string(), etag.map(str::to_string))
+    }
+
+    /// **揃っている月は静か。** 窓の端まで運行開始が届いていれば warning ゼロ。
+    #[test]
+    fn missing_input_warnings_is_silent_when_the_window_is_covered() {
+        let pairs = vec![
+            pair("26060110000000000023021", Some("e1")),
+            pair("26070110000000000023021", Some("e2")),
+        ];
+        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        assert!(w.is_empty(), "窓の端 (07-01) まで在るので静か: {w:?}");
+    }
+
+    /// **実測の自然な空き (1 日) では立たない。** 閾値の余裕ぶんの確認。
+    #[test]
+    fn missing_input_warnings_tolerates_the_measured_natural_tail_gap() {
+        let pairs = vec![pair("25123110000000000023021", Some("e1"))];
+        let w = missing_input_warnings(&pairs, d(2026, 1, 1), d(2026, 1, 20));
+        assert!(w.is_empty(), "年末の 1 日空きは自然: {w:?}");
+    }
+
+    /// **#205-19 が実証した形。** 末尾の運行が丸ごと欠けたら立つ。
+    #[test]
+    fn missing_input_warnings_fires_when_the_tail_of_the_month_is_missing() {
+        let pairs = vec![
+            pair("26060110000000000023021", Some("e1")),
+            pair("26062410000000000023021", Some("e2")),
+        ];
+        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        assert_eq!(w.len(), 1, "末尾 7 日ぶんの欠け: {w:?}");
+        assert!(
+            w[0].contains("2026-06-24"),
+            "どこまでしか無いかを書く: {w:?}"
+        );
+        assert!(w[0].contains("2026-07-01"), "期待した末尾も書く: {w:?}");
+    }
+
+    /// **進行中の月は末尾に運行が無くて当然。** 期待値を `today - 1` に切り下げる。
+    #[test]
+    fn missing_input_warnings_clamps_the_expectation_to_yesterday() {
+        let pairs = vec![pair("26070310000000000023021", Some("e1"))];
+        // 7 月を 07-04 に畳む — 窓の端 (08-01) はまだ来ていない
+        let w = missing_input_warnings(&pairs, d(2026, 8, 1), d(2026, 7, 4));
+        assert!(w.is_empty(), "当月の末尾の空きは欠けではない: {w:?}");
+    }
+
+    /// **1 件も日付が読めなければ「判定できない」ではなく警告。** 安全側。
+    #[test]
+    fn missing_input_warnings_fires_when_no_unko_no_carries_a_date() {
+        let pairs = vec![pair("U1", Some("e1")), pair("U2", Some("e2"))];
+        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("0 件"), "{w:?}");
+    }
+
+    /// **`etag: null` は閾値の要らない確実な欠け** (R2 に CSV がまだ無い)。
+    #[test]
+    fn missing_input_warnings_fires_for_operations_without_an_r2_etag() {
+        let pairs = vec![
+            pair("26060110000000000023021", Some("e1")),
+            pair("26070110000000000023021", None),
+        ];
+        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        assert_eq!(w.len(), 1, "末尾は埋まっているので etag の 1 本だけ: {w:?}");
+        assert!(w[0].contains("R2 に CSV の無い運行 1 件"), "{w:?}");
+    }
+
+    /// 空の一覧は「末尾が欠けている」ではなく「1 件も読めない」で立つ。
+    #[test]
+    fn missing_input_warnings_fires_on_an_empty_list() {
+        let w = missing_input_warnings(&[], d(2026, 7, 1), d(2026, 7, 20));
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    /// `today_jst` は UTC 深夜の前後で日付がずれない (JST 固定オフセット)。
+    #[test]
+    fn today_jst_is_a_plausible_date() {
+        assert!(today_jst() >= d(2026, 1, 1), "2026 年以降のはず");
     }
 
     #[test]
