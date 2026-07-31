@@ -62,6 +62,10 @@ path = "src/kosoku_paper.rs"
 [[files]]
 path = "src/kintai_rest_diff.rs"
 
+# 運行 → 読取日の引き当て (Refs #205 の 42)。同じく純粋関数
+[[files]]
+path = "src/kintai_reading_dates.rs"
+
 # --- 給与 (給与大臣) ---
 
 [[files]]

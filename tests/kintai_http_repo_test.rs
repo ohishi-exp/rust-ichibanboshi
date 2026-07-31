@@ -808,6 +808,20 @@ impl KintaiEventsApi for FallbackStub {
                        "unko_no": "26070208000000000011301"}),
         ])
     }
+
+    async fn fetch_operation_reading_dates_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        Ok(vec![
+            json!({"driver_cd": 1130, "unko_no": "26070208000000000011301",
+                       "reading_date": "2026-07-06", "run_date": "2026-07-02",
+                       "departure_at": "2026-07-02 08:00:00",
+                       "return_at": "2026-07-02 18:00:00"}),
+        ])
+    }
 }
 
 fn repo_with_fallback(base_url: &str) -> HttpKintaiEventsRepo {
@@ -912,6 +926,27 @@ async fn test_rest_events_need_the_fallback_and_are_fail_closed_without_it() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["source"], "dtako");
     assert_eq!(rows[0]["state"], "休息");
+}
+
+/// 運行の読取日もオンプレ専用 (Refs #205 の 42)。**alc の `dtako_operations` にも
+/// `reading_date` はあるが、そちらは使わない** — 引き当てる相手がオンプレにしか
+/// 無いため。委譲先が無ければ 503。
+#[tokio::test]
+async fn test_reading_dates_need_the_fallback_and_are_fail_closed_without_it() {
+    let server = MockServer::start().await;
+    let err = repo(&server.uri())
+        .fetch_operation_reading_dates("2026-07", Some(1130))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, KintaiRepoError::NotConfigured));
+
+    let rows = repo_with_fallback(&server.uri())
+        .fetch_operation_reading_dates("2026-07", Some(1130))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["reading_date"], "2026-07-06");
+    assert_eq!(rows[0]["driver_cd"], 1130);
 }
 
 // ── token の渡し方 ────────────────────────────────────────────────────────

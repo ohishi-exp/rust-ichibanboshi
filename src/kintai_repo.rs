@@ -277,6 +277,39 @@ pub trait KintaiEventsApi: Send + Sync {
         self.fetch_rest_events_between(&from, &to, driver).await
     }
 
+    /// 任意の期間 `[from, to)` に**かかる運行**と、その**読取日** (Refs #205 の 42)。
+    /// `driver` を省略すると全乗務員。
+    ///
+    /// [`crate::kintai_reading_dates`] が「値のずれた勤務を直すのにどの読取日を
+    /// 取り直せばよいか」を答えるための読み出し口。読み先は `dtako_rows` で、
+    /// **alc は呼ばない** — 理由はあちらのモジュール docs。
+    ///
+    /// **既定は `NotConfigured` = 503。** フェリー ([`fetch_ferry_between`]) と
+    /// 休息のずれ ([`fetch_rest_events_between`]) と同じオンプレ専用の口。
+    ///
+    /// [`fetch_ferry_between`]: KintaiEventsApi::fetch_ferry_between
+    /// [`fetch_rest_events_between`]: KintaiEventsApi::fetch_rest_events_between
+    async fn fetch_operation_reading_dates_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        Err(KintaiRepoError::NotConfigured)
+    }
+
+    /// 対象月 (`YYYY-MM`) にかかる運行の読取日。範囲は [`month_range`]。
+    async fn fetch_operation_reading_dates(
+        &self,
+        month: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let (from, to) = month_range(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        self.fetch_operation_reading_dates_between(&from, &to, driver)
+            .await
+    }
+
     /// 対象月の dtako 側 (alc) 指紋材料 (Refs #205 実装計画 13、月ゲート)。
     ///
     /// `fetch_all_events_between` を実際に読まなくても「前回 fold したときと入力が
@@ -677,6 +710,72 @@ fn rest_row_to_json(row: RestEventRow) -> serde_json::Value {
     })
 }
 
+/// 期間にかかる運行と、その**読取日** (Refs #205 の 42)。
+///
+/// `dtako_rows` は**1 運行 × 対象乗務員で 1 行**の表で、`読取日` / `運行日` /
+/// `運行NO` / `対象乗務員CD` / `出庫日時` / `帰庫日時` を全部持っている
+/// (`yhonda-ohishi/nginx` の `Model/Entity/DtakoRow.php` / `Model/Table/DtakoRowsTable.php`)。
+/// JOIN も集約も要らない。
+///
+/// - **期間の条件は 3 つの OR。** 出庫・帰庫・運行日のどれかが窓に入れば拾う。
+///   - `出庫日時` / `帰庫日時` の 2 本立ては [`FERRY_SQL`] と同じで、上流の
+///     「当月に出庫**または**帰庫した運行」を写したもの
+///   - `運行日` を足すのは #205 の 38 と同じ理由 — **日時だけだと月末の運行が落ちる**
+///     (alc も `reading_date` 単独から `reading_date OR operation_date` へ直した)
+///   - **`COALESCE` で 1 本にまとめないこと。** 関数適用で索引が効かなくなる
+///     ([`EVENTS_SQL`] が 0.2 秒 → 4 分になった罠と同じ)。列ごとに条件を分ける
+/// - **`読取日` で絞らない。** 読取日は運行終了の後に付く (実測: 運行日 06-24 →
+///   読取日 07-06) ので、読取日で窓を切ると月末の運行が丸ごと落ちる
+/// - `:driver` が NULL なら全乗務員
+///
+/// ## `kintai_reader` の GRANT は未確認 (Refs #205 の 42)
+///
+/// `dtako_rows` 自体は [`FERRY_SQL`] が既に読んでいる (`運行NO` / `対象乗務員CD` /
+/// `帰庫日時` / `出庫日時`) が、**`読取日` / `運行日` が GRANT に入っているかは
+/// 確かめられていない**。`dtako_ferry_rows` は料金列があるため列単位 GRANT で、
+/// 列を足すときは GRANT の追加が要る (そちらの docs)。`dtako_rows` が表単位か
+/// 列単位かは読み取れていない。
+///
+/// **外れても黙って 0 件にはならない** — `map_repo_err` が MariaDB のエラー文を
+/// そのまま載せて 502 になる。落ちるのはこの口だけ。
+const OPERATION_READING_DATES_SQL: &str = r#"
+SELECT r.`対象乗務員CD`                                 AS driver_cd,
+       r.`運行NO`                                       AS unko_no,
+       DATE_FORMAT(r.`読取日`, '%Y-%m-%d')              AS reading_date,
+       DATE_FORMAT(r.`運行日`, '%Y-%m-%d')              AS run_date,
+       DATE_FORMAT(r.`出庫日時`, '%Y-%m-%d %H:%i:%s')   AS departure_at,
+       DATE_FORMAT(r.`帰庫日時`, '%Y-%m-%d %H:%i:%s')   AS return_at
+  FROM dtako_rows r
+ WHERE (:driver IS NULL OR r.`対象乗務員CD` = :driver)
+   AND (   (r.`出庫日時` >= :from AND r.`出庫日時` < :to)
+        OR (r.`帰庫日時` >= :from AND r.`帰庫日時` < :to)
+        OR (r.`運行日` >= DATE(:from) AND r.`運行日` < DATE(:to)) )
+ ORDER BY r.`対象乗務員CD`, r.`運行NO`
+"#;
+
+/// `OPERATION_READING_DATES_SQL` の 1 行 (列の順序と 1:1)。
+type ReadingDateRow = (
+    Option<i64>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// 運行 1 行を JSON へ。`null` は `null` のまま (欠損を化かさない)。
+fn reading_date_row_to_json(row: ReadingDateRow) -> serde_json::Value {
+    let (driver_cd, unko_no, reading_date, run_date, departure_at, return_at) = row;
+    serde_json::json!({
+        "driver_cd": driver_cd,
+        "unko_no": unko_no,
+        "reading_date": reading_date,
+        "run_date": run_date,
+        "departure_at": departure_at,
+        "return_at": return_at,
+    })
+}
+
 /// フェリー区間 (Refs #146)。
 ///
 /// - **`dtako_ferry_rows` は 3 列しか読めない** (`運行NO` / `開始日時` / `終了日時`)。
@@ -838,6 +937,32 @@ impl KintaiEventsApi for MariadbKintaiEventsRepo {
             .await
             .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
         Ok(rows.into_iter().map(row_to_json).collect())
+    }
+
+    /// 期間にかかる運行と読取日 (Refs #205 の 42、[`OPERATION_READING_DATES_SQL`])。
+    async fn fetch_operation_reading_dates_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let rows: Vec<ReadingDateRow> = conn
+            .exec(
+                OPERATION_READING_DATES_SQL,
+                params! {
+                    "from" => from,
+                    "to" => to,
+                    "driver" => driver,
+                },
+            )
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(reading_date_row_to_json).collect())
     }
 
     /// 休息だけを `運行NO` 付きで両表から読む (Refs #205 の 41、[`REST_EVENTS_SQL`])。

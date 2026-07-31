@@ -1965,6 +1965,27 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
         }
     }
 
+    /// 運行の読取日もオンプレ専用 (Refs #205 の 42)。読み先の `dtako_rows` は
+    /// 上流に口が無いので、フェリー・休息と同じく `fallback` へ委譲する。
+    ///
+    /// **alc の `dtako_operations` も `reading_date` を持つが、そちらは使わない。**
+    /// 引き当てる相手 (勤務・運行) がオンプレの MariaDB からしか出ないため、
+    /// 別システムの日付と突き合わせる形にしない ([`crate::kintai_reading_dates`] の docs)。
+    async fn fetch_operation_reading_dates_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        match &self.fallback {
+            Some(fb) => {
+                fb.fetch_operation_reading_dates_between(from, to, driver)
+                    .await
+            }
+            None => Err(KintaiRepoError::NotConfigured),
+        }
+    }
+
     async fn fetch_dtako_month_digest(
         &self,
         month: &str,
