@@ -83,6 +83,20 @@ pub const ALLOWED_STATES: [&str; 7] = [
 /// R2 に永続化済みだから。
 pub const PUSHED_SOURCES: [&str; 2] = ["timecard", "dtako"];
 
+/// **運ばないと決めた `state` の実値** (2026-07-31 のユーザー判断)。
+///
+/// `time_card_dtako` の休息は開始 (state 20) と終了 (21) が**同じ名前「休息」**で
+/// 来る ([`crate::kosoku_paper`] の `tc_stream` が実データから確認済み)。紙との突合は
+/// `dtako_events` の休息区間の端と時刻照合して `休息開始` / `休息終了` に読み替えて
+/// いるが、**この経路は `dtako_events` を運ばない** (決定 5) ので同じ手が使えない。
+///
+/// 畳むのに要る休息区間は GCP が alc から直接引くため、**打刻由来の確定休息は
+/// 運ばない**。読んでから捨てるのではなく [`crate::kintai_repo`] の SQL で落とす。
+///
+/// [`ALLOWED_STATES`] からは外さない — 万一 GCP 側に届いたときに DDL の CHECK で
+/// 落ちるより、`UnknownState` として実値が報告されるほうが原因に辿り着ける。
+pub const NOT_CARRIED_STATES: [&str; 1] = ["休息"];
+
 /// 同じ `(occurred_at, state)` が衝突したときに残す `source` の優先順。
 ///
 /// 添字が小さい方を残す。`timecard` が上なのは、人が確定させた打刻であり
