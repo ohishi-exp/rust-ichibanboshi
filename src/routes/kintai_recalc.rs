@@ -101,6 +101,23 @@
 //! になる。**5 条件は「そのページで実際に何か書いたか」を問わない** — 2 の呼び出しが
 //! 全員 unchanged でも、月まるごと 1 ページで回りきっていれば gate は書かれる。
 //!
+//! ## 応答から読める観測 — `unsplit` / `unko_diff` (Refs #205 の 32 / 37)
+//!
+//! どちらも**判定に一切入らない素通し**で、材料は月ゲートが毎回引いている
+//! `GET /api/dtako/events/etags` の応答:
+//!
+//! | キー | 中身 |
+//! |---|---|
+//! | `unsplit` / `unsplit_total` | alc 側で `has_kudgivt = FALSE` の運行 (#205 の 32) |
+//! | `unko_diff` / `unko_diff_total` | **オンプレに在って GCP に無い運行** (#205 の 37) |
+//! | `unko_diff_gcp_only` | 逆方向 (GCP に在ってオンプレに無い) の件数 |
+//!
+//! `unko_diff` の突合は「押し込み済みの `kintai.kintai_events` の
+//! `(乗務員CD, unko_no)`」対「etags の `unko_no`」。142 行差の復旧対象リストが
+//! そのまま得られる。**空でなければ `warnings` に 1 行立つ**ので、上の 5 条件の
+//! `warnings.is_empty()` が外れて月ゲートは封をしない — 運行が欠けたままの月を
+//! 「最新」と刻まないための意図した挙動 (欠けが埋まれば静かになる)。
+//!
 //! ## GET は絶対に書かない
 //!
 //! `GET` は `apply` を持たない。「読むだけのつもりが全乗務員を書き直していた」を
@@ -232,9 +249,16 @@ async fn run(
     // `with_unsplit_sink` を重ねて包むのは `unsplit` (Refs #205 の 32、alc の
     // `has_kudgivt = FALSE` 一覧) も同じ `fetch_etags` の応答から拾うため。判定には
     // 使わない素通しで、142 行差の仮説検証用に応答へそのまま載せるだけ
-    let ((gate, gate_warnings), unsplit, unsplit_total) =
-        crate::kintai_http_repo::with_unsplit_sink(crate::kintai_http_repo::with_warning_sink(
-            crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply),
+    //
+    // `with_unko_diff_sink` をさらに重ねるのは運行の突合 (Refs #205 の 37) — オンプレ
+    // (押し込み済みの `kintai_events`) に在って GCP (alc の etags) に無い運行の一覧。
+    // これも同じ `fetch_etags` の応答が材料で、判定には使わず応答へ素通しするだけ
+    #[allow(clippy::type_complexity)]
+    let (((gate, gate_warnings), unsplit, unsplit_total), unko_diff) =
+        crate::kintai_http_repo::with_unko_diff_sink(crate::kintai_http_repo::with_unsplit_sink(
+            crate::kintai_http_repo::with_warning_sink(crate::kintai_fold::month_gate_report(
+                &repo, &st, &params, &req.month, req.apply,
+            )),
         ))
         .await;
     let gate = match gate.map_err(map_push_err)? {
@@ -258,6 +282,9 @@ async fn run(
                 "elapsed_ms": started.elapsed().as_millis() as u64,
                 "unsplit": unsplit,
                 "unsplit_total": unsplit_total,
+                "unko_diff": unko_diff.items,
+                "unko_diff_total": unko_diff.total,
+                "unko_diff_gcp_only": unko_diff.gcp_only,
             })));
         }
         other => other,
@@ -347,6 +374,9 @@ async fn run(
         "elapsed_ms": started.elapsed().as_millis() as u64,
         "unsplit": unsplit,
         "unsplit_total": unsplit_total,
+        "unko_diff": unko_diff.items,
+        "unko_diff_total": unko_diff.total,
+        "unko_diff_gcp_only": unko_diff.gcp_only,
     })))
 }
 

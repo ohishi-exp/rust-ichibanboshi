@@ -1088,6 +1088,9 @@ async fn compute_month_digests(
     let bad_month = || KintaiPushError::NotConfigured(format!("bad month: {month}"));
     let from = tz(parse_dt(&from_s).ok_or_else(bad_month)?);
     let to = tz(parse_dt(&to_s).ok_or_else(bad_month)?);
+    // 運行の突合 (Refs #205 の 37)。両側とも既に読んでいるものだけで組む —
+    // GCP 側は直前の etags、オンプレ側は押し込み済みの kintai_events
+    measure_unko_diff(store, month, from, to).await;
     let punch_digest = match store.stored_month_punch_digest(from, to).await {
         Ok(d) => d,
         Err(e) => {
@@ -1096,6 +1099,50 @@ async fn compute_month_digests(
         }
     };
     Ok(Some((dtako_digest, punch_digest)))
+}
+
+/// **オンプレと GCP の運行を突き合わせて記録する** (Refs #205 の 37)。
+///
+/// GCP 側で畳んだ 2026-06 が オンプレ基準より 143 行少ない件は「乗務員ごとに最後の
+/// 1 本の `運行NO` がまるごと GCP 側の運行一覧に無い」形だと分かっている。**どの
+/// 運行が欠けているかを名指し**できるようにするのがここ — 結果は task local に
+/// 積まれ、[`crate::routes::kintai_recalc`] が `unko_diff` として応答に載せる。
+///
+/// **判定には一切入らない。** GCP 側の一覧は直前の `fetch_dtako_month_digest` が
+/// 引いた etags をそのまま読むだけで、月ゲートの指紋 (`digest_from_pairs`) には
+/// 触れない。突合そのものが失敗しても loud に warn して先へ進む — 最適化でも
+/// 判定でもない観測なので、ここで口を落とす理由が無い ([`compute_month_digests`]
+/// の docs と同じ考え方)。
+async fn measure_unko_diff(
+    store: &KintaiPgStore,
+    month: &str,
+    from: DateTime<FixedOffset>,
+    to: DateTime<FixedOffset>,
+) {
+    let Some(gcp) = crate::kintai_http_repo::collected_etag_unko_nos() else {
+        return;
+    };
+    let rows = match store.stored_month_operations(from, to).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(month = %month, error = %e, "kintai unko diff read failed");
+            return;
+        }
+    };
+    let onprem: Vec<crate::kintai_http_repo::OnpremOperation> = rows
+        .into_iter()
+        .map(|(driver_cd, unko_no, first_date, last_date)| {
+            crate::kintai_http_repo::OnpremOperation {
+                driver_cd,
+                unko_no,
+                first_date,
+                last_date,
+            }
+        })
+        .collect();
+    let diff = crate::kintai_http_repo::record_unko_diff(&onprem, &gcp);
+    let (n, r) = (diff.total, diff.gcp_only);
+    tracing::info!(n, r, "kintai unko diff");
 }
 
 /// 保存済みの指紋がいまの指紋と一致するか (= 読み・畳みを省いてよいか)。

@@ -334,6 +334,28 @@ SELECT encode(sha256(convert_to(coalesce(string_agg(
  WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3 AND source = ANY($4)
 "#;
 
+/// **オンプレ側の運行一覧** (Refs #205 の 37)。GCP 側 (alc の etags) と突き合わせて
+/// 「オンプレに在って GCP に無い運行」を名指しするための材料。
+///
+/// 実体は押し込み済みの `kintai.kintai_events` で、`unko_no` を持つのは `dtako`
+/// (= オンプレ MariaDB の `time_card_dtako`) 由来の行だけ ([`PUSHED_SOURCES`])。
+/// 打刻だけの行 (`timecard`) は `unko_no` が NULL なので自然に落ちる。
+///
+/// **窓は [`crate::kintai_repo::month_range`]** — `fold_month` が実際に読む窓と
+/// 同じにする。ずらすと「fold の入力には在るのに突合には出ない」運行ができる。
+/// 日付は署名 SQL と同じく JST の暦日で返す。
+pub const MONTH_OPERATIONS_SQL: &str = r#"
+SELECT driver_cd,
+       unko_no,
+       min((occurred_at AT TIME ZONE 'Asia/Tokyo')::date) AS first_date,
+       max((occurred_at AT TIME ZONE 'Asia/Tokyo')::date) AS last_date
+  FROM kintai.kintai_events
+ WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3
+   AND source = ANY($4) AND unko_no IS NOT NULL AND unko_no <> ''
+ GROUP BY 1, 2
+ ORDER BY 1, 2
+"#;
+
 /// [`STORED_SIGNATURES_SQL`] の**複数乗務員版**。式は 1 文字も変えない。
 ///
 /// 署名の突き合わせを**受け側の中**でやるための口 (Refs #205 の 04b)。送り側が
@@ -625,6 +647,37 @@ impl KintaiPgStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<String, _>("digest"))
+    }
+
+    /// **オンプレ側の運行一覧** (Refs #205 の 37、[`MONTH_OPERATIONS_SQL`])。
+    /// `(乗務員CD, unko_no)` と、その運行のイベントが覆う暦日 (JST) の範囲。
+    ///
+    /// 突合の材料を返すだけで**判定には使わない** — 呼び出し側
+    /// ([`crate::kintai_fold`]) が etags の一覧と突き合わせて応答に載せる。
+    pub async fn stored_month_operations(
+        &self,
+        from: DateTime<FixedOffset>,
+        to: DateTime<FixedOffset>,
+    ) -> Result<Vec<(i64, String, NaiveDate, NaiveDate)>, KintaiPushError> {
+        use sqlx::Row;
+        let rows = sqlx::query(MONTH_OPERATIONS_SQL)
+            .bind(self.tenant_id)
+            .bind(from)
+            .bind(to)
+            .bind(&PUSHED_SOURCES[..])
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>("driver_cd"),
+                    r.get::<String, _>("unko_no"),
+                    r.get::<NaiveDate, _>("first_date"),
+                    r.get::<NaiveDate, _>("last_date"),
+                )
+            })
+            .collect())
     }
 
     /// 差分のあった日だけを delete-then-insert する。**1 トランザクション**。

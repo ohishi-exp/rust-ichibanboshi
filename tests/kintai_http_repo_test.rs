@@ -1405,3 +1405,81 @@ async fn test_unsplit_defaults_to_empty_when_the_upstream_omits_it() {
     assert!(items.is_empty());
     assert_eq!(total, 0);
 }
+
+// ── #205 の 37: 運行の突合 (オンプレ × GCP) ─────────────────────────────────
+
+/// **本題。** 実 HTTP 応答の `items[].unko_no` がそのまま突合の GCP 側になり、
+/// オンプレ (Postgres の `kintai_events` 相当) に在って GCP に無い運行が名指しで
+/// 出る。**月ゲートの digest は従来どおり返る** — 突合は読むだけで判定を変えない。
+#[tokio::test]
+async fn test_unko_diff_names_the_operations_missing_from_the_real_etags_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-01-01", "date_to": "2026-02-01"},
+            "items": [
+                {"unko_no": "26013110000000000023021", "etag": "e1", "driver_cds": ["D1"]},
+            ],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (digest, diff) = rust_ichibanboshi::kintai_http_repo::with_unko_diff_sink(async {
+        let d = repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await;
+        // 突き合わせるのは kintai_fold の仕事 — ここでは同じ口を直に叩いて配線を見る
+        let gcp = rust_ichibanboshi::kintai_http_repo::collected_etag_unko_nos();
+        let gcp = gcp.expect("etags を引いた後は集合が立っている");
+        assert!(gcp.contains("26013110000000000023021"), "{gcp:?}");
+        let onprem = vec![
+            rust_ichibanboshi::kintai_http_repo::OnpremOperation {
+                driver_cd: 1078,
+                unko_no: "26013110000000000023021".to_string(),
+                first_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+                last_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+            },
+            rust_ichibanboshi::kintai_http_repo::OnpremOperation {
+                driver_cd: 1517,
+                unko_no: "26012410055500000023022".to_string(),
+                first_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 24).unwrap(),
+                last_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
+            },
+        ];
+        rust_ichibanboshi::kintai_http_repo::record_unko_diff(&onprem, &gcp);
+        d
+    })
+    .await;
+    assert!(digest.unwrap().is_some(), "月ゲートの指紋は従来どおり");
+    assert_eq!(diff.total, 1, "{diff:?}");
+    assert_eq!(diff.items[0].driver_cd, 1517);
+    assert_eq!(diff.items[0].unko_no, "26012410055500000023022");
+    assert_eq!(diff.items[0].start_date.as_deref(), Some("2026-01-24"));
+    assert_eq!(diff.items[0].first_date, "2026-01-24");
+    assert_eq!(diff.items[0].last_date, "2026-01-26");
+    assert_eq!(diff.gcp_only, 0);
+}
+
+/// 突合していない呼び出し (sink は張ったが `record_unko_diff` を呼ばない) は空。
+#[tokio::test]
+async fn test_unko_diff_defaults_to_empty_without_a_comparison() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-06-01", "date_to": "2026-06-30"},
+            "items": [],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (digest, diff) = rust_ichibanboshi::kintai_http_repo::with_unko_diff_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-06")
+            .await
+    })
+    .await;
+    assert!(digest.unwrap().is_some());
+    assert_eq!(diff.total, 0);
+    assert!(diff.items.is_empty());
+    assert_eq!(diff.gcp_only, 0);
+}
