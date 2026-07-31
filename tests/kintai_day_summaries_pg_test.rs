@@ -22,6 +22,7 @@ use axum::extract::Query;
 use axum::Extension;
 use rust_ichibanboshi::kintai_push::{jst_at, KintaiPgStore};
 use rust_ichibanboshi::routes::kintai_day_summaries::{day_summaries, DaySummariesQuery};
+use rust_ichibanboshi::routes::kintai_timecard::ReadTenant;
 
 // ── 前提 (tests/kintai_events_pg_test.rs / kintai_push_pg_test.rs と同じ形) ──────
 
@@ -202,6 +203,12 @@ fn query(month: &str, driver: Option<&str>) -> Query<DaySummariesQuery> {
     })
 }
 
+/// 読み先のテナント (`[kintai_events] tenant_id`)。**本番と同じく、これが正**
+/// — `[kintai_push]` の pin ではない (Refs #205 の 23)。
+fn read(tenant: uuid::Uuid) -> Extension<ReadTenant> {
+    Extension(ReadTenant(Some(tenant)))
+}
+
 // ── 1. 月を指定して、入れた行がそのままの形で返る ─────────────────────────────
 
 /// キーの作り方 (`乗務員CD|暦日|開始時刻`) と列名がオンプレ基準ファイル
@@ -228,10 +235,14 @@ async fn test_row_round_trips_with_the_onprem_key_and_column_shape() {
     )
     .await;
 
-    let got = day_summaries(query("2026-06", None), Extension(Some(store.clone())))
-        .await
-        .expect("handler")
-        .0;
+    let got = day_summaries(
+        query("2026-06", None),
+        Extension(Some(store.clone())),
+        read(store.tenant_id()),
+    )
+    .await
+    .expect("handler")
+    .0;
 
     assert_eq!(got["month"], "2026-06");
     assert_eq!(got["rows"], 1);
@@ -285,6 +296,7 @@ async fn test_driver_filters_to_a_single_driver() {
     let got = day_summaries(
         query("2026-06", Some("1518")),
         Extension(Some(store.clone())),
+        read(store.tenant_id()),
     )
     .await
     .expect("handler")
@@ -327,13 +339,122 @@ async fn test_other_tenant_rows_do_not_leak_in() {
     .await;
     // 自テナント側は何も入れていない
 
-    let got = day_summaries(query("2026-06", None), Extension(Some(store.clone())))
+    let got = day_summaries(
+        query("2026-06", None),
+        Extension(Some(store.clone())),
+        read(store.tenant_id()),
+    )
+    .await
+    .expect("handler")
+    .0;
+
+    assert_eq!(got["rows"], 0, "他テナントの行が混ざった: {got}");
+    assert_eq!(got["summaries"], serde_json::json!({}));
+}
+
+// ── 3b. **本番と同じ形** — 書き先の pin が空でも読める (Refs #205 の 23) ───────
+
+/// **このタスクで直したバグそのものの回帰テスト。**
+///
+/// 本番 GCP は `KINTAI_PUSH_TENANT_ID` を設定しない運用 (受け口が `X-Tenant-ID` で
+/// 名乗る) なので、`KintaiPgStore::tenant_id()` は **nil UUID** になる。かつて
+/// handler がそれを `WHERE tenant_id = $1` に bind していたため、行がいくら
+/// 入っていても**本番では常に 0 件**が返っていた。
+///
+/// 読み先は `[kintai_events] tenant_id` の pin (`ReadTenant`) が正 — 畳んだ行が
+/// そのテナントで書かれていることは `assert_same_tenant` が保証している。
+#[tokio::test]
+async fn test_rows_are_readable_when_the_write_pin_is_empty() {
+    let configured = require_db!();
+    let tenant = configured.tenant_id();
+    insert_shift(
+        configured.pool(),
+        tenant,
+        1518,
+        "2026-06-17 19:09:00",
+        "2026-06-17 19:33:00",
+    )
+    .await;
+    insert_day_summary(
+        configured.pool(),
+        tenant,
+        1518,
+        "2026-06-17",
+        "2026-06-17 19:09:00",
+        "rest",
+        &some_minutes(),
+    )
+    .await;
+
+    // 本番 GCP の形: `[kintai_push] tenant_id` が空 = store の pin は nil
+    let store = Arc::new(configured.for_tenant(uuid::Uuid::nil()));
+    assert!(store.tenant_id().is_nil(), "前提: 書き先の pin は nil");
+
+    let got = day_summaries(query("2026-06", None), Extension(Some(store)), read(tenant))
         .await
         .expect("handler")
         .0;
 
+    assert_eq!(got["rows"], 1, "書き先の pin が空だと 0 件になる: {got}");
+    assert!(got["summaries"]
+        .as_object()
+        .unwrap()
+        .contains_key("1518|2026-06-17|2026-06-17 19:09:00"));
+}
+
+/// 上と同じ「pin が nil」の形でも、**読み先のテナントが違えば引けない** —
+/// `ReadTenant` に落としたことでテナント分離が緩んでいないことを固定する。
+#[tokio::test]
+async fn test_other_tenant_rows_do_not_leak_in_with_an_empty_write_pin() {
+    let configured = require_db!();
+    let other_tenant = uuid::Uuid::new_v4();
+    insert_shift(
+        configured.pool(),
+        other_tenant,
+        1518,
+        "2026-06-17 19:09:00",
+        "2026-06-17 19:33:00",
+    )
+    .await;
+    insert_day_summary(
+        configured.pool(),
+        other_tenant,
+        1518,
+        "2026-06-17",
+        "2026-06-17 19:09:00",
+        "rest",
+        &some_minutes(),
+    )
+    .await;
+
+    let store = Arc::new(configured.for_tenant(uuid::Uuid::nil()));
+    let got = day_summaries(
+        query("2026-06", None),
+        Extension(Some(store)),
+        read(configured.tenant_id()),
+    )
+    .await
+    .expect("handler")
+    .0;
+
     assert_eq!(got["rows"], 0, "他テナントの行が混ざった: {got}");
-    assert_eq!(got["summaries"], serde_json::json!({}));
+}
+
+/// 読み先も書き先も決まらない形は **503**。nil で引いて 0 件を返すと
+/// 「設定が無い」と「その月の勤務が無い」が区別できない。
+#[tokio::test]
+async fn test_no_tenant_anywhere_is_service_unavailable() {
+    let configured = require_db!();
+    let store = Arc::new(configured.for_tenant(uuid::Uuid::nil()));
+    let (status, msg) = day_summaries(
+        query("2026-06", None),
+        Extension(Some(store)),
+        Extension(ReadTenant(None)),
+    )
+    .await
+    .expect_err("must fail when no tenant is configured at all");
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(msg.contains("kintai_events"), "{msg}");
 }
 
 // ── 4. month 不正は 400 ───────────────────────────────────────────────────────
@@ -342,9 +463,13 @@ async fn test_other_tenant_rows_do_not_leak_in() {
 async fn test_invalid_month_is_bad_request() {
     let store = require_db!();
     for month in ["2026-6", "", "2026-06-01"] {
-        let (status, msg) = day_summaries(query(month, None), Extension(Some(store.clone())))
-            .await
-            .expect_err(&format!("{month:?} should be rejected"));
+        let (status, msg) = day_summaries(
+            query(month, None),
+            Extension(Some(store.clone())),
+            read(store.tenant_id()),
+        )
+        .await
+        .expect_err(&format!("{month:?} should be rejected"));
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         assert!(msg.contains("month"));
     }
@@ -355,9 +480,13 @@ async fn test_invalid_month_is_bad_request() {
 #[tokio::test]
 async fn test_empty_month_is_200_with_empty_summaries_not_404() {
     let store = require_db!();
-    let got = day_summaries(query("2026-01", None), Extension(Some(store.clone())))
-        .await
-        .expect("handler must not error on an empty month");
+    let got = day_summaries(
+        query("2026-01", None),
+        Extension(Some(store.clone())),
+        read(store.tenant_id()),
+    )
+    .await
+    .expect("handler must not error on an empty month");
 
     assert_eq!(got.0["rows"], 0);
     assert_eq!(got.0["summaries"], serde_json::json!({}));
@@ -367,9 +496,13 @@ async fn test_empty_month_is_200_with_empty_summaries_not_404() {
 
 #[tokio::test]
 async fn test_no_store_is_service_unavailable() {
-    let (status, _msg) = day_summaries(query("2026-06", None), Extension(None))
-        .await
-        .expect_err("must fail without a store");
+    let (status, _msg) = day_summaries(
+        query("2026-06", None),
+        Extension(None),
+        read(uuid::Uuid::new_v4()),
+    )
+    .await
+    .expect_err("must fail without a store");
     assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -381,6 +514,7 @@ async fn test_non_numeric_driver_is_bad_request() {
     let (status, msg) = day_summaries(
         query("2026-06", Some("abc")),
         Extension(Some(store.clone())),
+        read(store.tenant_id()),
     )
     .await
     .expect_err("non-numeric driver must be rejected");
@@ -397,6 +531,7 @@ async fn test_driver_overflowing_i64_is_bad_request() {
     let (status, msg) = day_summaries(
         query("2026-06", Some(&too_big)),
         Extension(Some(store.clone())),
+        read(store.tenant_id()),
     )
     .await
     .expect_err("driver overflowing i64 must be rejected");
@@ -410,9 +545,13 @@ async fn test_driver_overflowing_i64_is_bad_request() {
 async fn test_db_error_maps_to_bad_gateway() {
     let store = require_db!();
     store.pool().close().await;
-    let (status, msg) = day_summaries(query("2026-06", None), Extension(Some(store.clone())))
-        .await
-        .expect_err("closed pool must surface as an error");
+    let (status, msg) = day_summaries(
+        query("2026-06", None),
+        Extension(Some(store.clone())),
+        read(store.tenant_id()),
+    )
+    .await
+    .expect_err("closed pool must surface as an error");
     assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
     assert!(msg.contains("day_summaries"));
 }
