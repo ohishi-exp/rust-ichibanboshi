@@ -584,6 +584,70 @@ pub async fn rest_diff(
     })))
 }
 
+/// GET /api/kintai/reading-dates?month=YYYY-MM[&driver=1107] — **運行を読取日へ
+/// 引き当てる** (Refs #205 の 42)。
+///
+/// 値のずれた勤務は該当の**読取日**を取り直せば直るが、読取日は運行の属性で、
+/// 勤務の日とは一致しない (実測: 運行日 06-24 → 読取日 07-06)。この口が
+/// 「どの日を取り直せばよいか」を 1 リクエストで返す。何を測っているかは
+/// [`crate::kintai_reading_dates`] のモジュール docs。
+///
+/// **`driver` は省略可** ([`rest_diff`] / [`kosoku_daily`] と同じ)。`driver=` (空) は
+/// 省略ではなく**不正**として 400 にする。
+///
+/// **判定には一切入らない。** 勤務も拘束も畳まない。
+pub async fn reading_dates(
+    Query(params): Query<EventsQuery>,
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    let Some((from, to)) = crate::kintai_repo::month_range(&month) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください".to_string(),
+        ));
+    };
+    let driver = match params.driver {
+        None => None,
+        Some(raw) => match parse_driver(&raw) {
+            Some(d) => Some(d),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "driver は乗務員CD (数字) で指定してください".to_string(),
+                ))
+            }
+        },
+    };
+    let _permit = KOSOKU_DB_PERMITS.acquire().await.expect("semaphore open");
+    let rows = repo
+        .fetch_operation_reading_dates_between(&from, &to, driver)
+        .await
+        .map_err(map_repo_err)?;
+    let mapped = crate::kintai_reading_dates::reading_dates(&rows);
+    // マクロは 1 行に収める (CLAUDE.md)
+    let (total, dates) = (mapped.total, mapped.by_reading_date.len());
+    tracing::info!(month = %month, total, dates, "kintai reading-dates built");
+    // 読取日が引けなかった運行は 0 でも出す (答えの取りこぼしが見えるように)
+    tracing::info!(
+        unknown = mapped.unknown_reading_date,
+        "kintai reading-dates gap"
+    );
+    Ok(Json(serde_json::json!({
+        "month": month,
+        "driver": driver,
+        "from": from,
+        "to": to,
+        // **取り直す日の一覧が答え。** 上限で切られない
+        "by_reading_date": mapped.by_reading_date,
+        "unknown_reading_date": mapped.unknown_reading_date,
+        "total": mapped.total,
+        "items": mapped.items,
+        "skipped_rows": mapped.skipped_rows,
+        "max_items": crate::kintai_reading_dates::MAX_READING_DATES,
+    })))
+}
+
 /// GET /api/kintai/kosoku-daily?month=YYYY-MM[&driver=1051] — **打刻基準の日別サマリ**
 /// (Refs #118、拘束時間の打刻基準化 Phase 2)。
 ///

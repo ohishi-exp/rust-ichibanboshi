@@ -358,6 +358,8 @@ pub async fn run(
         .route("/kintai/pdf-json", get(routes::kintai::pdf_json))
         // 休息のずれの診断 (Refs #205 の 41)。読むだけ・判定に入らない
         .route("/kintai/rest-diff", get(routes::kintai::rest_diff))
+        // 運行 → 読取日の引き当て (Refs #205 の 42)。同じく読むだけ
+        .route("/kintai/reading-dates", get(routes::kintai::reading_dates))
         // 畳んだ結果の読み出し (Refs #205 の 18)。読むだけ。POST は無い
         .route(
             "/kintai/day-summaries",
