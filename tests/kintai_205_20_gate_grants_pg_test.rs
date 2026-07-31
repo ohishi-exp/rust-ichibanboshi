@@ -257,11 +257,28 @@ fn rest(start: &str, end: &str) -> serde_json::Value {
     json!({"datetime": start, "end_datetime": end, "driver_id": DRIVER, "source": "dtako_events", "state": "休息", "unko_no": null})
 }
 
+fn punch(at: &str, state: &str) -> serde_json::Value {
+    json!({"datetime": at, "end_datetime": null, "driver_id": DRIVER, "source": "timecard", "state": state, "unko_no": null})
+}
+
 fn gate_repo(digest_label: &str) -> DynKintaiEventsRepo {
     std::sync::Arc::new(GateRepo {
         rows: vec![
             rest("2026-06-01 16:19:00", "2026-06-02 04:42:00"),
             rest("2026-06-02 16:18:00", "2026-06-03 06:01:00"),
+            // **この打刻を消すと gate が書かれなくなり、下の 2 本が落ちる**
+            // (Refs #205 の 30)。fold は `month_range` = `[月初, 翌月 2 日)` まで
+            // 読むが、push は `exact_month_range` = `[月初, 翌月初)` までしか
+            // 書かない。はみ出した 1 日 (翌月 1 日) に `timecard` / `dtako` の行が
+            // 1 つも無いと `kintai_fold::push_window_gap_warning` が
+            // 「翌月が未 push かもしれない」と鳴らし、gate を書く条件の
+            // `warnings.is_empty()` が false になって `fold_gate` が 1 行も
+            // 書かれない。
+            //
+            // **実データでは打刻が 0 件の暦日は 1 日も無い** (2026-06 の実測で
+            // 月初 84 件 / 最小 30 件) ので、「翌月ぶんが push 済み」の普通の状態を
+            // ここでも作っておく。休息だけで打刻ゼロの月は実在しない形。
+            punch("2026-07-01 07:00:00", "始業"),
         ],
         // `fold_gate.dtako_digest` は CHAR(64) なので 64 桁に揃える
         // (短いと読み出しで空白パディングされ、比較がテストの都合で落ちる)
@@ -350,7 +367,9 @@ async fn the_production_writer_role_can_use_the_fold_gate() {
     assert_eq!(
         stored_gate_digest(&owner, tenant).await,
         Some(format!("{:0<64}", "writer")),
-        "kintai_writer で fold_gate に書けていない (GRANT 漏れ)"
+        "kintai_writer で fold_gate に書けていない。GRANT 漏れが第一候補だが、\
+         **warnings が 1 本でも立つと gate は書かれない** ので、まず fixture が \
+         push 被覆の warning を踏んでいないかを見ること (Refs #205 の 30)"
     );
 
     // 2 回目は Hit — 全量読みごと省ける (この経路が本番で成立してほしかった形)

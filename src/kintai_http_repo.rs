@@ -165,7 +165,11 @@ fn collected_warnings() -> Vec<String> {
 }
 
 /// 集めている最中なら記録する。**同じ文面は 1 回だけ**、上限まで。
-fn record_warning(w: &str) {
+///
+/// `pub(crate)` なのは [`crate::kintai_fold`] が push 窓の欠けをここへ載せるため
+/// (Refs #205 の 30)。上流 warnings と同じ器に入れることで、月ゲートの
+/// `warnings.is_empty()` がそのまま効く。
+pub(crate) fn record_warning(w: &str) {
     let _ = WARNING_SINK.try_with(|sink| {
         let mut v = sink.borrow_mut();
         if v.len() < MAX_COLLECTED_WARNINGS && !v.iter().any(|s| s == w) {
