@@ -2135,23 +2135,21 @@ async fn a_driver_with_no_stored_rows_still_gets_folded_in_a_batch() {
     assert_eq!(again.drivers_unchanged, 2);
 }
 
+// 保存済みの姿を読んだクエリの回数 (**このスレッドぶんだけ**)。
+//
+// 数え方が大域だと、同じ binary で並行して走る他の pg テストの fold まで混ざる。
+// `#[tokio::test]` は current-thread runtime なので、テストの future はテスト自身の
+// スレッドで進む — スレッド局所に持てば他のテストと混ざらない。
+thread_local! {
+    static STORED_STATE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// sqlx が 1 クエリごとに出す `sqlx::query` の tracing event を数える層。
 ///
 /// **往復回数が費用**なので、往復が減ったことを機械で確かめられる形にしておく。
-#[derive(Clone, Default)]
-struct QueryCounter(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-impl QueryCounter {
-    /// 保存済みの姿を読んだクエリの回数 (単数版・複数版のどちらも `n_parts` を持つ)。
-    fn stored_state_reads(&self) -> usize {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.contains("n_parts"))
-            .count()
-    }
-}
+/// 単数版・複数版のどちらの SQL にも `n_parts` があるので、それで保存済みの姿の
+/// 読みだけを拾う。
+struct QueryCounter;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCounter {
     fn on_event(
@@ -2173,8 +2171,37 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCounter {
         }
         let mut sql = String::new();
         event.record(&mut Collect(&mut sql));
-        self.0.lock().unwrap().push(sql);
+        if sql.contains("n_parts") {
+            STORED_STATE_READS.with(|c| c.set(c.get() + 1));
+        }
     }
+}
+
+/// 数え方を process に 1 度だけ挿す。**scoped (`set_default`) では駄目**。
+///
+/// callsite の interest は**最初にそこを踏んだスレッドの dispatcher** で決まり、
+/// process 大域にキャッシュされる。並行して走る別のテストのスレッドが先に sqlx を
+/// 踏むと `never` で焼き付き、あとからスレッド局所に subscriber を挿しても event が
+/// 飛ばない — **数え方が死んで静かに 0 と出る** (`--test-threads=4` で 2/6、
+/// 8 で 3/6 の頻度で再現。CI の Coverage regression check で実際に踏んだ)。
+///
+/// **大域 default なら `get_default` がどのスレッドでもこれを返す**ので、
+/// どのスレッドが先に踏んでも interest は `always` に決まる。数える側だけ
+/// スレッド局所にして他のテストと混ざらないようにする。
+fn install_query_counter() {
+    use tracing_subscriber::layer::SubscriberExt;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let subscriber = tracing_subscriber::registry().with(QueryCounter);
+        tracing::subscriber::set_global_default(subscriber).expect("set global subscriber");
+        // 既に `never` で焼き付いている callsite を拾い直す (大域 default を
+        // 挿した後なので、どのスレッドから見ても `always` に決まる)
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
+fn take_reads() -> usize {
+    STORED_STATE_READS.with(|c| c.replace(0))
 }
 
 /// **乗務員が何人でも保存済みの姿を読むのは 1 クエリ**。
@@ -2185,24 +2212,22 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCounter {
 #[tokio::test]
 async fn the_stored_state_read_is_one_query_however_many_drivers() {
     let (store, _pool) = require_db!();
+    install_query_counter();
+
+    // **まず数え方が生きていることを確かめる。** 単数版を 1 回だけ直接呼べば
+    // 1 と出るはず — ここが 0 なら「往復が減った」ではなく数え方が死んでいる。
+    // 0 を成功と読み違えないための較正
+    stored_state(&store, 1201, "2026-07")
+        .await
+        .expect("calibrate");
+    assert_eq!(take_reads(), 1, "数え方の較正: 単数版 1 回 = 1 クエリ");
 
     async fn count_reads(store: &KintaiPgStore, drivers: &[u64]) -> usize {
-        use tracing_subscriber::layer::SubscriberExt;
         let repo = repo(punches_for(drivers));
-        let counter = QueryCounter::default();
-        let subscriber = tracing_subscriber::registry().with(counter.clone());
-        // `#[tokio::test]` は current-thread runtime なので、この future は
-        // このスレッドで進む = スレッド局所の subscriber で拾える
-        let guard = tracing::subscriber::set_default(subscriber);
-        // **callsite の interest は process 大域にキャッシュされる。** subscriber の
-        // 無いまま sqlx が 1 度でも走ると「never」で焼き付き、後から subscriber を
-        // 挿しても event が飛ばない (数え方の側の罠で、0 と出る)
-        tracing::callsite::rebuild_interest_cache();
         recalc_drivers(&repo, store, &params(), "2026-07", drivers, true)
             .await
             .expect("fold");
-        drop(guard);
-        counter.stored_state_reads()
+        take_reads()
     }
 
     // 1 名でも 8 名でも 1 回。**人数に比例しない**ことがこの PR の全て
@@ -2211,5 +2236,39 @@ async fn the_stored_state_read_is_one_query_however_many_drivers() {
         count_reads(&store, &[1301, 1302, 1303, 1304, 1305, 1306, 1307, 1308]).await,
         1,
         "8 名でも 1 クエリ (乗務員ごとに読んでいたら 8)"
+    );
+}
+
+/// 往復が減ったことを**実行に依らず構造でも**示す (数え方が死んでも残る保険)。
+///
+/// 上の口は sqlx の tracing event を数えるので、tracing の callsite キャッシュの
+/// ような環境要因で死にうる。`store_units` が乗務員ごとに読んでいないことは
+/// ソースの形でも縛れるので、両方置く。
+#[test]
+fn store_units_reads_the_stored_state_outside_the_loop() {
+    let src = std::fs::read_to_string("src/kintai_fold.rs").expect("read src");
+    let body = src
+        .split_once("async fn store_units(")
+        .expect("store_units")
+        .1
+        .split_once("\n/// 空の [`FoldReport`]")
+        .expect("次の item まで")
+        .0;
+    assert_eq!(
+        body.matches("stored_states(store").count(),
+        1,
+        "一括読みは 1 箇所だけ"
+    );
+    assert!(
+        !body.contains("stored_state(store"),
+        "乗務員ごとの単数版は呼ばない (往復が人数に比例する)"
+    );
+    let batch = body.find("stored_states(store").expect("一括読み");
+    let loop_at = body
+        .find("for (driver_cd, unit, fp) in units")
+        .expect("loop");
+    assert!(
+        batch < loop_at,
+        "一括読みは loop の外 (中なら往復が減らない)"
     );
 }
