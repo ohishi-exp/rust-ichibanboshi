@@ -263,6 +263,35 @@ pub struct UnkoDiffItem {
     pub last_date: String,
 }
 
+/// 突合が噛み合わないときに**両側の生の文字列を並べて見る**ための標本の件数
+/// (Refs #205 の 37)。
+///
+/// 本番 2026-06 の初回実測で `gcp_only` が etags の item 総数 (1,130) と一致した
+/// = **2 集合の重なりがゼロ**だった。データの欠落ではなく突合キーが一度も一致して
+/// いないので、まず「どう違うか」を実物で見る。10 件あれば形は分かる。
+pub const MAX_UNKO_DIFF_SAMPLE: usize = 10;
+
+/// 突合キーの標本 1 件 (Refs #205 の 37)。
+///
+/// **`len` を添えるのは推測を挟まないため。** 桁が違うのか・前後に空白が付いて
+/// いるのか・そもそも別物なのかは、生の文字列と長さを並べれば数えずに分かる
+/// (JSON では前後の空白が読み飛ばされやすい)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnkoSample {
+    pub unko_no: String,
+    /// 文字数 (前後の空白も数える)。
+    pub len: usize,
+}
+
+impl UnkoSample {
+    fn new(unko_no: &str) -> Self {
+        Self {
+            unko_no: unko_no.to_string(),
+            len: unko_no.chars().count(),
+        }
+    }
+}
+
 /// 運行の突合の結果 (Refs #205 の 37)。**判定には使わない — 応答に載せるだけ。**
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UnkoDiff {
@@ -272,6 +301,11 @@ pub struct UnkoDiff {
     pub total: usize,
     /// **逆方向** (GCP に在ってオンプレに無い) の運行数。ゼロでなければ別の異常。
     pub gcp_only: usize,
+    /// 逆方向の実物 (辞書順の先頭 [`MAX_UNKO_DIFF_SAMPLE`] 件)。
+    pub gcp_only_sample: Vec<UnkoSample>,
+    /// **突き合わせた相手側**の実物 (オンプレの `unko_no`、同じく辞書順の先頭)。
+    /// 片側だけ見ても違いは分からないので、必ず対で返す。
+    pub onprem_sample: Vec<UnkoSample>,
 }
 
 /// **オンプレの `(乗務員CD, unko_no)` 集合と etags の `unko_no` 集合を突き合わせる**
@@ -283,8 +317,12 @@ pub struct UnkoDiff {
 ///
 /// - 突合の単位は **`(乗務員CD, unko_no)`** — 2 名乗務の運行は同じ `unko_no` が
 ///   2 人に紐づくので、片方だけ欠けている形も見える
-/// - 逆方向は**件数だけ**。ゼロでないなら「オンプレに無い運行を GCP が持っている」
+/// - 逆方向は**件数と標本**。ゼロでないなら「オンプレに無い運行を GCP が持っている」
 ///   という別の異常なので、名指しより先に気づけることが要る
+/// - **両側の標本を必ず対で返す** ([`UnkoSample`])。本番の初回実測で重なりがゼロ
+///   だった = キーが一度も一致していないので、片側だけでは何が違うのか分からない。
+///   標本は辞書順の先頭 — 呼ぶたびに違う 10 件が出ると比較にならないため
+///   (`HashSet` の反復順は不定)
 fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
     let mut items = Vec::new();
     let mut total = 0;
@@ -304,12 +342,30 @@ fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
         }
     }
     let seen: HashSet<&str> = onprem.iter().map(|o| o.unko_no.as_str()).collect();
-    let gcp_only = gcp.iter().filter(|u| !seen.contains(u.as_str())).count();
+    let mut only: Vec<&str> = gcp
+        .iter()
+        .map(String::as_str)
+        .filter(|u| !seen.contains(u))
+        .collect();
+    only.sort_unstable();
+    let mut mine: Vec<&str> = seen.into_iter().collect();
+    mine.sort_unstable();
     UnkoDiff {
         items,
         total,
-        gcp_only,
+        gcp_only: only.len(),
+        gcp_only_sample: sample(&only),
+        onprem_sample: sample(&mine),
     }
+}
+
+/// 辞書順に並べ終わった一覧の頭 [`MAX_UNKO_DIFF_SAMPLE`] 件。
+fn sample(sorted: &[&str]) -> Vec<UnkoSample> {
+    sorted
+        .iter()
+        .take(MAX_UNKO_DIFF_SAMPLE)
+        .map(|u| UnkoSample::new(u))
+        .collect()
 }
 
 /// [`with_unko_diff_sink`] が抱える 2 つの値。
@@ -868,9 +924,29 @@ const UNKO_NO_DATE_DIGITS: usize = 6;
 
 /// etags の窓の末尾がこれより長く空いていたら「入力が欠けている」と見なす (日)。
 ///
-/// **実測で決めた値。** オンプレの生イベント口 (`/api/kintai/events`) から乗務員
-/// 47 名 (全 141 名の 1/3) × 4 か月の 966 運行を引いて、窓 `[月初, 翌月初]` の
-/// 日ごとの運行開始件数を数えると:
+/// ## 2 日 → 7 日 (Refs #205 の 37、**暫定値**)
+///
+/// **元の 2 日は「月・全乗務員を通した単一の `last`」向けの値**だった。下の実測は
+/// 「全乗務員のうち誰か 1 人でも走っていれば窓は埋まる」前提で数えたもので、
+/// 誰か 1 人が窓の端まで走っていれば gap は 0 になる。
+///
+/// #205 の 32 が粒度を**乗務員別**に割った際、閾値はこの 2 日のまま据え置かれた。
+/// 乗務員 1 人を見れば**土日を挟むだけで gap は 3〜4 日**になるので、本番 2026-06
+/// では母集団 113 名のうち **72 名**が鳴り続けた。warning が立つと月ゲートが封を
+/// しないため、#205 の主目的 (fold の全量読みを省く) が無効化されたままになる。
+///
+/// **7 日 = 週末 + 1 日。「1 週間以上音沙汰が無い」は業務として異常**と言える位置で、
+/// 実際に欠けている 1078 / 1517 / 1688 (gap 8 前後) は拾える。14 日まで緩めると
+/// この本物を取りこぼす (親の判断、2026-07-31)。
+///
+/// **暫定値なのは、この閾値が見ているのが etags の運行開始日で、閾値を選ぶ根拠に
+/// 使った分布 (`day_summaries` の最終勤務日) とは別の量だから。** 実際に何名鳴るかは
+/// deploy して測るまで分からない。十分下がらなければ再調整する。
+///
+/// ## 元の実測 (単一 `last` 時代、2 日の根拠)
+///
+/// オンプレの生イベント口 (`/api/kintai/events`) から乗務員 47 名 (全 141 名の 1/3)
+/// × 4 か月の 966 運行を引いて、窓 `[月初, 翌月初]` の日ごとの運行開始件数を数えると:
 ///
 /// | 月 | 運行開始が 0 件の日 (窓の途中) | 窓の末尾の空き |
 /// |---|---|---|
@@ -881,9 +957,8 @@ const UNKO_NO_DATE_DIGITS: usize = 6;
 ///
 /// **年末年始でも運行開始は途切れない** (12/27〜12/31 も毎日 4〜10 件、01/01 も
 /// 2 件)。1/3 の抽出でこれなので、全乗務員なら空き日はさらに減る方向にしか動かない
-/// (部分集合のゼロ日 ⊇ 全体のゼロ日)。実測の最大 1 日に 1 日ぶんの余裕を足して
-/// 「3 日以上空いたら立てる」にしてある。
-const MAX_TAIL_GAP_DAYS: i64 = 2;
+/// (部分集合のゼロ日 ⊇ 全体のゼロ日)。
+const MAX_TAIL_GAP_DAYS: i64 = 7;
 
 /// `unko_no` の先頭 6 桁 (`YYMMDD`) = **運行開始日**。
 ///
@@ -932,6 +1007,11 @@ fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
 /// そちらは [`diff_unko`] (オンプレの `(乗務員CD, unko_no)` との突合) が名指しで
 /// 拾う — etags だけを見ていては「働いていない」と原理的に区別が付かない。
 /// `no_etag` (R2 に CSV が無い) の検知は母集団に関係なく従来どおり。
+///
+/// **母集団を絞っただけでは足りず、閾値も乗務員別に合わせ直した**
+/// ([`MAX_TAIL_GAP_DAYS`] 2 → 7)。母集団 137 → 113 名で最大 gap は 37 → 27 日に
+/// 落ちたが、それでも 72 名が鳴っていた — 乗務員 1 人を見れば土日を挟むだけで
+/// gap 3〜4 日になるため。2 つは別の原因で、片方だけでは静かにならない。
 struct InputCoverage {
     /// etags の item 数 (= 窓の中の運行数)。
     items: usize,
@@ -2176,20 +2256,44 @@ mod tests {
     fn missing_input_warnings_fires_when_the_tail_of_the_month_is_missing() {
         let pairs = vec![
             pair("26060110000000000023021", Some("e1")),
-            pair("26062410000000000023021", Some("e2")),
+            pair("26062310000000000023021", Some("e2")),
         ];
         let w = warns(&pairs, d(2026, 7, 1), d(2026, 7, 20));
-        assert_eq!(w.len(), 1, "末尾 7 日ぶんの欠け: {w:?}");
+        assert_eq!(w.len(), 1, "末尾 8 日ぶんの欠け: {w:?}");
         // driver_cd 無しなので全員 1 グループにまとまり、その 1 グループが超過する
         assert!(
-            w[0].contains("乗務員1名の末尾が7日超"),
+            w[0].contains("乗務員1名の末尾が8日超"),
             "不足日数を書く: {w:?}"
         );
-        assert!(w[0].contains("2026-06-01..2026-06-24"), "範囲を書く: {w:?}");
+        assert!(w[0].contains("2026-06-01..2026-06-23"), "範囲を書く: {w:?}");
         assert!(
             w[0].contains("期待=2026-07-01"),
             "期待した末尾も書く: {w:?}"
         );
+    }
+
+    /// **閾値 7 日の境目を両側から縛る** (Refs #205 の 37)。
+    ///
+    /// 乗務員別に割った以上、**土日を挟むだけで gap は 3〜4 日**になる — 2 日の
+    /// ままでは本番 2026-06 で 113 名中 72 名が鳴り続けた。7 日は「週末 + 1 日」で、
+    /// **実際に欠けている 1078 / 1517 / 1688 (gap 8 前後) は拾える**位置。
+    #[test]
+    fn the_tail_gap_threshold_tolerates_a_weekend_but_catches_the_real_gaps() {
+        // 金曜まで走って月曜の朝に測る形 = gap 4 日。業務として正常
+        let weekend = vec![driver_pair("26062610000000000023021", Some("e1"), "D1")];
+        let w = warns_in(&weekend, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        assert!(w.is_empty(), "週末ぶんの空きでは鳴らない: {w:?}");
+
+        // ちょうど 7 日はまだ許容 (閾値は「超えたら」)
+        let exactly = vec![driver_pair("26062310000000000023021", Some("e1"), "D1")];
+        let w = warns_in(&exactly, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        assert!(w.is_empty(), "gap 7 日ちょうどは境界の内側: {w:?}");
+
+        // 1078 の実際の欠け (最終運行 06-24 が丸ごと無く 06-22 で切れる) = gap 8 日
+        let real = vec![driver_pair("26062210000000000023021", Some("e1"), "D1")];
+        let w = warns_in(&real, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        assert_eq!(w.len(), 1, "本物の欠けは拾う: {w:?}");
+        assert!(w[0].contains("乗務員1名の末尾が8日超"), "{w:?}");
     }
 
     /// **進行中の月は末尾に運行が無くて当然。** 期待値を `today - 1` に切り下げる。
@@ -2237,7 +2341,7 @@ mod tests {
         let pairs = vec![
             driver_pair("26063010000000000023021", Some("e1"), "D1"),
             driver_pair("26063010000000000023022", Some("e2"), "D2"),
-            // 1 日の空きは実測の自然な揺らぎとして許容範囲内 (MAX_TAIL_GAP_DAYS = 2)
+            // 1 日の空きは実測の自然な揺らぎとして許容範囲内 (MAX_TAIL_GAP_DAYS = 7)
             driver_pair("26062910000000000023023", Some("e3"), "D3"),
         ];
         let w = warns(&pairs, d(2026, 6, 30), d(2026, 7, 5));
@@ -2412,12 +2516,55 @@ mod tests {
         assert_eq!(diff.gcp_only, 0, "逆方向は無い");
     }
 
-    /// 両方揃っていれば空。
+    /// 両方揃っていれば「欠け」はゼロ。標本は突合が成立していても出す
+    /// (キーが噛み合っているかどうかを毎回目視できるようにするため)。
     #[test]
     fn diff_unko_is_empty_when_both_sides_agree() {
         let onprem = vec![op(1078, "U1"), op(1517, "U2")];
         let diff = diff_unko(&onprem, &gcp_set(&["U1", "U2"]));
-        assert_eq!(diff, UnkoDiff::default());
+        assert_eq!(diff.total, 0);
+        assert_eq!(diff.gcp_only, 0);
+        assert!(diff.items.is_empty());
+        assert!(diff.gcp_only_sample.is_empty(), "逆方向が無いので空");
+        let mine: Vec<&str> = diff.onprem_sample.iter().map(|s| &*s.unko_no).collect();
+        assert_eq!(mine, vec!["U1", "U2"], "自分側は辞書順で出る");
+    }
+
+    /// **キーが 1 つも一致しないとき、両側の実物が対で返る** (Refs #205 の 37)。
+    /// 本番 2026-06 の初回実測がこの形だった (重なりゼロ)。標本は**辞書順**で、
+    /// `HashSet` の反復順に振り回されない (呼ぶたびに違う 10 件だと比較にならない)。
+    #[test]
+    fn diff_unko_samples_both_sides_in_a_stable_order() {
+        let onprem = vec![op(1078, "B2"), op(1517, "B1")];
+        let diff = diff_unko(&onprem, &gcp_set(&["A2", "A1", "A3"]));
+        let theirs: Vec<&str> = diff.gcp_only_sample.iter().map(|s| &*s.unko_no).collect();
+        assert_eq!(theirs, vec!["A1", "A2", "A3"], "GCP 側は辞書順");
+        let mine: Vec<&str> = diff.onprem_sample.iter().map(|s| &*s.unko_no).collect();
+        assert_eq!(mine, vec!["B1", "B2"], "オンプレ側も辞書順");
+        assert_eq!(diff.gcp_only, 3);
+        assert_eq!(diff.total, 2);
+    }
+
+    /// **`len` は前後の空白も数える。** 桁違いと空白混入をその場で見分けるため。
+    #[test]
+    fn the_sample_reports_the_length_including_padding() {
+        let diff = diff_unko(
+            &[op(1078, "26062411400600000023021")],
+            &gcp_set(&[" 2606241140060000002302 "]),
+        );
+        assert_eq!(diff.onprem_sample[0].len, 23);
+        assert_eq!(diff.gcp_only_sample[0].len, 24, "前後の空白を数える");
+    }
+
+    /// 標本は 10 件で切る (実物の形が分かればよく、全量は `total` で足りる)。
+    #[test]
+    fn the_sample_is_capped() {
+        let onprem: Vec<OnpremOperation> = (0..MAX_UNKO_DIFF_SAMPLE + 3)
+            .map(|i| op(1000 + i as i64, &format!("U{i:03}")))
+            .collect();
+        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        assert_eq!(diff.onprem_sample.len(), MAX_UNKO_DIFF_SAMPLE);
+        assert_eq!(diff.onprem_sample[0].unko_no, "U000", "頭から");
     }
 
     /// **逆方向 (GCP に在ってオンプレに無い) は件数だけ数える。**
@@ -2488,7 +2635,8 @@ mod tests {
         }))
         .await;
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(diff, UnkoDiff::default());
+        assert_eq!(diff.total, 0);
+        assert_eq!(diff.gcp_only, 0);
     }
 
     /// **集めていないときは何も起きない** (`record_unsplit` と同じ扱い)。

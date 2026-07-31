@@ -111,12 +111,18 @@
 //! | `unsplit` / `unsplit_total` | alc 側で `has_kudgivt = FALSE` の運行 (#205 の 32) |
 //! | `unko_diff` / `unko_diff_total` | **オンプレに在って GCP に無い運行** (#205 の 37) |
 //! | `unko_diff_gcp_only` | 逆方向 (GCP に在ってオンプレに無い) の件数 |
+//! | `unko_diff_gcp_only_sample` / `unko_diff_onprem_sample` | **突合キーの実物**を両側 10 件ずつ |
 //!
 //! `unko_diff` の突合は「押し込み済みの `kintai.kintai_events` の
 //! `(乗務員CD, unko_no)`」対「etags の `unko_no`」。142 行差の復旧対象リストが
 //! そのまま得られる。**空でなければ `warnings` に 1 行立つ**ので、上の 5 条件の
 //! `warnings.is_empty()` が外れて月ゲートは封をしない — 運行が欠けたままの月を
 //! 「最新」と刻まないための意図した挙動 (欠けが埋まれば静かになる)。
+//!
+//! **標本を両側で返すのは、本番の初回実測 (2026-06) で `unko_diff_gcp_only` が
+//! etags の item 総数 (1,130) と一致した = 2 集合の重なりがゼロだったため。**
+//! データの欠落ではなく突合キーが一度も一致していない形なので、正規化を推測で
+//! 入れる前に生の文字列と長さを並べて見る ([`crate::kintai_http_repo::UnkoSample`])。
 //!
 //! ## GET は絶対に書かない
 //!
@@ -285,6 +291,8 @@ async fn run(
                 "unko_diff": unko_diff.items,
                 "unko_diff_total": unko_diff.total,
                 "unko_diff_gcp_only": unko_diff.gcp_only,
+                "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
+                "unko_diff_onprem_sample": unko_diff.onprem_sample,
             })));
         }
         other => other,
@@ -377,6 +385,8 @@ async fn run(
         "unko_diff": unko_diff.items,
         "unko_diff_total": unko_diff.total,
         "unko_diff_gcp_only": unko_diff.gcp_only,
+        "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
+        "unko_diff_onprem_sample": unko_diff.onprem_sample,
     })))
 }
 
