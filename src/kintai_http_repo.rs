@@ -113,6 +113,60 @@ const OUT_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 /// この経路が名乗る `source`。MariaDB の 3 / 4 番目のブランチと同じ値。
 const SOURCE_DTAKO_EVENTS: &str = "dtako_events";
 
+// ── 上流 warnings の持ち出し ───────────────────────────────────────────────
+
+/// 1 回の呼び出しで持ち帰る warnings の上限。
+///
+/// 上流は運行ごとに 1 本出すので、R2 の分割がまるごと遅れていると月ぶんの
+/// 運行数 (実測 1,100 件超) が並ぶ。応答を膨らませても読めないので頭だけ。
+const MAX_COLLECTED_WARNINGS: usize = 20;
+
+tokio::task_local! {
+    /// いま集めている最中の warnings。[`with_warning_sink`] の中だけで立つ。
+    ///
+    /// `Mutex` ではなく `RefCell` — task local なので触るのは 1 つの task だけで、
+    /// `.await` を挟んで借りたままにする箇所も無い。
+    static WARNING_SINK: std::cell::RefCell<Vec<String>>;
+}
+
+/// **上流の warnings を集めながら `fut` を走らせる** (Refs #205 の 06 の HTTP 版)。
+///
+/// R2 の分割遅れ (`NoSuchKey`) の最中に畳むと、欠けた入力を指紋付きで「最新」として
+/// 保存してしまう。指紋は入力から作るので次に運行が揃えば畳み直されるが、**その間は
+/// 静かに少ない拘束を返す** — #205 のリスク欄の筆頭そのものなので、`tracing` に
+/// 落として終わりにせず呼び出し側の応答まで運ぶ。
+///
+/// **task local にしてあるのは混線させないため。** repo は `Arc` で全リクエストに
+/// 共有されているので、struct にバッファを持たせると隣のリクエストの warnings が
+/// 混ざる (逆に、隣に持って行かれて自分の分が消える)。axum のハンドラは 1
+/// リクエスト = 1 task なので、その task に閉じた置き場なら取り違えが起きない。
+pub async fn with_warning_sink<F: std::future::Future>(fut: F) -> (F::Output, Vec<String>) {
+    WARNING_SINK
+        .scope(std::cell::RefCell::new(Vec::new()), async move {
+            let out = fut.await;
+            let collected = collected_warnings();
+            (out, collected)
+        })
+        .await
+}
+
+/// いま集まっている warnings。sink が無ければ空。
+fn collected_warnings() -> Vec<String> {
+    WARNING_SINK
+        .try_with(|sink| sink.borrow().clone())
+        .unwrap_or_default()
+}
+
+/// 集めている最中なら記録する。**同じ文面は 1 回だけ**、上限まで。
+fn record_warning(w: &str) {
+    let _ = WARNING_SINK.try_with(|sink| {
+        let mut v = sink.borrow_mut();
+        if v.len() < MAX_COLLECTED_WARNINGS && !v.iter().any(|s| s == w) {
+            v.push(w.to_string());
+        }
+    });
+}
+
 // ── 認証 token の取り方 (設定で与える。コードに焼かない) ────────────────────
 
 /// 上流に付ける Bearer token の供給元。
@@ -655,9 +709,14 @@ impl HttpKintaiEventsRepo {
     }
 
     /// 上流の warnings を握り潰さない (R2 の分割遅れで一部の運行が欠けたことが分かる)。
+    ///
+    /// `tracing` は運用ログ、[`record_warning`] は**呼び出し側の応答**への持ち出し。
+    /// 畳んだ結果を返す口は「この計算の入力が欠けていたか」を出せないと、
+    /// 欠けたまま最新として保存した値を静かに返すことになる。
     fn log_warnings(warnings: &[String]) {
         for w in warnings {
             tracing::warn!(warning = %w, "alc dtako-events warning");
+            record_warning(w);
         }
     }
 
@@ -1253,6 +1312,48 @@ mod tests {
             MetadataTokenProvider::new("http://127.0.0.1:1", "https://alc.example", 60).unwrap();
         let err = p.token().await.unwrap_err();
         assert!(err.to_string().contains("metadata identity"), "{err}");
+    }
+
+    /// **上流 warnings が呼び出し側まで届く。**
+    ///
+    /// R2 の分割遅れ (`NoSuchKey`) の最中に畳むと、欠けた入力を「最新」として
+    /// 保存する。`tracing` に落とすだけでは応答から見えない。
+    #[tokio::test]
+    async fn upstream_warnings_come_back_to_the_caller() {
+        let (out, warnings) = with_warning_sink(async {
+            HttpKintaiEventsRepo::log_warnings(&[
+                "NoSuchKey: 1234/KUDGIVT.csv".to_string(),
+                "NoSuchKey: 5678/KUDGIVT.csv".to_string(),
+            ]);
+            42
+        })
+        .await;
+        assert_eq!(out, 42, "中身の戻り値はそのまま");
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("NoSuchKey"), "{warnings:?}");
+    }
+
+    /// **同じ文面は 1 回だけ、頭だけ。** 月ぶんの運行が全部欠けると 1,100 本並ぶ。
+    #[tokio::test]
+    async fn warnings_are_deduped_and_capped() {
+        let (_, warnings) = with_warning_sink(async {
+            let same = vec!["same".to_string(); 3];
+            HttpKintaiEventsRepo::log_warnings(&same);
+            let many: Vec<String> = (0..MAX_COLLECTED_WARNINGS + 10)
+                .map(|i| format!("w{i}"))
+                .collect();
+            HttpKintaiEventsRepo::log_warnings(&many);
+        })
+        .await;
+        assert_eq!(warnings.iter().filter(|w| *w == "same").count(), 1);
+        assert_eq!(warnings.len(), MAX_COLLECTED_WARNINGS);
+    }
+
+    /// **集めていないときは何も起きない。** 大半の呼び出しがこちら。
+    #[test]
+    fn warnings_outside_a_sink_are_dropped() {
+        HttpKintaiEventsRepo::log_warnings(&["orphan".to_string()]);
+        assert!(collected_warnings().is_empty());
     }
 
     #[test]

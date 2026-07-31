@@ -46,6 +46,13 @@ struct BatchArgs {
     /// **実際に書き込む。** 付けない限り 1 行も書かない (既定は dry-run)
     #[arg(long, default_value_t = false)]
     apply: bool,
+
+    /// MariaDB を読んだまま `recalc` / `sync` を `--apply` する (**通常は不要**)。
+    ///
+    /// 既定で拒否している理由は [`refuse_onprem_fold`]。GCP と書き合いになるので、
+    /// Cloudflare か GCP が落ちている間の緊急経路としてだけ使う。
+    #[arg(long, default_value_t = false)]
+    allow_onprem_fold: bool,
 }
 
 /// 想定内に終わったが、入力に想定外があった。
@@ -114,6 +121,7 @@ fn run_console(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// バッチを 1 回走らせて終わる。
 fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
     use rust_ichibanboshi::kintai_fold::{recalc_month, sync_month};
+    use rust_ichibanboshi::kintai_http_repo::with_warning_sink;
     use rust_ichibanboshi::kintai_push::{push_month, KintaiPgStore, PushOptions};
     use rust_ichibanboshi::server::{build_kintai_events_repo, build_kosoku_params};
 
@@ -134,6 +142,10 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
     let batch = match &command {
         Command::Push(b) | Command::Recalc(b) | Command::Sync(b) => b.clone(),
     };
+    let folds = matches!(command, Command::Recalc(_) | Command::Sync(_));
+    if folds && batch.apply && !batch.allow_onprem_fold {
+        refuse_onprem_fold(&config)?;
+    }
     let opts = PushOptions {
         month: batch.month.clone(),
         driver: batch.driver,
@@ -160,14 +172,28 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
                 print_push(&r);
                 r.has_unexpected()
             }
+            // 上流 warnings を握り潰さない — R2 の分割遅れの最中に畳むと、
+            // 欠けた入力を「最新」として保存する
             Command::Recalc(_) => {
-                let r = recalc_month(&repo, &store, &params, &opts.month, opts.driver, opts.apply)
-                    .await?;
+                let (r, warnings) = with_warning_sink(recalc_month(
+                    &repo,
+                    &store,
+                    &params,
+                    &opts.month,
+                    opts.driver,
+                    opts.apply,
+                ))
+                .await;
+                let mut r = r?;
+                r.warnings = warnings;
                 print_fold(&r);
-                !r.skipped.is_empty()
+                r.has_unexpected()
             }
             Command::Sync(_) => {
-                let r = sync_month(&repo, &store, &params, &opts).await?;
+                let (r, warnings) =
+                    with_warning_sink(sync_month(&repo, &store, &params, &opts)).await;
+                let mut r = r?;
+                r.fold.warnings = warnings;
                 print_push(&r.push);
                 print_fold(&r.fold);
                 r.has_unexpected()
@@ -181,6 +207,28 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
         std::process::exit(EXIT_UNEXPECTED_INPUT);
     }
     Ok(())
+}
+
+/// **書き手を GCP 1 本に固定する** (Refs #205 の 06)。
+///
+/// 畳んだ行の指紋は「読んだ生行の JSON」が材料なので、MariaDB の行と HTTP + Supabase
+/// の行では**同じ乗務員の同じ月でも必ず違う値になる** (列も文字列表現も違う)。両方が
+/// 同じ Supabase に `--apply` すると、互いの指紋を「古い」と見なして毎回全量を書き
+/// 直し合う — 差分検知が意味を失い、どちらの値が正かも決まらない。
+///
+/// `push` は止めない (指紋を持たない生イベントの写しなので、二重に走っても
+/// 冪等キーで収束する)。止めるのは畳む側だけ。
+fn refuse_onprem_fold(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    use rust_ichibanboshi::config::KintaiEventsSource;
+    if config.kintai_events.source != KintaiEventsSource::Mariadb {
+        return Ok(());
+    }
+    Err(
+        "MariaDB を読む形での recalc/sync --apply は拒否します。畳んで書くのは GCP 側の \
+         1 本に固定してあります (指紋の材料が読み先ごとに違うので、両方が書くと毎回 \
+         全量を書き直し合います)。緊急経路として承知の上で回すなら --allow-onprem-fold"
+            .into(),
+    )
 }
 
 fn print_push(r: &rust_ichibanboshi::kintai_push::PushReport) {
@@ -210,7 +258,15 @@ fn print_fold(r: &rust_ichibanboshi::kintai_fold::FoldReport) {
         "recalc: shifts {} / day_summaries {} / day_parts {}",
         r.shifts, r.day_summaries, r.day_parts
     );
+    println!(
+        "recalc: logic_version {} / 計算時刻 {}",
+        r.logic_version, r.calculated_at
+    );
     for s in &r.skipped {
         println!("recalc: 写せなかった行 {s:?}");
+    }
+    // 欠けた入力で畳んだかもしれない — 黙って「最新」にしない
+    for w in &r.warnings {
+        println!("recalc: 上流の warning {w}");
     }
 }

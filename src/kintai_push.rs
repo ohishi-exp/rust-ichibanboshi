@@ -997,7 +997,7 @@ pub async fn apply_timecard_batch(
 /// **始業 / 終業は後から直る。** 積み増しだけにすると、直された打刻が永久に
 /// 反映されない。よって窓 (既定は当月 + 前月) を毎回まるごと送り直す。
 /// 書き込みが無駄にならないのは日単位署名が守るから — **変わった日しか書かない**。
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TimecardWindow {
     /// 覆う月 (`YYYY-MM`)。**送り主はこの月ぶんを漏れなく送っていること** —
     /// 受け側はこの範囲の内側でしか書かないし、消さない。
@@ -1019,6 +1019,30 @@ pub struct TimecardWindow {
     /// 安全側を作る。
     #[serde(default)]
     pub dry_run: bool,
+    /// 反映のあとに**畳み直すか** (Refs #205 の 06)。既定 `true`。
+    ///
+    /// 既定を「畳む」にしてあるのが 06 そのもの — 読み出しは計算しないので、
+    /// 打刻を運んだのに畳み直していない状態は遅いのではなく**静かに間違う**。
+    /// 切れるようにしてあるのは、運ぶのと畳むのを別々に試したい場合のため。
+    #[serde(default = "yes")]
+    pub fold: bool,
+}
+
+/// `serde(default)` 用。既定を「畳む」にするため。
+fn yes() -> bool {
+    true
+}
+
+impl Default for TimecardWindow {
+    fn default() -> Self {
+        Self {
+            months: Vec::new(),
+            drivers: Vec::new(),
+            events: Vec::new(),
+            dry_run: false,
+            fold: true,
+        }
+    }
 }
 
 /// [`apply_timecard_window`] の結果。
@@ -1028,6 +1052,13 @@ pub struct TimecardWindowResult {
     pub drivers: usize,
     /// 実際に書き換えた乗務員数。**大半は 0 のはず** (打刻はほとんど戻らない)。
     pub drivers_written: usize,
+    /// 書き換えた乗務員CD。**apply 後に畳み直す対象がこれ** (Refs #205 の 06)。
+    ///
+    /// 件数だけでは「誰を畳み直すか」が決まらない。窓の受け口はこの並びを
+    /// [`crate::kintai_fold::recalc_drivers`] に渡して、変わった乗務員だけを
+    /// 畳み直す — 定常時はほぼ空なので、束ねても proxy の 100 秒に収まる。
+    #[serde(default)]
+    pub drivers_changed: Vec<i64>,
     pub days_written: usize,
     pub days_deleted: usize,
     pub events_written: usize,
@@ -1177,6 +1208,7 @@ pub fn plan_window(
             continue;
         }
         result.drivers_written += 1;
+        result.drivers_changed.push(*driver);
         result.days_written += plan.changed.len();
         result.days_deleted += plan.deleted.len();
         result.events_written += plan.changed.values().map(Vec::len).sum::<usize>();
