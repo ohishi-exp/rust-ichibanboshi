@@ -924,14 +924,16 @@ async fn read_fold_gate(
     }))
 }
 
-/// `pub(crate)` — [`crate::routes::kintai_recalc::run`] からも直接呼ぶ (実装計画 13)。
+/// gate の実書き込み (実装計画 13)。**呼ぶのは [`write_fold_gate_best_effort`]
+/// だけ** — 失敗を持ち上げてよい呼び出し元が 1 つも無いため private にしてある
+/// (Refs #205 の 20)。
 ///
 /// [`recalc_month`] 経由 (CLI の `Recalc` / `Sync`) は
 /// [`crate::kintai_http_repo::warnings_seen`] で「収集器の中で warnings ゼロ」が
 /// 確認できた回だけ書く (Refs #205-17)。`routes::kintai_recalc::run` の 5 条件の
 /// 1 つ (`folded.warnings.is_empty()`) と同じ理由 — R2 の分割遅れ中に欠けた入力を
 /// 「最新」と刻まないため。
-pub(crate) async fn write_fold_gate(
+async fn write_fold_gate(
     store: &KintaiPgStore,
     month: &str,
     dtako_digest: &str,
@@ -949,10 +951,40 @@ pub(crate) async fn write_fold_gate(
     Ok(())
 }
 
+/// [`write_fold_gate`] の「書けなくても呼び出し元の口を落とさない」版
+/// (Refs #205 の 20)。
+///
+/// 書き込みは**畳み終わった後**に走る。ここで `Err` を持ち上げると、再計算も保存も
+/// 全部成功したリクエストが最適化の書き込み 1 本だけを理由に 502 (`map_push_err`)
+/// になる — 呼び出し側から見ると「再計算が失敗した」と区別が付かない。書けなければ
+/// gate が立たないだけで、次回また全量読みに落ちる**安全側**なので、loud に warn
+/// して先へ進む。無言にはしない。
+pub(crate) async fn write_fold_gate_best_effort(
+    store: &KintaiPgStore,
+    month: &str,
+    dtako_digest: &str,
+    punch_digest: &str,
+    logic_version: &str,
+) {
+    let w = write_fold_gate(store, month, dtako_digest, punch_digest, logic_version).await;
+    if let Err(e) = w {
+        tracing::warn!(month = %month, error = %e, "kintai month-gate write failed");
+    }
+}
+
 /// いまの月の入力から指紋を作る。**`Ok(None)` は「判定できない」の意味** —
-/// alc に `GET /api/dtako/events/etags` の口が無い環境や、上流エラーがこれになる。
-/// どちらも呼び出し側は安全側 (従来どおり全量読み) に倒す。**loud** — 呼び出し元の
-/// 応答を握り潰さないよう、ここで tracing::warn しておく。
+/// alc に `GET /api/dtako/events/etags` の口が無い環境、上流エラー、そして
+/// **打刻側 (Pg) の読み取り失敗**がこれになる。どれも呼び出し側は安全側
+/// (従来どおり全量読み) に倒す。**loud** — 呼び出し元の応答を握り潰さないよう、
+/// ここで tracing::warn しておく。
+///
+/// **Pg 側の失敗を `Err` で持ち上げない** (Refs #205 の 20)。月ゲートは最適化で
+/// あって、失敗しても「省けなかった」以上の意味を持たない。持ち上げると
+/// [`crate::routes::kintai_recalc::run`] の `map_push_err` が **502** に変えて
+/// 口ぜんたいを落とす — 2026-07-31 に実害。`kintai.fold_gate` の GRANT 漏れ
+/// (migrations/005) で `permission denied` になり、`POST /api/kintai/recalc` が
+/// **ログ 1 行も出さずに** 502 を返し続けた。Pg が本当に死んでいるなら後続の
+/// [`store_units`] が正しくエラーを返すので、ここで倒しても失敗は隠れない。
 ///
 /// 打刻側 ([`KintaiPgStore::stored_month_punch_digest`]) の窓は [`fold_month`] が
 /// 実際に読む [`month_range`] と**同じ**にする。窓がずれると、fold の入力が
@@ -978,7 +1010,13 @@ async fn compute_month_digests(
     let bad_month = || KintaiPushError::NotConfigured(format!("bad month: {month}"));
     let from = tz(parse_dt(&from_s).ok_or_else(bad_month)?);
     let to = tz(parse_dt(&to_s).ok_or_else(bad_month)?);
-    let punch_digest = store.stored_month_punch_digest(from, to).await?;
+    let punch_digest = match store.stored_month_punch_digest(from, to).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(month = %month, error = %e, "kintai month-gate punch digest failed");
+            return Ok(None);
+        }
+    };
     Ok(Some((dtako_digest, punch_digest)))
 }
 
@@ -1023,6 +1061,10 @@ pub enum MonthGate {
 /// 月ゲートを判定する (実装計画 13)。**読むだけで書かない** — 書くかどうかは
 /// 呼び出し側が「月まるごとを 1 呼び出しで完結させたか」を見て決める
 /// ([`recalc_month`] / [`crate::routes::kintai_recalc::run`] の docs 参照)。
+///
+/// **`kintai.fold_gate` が読めなくても `Err` にしない** ([`MonthGate::Unavailable`]
+/// に倒す、Refs #205 の 20)。理由は [`compute_month_digests`] の docs と同じ —
+/// 最適化の失敗で口ぜんたいを 502 にしない。
 pub async fn month_gate_report(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,
@@ -1035,7 +1077,14 @@ pub async fn month_gate_report(
         return Ok(MonthGate::Unavailable);
     };
     let version = logic_version(params);
-    if month_gate_hit(store, month, &version, &dtako_digest, &punch_digest).await? {
+    let hit = match month_gate_hit(store, month, &version, &dtako_digest, &punch_digest).await {
+        Ok(hit) => hit,
+        Err(e) => {
+            tracing::warn!(month = %month, error = %e, "kintai month-gate read failed");
+            return Ok(MonthGate::Unavailable);
+        }
+    };
+    if hit {
         tracing::info!(month = %month, "kintai month-gate skip");
         return Ok(MonthGate::Hit(new_report(params, apply)));
     }
@@ -1090,8 +1139,14 @@ pub async fn recalc_month(
                 // warnings が確認できた回 (Some(false)) だけ刻む。None (収集器の外) や
                 // Some(true) では書かない — 迷ったら書かない側 (Refs #205-17)
                 if apply && crate::kintai_http_repo::warnings_seen() == Some(false) {
-                    write_fold_gate(store, month, &dtako_digest, &punch_digest, &logic_version)
-                        .await?;
+                    write_fold_gate_best_effort(
+                        store,
+                        month,
+                        &dtako_digest,
+                        &punch_digest,
+                        &logic_version,
+                    )
+                    .await;
                 }
                 return Ok(report);
             }

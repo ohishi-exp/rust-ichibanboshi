@@ -89,7 +89,14 @@ pub(crate) fn map_push_err(e: KintaiPushError) -> (StatusCode, String) {
     match e {
         // 宣言していない instance に投げられた = 呼び出し側の経路違い
         KintaiPushError::NotConfigured(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
-        other => (StatusCode::BAD_GATEWAY, other.to_string()),
+        other => {
+            // **無言の 502 を作らない** (Refs #205 の 20)。2026-07-31 に
+            // `kintai.fold_gate` の GRANT 漏れで `POST /api/kintai/recalc` が
+            // 502 を返し続けたとき、ここが何も出さないせいで「コンテナが落ちて
+            // いる」ようにしか見えず、切り分けに丸 1 タスクかかった
+            tracing::warn!(error = %other, "kintai push failed (502)");
+            (StatusCode::BAD_GATEWAY, other.to_string())
+        }
     }
 }
 

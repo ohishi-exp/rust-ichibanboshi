@@ -280,15 +280,16 @@ async fn run(
             && !req.stale_only
             && folded.warnings.is_empty();
         if completed_the_whole_month {
-            crate::kintai_fold::write_fold_gate(
+            // 書けなくてもこの応答は落とさない (Refs #205 の 20 — 畳みは全部
+            // 成功しているので、最適化の書き込み 1 本で 502 にしない)
+            crate::kintai_fold::write_fold_gate_best_effort(
                 &st,
                 &req.month,
                 &dtako_digest,
                 &punch_digest,
                 &logic_version,
             )
-            .await
-            .map_err(map_push_err)?;
+            .await;
         }
     }
 
