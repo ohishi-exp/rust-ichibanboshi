@@ -737,7 +737,10 @@ pub fn jst_day_bounds(date: NaiveDate) -> (DateTime<FixedOffset>, DateTime<Fixed
 }
 
 /// `YYYY-MM-DD HH:MM:SS` (JST 壁時計) を `TIMESTAMPTZ` へ渡せる形に。
-fn jst_at(s: &str) -> Result<DateTime<FixedOffset>, KintaiPushError> {
+///
+/// 読み返す側 ([`crate::kintai_pg_repo`]) も同じ変換で範囲を作る。**写さない** —
+/// 書きと読みで壁時計の解釈が 1 箇所でも割れると、書いた行が読めない日ができる。
+pub fn jst_at(s: &str) -> Result<DateTime<FixedOffset>, KintaiPushError> {
     let naive = NaiveDateTime::parse_from_str(s, DATETIME_FORMAT)
         .map_err(|e| KintaiPushError::NotConfigured(format!("bad range {s:?}: {e}")))?;
     Ok(FixedOffset::east_opt(JST_OFFSET_SECONDS)

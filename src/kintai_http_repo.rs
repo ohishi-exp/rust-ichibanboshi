@@ -47,9 +47,14 @@
 //!
 //! そこで `fallback` (通常は MariaDB 実装) を持ち、**上流に口が無いものだけ**そちらへ
 //! 委譲する。オンプレでは両方揃うので HTTP 経路の出力を MariaDB と突き合わせて
-//! 検証できる。`fallback` が無い実行形態 (GCP) では打刻が読めないため
-//! `shifts_from_timecard` が空になる — これは #205 の 04 / 05 (打刻の push) が
-//! 埋める穴で、起動時に warn を出して静かな欠損にしない。
+//! 検証できる。
+//!
+//! MariaDB が無い実行形態 (GCP) の `fallback` は
+//! [`crate::kintai_pg_repo::PgKintaiEventsRepo`] — 04b で `kintai.kintai_events` に
+//! 入った打刻を読み返す (#205 の G6)。**かつてここが `None` になり
+//! `shifts_from_timecard` が空になっていた穴がこれで閉じる。** どちらも無い形態は
+//! 今も打刻が読めないので、起動時に warn を出して静かな欠損にしない
+//! (`crate::server::build_kintai_events_repo`)。
 //!
 //! ## 期間の写し方
 //!
