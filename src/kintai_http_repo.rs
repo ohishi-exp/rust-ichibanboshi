@@ -470,6 +470,44 @@ impl UnkoDiffDriverSplit {
 /// 通常は切られない — 桁違いの値が来たときに応答を膨らませないための蓋。
 pub const MAX_UNKO_DIFF_DRIVERS: usize = 300;
 
+/// 同じく車輌別の上限 ([`UnkoDiffVehicle`])。
+pub const MAX_UNKO_DIFF_VEHICLES: usize = 300;
+
+/// 逆方向の 1 車輌ぶん (Refs #205 の 39)。
+///
+/// **車輌は別の列ではなく運行NO の中に埋まっている** ([`unko_no_vehicle_cd`])。
+/// 「`time_card_dtako` に出るかどうかは車輌で決まる」という読みを 401 件の規模で
+/// 確かめるための内訳で、`onprem_in_month` が 0 の車輌に固まっていれば
+/// **射程外 (A)** の裏が取れる。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnkoDiffVehicle {
+    /// 運行NO の 13〜22 桁目 (先頭の 0 を落としたもの)。
+    pub vehicle_cd: String,
+    /// **対象月に始まった、GCP にしか無い運行**の数。
+    pub gcp_only: usize,
+    /// 同じ車輌CD を持つ押し込み済みの運行の数 (同じ月)。
+    pub onprem_in_month: usize,
+}
+
+/// **運行NO に埋まっている車輌CD** (13〜22 桁目、Refs #205 の 39)。
+///
+/// 実測で裏が取れている (2026-01..06 の生イベント、`GET /api/kintai/events`):
+/// `…0000007132…` = `帯広100か7132` / `…0000002302…` = `長崎800か2302` /
+/// `…0000000120…` = `十勝100か120` — **6 車輌すべてで 1:1**。
+///
+/// **オンプレ 23 桁 / GCP 22 桁のどちらでも同じ位置**なので、
+/// [`onprem_unko_no`] で対象CD を落とす前でも後でも同じ値が出る。
+/// 数字以外が混ざっていれば `None` (推測で切らない)。全部 0 なら `"0"`。
+fn unko_no_vehicle_cd(unko_no: &str) -> Option<&str> {
+    let s = unko_no.get(12..22)?;
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let t = s.trim_start_matches('0');
+    // 全部 0 でも空文字にはしない (車輌CD 0 として数える)
+    Some(if t.is_empty() { "0" } else { t })
+}
+
 /// 試算する突合キーの候補。`None` = そのまま、`Some(n)` = 先頭 n 文字。
 ///
 /// `22` は「オンプレ 23 桁 − 余分な 1 文字」、`12` は `YYMMDDHHMMSS`
@@ -605,6 +643,11 @@ pub struct UnkoDiff {
     pub gcp_only_in_month_unknown_driver: usize,
     /// 乗務員別の内訳を 3 つの桶へ畳んだもの ([`UnkoDiffDriverSplit`])。
     pub gcp_only_driver_split: UnkoDiffDriverSplit,
+    /// **対象月に始まった逆方向の車輌別の内訳** ([`UnkoDiffVehicle`])。
+    /// 車輌CD は運行NO の中から読むので、上流に足すものは無い。
+    pub gcp_only_in_month_by_vehicle: Vec<UnkoDiffVehicle>,
+    /// 車輌CD を読めなかった逆方向の件数 (運行NO の形が違う)。
+    pub gcp_only_in_month_unknown_vehicle: usize,
     /// 逆方向の実物 (辞書順の先頭 [`MAX_UNKO_DIFF_SAMPLE`] 件)。
     pub gcp_only_sample: Vec<UnkoSample>,
     /// **突き合わせた相手側**の実物 (オンプレの `unko_no`、同じく辞書順の先頭)。
@@ -687,6 +730,7 @@ fn diff_unko(
         *by_day.entry(d.to_string()).or_default() += 1;
     }
     let (by_driver, unknown_driver) = gcp_only_by_driver(&only_in_month, onprem, aux);
+    let (by_vehicle, unknown_vehicle) = gcp_only_by_vehicle(&only_in_month, onprem);
     let mut mine: Vec<&str> = seen.into_iter().collect();
     mine.sort_unstable();
     UnkoDiff {
@@ -699,6 +743,8 @@ fn diff_unko(
         gcp_only_driver_split: UnkoDiffDriverSplit::measure(&by_driver),
         gcp_only_in_month_by_driver: by_driver,
         gcp_only_in_month_unknown_driver: unknown_driver,
+        gcp_only_in_month_by_vehicle: by_vehicle,
+        gcp_only_in_month_unknown_vehicle: unknown_vehicle,
         gcp_only_sample: sample(&only),
         onprem_sample: sample(&mine),
         onprem_shape: UnkoShape::measure(onprem.iter().map(|o| o.unko_no.as_str())),
@@ -756,6 +802,43 @@ fn gcp_only_by_driver(
     // 多い順。同数なら乗務員CD 順 (BTreeMap から来ているので既に整列済み)
     rows.sort_by_key(|r| std::cmp::Reverse(r.gcp_only));
     rows.truncate(MAX_UNKO_DIFF_DRIVERS);
+    (rows, unknown)
+}
+
+/// **対象月の逆方向を車輌別に割る** (Refs #205 の 39)。返すのは
+/// `(車輌別の表, 車輌CD を読めなかった件数)`。
+///
+/// 車輌CD は運行NO の中から読む ([`unko_no_vehicle_cd`]) ので、両側とも
+/// 追加の列も往復も要らない。**`onprem_in_month` が 0 の車輌に固まっていれば
+/// 「その車輌は `time_card_dtako` に出ない」= 射程外 (A) の裏**になる。
+fn gcp_only_by_vehicle(
+    only_in_month: &[(&str, NaiveDate)],
+    onprem: &[OnpremOperation],
+) -> (Vec<UnkoDiffVehicle>, usize) {
+    let mut per: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unknown = 0;
+    for (u, _) in only_in_month {
+        match unko_no_vehicle_cd(u) {
+            Some(cd) => *per.entry(cd).or_default() += 1,
+            None => unknown += 1,
+        }
+    }
+    let mut mine: HashMap<&str, usize> = HashMap::new();
+    for o in onprem {
+        if let Some(cd) = unko_no_vehicle_cd(&o.unko_no) {
+            *mine.entry(cd).or_default() += 1;
+        }
+    }
+    let mut rows: Vec<UnkoDiffVehicle> = per
+        .into_iter()
+        .map(|(cd, gcp_only)| UnkoDiffVehicle {
+            vehicle_cd: cd.to_string(),
+            gcp_only,
+            onprem_in_month: mine.get(cd).copied().unwrap_or(0usize),
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.gcp_only));
+    rows.truncate(MAX_UNKO_DIFF_VEHICLES);
     (rows, unknown)
 }
 
@@ -3152,6 +3235,61 @@ mod tests {
         assert_eq!(other, (1, 1), "1078 は過去に居たのに当月 0 件 = 欠落が濃い");
         let also = (s.also_in_month_drivers, s.also_in_month_ops);
         assert_eq!(also, (1, 1), "1517 は当月にも押し込み済みが在る");
+    }
+
+    /// **運行NO の 13〜22 桁目が車輌CD。** 本番の生イベントで裏が取れている
+    /// (`帯広100か7132` / `長崎800か2302` / `十勝100か120` …、6 車輌すべて 1:1)。
+    #[test]
+    fn the_vehicle_cd_is_read_out_of_the_unko_no() {
+        let real = unko_no_vehicle_cd("26053010120300000071321");
+        assert_eq!(real, Some("7132"), "帯広100か7132 (オンプレ 23 桁)");
+        let gcp = unko_no_vehicle_cd("2606241140060000002302");
+        assert_eq!(gcp, Some("2302"), "GCP 22 桁でも同じ位置");
+        assert_eq!(unko_no_vehicle_cd("26021208325500000001201"), Some("120"));
+        assert_eq!(
+            unko_no_vehicle_cd("2602120832550000000000"),
+            Some("0"),
+            "全 0"
+        );
+        assert_eq!(
+            unko_no_vehicle_cd("260212083255000000xx01"),
+            None,
+            "数字以外"
+        );
+        assert_eq!(unko_no_vehicle_cd("2602"), None, "短すぎる");
+    }
+
+    /// **車輌別の内訳 (Refs #205 の 39)。** `onprem_in_month` が 0 の車輌に
+    /// 固まっていれば「その車輌は `time_card_dtako` に出ない」= 射程外 (A)。
+    #[test]
+    fn the_reverse_direction_splits_by_vehicle_read_from_the_unko_no() {
+        // 押し込み済みに在るのは 2302 の車輌だけ
+        let onprem = vec![op(1078, "26062411400600000023021")];
+        let gcp = gcp_set(&[
+            "2606010930290000007132", // 7132 — 押し込み済みに 1 件も無い
+            "2606280911250000007132",
+            "2606050751400000002302", // 2302 — 押し込み済みにも在る車輌
+            "260605075140000000xx02", // 車輌CD が読めない
+        ]);
+        let diff = diff_unko(&onprem, &gcp, &UnkoDiffAux::default(), Some((2026, 6)));
+        let rows = &diff.gcp_only_in_month_by_vehicle;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].vehicle_cd, "7132", "多い順");
+        assert_eq!(
+            (rows[0].gcp_only, rows[0].onprem_in_month),
+            (2, 0),
+            "射程外の形"
+        );
+        assert_eq!(rows[1].vehicle_cd, "2302");
+        assert_eq!(
+            (rows[1].gcp_only, rows[1].onprem_in_month),
+            (1, 1),
+            "両側に在る"
+        );
+        assert_eq!(
+            diff.gcp_only_in_month_unknown_vehicle, 1,
+            "読めなかった 1 件"
+        );
     }
 
     /// **日別の内訳。** 特定の日に固まっているのか散っているのかを見る。
