@@ -564,11 +564,17 @@ pub async fn rest_diff(
     // マクロは 1 行に収める (CLAUDE.md)
     let (total, scanned) = (diff.total, diff.scanned_unko);
     tracing::info!(month = %month, total, scanned, "kintai rest-diff built");
+    // 押す対象の数は必ず出す (0 でも黙らない)
+    tracing::info!(mismatch = diff.mismatch_total, "kintai rest-diff to fix");
     Ok(Json(serde_json::json!({
         "month": month,
         "driver": driver,
         "from": from,
         "to": to,
+        // **押す対象の数を `total` より先に置く** — 混ぜると必ず読み違える
+        // ([`crate::kintai_rest_diff::RestDiffKind`] の docs、2026-06 の実測)
+        "mismatch_total": diff.mismatch_total,
+        "total_by_kind": diff.total_by_kind,
         "total": diff.total,
         "items": diff.items,
         "by_driver": diff.by_driver,
