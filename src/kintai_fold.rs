@@ -488,10 +488,20 @@ SELECT (SELECT coalesce(array_agg(DISTINCT logic_version), '{}')
 
 /// 全量再計算の対象乗務員を 1 ページ (`driver_cd` の keyset ページング)。
 ///
-/// **母集団は Postgres の中だけで決める。** 生イベントの読み先 (alc / MariaDB) に
+/// **母集団は Postgres の distinct driver_cd と `extra` (呼び出し側の `unnest`) の和。**
+///
+/// 昔は Postgres の中だけで決めていた — 生イベントの読み先 (alc / MariaDB) に
 /// 聞くと、乗務員を数えるためだけに月ぶんの `dtako_events` を JSON にして捨てる
 /// ことになる (`kintai_diff::drivers_page` が同じ理由で `UNION` 1 本に絞ったのと
-/// 同じ話)。運んだ打刻と、既に畳んである行の和が対象。
+/// 同じ話)、という考え方自体は正しい。**が、それだと打刻ゼロ・休息由来だけの
+/// 乗務員が母集団から永久に漏れる** — `kintai_events` は打刻由来の行しか持たず、
+/// `day_summaries` は最低 1 回畳まれていないと現れない。1 回も畳んだことが無い
+/// rest-only 乗務員はどちらの表にも 1 行も無い (#205-12、2026-06 実測で 42 名)。
+///
+/// 呼び出し元 ([`crate::routes::kintai_recalc::run`]) は母集団を決める前に
+/// [`fold_month`] を 1 回読んでいる (ページの畳みそのものに要るので、ここで
+/// もう 1 回生イベントを読み直す必要が無い)。その `split_by_driver` の
+/// キー集合を `extra` として渡せば、月ぶんの読みを増やさずに埋まる。
 const RECALC_DRIVER_PAGE_SQL: &str = r#"
 WITH pop AS (
     SELECT DISTINCT driver_cd FROM kintai.kintai_events
@@ -499,9 +509,11 @@ WITH pop AS (
     UNION
     SELECT DISTINCT driver_cd FROM kintai.day_summaries
      WHERE tenant_id = $1 AND date >= $4 AND date < $5
+    UNION
+    SELECT driver_cd FROM unnest($10::int8[]) AS e(driver_cd)
 )
 SELECT driver_cd FROM pop
- WHERE driver_cd > $6
+ WHERE driver_cd > $6 AND driver_cd > 0
    AND (NOT $7 OR NOT EXISTS (
          SELECT 1 FROM kintai.day_summaries s
           WHERE s.tenant_id = $1 AND s.driver_cd = pop.driver_cd
@@ -641,6 +653,10 @@ pub async fn stale_state(
 
 /// 全量再計算の対象乗務員を 1 ページ返す。`after` は前ページの最後の乗務員CD。
 ///
+/// `extra` は Postgres の外から足す母集団 (rest-only 乗務員の穴埋め、
+/// [`RECALC_DRIVER_PAGE_SQL`] docs 参照)。`driver_cd <= 0` は呼び出し側が
+/// 混ぜていても SQL 側で落とす ([`crate::kintai_repo`] の「0 以下は捨てる」と同じ規則)。
+///
 /// `stale_only` は「対象月に**現行版の行を 1 つも持たない**乗務員」に絞る。
 /// 勤務が 1 本も立たない乗務員 (打刻はあるが全部落ちた月) は保存行を作れないので
 /// **毎回この網に残る** — 収束しないので、全量を回す用途では `false` で使う。
@@ -648,6 +664,7 @@ pub async fn recalc_driver_page(
     store: &KintaiPgStore,
     month: &str,
     params: &KosokuParams,
+    extra: &std::collections::BTreeSet<i64>,
     after: Option<i64>,
     stale_only: bool,
     limit: usize,
@@ -655,6 +672,7 @@ pub async fn recalc_driver_page(
     use sqlx::Row;
     let (m0, m1) = month_date_bounds(month)
         .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
+    let extra: Vec<i64> = extra.iter().copied().collect();
     let rows = sqlx::query(RECALC_DRIVER_PAGE_SQL)
         .bind(store.tenant_id())
         .bind(jst_day_bounds(m0).0)
@@ -665,6 +683,7 @@ pub async fn recalc_driver_page(
         .bind(stale_only)
         .bind(logic_version(params))
         .bind(limit as i64)
+        .bind(&extra)
         .fetch_all(store.pool())
         .await?;
     Ok(rows
@@ -906,8 +925,28 @@ pub async fn recalc_drivers(
     if drivers.is_empty() {
         return Ok(new_report(params, apply));
     }
-    let want: std::collections::BTreeSet<u64> = drivers.iter().copied().collect();
     let all = fold_month(repo, params, month, None).await?;
+    recalc_drivers_from_units(store, params, month, drivers, all, apply).await
+}
+
+/// [`recalc_drivers`] の続き — **生イベントの読みを呼び出し側から受け取る**。
+///
+/// 呼び出し元が [`fold_month`] を既に済ませている場合 (`kintai_recalc` が母集団の
+/// 決定 (#205-12) と畳みで同じ 1 回読みを使い回すとき) はこちらを直接呼ぶ。ここで
+/// もう一度 [`fold_month`] を呼ぶと 1 ページの費用 (全量読み 25〜55 秒) が単純に
+/// 倍になる。
+pub async fn recalc_drivers_from_units(
+    store: &KintaiPgStore,
+    params: &KosokuParams,
+    month: &str,
+    drivers: &[u64],
+    all: Vec<(u64, FoldUnit, String)>,
+    apply: bool,
+) -> Result<FoldReport, KintaiPushError> {
+    if drivers.is_empty() {
+        return Ok(new_report(params, apply));
+    }
+    let want: std::collections::BTreeSet<u64> = drivers.iter().copied().collect();
     let mut units: Vec<(u64, FoldUnit, String)> = all
         .into_iter()
         .filter(|(cd, _, _)| want.contains(cd))

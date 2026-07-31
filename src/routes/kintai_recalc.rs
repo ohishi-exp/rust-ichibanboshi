@@ -14,16 +14,29 @@
 //! 畳み直そうとすると必ず時間切れになるため、口を分けて `after_driver_cd` で
 //! ページングする。stale かどうかは窓の応答の `stale.drivers` で分かる。
 //!
-//! ## 1 ページの乗務員数を小さく採る
+//! ## 1 ページの費用は「全量読み × ページ数」であって乗務員数ではない
 //!
 //! `GET /api/kintai/timecard/drivers` の 50 ([`crate::kintai_diff::DEFAULT_MAX_DRIVERS`])
-//! より小さいのは、**1 乗務員あたりの費用が違う**から。あちらは乗務員CD を数える
-//! 1 クエリで 1 ページぶんが返るのに対し、こちらは乗務員ごとに生イベントの読み
-//! (alc への 1 往復 = R2 GET が何十回) と書き込みトランザクションを 1 本ずつ払う。
+//! とは費用の形が違う。あちらは乗務員CD を数える 1 クエリで 1 ページぶんが
+//! 返るのに対し、こちらは**乗務員数によらず月ぶんの生イベントを 1 回丸ごと読む**
+//! ([`crate::kintai_fold::fold_month`] — alc / R2 への往復)。母集団の決定 ([`recalc_driver_page`])
+//! もこの 1 回読みを使い回すので、1 乗務員だけ畳んでも 100 人畳んでも読み出し側の
+//! 費用は同じだけ払う。ページを増やす意味は「1 回のリクエストで書く乗務員数」に
+//! しかない。
 //!
-//! **[`DEFAULT_MAX_FOLD_DRIVERS`] は未実測。** 呼び直せば続きから進むだけなので、
-//! 時間切れしても壊れない側に倒してある (#226 が実測して上げたのと同じ手順を
-//! 踏めばよい)。
+//! 実測 (2026-07-31、2026-06 = 94 名、[`DEFAULT_MAX_FOLD_DRIVERS`] = 20 名/ページ時):
+//!
+//! | 内訳 | 時間 |
+//! |---|---|
+//! | 全量読み (alc / R2) | 25〜55 秒 (ページ数・乗務員数に非依存) |
+//! | fold (20 名ぶん書く) | 3〜4.6 秒 |
+//!
+//! **費用がページ数 × 全量読みなので、1 ページの乗務員数を上げるほど総費用が減る。**
+//! [`DEFAULT_MAX_FOLD_DRIVERS`] を 100 に上げると 94 名が 1 回で終わり、全量読みを
+//! 2 回払わずに済む。100 名分の fold は実測の線形外挿で 15〜23 秒、合計しても
+//! auth-worker proxy の 100 秒上限に収まる (40〜78 秒)。内訳は応答の
+//! `elapsed_ms` (全体) と `fold.elapsed_ms` (fold だけ) の差で読める
+//! — 見積もりで上限を決めない、が [`crate::kintai_diff`] と同じ方針。
 //!
 //! ## GET は絶対に書かない
 //!
@@ -38,18 +51,26 @@ use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::kintai_fold::{recalc_driver_page, recalc_drivers, stale_state, FoldReport};
+use crate::kintai_fold::{recalc_driver_page, recalc_drivers_from_units, stale_state, FoldReport};
 use crate::kintai_push::KintaiPgStore;
 use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai::is_valid_month;
 use crate::routes::kintai_timecard::{assert_same_tenant, map_push_err, store_for};
 use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
 
-/// 1 回で畳み直す乗務員数の既定。モジュール docs のとおり**未実測**。
-pub const DEFAULT_MAX_FOLD_DRIVERS: usize = 20;
+/// 1 回で畳み直す乗務員数の既定。
+///
+/// **2026-07-31 の実測 (2026-06 = 94 名) に基づき 20 → 100 へ引き上げ。**
+/// モジュール docs のとおり費用の主成分は乗務員数に依存しない全量読みなので、
+/// 20 のままだと 94 名を畳むのに全量読みを 5 回払っていた。100 なら 1 回で終わる。
+pub const DEFAULT_MAX_FOLD_DRIVERS: usize = 100;
 
 /// `max_drivers` の上限。呼び出し側が大きな値を入れて proxy を殺すのを防ぐ。
-pub const MAX_MAX_FOLD_DRIVERS: usize = 50;
+///
+/// 既定の 1.5 倍。**150 は未実測** — 100 名ぶんの fold (実測の線形外挿で
+/// 15〜23 秒) より上は測っていない。[`crate::kintai_diff::MAX_MAX_DRIVERS`] と
+/// 同じ考え方 (踏んだら下げる) で先に開けてある。
+pub const MAX_MAX_FOLD_DRIVERS: usize = 150;
 
 /// `?month=&after_driver_cd=&max_drivers=&stale_only=`。
 #[derive(Debug, Default, Deserialize)]
@@ -137,22 +158,41 @@ async fn run(
         .max_drivers
         .unwrap_or(DEFAULT_MAX_FOLD_DRIVERS)
         .clamp(1, MAX_MAX_FOLD_DRIVERS);
+
+    // 生イベントは月 1 回だけ読み、母集団の決定 (#205-12) と畳みの両方に使い回す。
+    // ここで 2 回読むと 1 ページの費用 (全量読み 25〜55 秒、モジュール docs) が
+    // 単純に倍になる。上流 warnings を握り潰さない
+    // ([`crate::kintai_http_repo::with_warning_sink`])
+    let (all_units, warnings) = crate::kintai_http_repo::with_warning_sink(
+        crate::kintai_fold::fold_month(&repo, &params, &req.month, None),
+    )
+    .await;
+    let all_units = all_units.map_err(map_push_err)?;
+    // rest-only 乗務員 (Postgres に 1 行も無い) を母集団に足すための集合
+    // ([`recalc_driver_page`] docs)
+    let extra: std::collections::BTreeSet<i64> = all_units
+        .iter()
+        .map(|(cd, _, _)| *cd as i64)
+        .filter(|cd| *cd > 0)
+        .collect();
+
     let page = recalc_driver_page(
         &st,
         &req.month,
         &params,
+        &extra,
         req.after_driver_cd,
         req.stale_only,
         max,
     )
     .await
     .map_err(map_push_err)?;
-    let (folded, stale) = fold_page(&repo, &st, &params, &req, &page).await?;
     // 回りきったかは「1 ページに満たなかったか」で決める。次を空で返すより往復が 1 回減る
     let next = match page.len() < max {
         true => None,
         false => page.last().copied(),
     };
+    let (folded, stale) = fold_page(&st, &params, &req, &page, all_units, warnings).await?;
     // マクロは 1 行に収める (CLAUDE.md)
     let (n, w) = (folded.drivers, folded.drivers_written);
     tracing::info!(n, w, "kintai recalc page done");
@@ -168,20 +208,22 @@ async fn run(
 }
 
 /// 1 ページぶんを畳み、`stale` を数える。
+///
+/// `all_units` は `run` が既に読んでいる全乗務員ぶん ([`crate::kintai_fold::fold_month`])。
+/// ここでは読み直さない ([`recalc_drivers_from_units`])。
 async fn fold_page(
-    repo: &DynKintaiEventsRepo,
     st: &KintaiPgStore,
     params: &crate::kosoku::KosokuParams,
     req: &RecalcRequest,
     page: &[i64],
+    all_units: Vec<(u64, crate::kintai_fold::FoldUnit, String)>,
+    warnings: Vec<String>,
 ) -> Result<(FoldReport, crate::kintai_fold::StaleReport), (StatusCode, String)> {
     let drivers: Vec<u64> = page.iter().filter(|d| **d > 0).map(|d| *d as u64).collect();
-    // 上流 warnings を握り潰さない ([`crate::kintai_http_repo::with_warning_sink`])
-    let (folded, warnings) = crate::kintai_http_repo::with_warning_sink(recalc_drivers(
-        repo, st, params, &req.month, &drivers, req.apply,
-    ))
-    .await;
-    let mut folded = folded.map_err(map_push_err)?;
+    let mut folded =
+        recalc_drivers_from_units(st, params, &req.month, &drivers, all_units, req.apply)
+            .await
+            .map_err(map_push_err)?;
     folded.warnings = warnings;
     let months = [req.month.clone()];
     let stale = stale_state(st, &months, params)
@@ -271,8 +313,8 @@ mod tests {
 
     #[test]
     fn the_page_size_is_clamped() {
-        assert_eq!(DEFAULT_MAX_FOLD_DRIVERS.clamp(1, MAX_MAX_FOLD_DRIVERS), 20);
+        assert_eq!(DEFAULT_MAX_FOLD_DRIVERS.clamp(1, MAX_MAX_FOLD_DRIVERS), 100);
         assert_eq!(0_usize.clamp(1, MAX_MAX_FOLD_DRIVERS), 1);
-        assert_eq!(999_usize.clamp(1, MAX_MAX_FOLD_DRIVERS), 50);
+        assert_eq!(999_usize.clamp(1, MAX_MAX_FOLD_DRIVERS), 150);
     }
 }
