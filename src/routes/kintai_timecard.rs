@@ -54,7 +54,8 @@ use serde::Deserialize;
 
 use crate::kintai_diff::{diff_month, drivers_page, KintaiDiffError, DEFAULT_MAX_DRIVERS};
 use crate::kintai_push::{
-    apply_timecard_batch, jst_day_bounds, KintaiPgStore, KintaiPushError, TimecardBatch,
+    apply_timecard_batch, apply_timecard_window, jst_day_bounds, KintaiPgStore, KintaiPushError,
+    TimecardBatch, TimecardWindow,
 };
 use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai::is_valid_month;
@@ -261,6 +262,102 @@ pub async fn signatures(
         "driver_cd": driver_cd,
         "signatures": sigs,
     })))
+}
+
+/// `?months=2026-06,2026-07`。送り主が覆う月をそのまま名乗る。
+#[derive(Debug, Deserialize)]
+pub struct WindowQuery {
+    pub months: Option<String>,
+}
+
+/// GET /api/kintai/timecard/events?months=YYYY-MM,YYYY-MM
+/// → **窓ぶんの打刻を全乗務員まとめて**返す (オンプレ)。
+///
+/// 乗務員でも日でも刻まない。実測では、乗務員ごとに 1 往復していたレグが 94 名で
+/// 33.6 秒だったのに対し、同じ月の全打刻の転送は 1.3 秒だった — 費用は往復の回数。
+///
+/// **何も書かない。** 冪等なので呼び直しは安全。
+pub async fn window_events(
+    Query(params): Query<WindowQuery>,
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let months = parse_months(params.months.as_deref().unwrap_or_default())?;
+    let started = std::time::Instant::now();
+    let (from, to) = window_bounds(&months).ok_or_else(|| bad_request("months が不正です"))?;
+    let events = repo
+        .fetch_timecard_window(&from, &to)
+        .await
+        .map_err(|e| map_diff_err(KintaiDiffError::Read(e)))?;
+    let drivers: Vec<u64> = events
+        .iter()
+        .filter_map(|r| r.get("driver_id").and_then(|v| v.as_u64()))
+        .collect::<std::collections::BTreeSet<u64>>()
+        .into_iter()
+        .collect();
+    let n = events.len();
+    tracing::info!(n, "timecard window read");
+    Ok(Json(serde_json::json!({
+        "months": months,
+        "drivers": drivers,
+        "events": events,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    })))
+}
+
+/// `months=YYYY-MM,YYYY-MM` を検証して返す。**重複は潰し、昇順に揃える。**
+fn parse_months(raw: &str) -> Result<Vec<String>, (StatusCode, String)> {
+    let months: std::collections::BTreeSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if months.is_empty() {
+        return Err(bad_request(
+            "months は YYYY-MM をカンマ区切りで指定してください",
+        ));
+    }
+    if let Some(bad) = months.iter().find(|m| !is_valid_month(m)) {
+        return Err(bad_request(&format!("month は YYYY-MM です: {bad}")));
+    }
+    Ok(months.into_iter().collect())
+}
+
+/// 窓ぜんたいの `[最初の月初, 最後の翌月初)` を MariaDB 用の文字列で返す。
+///
+/// 月が飛んでいても 1 クエリで読む — 隙間ぶんが混ざっても受け側が窓の外として
+/// 落とすので、往復を増やすより安い。
+fn window_bounds(months: &[String]) -> Option<(String, String)> {
+    let first = crate::kintai_repo::exact_month_range(months.first()?)?;
+    let last = crate::kintai_repo::exact_month_range(months.last()?)?;
+    Some((first.0, last.1))
+}
+
+/// POST /api/kintai/timecard/window — **窓ぶんをまるごと**受けて、変わった日だけ書く。
+///
+/// 突き合わせはここ。送り主に署名を引かせない ([`apply_timecard_window`])。
+pub async fn receive_window(
+    headers: HeaderMap,
+    Extension(pg): Extension<DynKintaiPgStore>,
+    Json(window): Json<TimecardWindow>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if window.months.is_empty() {
+        return Err(bad_request("months が空です"));
+    }
+    if let Some(bad) = window.months.iter().find(|m| !is_valid_month(m)) {
+        return Err(bad_request(&format!("month は YYYY-MM です: {bad}")));
+    }
+    let st = store_for(&pg, &headers)?;
+    let result = apply_timecard_window(&st, &window)
+        .await
+        .map_err(map_push_err)?;
+    // マクロは 1 行に収める (CLAUDE.md)
+    let (w, d, m) = (result.days_written, result.days_deleted, result.misplaced);
+    tracing::info!(w, d, "timecard window applied");
+    if result.has_unexpected() {
+        tracing::warn!(m, "timecard window had odd rows");
+    }
+    Ok(Json(serde_json::json!(result)))
 }
 
 /// POST /api/kintai/timecard — 差分の日だけを反映する。
