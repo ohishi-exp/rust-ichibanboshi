@@ -48,16 +48,27 @@ use crate::kintai_repo::{exact_month_range, DynKintaiEventsRepo, KintaiRepoError
 
 /// 1 回の呼び出しで返す乗務員数の既定。
 ///
-/// **「1 乗務員あたり 0.2 秒」という以前の見積もりは本番で外れた。** 2026-07-30 の
-/// 初回 dry-run では 10 人ぶんの `POST /api/kintai/timecard/diff` が Cloudflare の
-/// 524 (100 秒) を超え、1 人なら通った。原因は乗務員ごとの読み出しが `dtako_events`
-/// と `dtako_cars` まで引いていたこと — [`crate::kintai_push::parse_row`] が
-/// `NotPushedSource` で全部捨てる行だった。読み口を打刻 2 表に絞って解消したが、
-/// **実測を取り直すまで既定は 10 のまま置く** (Tunnel の 30 秒に対する安全側)。
-pub const DEFAULT_MAX_DRIVERS: usize = 10;
+/// 経緯 — かつての根拠「1 乗務員あたり 0.2 秒」は本番で成立していなかった。
+/// 2026-07-30 の初回 dry-run では 10 人ぶんの `POST /api/kintai/timecard/diff` が
+/// Cloudflare の 524 (100 秒) を超え、1 人なら通った。原因は乗務員ごとの読み出しが
+/// `dtako_events` と `dtako_cars` まで引いていたこと (#225) — 押し出さない行だった。
+///
+/// 打刻 2 表に絞ったあとの実測 (2026-07-31、2026-06 = 94 名):
+///
+/// | 1 回の人数 | 結果 |
+/// |---|---|
+/// | 10 | 通る (524 が消えた) |
+/// | 50 | 通る |
+///
+/// **50 は実測済みなので既定に上げる。** 94 名なら 2 回で終わる。
+pub const DEFAULT_MAX_DRIVERS: usize = 50;
 
 /// `max_drivers` の上限。呼び出し側が大きな値を入れて Tunnel を殺すのを防ぐ。
-pub const MAX_MAX_DRIVERS: usize = 50;
+///
+/// **100 は未実測。** 50 が通ったこと・上限に当たっても 524 で落ちるだけで
+/// **1 件も書かれない** (この経路は読むだけ、呼び直せば同じ状態に収束する) ことから、
+/// 現在の頭数 (94 名) が 1 回で終わる値まで開ける。踏んだら下げればよい。
+pub const MAX_MAX_DRIVERS: usize = 100;
 
 /// 差分の取り出しに失敗した。
 ///
