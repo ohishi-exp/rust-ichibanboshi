@@ -552,6 +552,19 @@ checksum) なので、postgres client を入れた後は `sqlx::migrate!` がそ
 — どちらで適用しても状態が割れない。捨てクレートで `sqlx migrate run` を走らせて
 checksum 一致・無再適用を実証済み。
 
+### 本番へ当たるのは CI のジョブ (merge = 反映ではない)
+
+本番の適用は手で流すものではなく、**CI の `Apply kintai schema (Supabase)` ジョブ**
+(`ci.yml`、main への push で `scripts/migrate_kintai.sh` を回す) が行う。
+**merge = 本番反映ではなく、このジョブが success になった時点が反映。**
+merge 後は必ずこのジョブの結果を確認する — 2026-07-31 に Supabase pooler への
+接続タイムアウトでこのジョブだけが落ちた実例がある (再実行で復旧)。
+
+**適用済み migration はコメント 1 文字でも変えない。** checksum は
+`migrate_kintai.sh` がファイル内容の **SHA-384** で照合するので、変えると以後の適用が
+全部止まる。直すときは必ず新しい連番で (2026-07-31 の #205 の 20 で、merge 済みの
+005 のコメントを直そうとして踏みかけた)。
+
 env var は `DATABASE_URL` ではなく **`KINTAI_DATABASE_URL`**。`DATABASE_*` は
 `src/config.rs` で既に SQL Server の名前空間 (`DATABASE_ENABLED` / `DATABASE_HOST` …)
 なので、そこに `DATABASE_URL` を置くと「売上 SQL Server の URL」と読める。
