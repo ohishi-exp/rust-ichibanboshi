@@ -180,6 +180,22 @@ pub trait KintaiEventsApi: Send + Sync {
         Ok(rows.into_iter().filter(is_carried).collect())
     }
 
+    /// 期間ぶんの打刻を**全乗務員まとめて**返す (Refs #205 の 04b)。
+    ///
+    /// 1 名ずつ引かない理由は [`TIMECARD_WINDOW_SQL`] を参照 — 費用は往復の回数で
+    /// あって転送量ではない。既定は [`fetch_all_events_between`] を絞ったもので、
+    /// MariaDB 実装は SQL 側で落とす。
+    ///
+    /// [`fetch_all_events_between`]: KintaiEventsApi::fetch_all_events_between
+    async fn fetch_timecard_window(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let rows = self.fetch_all_events_between(from, to).await?;
+        Ok(rows.into_iter().filter(is_carried).collect())
+    }
+
     /// 対象期間に**打刻がある**乗務員CD を昇順で返す (Refs #205 の 04b)。
     ///
     /// 乗務員の洗い出しに [`fetch_all_events_between`] を使うと、行を 1 つも使わない
@@ -473,6 +489,45 @@ SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'),
  ORDER BY datetime, source
 "#;
 
+/// 期間ぶんの打刻を**全乗務員まとめて** 1 回で読む (Refs #205 の 04b)。
+///
+/// [`TIMECARD_EVENTS_SQL`] から乗務員の絞り込みを外しただけ。**列は同じ 7 列**なので、
+/// 1 名ずつ読んだときと `raw` が一致する = 既に書いた日の署名が変わらない。
+/// (`ALL_EVENTS_SQL` は速さのために `運行NO` を落としているので、あれは使えない。)
+///
+/// ## なぜ 1 名ずつ引かないのか
+///
+/// 2026-07-31 の実測: 署名の引き当てを乗務員ごとに 1 往復していたレグが
+/// **33.6 秒 / 全体の 94%** を占めていた (94 名 × 約 358ms)。往復の回数が費用で、
+/// 転送量ではない — 同じ月の全打刻は Tunnel 越しでも 1.3 秒で運べている。
+///
+/// `ORDER BY driver_id` は受け側が乗務員ごとに束ねるため。
+const TIMECARD_WINDOW_SQL: &str = r#"
+SELECT DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
+       NULL                                         AS end_datetime,
+       d.id                                         AS driver_id,
+       'timecard'                                   AS source,
+       s.name                                       AS state,
+       NULL                                         AS unko_no,
+       NULL                                         AS vehicle
+  FROM time_card_dstate d
+  LEFT JOIN time_card_dtako_state s ON s.id = d.state
+ WHERE d.datetime >= :from AND d.datetime < :to AND d.id > 0
+UNION ALL
+SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'),
+       NULL,
+       t.driver_id,
+       'dtako',
+       COALESCE(t.event_name, s.name),
+       t.unko_no,
+       NULL
+  FROM time_card_dtako t
+  LEFT JOIN time_card_dtako_state s ON s.id = t.state
+ WHERE t.datetime >= :from AND t.datetime < :to AND t.driver_id > 0
+   AND COALESCE(t.event_name, s.name) <> '休息'
+ ORDER BY driver_id, datetime, source
+"#;
+
 /// 対象期間に打刻がある乗務員CD だけを昇順で返す (Refs #205 の 04b)。
 ///
 /// **行を返さない。** 乗務員の洗い出しに `ALL_EVENTS_SQL` を使うと、CD の集合しか
@@ -695,6 +750,30 @@ impl KintaiEventsApi for MariadbKintaiEventsRepo {
                 TIMECARD_EVENTS_SQL,
                 params! {
                     "driver" => driver,
+                    "from" => from,
+                    "to" => to,
+                },
+            )
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(row_to_json).collect())
+    }
+
+    /// 既定実装 (読んでから捨てる) を上書きし、**全乗務員ぶんを 1 クエリで**返す。
+    async fn fetch_timecard_window(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let rows: Vec<EventRow> = conn
+            .exec(
+                TIMECARD_WINDOW_SQL,
+                params! {
                     "from" => from,
                     "to" => to,
                 },

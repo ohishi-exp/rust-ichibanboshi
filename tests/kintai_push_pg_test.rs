@@ -475,7 +475,9 @@ async fn raw_keeps_the_original_row() {
 
 // ── 04b: 打刻の受け口 (オンプレ → GCP) ──────────────────────────────────────
 
-use rust_ichibanboshi::kintai_push::{apply_timecard_batch, plan_batch, TimecardBatch};
+use rust_ichibanboshi::kintai_push::{
+    apply_timecard_batch, apply_timecard_window, plan_batch, TimecardBatch, TimecardWindow,
+};
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -733,4 +735,171 @@ async fn the_header_decides_which_tenant_the_rows_land_in() {
     assert_eq!(sa.0["signatures"].as_object().unwrap().len(), 1);
     assert_eq!(sb.0["signatures"].as_object().unwrap().len(), 1);
     assert_eq!(sa.0["signatures"], sb.0["signatures"]);
+}
+
+// ── 窓ぶんをまるごと運ぶ経路 (Refs #205 の 04b) ────────────────────────────
+
+/// 窓ぶんの生行 (乗務員を混ぜられる形)。
+fn win_punch(driver: i64, at: &str, state: &str) -> serde_json::Value {
+    json!({
+        "datetime": at,
+        "end_datetime": null,
+        "driver_id": driver,
+        "source": "timecard",
+        "state": state,
+        "unko_no": null,
+    })
+}
+
+fn window_of(months: &[&str], drivers: &[i64], events: Vec<serde_json::Value>) -> TimecardWindow {
+    TimecardWindow {
+        months: months.iter().map(|m| m.to_string()).collect(),
+        drivers: drivers.to_vec(),
+        events,
+    }
+}
+
+/// **複数乗務員版の署名が 1 名版と一致するか。**
+///
+/// 突き合わせを受け側へ移した以上、この 2 つが割れると「毎回全日が違う」に倒れる。
+/// 式を写した先が本当に同じ値を出すかは、実 Postgres でしか確かめられない。
+#[tokio::test]
+async fn window_signatures_match_the_single_driver_query() {
+    let (store, _pool) = require_db!();
+    let events = vec![
+        win_punch(1130, "2026-06-01 08:00:00", "始業"),
+        win_punch(1130, "2026-06-01 18:00:00", "終業"),
+        win_punch(1200, "2026-06-01 09:00:00", "始業"),
+        win_punch(1200, "2026-06-02 09:00:00", "始業"),
+    ];
+    let w = window_of(&["2026-06"], &[1130, 1200], events);
+    apply_timecard_window(&store, &w).await.expect("apply");
+
+    let (from, _) = jst_day_bounds(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+    let (to, _) = jst_day_bounds(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+    let all = store
+        .stored_window_signatures(&[1130, 1200], from, to)
+        .await
+        .expect("window signatures");
+
+    for driver in [1130_i64, 1200] {
+        let one = store
+            .stored_day_signatures(driver, from, to)
+            .await
+            .expect("single signatures");
+        assert_eq!(all[&driver], one, "乗務員 {driver} で 2 つの式が割れた");
+    }
+    assert_eq!(all[&1130].len(), 1);
+    assert_eq!(all[&1200].len(), 2);
+}
+
+/// **同じ窓を送り直しても 1 行も書かない。** 窓を毎回まるごと送る設計の前提。
+#[tokio::test]
+async fn resending_the_same_window_writes_nothing() {
+    let (store, pool) = require_db!();
+    let events = vec![
+        win_punch(1130, "2026-06-03 08:00:00", "始業"),
+        win_punch(1130, "2026-06-03 18:00:00", "終業"),
+    ];
+    let w = window_of(&["2026-06"], &[1130], events);
+
+    let first = apply_timecard_window(&store, &w).await.expect("1st");
+    assert_eq!(first.days_written, 1);
+    assert_eq!(first.drivers_written, 1);
+
+    let second = apply_timecard_window(&store, &w).await.expect("2nd");
+    assert_eq!(second.days_written, 0, "2 回目に差分が出た");
+    assert_eq!(second.drivers_written, 0);
+    assert_eq!(second.days_deleted, 0);
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 2);
+}
+
+/// **始業が後から直ると、その日だけ書き直る。** 打刻はほとんど戻らないが、
+/// 始業 / 終業 の修正だけはありうる — 窓を送り直す理由そのもの。
+#[tokio::test]
+async fn an_edited_punch_rewrites_only_that_day() {
+    let (store, _pool) = require_db!();
+    let base = vec![
+        win_punch(1130, "2026-06-05 08:00:00", "始業"),
+        win_punch(1130, "2026-06-05 18:00:00", "終業"),
+        win_punch(1130, "2026-06-06 08:00:00", "始業"),
+    ];
+    apply_timecard_window(&store, &window_of(&["2026-06"], &[1130], base))
+        .await
+        .expect("1st");
+
+    let edited = vec![
+        win_punch(1130, "2026-06-05 08:00:00", "始業"),
+        win_punch(1130, "2026-06-05 18:00:00", "終業"),
+        // 06-06 の始業が 07:30 に直された
+        win_punch(1130, "2026-06-06 07:30:00", "始業"),
+    ];
+    let again = apply_timecard_window(&store, &window_of(&["2026-06"], &[1130], edited))
+        .await
+        .expect("2nd");
+    assert_eq!(again.days_written, 1, "直した 1 日だけ");
+    assert_eq!(again.days_deleted, 0);
+}
+
+/// **窓の外は 1 行も触らない。** 前月ぶんを送り直しても、それ以前が消えない。
+#[tokio::test]
+async fn the_window_never_touches_months_outside_it() {
+    let (store, pool) = require_db!();
+    // 5 月と 6 月を入れておく
+    apply_timecard_window(
+        &store,
+        &window_of(
+            &["2026-05", "2026-06"],
+            &[1130],
+            vec![
+                win_punch(1130, "2026-05-10 08:00:00", "始業"),
+                win_punch(1130, "2026-06-10 08:00:00", "始業"),
+            ],
+        ),
+    )
+    .await
+    .expect("seed");
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 2);
+
+    // 6 月だけの窓を、6 月が空の状態で送り直す → 6 月だけ消えて 5 月は残る
+    let result = apply_timecard_window(&store, &window_of(&["2026-06"], &[1130], vec![]))
+        .await
+        .expect("narrow window");
+    assert_eq!(result.days_deleted, 1);
+    assert_eq!(
+        count_events(&pool, store.tenant_id()).await,
+        1,
+        "5 月まで消えた"
+    );
+}
+
+/// **名乗っていない乗務員は触らない。** 送り主が知らない乗務員の日を
+/// 「元が消えた」と見なして消しにいかない。
+#[tokio::test]
+async fn drivers_the_sender_did_not_declare_are_left_alone() {
+    let (store, pool) = require_db!();
+    apply_timecard_window(
+        &store,
+        &window_of(
+            &["2026-06"],
+            &[1130, 1200],
+            vec![
+                win_punch(1130, "2026-06-11 08:00:00", "始業"),
+                win_punch(1200, "2026-06-11 08:00:00", "始業"),
+            ],
+        ),
+    )
+    .await
+    .expect("seed");
+
+    // 1130 しか名乗らずに空を送る → 1130 だけ消え、1200 は残る
+    let result = apply_timecard_window(&store, &window_of(&["2026-06"], &[1130], vec![]))
+        .await
+        .expect("apply");
+    assert_eq!(result.days_deleted, 1);
+    assert_eq!(
+        count_events(&pool, store.tenant_id()).await,
+        1,
+        "1200 まで消えた"
+    );
 }
