@@ -113,6 +113,7 @@ path = "src/routes/vehicle_daily.rs"
 #   src/kintai_version.rs     122/145  84.1%  (miss 23)
 #   src/routes/uriage.rs     1106/1334 82.9%  (miss 228)
 #   src/kintai_repo.rs        134/168  79.8%  (miss 34)
+#   src/kintai_pg_repo.rs      36/43   83.7%  (miss 7)   DB 層 (2026-07-31 実測)
 #   src/kintai_store.rs        67/92   72.8%  (miss 25)
 #   src/kyuyo/repo.rs          20/144  13.9%  (miss 124)  DB 層
 #   src/db.rs                   0/36    0.0%              DB 層

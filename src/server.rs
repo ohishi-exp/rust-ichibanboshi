@@ -23,9 +23,27 @@ use crate::sqlite::{DynLocalStore, LocalStore};
 /// HTTP を読んでいた」という食い違いが構造的に起きない。
 ///
 /// 戻り値の `&'static str` は `/health` の `backends.kintai_events` に出す名前。
-/// pool は lazy なので、ここでは DB 接続は張られない。
+/// MariaDB pool は lazy なので、ここでは DB 接続は張られない。
+///
+/// ## `kintai_pg` — 打刻を Supabase から読み返す (Refs #205 の G6)
+///
+/// 上流 (`rust-alc-api`) には `dtako_events` の口しか無いので、HTTP 経路は打刻を
+/// `fallback` から借りる。オンプレはそれが MariaDB だが、**GCP には MariaDB が無い**
+/// ため `fallback = None` になり `shifts_from_timecard` が空になっていた。
+/// 04b で打刻が `kintai.kintai_events` に入るようになったので、そこを読み返す
+/// [`crate::kintai_pg_repo::PgKintaiEventsRepo`] を代わりに挿す。
+///
+/// | MariaDB | `[kintai_push]` | `fallback` | `/health` |
+/// |---|---|---|---|
+/// | あり | 問わない | MariaDB | `http` |
+/// | 無し | 有効 | Supabase の `kintai_events` | `http+pg` |
+/// | 無し | 無効 | 無し (打刻は読めない) | `http` + warn |
+///
+/// **MariaDB があるときは Pg を挿さない。** オンプレでは MariaDB が打刻の正で、
+/// Supabase 側はそれを写した結果でしかない。両方挿すと同じ打刻が二重に返る。
 pub fn build_kintai_events_repo(
     config: &Config,
+    kintai_pg: Option<Arc<crate::kintai_push::KintaiPgStore>>,
 ) -> Result<(crate::kintai_repo::DynKintaiEventsRepo, &'static str), Box<dyn std::error::Error>> {
     config.kintai_events.validate()?;
     let mariadb_events: Option<crate::kintai_repo::DynKintaiEventsRepo> =
@@ -37,14 +55,27 @@ pub fn build_kintai_events_repo(
             None
         };
     if config.kintai_events.http_enabled() {
-        if mariadb_events.is_none() {
-            tracing::warn!("kintai events via HTTP without mariadb — 打刻とフェリーは読めない");
-        }
-        let repo = crate::kintai_http_repo::HttpKintaiEventsRepo::new(
-            &config.kintai_events,
-            mariadb_events,
-        )?;
-        return Ok((Arc::new(repo), "http"));
+        let (fallback, backend) = match (mariadb_events, kintai_pg) {
+            (Some(mariadb), _) => (Some(mariadb), "http"),
+            (None, Some(store)) => {
+                // 読みのテナントは alc へ名乗っているのと同じ値で固定する。
+                // 書き先の pin (`[kintai_push] tenant_id`) は GCP では空なので使えない
+                let tenant = uuid::Uuid::parse_str(config.kintai_events.tenant_id.trim())
+                    .map_err(|e| format!("[kintai_events] tenant_id must be a UUID: {e}"))?;
+                tracing::info!(%tenant, "kintai timecard events via kintai.kintai_events");
+                let pg: crate::kintai_repo::DynKintaiEventsRepo = Arc::new(
+                    crate::kintai_pg_repo::PgKintaiEventsRepo::new(store, tenant),
+                );
+                (Some(pg), "http+pg")
+            }
+            (None, None) => {
+                tracing::warn!("kintai events: no mariadb/pg fallback — 打刻とフェリーは読めない");
+                (None, "http")
+            }
+        };
+        let repo =
+            crate::kintai_http_repo::HttpKintaiEventsRepo::new(&config.kintai_events, fallback)?;
+        return Ok((Arc::new(repo), backend));
     }
     if let Some(repo) = mariadb_events {
         return Ok((repo, "mariadb"));
@@ -141,6 +172,24 @@ pub async fn run(
         }
     };
 
+    // 畳んだ勤怠の書き先 (Refs #205 の 04b)。**宣言したら起動時に必ず繋ぐ** —
+    // 「受け取ったがどこにも書いていない」を作らないため ([database] enabled と
+    // 同じ流儀)。宣言していなければ挿さらず、打刻の受け口は 503 で fail-closed。
+    //
+    // **生イベントの読み先より先に組む** (Refs #205 の G6)。GCP では打刻の読み返しが
+    // この pool を共有するので、順番が逆だと読み先に渡すものが無い
+    let kintai_pg_store: routes::kintai_timecard::DynKintaiPgStore = if config.kintai_push.enabled {
+        config
+            .kintai_push
+            .validate(&config.kintai_events.tenant_id)?;
+        Some(Arc::new(
+            crate::kintai_push::KintaiPgStore::connect(&config.kintai_push).await?,
+        ))
+    } else {
+        tracing::info!("kintai_push not enabled — /api/kintai/timecard returns 503");
+        None
+    };
+
     // 勤怠の生イベント読み取り。読み先は宣言で決まる (Refs #116 / #205 実装計画 02)。
     //
     //   [kintai_events] source = "mariadb"  → 社内 MariaDB 直読み (既定 = オンプレ)
@@ -149,8 +198,9 @@ pub async fn run(
     // 宣言が足りなければ**黙って既定へ落とさず起動を失敗させる** ([database] enabled
     // と同じ流儀)。MariaDB も無い形態では Disabled を挿して `/api/kintai/events` だけ
     // 503 — 空配列を返して「0 件」に見せない。pool は lazy なので DB 停止中でも
-    // 起動は失敗しない
-    let (kintai_events_repo, kintai_events_backend) = build_kintai_events_repo(&config)?;
+    // 起動は失敗しない。打刻だけは MariaDB が無くても `kintai_pg_store` から読み返す
+    let (kintai_events_repo, kintai_events_backend) =
+        build_kintai_events_repo(&config, kintai_pg_store.clone())?;
 
     // 勤怠の月別バージョン (ETag) 読み取り (Refs #184)。events と同じ MariaDB を
     // 読むが trait / pool は分離 — 未設定なら Disabled で 503 fail-closed
@@ -163,21 +213,6 @@ pub async fn run(
             tracing::info!("mariadb not configured — /api/kintai/version returns 503");
             Arc::new(crate::kintai_version::DisabledKintaiVersionRepo)
         };
-
-    // 畳んだ勤怠の書き先 (Refs #205 の 04b)。**宣言したら起動時に必ず繋ぐ** —
-    // 「受け取ったがどこにも書いていない」を作らないため ([database] enabled と
-    // 同じ流儀)。宣言していなければ挿さらず、打刻の受け口は 503 で fail-closed
-    let kintai_pg_store: routes::kintai_timecard::DynKintaiPgStore = if config.kintai_push.enabled {
-        config
-            .kintai_push
-            .validate(&config.kintai_events.tenant_id)?;
-        Some(Arc::new(
-            crate::kintai_push::KintaiPgStore::connect(&config.kintai_push).await?,
-        ))
-    } else {
-        tracing::info!("kintai_push not enabled — /api/kintai/timecard returns 503");
-        None
-    };
 
     // 拘束サマリの計算パラメータ (所定 7.5h / 法定 8h / 休憩 10 分。Refs #118)。
     // 就業規則が変わったら TOML で追随できるよう config から取る。
