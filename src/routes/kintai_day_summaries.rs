@@ -14,6 +14,22 @@
 //! 列名は [`crate::kintai_fold::DaySummaryRow`] (= `kintai.day_summaries` の列) と
 //! オンプレ基準ファイルとで**もともと一致している**ので、名前の写し替えはしていない。
 //!
+//! ## テナントは `[kintai_events] tenant_id` の設定 pin
+//!
+//! **この口は `X-Tenant-ID` を読まない。** テナントは [`ReadTenant`]
+//! (= `[kintai_events] tenant_id`) の設定 pin で固定される。auth-worker の
+//! `/ichibanboshi-proxy` allowlist に載っているのは**そのため** — あの関門は
+//! `X-Tenant-ID` を素直に信用するので、ヘッダでテナントを選べる口を通すと shared
+//! secret だけで他テナントを引ける。**ヘッダ由来のテナントに変えるなら、同じ PR で
+//! allowlist から外すこと。**
+//!
+//! 読むべき行が `ReadTenant` で引けるのは、書き込み側 (`routes::kintai_recalc`) が
+//! `assert_same_tenant` で「読み (生イベント) と書き (畳んだ 3 表) が同じテナント」を
+//! 強制しているため。書き先の pin (`[kintai_push] tenant_id`) は**本番 GCP では空**で
+//! (`.github/workflows/gcp-image.yml`、受け口が `X-Tenant-ID` で名乗る運用)、
+//! [`KintaiPgStore::tenant_id`] は nil になる — かつてここがそれを bind していて、
+//! **本番では常に 0 件**を返していた (Refs #205 の 23)。
+//!
 //! ## 認可 — CF Access Service Token (edge)
 //!
 //! `/kintai/kosoku-daily` と同じ判断 (`routes::kintai` モジュール docs 参照)。
@@ -21,11 +37,7 @@
 //! `/kyuyo/*` の in-service gate は要らない。将来ここに金額を足すことになったら、
 //! その時点で `/kyuyo/*` と同じ in-service gate へ移すこと。
 //!
-//! ## まだ外から叩けない
-//!
-//! この口は auth-worker (`ippoan/auth-worker`) の `/ichibanboshi-proxy` allowlist に
-//! **まだ登録されていない** (path + method 完全一致の allowlist で、別 repo・別タスク)。
-//! 本番露出を広げる判断はこの PR と分けているため、登録は別タスク。
+//! [`KintaiPgStore::tenant_id`]: crate::kintai_push::KintaiPgStore::tenant_id
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -35,7 +47,7 @@ use serde::Deserialize;
 
 use crate::kintai_push::KintaiPgStore;
 use crate::routes::kintai::{is_valid_month, parse_driver};
-use crate::routes::kintai_timecard::DynKintaiPgStore;
+use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
 
 /// `?month=YYYY-MM[&driver=1051]`。`month` は必須、`driver` は任意
 /// (省略時は全乗務員)。範囲指定は受けない — 1 か月のみ。
@@ -51,6 +63,31 @@ fn store(pg: &DynKintaiPgStore) -> Result<&KintaiPgStore, (StatusCode, String)> 
     pg.as_deref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "[kintai_push] が無効です (書き先がありません)".to_string(),
+    ))
+}
+
+/// **読み先のテナント。`X-Tenant-ID` は見ない** (モジュール docs の線引き)。
+///
+/// 正は `[kintai_events] tenant_id` の設定 pin。それが無い形態 (MariaDB 直読み —
+/// テナントの概念が無い) では `[kintai_push] tenant_id` の pin に落とす。これは
+/// `kintai_timecard::tenant_of` が「pin だけで動かす構成 (単一テナントの instance) は
+/// 許す」としているのと同じ形。
+///
+/// **どちらも無ければ 503。** nil UUID で引くと 0 件が返るだけで、「設定が無い」と
+/// 「その月の勤務が無い」を呼び出し側が区別できない — 本番で丸ごと 0 件を返し続けた
+/// のがまさにこの形だった (Refs #205 の 23)。
+fn read_tenant_of(read: ReadTenant, pin: uuid::Uuid) -> Result<uuid::Uuid, (StatusCode, String)> {
+    if let Some(t) = read.0 {
+        if !t.is_nil() {
+            return Ok(t);
+        }
+    }
+    if !pin.is_nil() {
+        return Ok(pin);
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "読み先のテナントが決まりません ([kintai_events] tenant_id を設定してください)".to_string(),
     ))
 }
 
@@ -136,9 +173,12 @@ fn row_to_entry(
 /// `kintai.day_summaries` を読むだけで、突合が使うキー構成
 /// (`乗務員CD|暦日|開始時刻`) と列名をそのまま返す。データが 0 件の月は
 /// **404 ではなく 200 + 空の `summaries`** — 空と「この口が無い」を混ぜない。
+///
+/// テナントは [`read_tenant_of`] が決める (**`X-Tenant-ID` は読まない**)。
 pub async fn day_summaries(
     Query(params): Query<DaySummariesQuery>,
     Extension(pg): Extension<DynKintaiPgStore>,
+    Extension(read_tenant): Extension<ReadTenant>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let month = params.month.unwrap_or_default();
     if !is_valid_month(&month) {
@@ -165,9 +205,10 @@ pub async fn day_summaries(
         },
     };
     let store = store(&pg)?;
+    let tenant = read_tenant_of(read_tenant, store.tenant_id())?;
     let (from, to) = month_date_bounds(&month).expect("month validated by is_valid_month");
     let rows = sqlx::query(SELECT_SQL)
-        .bind(store.tenant_id())
+        .bind(tenant)
         .bind(from)
         .bind(to)
         .bind(driver)
@@ -212,6 +253,47 @@ mod tests {
                 chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
             ))
         );
+    }
+
+    fn uuid(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    /// **本番 GCP の形**。`[kintai_push] tenant_id` は空 (nil) で、読みは
+    /// `[kintai_events]` の pin — ここを取り違えると本番だけ 0 件になる (Refs #205 の 23)。
+    #[test]
+    fn read_tenant_wins_over_the_write_pin() {
+        assert_eq!(
+            read_tenant_of(ReadTenant(Some(uuid(1))), uuid::Uuid::nil()),
+            Ok(uuid(1))
+        );
+        // 両方あっても読みは `[kintai_events]` 側 (書き先の pin へ落ちない)
+        assert_eq!(
+            read_tenant_of(ReadTenant(Some(uuid(1))), uuid(2)),
+            Ok(uuid(1))
+        );
+    }
+
+    /// `[kintai_events]` が無い形態 (MariaDB 直読み) は書き先の pin に落とす —
+    /// 単一テナントの instance を許す `kintai_timecard::tenant_of` と同じ形。
+    #[test]
+    fn without_a_read_tenant_the_write_pin_is_used() {
+        assert_eq!(read_tenant_of(ReadTenant(None), uuid(2)), Ok(uuid(2)));
+        // 設定に nil UUID が書かれていた場合も「無い」と同じ扱い
+        assert_eq!(
+            read_tenant_of(ReadTenant(Some(uuid::Uuid::nil())), uuid(2)),
+            Ok(uuid(2))
+        );
+    }
+
+    /// **どちらも無ければ 503。** nil で引いて 0 件を返すと「設定が無い」と
+    /// 「その月の勤務が無い」が区別できない。
+    #[test]
+    fn no_tenant_at_all_is_service_unavailable() {
+        let (status, msg) = read_tenant_of(ReadTenant(None), uuid::Uuid::nil())
+            .expect_err("must fail without any tenant");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("kintai_events"), "{msg}");
     }
 
     #[test]
