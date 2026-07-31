@@ -1160,3 +1160,126 @@ async fn test_month_digest_of_an_empty_month_is_still_some() {
         .unwrap();
     assert!(digest.is_some());
 }
+
+// ── #205 の 21: 入力 (dtako_events) の欠けを検知して warning を立てる ──────
+//
+// #205-19 が実証したとおり、末尾の `dtako_events` が欠けると「打刻の無い勤務」は
+// エラーも警告も無く消える。#205-20 が実証したとおり、いまの warnings は**上流の
+// 応答の横流しだけ**なので、運行が alc の索引ごと無い形は誰も気付けない。
+// ここで固定するのは「月ゲートが毎回引いている etags の一覧から自分で見つけて
+// `record_warning` に流す」配線 — 乗るのは `FoldReport::warnings` と
+// `warnings_seen()` の両方で、gate の 5 条件と #205-17 の CLI 経路が同時に守られる。
+//
+// `unko_no` の先頭 6 桁が運行開始日であることはオンプレの生イベント口で
+// 891 運行 (乗務員 47 名 × 2025-12 / 2026-01 / 2026-06) を突き合わせて裏を取った。
+// **実データの生イベント JSON は repo に入れない** — 形だけを合成 fixture で持つ。
+
+/// 揃っている月は静か。窓の端 (翌月初) まで運行開始が届いていれば warning ゼロ。
+#[tokio::test]
+async fn test_month_digest_is_silent_when_the_dtako_input_covers_the_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-01-01", "date_to": "2026-02-01"},
+            "items": [
+                {"unko_no": "26010110000000000023021", "etag": "e1"},
+                {"unko_no": "26013110000000000023021", "etag": "e2"},
+                {"unko_no": "26020110000000000023021", "etag": "e3"},
+            ],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (digest, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await
+    })
+    .await;
+    assert!(digest.unwrap().is_some());
+    assert!(warnings.is_empty(), "揃っていれば静か: {warnings:?}");
+}
+
+/// **末尾が欠けたら立つ。** 月ゲートはこの warning を見て封をしない
+/// (`routes::kintai_recalc` の 5 条件 / `kintai_fold::recalc_month` の
+/// `warnings_seen()`)。少ないままの 3 表が「最新」として固定されるのを防ぐ。
+#[tokio::test]
+async fn test_month_digest_warns_when_the_tail_of_the_month_is_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-01-01", "date_to": "2026-02-01"},
+            "items": [
+                {"unko_no": "26010110000000000023021", "etag": "e1"},
+                {"unko_no": "26012410000000000023021", "etag": "e2"},
+            ],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (digest, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
+        let d = repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await;
+        // gate が見るのはこの関数 — 読みを 1 バイトも払う前に立っていること
+        assert_eq!(
+            rust_ichibanboshi::kintai_http_repo::warnings_seen(),
+            Some(true)
+        );
+        d
+    })
+    .await;
+    assert!(digest.unwrap().is_some(), "digest 自体は作れる");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("2026-01-24"), "{warnings:?}");
+}
+
+/// `etag: null` (alc の DB に運行はあるが R2 に CSV が無い) は閾値の要らない欠け。
+#[tokio::test]
+async fn test_month_digest_warns_for_operations_without_an_r2_etag() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-01-01", "date_to": "2026-02-01"},
+            "items": [
+                {"unko_no": "26010110000000000023021", "etag": "e1"},
+                {"unko_no": "26020110000000000023021", "etag": null},
+            ],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (_, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await
+    })
+    .await;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("R2 に CSV の無い運行 1 件"),
+        "{warnings:?}"
+    );
+}
+
+/// **alc に口が無い (404) は「欠けている」ではなく「判定できない」。** 月ゲートを
+/// 諦めて全量読みに degrade するだけで、入力欠けの warning は立てない。
+#[tokio::test]
+async fn test_month_digest_does_not_warn_when_the_etags_route_is_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let (digest, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await
+    })
+    .await;
+    assert!(digest.unwrap().is_none(), "口が無い = None");
+    assert!(
+        warnings.is_empty(),
+        "口が無いだけで欠けてはいない: {warnings:?}"
+    );
+}

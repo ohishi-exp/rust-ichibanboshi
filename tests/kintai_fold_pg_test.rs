@@ -1963,3 +1963,78 @@ async fn http_recalc_does_not_write_the_gate_when_upstream_warnings_are_non_empt
         "warnings が非空なら (回りきっていても) 書かない"
     );
 }
+
+// ── #205 の 21: 指紋を取ったときの warning が gate を止めること ───────────
+//
+// `routes::kintai_recalc::run` は `fold_month` だけを `with_warning_sink` に入れて
+// いた。入力の欠けを最初に見るのは指紋側 (`fetch_dtako_month_digest` →
+// `fetch_etags`) なので、そこが立てた warning は sink の外で黙って捨てられ、
+// 5 条件の `warnings.is_empty()` が素通りしていた。ここで固定するのはその穴。
+
+/// 指紋を取る側だけが warning を立てる repo (`fold_month` は静か)。
+struct DigestWarningRepo {
+    inner: GatedRepo,
+}
+
+#[async_trait]
+impl KintaiEventsApi for DigestWarningRepo {
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_events_between(from, to, driver).await
+    }
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_all_events_between(from, to).await
+    }
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_ferry_between(from, to, driver).await
+    }
+    async fn fetch_dtako_month_digest(
+        &self,
+        month: &str,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        // 実物 (HttpKintaiEventsRepo) が etags の一覧から入力の欠けを見つけた形
+        rust_ichibanboshi::kintai_http_repo::record_warning_for_test("dtako 入力欠け: 運行が …");
+        self.inner.fetch_dtako_month_digest(month).await
+    }
+}
+
+#[tokio::test]
+async fn http_recalc_does_not_write_the_gate_when_the_digest_saw_missing_input() {
+    let (store, pool) = require_db!();
+    let dyn_repo: DynKintaiEventsRepo = std::sync::Arc::new(DigestWarningRepo {
+        inner: GatedRepo::new(
+            vec![
+                punch("2026-07-25 08:00:00", "始業"),
+                punch("2026-07-25 18:00:00", "終業"),
+            ],
+            &digest("digest-warnings"),
+        ),
+    });
+    let resp = call_recalc(&store, &dyn_repo, &params(), recalc_req("2026-07", true))
+        .await
+        .expect("recalc");
+    assert!(
+        resp["next_after_driver_cd"].is_null(),
+        "1 名の母集団は回りきる: {resp}"
+    );
+    let warnings = resp["fold"]["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "指紋側の warning が応答に出る: {resp}");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "指紋側だけが立てた warning でも封をしない (Refs #205 の 21)"
+    );
+}
