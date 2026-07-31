@@ -1,6 +1,7 @@
 pub mod employees;
 pub mod health;
 pub mod kintai;
+pub mod kintai_day_summaries;
 pub mod kintai_recalc;
 pub mod kintai_timecard;
 pub mod kintai_version;
