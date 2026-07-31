@@ -63,6 +63,16 @@ use crate::routes::kintai::is_valid_month;
 /// `[kintai_push]` が無効な instance では挿さらない。
 pub type DynKintaiPgStore = Option<std::sync::Arc<KintaiPgStore>>;
 
+/// `[kintai_events] tenant_id` — **生イベントの読み先が名乗るテナント**。
+///
+/// 空 (= MariaDB 直読みの形。テナントの概念が無い) なら `None`。
+///
+/// 書き先は `X-Tenant-ID` が決めるのに対し、**読み先は設定で固定されている**
+/// ([`crate::kintai_http_repo`] が全リクエストで同じ値を送る)。畳むときは両方を
+/// 使うので、割れていると「A の打刻を B のデジタコで畳んで A に書く」が成立する。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadTenant(pub Option<uuid::Uuid>);
+
 /// `?month=YYYY-MM&driver_cd=1130`。どちらも必須。
 #[derive(Debug, Deserialize)]
 pub struct SignaturesQuery {
@@ -75,7 +85,7 @@ fn bad_request(msg: &str) -> (StatusCode, String) {
 }
 
 /// 書き先が無い / DB が落ちている、を分けて返す。
-fn map_push_err(e: KintaiPushError) -> (StatusCode, String) {
+pub(crate) fn map_push_err(e: KintaiPushError) -> (StatusCode, String) {
     match e {
         // 宣言していない instance に投げられた = 呼び出し側の経路違い
         KintaiPushError::NotConfigured(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
@@ -126,12 +136,33 @@ fn tenant_of(headers: &HeaderMap, pin: uuid::Uuid) -> Result<uuid::Uuid, (Status
 }
 
 /// 書き先を解決して、そのテナント向けの store を返す。
-fn store_for(
+pub(crate) fn store_for(
     pg: &DynKintaiPgStore,
     headers: &HeaderMap,
 ) -> Result<KintaiPgStore, (StatusCode, String)> {
     let st = store(pg)?;
     Ok(st.for_tenant(tenant_of(headers, st.tenant_id())?))
+}
+
+/// **読みと書きが同じテナントか。** 畳むときだけ効く。
+///
+/// 読み (生イベント) は設定で固定、書き (畳んだ 3 表) はリクエストが名乗る。
+/// 割れたまま畳むと、別テナントのデジタコで組んだ勤務をこちらのテナントへ
+/// 書き込む — RLS も指紋も「別テナントの入力で作った」ことを教えてくれない。
+///
+/// 読み先がテナントを名乗らない形 (MariaDB 直読み) では検査しない。社内 DB に
+/// テナントの概念が無く、突き合わせる相手が存在しない。
+pub(crate) fn assert_same_tenant(
+    read: ReadTenant,
+    write: uuid::Uuid,
+) -> Result<(), (StatusCode, String)> {
+    match read.0 {
+        Some(t) if t != write => Err((
+            StatusCode::FORBIDDEN,
+            "X-Tenant-ID が [kintai_events] tenant_id と一致しません (畳めません)".to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// 月の JST 境界を `TIMESTAMPTZ` の対で返す。
@@ -333,12 +364,37 @@ fn window_bounds(months: &[String]) -> Option<(String, String)> {
     Some((first.0, last.1))
 }
 
-/// POST /api/kintai/timecard/window — **窓ぶんをまるごと**受けて、変わった日だけ書く。
+/// POST /api/kintai/timecard/window — **窓ぶんをまるごと**受けて、変わった日だけ書き、
+/// 変わった乗務員だけ**畳み直す** (Refs #205 の 06)。
 ///
 /// 突き合わせはここ。送り主に署名を引かせない ([`apply_timecard_window`])。
+///
+/// ## 畳むところまでを 1 往復に束ねる
+///
+/// 「運んだが畳んでいない」状態を作らない。読み出しは計算しないので (#205 の決定 2)、
+/// 畳んだ値が古いままだと**遅いのではなく静かに間違う** — リスク欄の筆頭がこれ。
+///
+/// **対象は窓で変わった乗務員だけ。** 打刻はほとんど戻らないので定常時はほぼ 0 人で、
+/// auth-worker proxy (Cloudflare) の 100 秒に収まる。差分ゼロなら読み先も叩かない。
+///
+/// ## 全量再計算はここでやらない
+///
+/// deploy や TOML 変更で**全乗務員が stale** になったときは、窓 1 往復では終わらない。
+/// 応答の `stale.drivers` がそれを示すので、呼び出し側はページングする
+/// `POST /api/kintai/recalc` ([`crate::routes::kintai_recalc`]) に回す。
+///
+/// ## 畳めなくても 200
+///
+/// 打刻を書いたあとに fold が落ちても**リクエスト全体は成功**で、応答の
+/// `fold_error` に理由が載る ([`fold_into`])。全体を 5xx にすると relay が
+/// 「窓ごと失敗」と読んで同じ窓を再送し続けるため。テナントの不一致だけは
+/// **書く前**に 403 で断つので、この形にならない。
 pub async fn receive_window(
     headers: HeaderMap,
     Extension(pg): Extension<DynKintaiPgStore>,
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+    Extension(params): Extension<std::sync::Arc<crate::kosoku::KosokuParams>>,
+    Extension(read_tenant): Extension<ReadTenant>,
     Json(window): Json<TimecardWindow>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if window.months.is_empty() {
@@ -348,6 +404,11 @@ pub async fn receive_window(
         return Err(bad_request(&format!("month は YYYY-MM です: {bad}")));
     }
     let st = store_for(&pg, &headers)?;
+    // **畳むなら読みと書きのテナントが同じであることを先に確かめる。** 打刻を
+    // 書いてしまってから 403 にすると、書いた分だけが残って畳まれない
+    if window.fold {
+        assert_same_tenant(read_tenant, st.tenant_id())?;
+    }
     let result = apply_timecard_window(&st, &window)
         .await
         .map_err(map_push_err)?;
@@ -357,7 +418,124 @@ pub async fn receive_window(
     if result.has_unexpected() {
         tracing::warn!(m, "timecard window had odd rows");
     }
-    Ok(Json(serde_json::json!(result)))
+    let mut body = serde_json::json!(result);
+    if window.fold {
+        fold_into(&repo, &st, &params, &window, &result, &mut body).await;
+    }
+    Ok(Json(body))
+}
+
+/// 窓の apply 後に畳み直し、結果を応答へ**書き足す**。
+///
+/// ## fold の失敗で apply の成功を覆い隠さない
+///
+/// **`Result` を返さない。** ここへ来た時点で打刻は既にコミット済みなので、
+/// fold が落ちたからとリクエスト全体を 5xx にすると、relay は「窓ごと失敗」と読んで
+/// **同じ窓を再送し続ける** — 打刻は毎回冪等に書き直され、fold は毎回同じ理由で
+/// 落ちる。実際に起き得る形で、`[kintai_events]` が未設定の instance では
+/// 読み先が `NotConfigured` を返す。
+///
+/// 代わりに 200 のまま `fold_error` を応答に載せる。#205 のリスク欄の「push した
+/// だけで計算していない状態を作らない」とは矛盾しない — **畳めなかったことが
+/// 応答に明示される**のが、その状態を黙って作らないということ。
+///
+/// `fold` と `stale` は独立に試す。畳めたのに stale の集計だけ落ちたときに、
+/// 何を書いたかの報告まで失わないため。
+///
+/// ## dry-run の窓
+///
+/// `apply = false` で回すので 1 行も書かない。ただし dry-run では打刻も書いて
+/// いないので、報告は「**保存済みの打刻で畳んだら**」であって「いま届いた窓を
+/// 反映したら」ではない ([`crate::kintai_fold::recalc_drivers`])。
+async fn fold_into(
+    repo: &DynKintaiEventsRepo,
+    st: &KintaiPgStore,
+    params: &crate::kosoku::KosokuParams,
+    window: &TimecardWindow,
+    result: &crate::kintai_push::TimecardWindowResult,
+    body: &mut serde_json::Value,
+) {
+    match fold_window(repo, st, params, window, result).await {
+        Ok(folded) => {
+            // マクロは 1 行に収める (CLAUDE.md)
+            let (n, wr) = (folded.drivers, folded.drivers_written);
+            tracing::info!(n, wr, "timecard window folded");
+            body["fold"] = serde_json::json!(folded);
+        }
+        Err((code, msg)) => {
+            // 打刻は書けている。畳めなかったことを応答と log の両方で loud に
+            tracing::error!(status = code.as_u16(), "timecard window fold failed");
+            body["fold_error"] = serde_json::json!(msg);
+            body["fold_error_status"] = serde_json::json!(code.as_u16());
+        }
+    }
+    match crate::kintai_fold::stale_state(st, &window.months, params).await {
+        Ok(stale) => {
+            if stale.drivers > 0 {
+                tracing::warn!(s = stale.drivers, "fold is stale — run recalc");
+            }
+            body["stale"] = serde_json::json!(stale);
+        }
+        Err(e) => {
+            tracing::error!("timecard window stale check failed");
+            body["stale_error"] = serde_json::json!(e.to_string());
+        }
+    }
+}
+
+/// 窓ぶんを畳んで [`FoldReport`] を返す。
+///
+/// [`FoldReport`]: crate::kintai_fold::FoldReport
+async fn fold_window(
+    repo: &DynKintaiEventsRepo,
+    st: &KintaiPgStore,
+    params: &crate::kosoku::KosokuParams,
+    window: &TimecardWindow,
+    result: &crate::kintai_push::TimecardWindowResult,
+) -> Result<crate::kintai_fold::FoldReport, (StatusCode, String)> {
+    let drivers: Vec<u64> = result
+        .drivers_changed
+        .iter()
+        .filter(|d| **d > 0)
+        .map(|d| *d as u64)
+        .collect();
+    let apply = !window.dry_run;
+    // 上流 warnings を握り潰さない — R2 の分割遅れの最中に畳むと、欠けた入力を
+    // 「最新」として保存する。tracing だけでは呼び出し側から見えない
+    let (folded, warnings) = crate::kintai_http_repo::with_warning_sink(async {
+        let mut report = crate::kintai_fold::FoldReport::default();
+        for month in &window.months {
+            let r = crate::kintai_fold::recalc_drivers(repo, st, params, month, &drivers, apply)
+                .await?;
+            report = merge_fold(report, r);
+        }
+        Ok::<_, KintaiPushError>(report)
+    })
+    .await;
+    let mut folded = folded.map_err(map_push_err)?;
+    folded.warnings = warnings;
+    Ok(folded)
+}
+
+/// 月ごとの [`FoldReport`] を足し合わせる。窓は複数月を覆う。
+///
+/// [`FoldReport`]: crate::kintai_fold::FoldReport
+fn merge_fold(
+    mut acc: crate::kintai_fold::FoldReport,
+    r: crate::kintai_fold::FoldReport,
+) -> crate::kintai_fold::FoldReport {
+    acc.drivers += r.drivers;
+    acc.drivers_written += r.drivers_written;
+    acc.drivers_unchanged += r.drivers_unchanged;
+    acc.shifts += r.shifts;
+    acc.day_summaries += r.day_summaries;
+    acc.day_parts += r.day_parts;
+    acc.skipped.extend(r.skipped);
+    acc.elapsed_ms += r.elapsed_ms;
+    acc.dry_run = r.dry_run;
+    acc.logic_version = r.logic_version;
+    acc.calculated_at = r.calculated_at;
+    acc
 }
 
 /// POST /api/kintai/timecard — 差分の日だけを反映する。
@@ -564,6 +742,107 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// **読みと書きが別テナントなら畳まない** (Refs #205 の 06)。
+    ///
+    /// 生イベントは `[kintai_events] tenant_id` で固定、打刻は `X-Tenant-ID` が
+    /// 名乗る。割れたまま畳むと、別テナントのデジタコで組んだ勤務がこちらの
+    /// `kintai.shifts` に入る — RLS も指紋もそれを教えてくれない。
+    #[test]
+    fn folding_needs_the_read_and_write_tenants_to_agree() {
+        assert!(assert_same_tenant(ReadTenant(Some(uuid(T1))), uuid(T1)).is_ok());
+
+        let (code, msg) = assert_same_tenant(ReadTenant(Some(uuid(T2))), uuid(T1)).unwrap_err();
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert!(msg.contains("kintai_events"), "{msg}");
+
+        // 読み先がテナントを名乗らない形 (MariaDB 直読み) は突き合わせる相手が無い
+        assert!(assert_same_tenant(ReadTenant(None), uuid(T1)).is_ok());
+        assert!(assert_same_tenant(ReadTenant::default(), uuid(T1)).is_ok());
+    }
+
+    /// 窓ぜんたいを覆う月が壊れていれば、**書き先を見に行く前に** 400。
+    #[tokio::test]
+    async fn the_window_months_are_validated_first() {
+        let repo: DynKintaiEventsRepo =
+            std::sync::Arc::new(crate::kintai_repo::DisabledKintaiEventsRepo);
+        let params = std::sync::Arc::new(crate::kosoku::KosokuParams::default());
+        for months in [vec![], vec!["nope".to_string()]] {
+            let (code, _) = receive_window(
+                hdr(T1),
+                Extension(None),
+                Extension(repo.clone()),
+                Extension(params.clone()),
+                Extension(ReadTenant(None)),
+                Json(TimecardWindow {
+                    months,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// 月ごとの報告を足し合わせる。窓は複数月を覆う。
+    #[test]
+    fn fold_reports_add_up_across_months() {
+        let june = crate::kintai_fold::FoldReport {
+            drivers: 1,
+            drivers_written: 1,
+            shifts: 3,
+            day_summaries: 3,
+            day_parts: 4,
+            logic_version: "old".to_string(),
+            ..Default::default()
+        };
+        let july = crate::kintai_fold::FoldReport {
+            drivers: 2,
+            drivers_unchanged: 2,
+            shifts: 1,
+            day_summaries: 1,
+            day_parts: 1,
+            dry_run: true,
+            logic_version: "new".to_string(),
+            calculated_at: "t".to_string(),
+            skipped: vec![crate::kintai_fold::SkipReason::DegenerateShift {
+                start: "a".to_string(),
+                end: "a".to_string(),
+            }],
+            ..Default::default()
+        };
+        let sum = merge_fold(june, july);
+        assert_eq!(sum.drivers, 3);
+        assert_eq!(sum.drivers_written, 1);
+        assert_eq!(sum.drivers_unchanged, 2);
+        assert_eq!(sum.shifts, 4);
+        assert_eq!(sum.day_summaries, 4);
+        assert_eq!(sum.day_parts, 5);
+        assert_eq!(sum.skipped.len(), 1, "落とした行は畳まずに残す");
+        // 版と時刻は月で変わらないので後勝ちでよい
+        assert_eq!(sum.logic_version, "new");
+        assert_eq!(sum.calculated_at, "t");
+        assert!(sum.dry_run);
+    }
+
+    /// **既定は「畳む」。** 送り主が黙っていたら畳む側に倒す — 運んだのに
+    /// 畳んでいない状態が #205 のリスク欄の筆頭。
+    #[test]
+    fn the_window_folds_unless_told_otherwise() {
+        let w: TimecardWindow = serde_json::from_value(serde_json::json!({
+            "months": ["2026-07"],
+        }))
+        .expect("deserialize");
+        assert!(w.fold, "fold を書いていない窓も畳む");
+        assert!(!w.dry_run);
+
+        let off: TimecardWindow = serde_json::from_value(serde_json::json!({
+            "months": ["2026-07"], "fold": false,
+        }))
+        .expect("deserialize");
+        assert!(!off.fold);
     }
 
     /// 宣言していない (503) と、繋がらない (502) を分ける。
