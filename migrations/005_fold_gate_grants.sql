@@ -1,9 +1,11 @@
 -- 004 が作った kintai.fold_gate に GRANT を足す (Refs #205 の 20)
 --
--- ⚠️ **merge しただけでは本番は直らない。** migration は CI/CD に乗っていないので、
---    merge 後に `make kintai-migrate` を人が流すまで本番の `POST /api/kintai/recalc`
---    は 502 のまま (コード側の degrade は「gate が使えないときに口を落とさない」
---    ための保険で、gate を成立させるのはこのファイルの GRANT)。
+-- ⚠️ **本番の 502 を止めるのはこのファイル。** main への merge で ci.yml の
+--    `Apply kintai schema (Supabase)` ジョブが `scripts/migrate_kintai.sh` を回して
+--    自動適用するので、**そのジョブが success になって初めて**
+--    `POST /api/kintai/recalc` が返るようになる。コード側の degrade
+--    (`month_gate_report` の Unavailable 倒し) は「gate が使えないときに口を
+--    落とさない」ための保険で、gate を成立させるのはここの GRANT。
 --
 -- ## 何が起きていたか
 --
