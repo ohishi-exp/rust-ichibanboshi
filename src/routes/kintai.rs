@@ -519,6 +519,65 @@ pub async fn events(
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
+/// GET /api/kintai/rest-diff?month=YYYY-MM[&driver=1445] — **休息がずれている運行の
+/// 一覧** (Refs #205 の 41)。
+///
+/// `/events` と同じ経路 (社内 MariaDB の直読み、`kintai_repo`) で、同じ運行の
+/// `time_card_dtako` 由来の休息と `dtako_events` 由来の休息を突き合わせる。
+/// 何を測っているか・なぜずれるかは [`crate::kintai_rest_diff`] のモジュール docs。
+///
+/// **`driver` は省略可** ([`kosoku_daily`] と同じ扱い)。1 回叩けば月ぶんの対象が
+/// 全部出る形にしてある — 押す対象 (`yhonda-ohishi/nginx` の「勤務時間再登録」) を
+/// 数えるのが用途なので、乗務員を先に知っている必要が無い。`driver=` (空) は
+/// 省略ではなく**不正**として 400 にする (`kosoku_daily` と同じ)。
+///
+/// **判定には一切入らない。** 拘束も勤務も畳まず、突合の結果だけを返す。
+pub async fn rest_diff(
+    Query(params): Query<EventsQuery>,
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    let Some((from, to)) = crate::kintai_repo::month_range(&month) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください".to_string(),
+        ));
+    };
+    let driver = match params.driver {
+        None => None,
+        Some(raw) => match parse_driver(&raw) {
+            Some(d) => Some(d),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "driver は乗務員CD (数字) で指定してください".to_string(),
+                ))
+            }
+        },
+    };
+    let _permit = KOSOKU_DB_PERMITS.acquire().await.expect("semaphore open");
+    let rows = repo
+        .fetch_rest_events_between(&from, &to, driver)
+        .await
+        .map_err(map_repo_err)?;
+    let diff = crate::kintai_rest_diff::rest_diff(&rows, &from, &to);
+    // マクロは 1 行に収める (CLAUDE.md)
+    let (total, scanned) = (diff.total, diff.scanned_unko);
+    tracing::info!(month = %month, total, scanned, "kintai rest-diff built");
+    Ok(Json(serde_json::json!({
+        "month": month,
+        "driver": driver,
+        "from": from,
+        "to": to,
+        "total": diff.total,
+        "items": diff.items,
+        "by_driver": diff.by_driver,
+        "scanned_unko": diff.scanned_unko,
+        "skipped_rows": diff.skipped_rows,
+        "max_items": crate::kintai_rest_diff::MAX_REST_DIFF,
+    })))
+}
+
 /// GET /api/kintai/kosoku-daily?month=YYYY-MM[&driver=1051] — **打刻基準の日別サマリ**
 /// (Refs #118、拘束時間の打刻基準化 Phase 2)。
 ///

@@ -1416,7 +1416,10 @@ const MAX_TAIL_GAP_DAYS: i64 = 7;
 ///
 /// 末尾 (車輌コード) の長さは可変 (実データは 23 桁、22 桁の実物も居る) なので、
 /// **先頭だけを見て後ろは一切見ない**。
-fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
+///
+/// `pub(crate)` なのは [`crate::kintai_rest_diff`] が休息のずれの一覧に
+/// 運行日を添えるため (Refs #205 の 41)。読み方は 1 か所に置く。
+pub(crate) fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(unko_no.get(..UNKO_NO_DATE_DIGITS)?, "%y%m%d").ok()
 }
 
@@ -1938,6 +1941,26 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
         match &self.fallback {
             Some(fb) => fb.fetch_ferry_between(from, to, driver).await,
+            None => Err(KintaiRepoError::NotConfigured),
+        }
+    }
+
+    /// 休息のずれの突合もオンプレ専用 (Refs #205 の 41)。左辺の `time_card_dtako` は
+    /// 上流に口が無く、`fallback` (MariaDB) からしか読めないため、フェリーと同じく
+    /// `fallback` へ委譲し、無ければ `NotConfigured` = 503 で fail-closed にする。
+    ///
+    /// **`fallback` が `PgKintaiEventsRepo` (GCP) の形では読めない。** あちらの
+    /// `kintai.kintai_events` は `休息` を 1 行も持たない
+    /// ([`crate::kintai_push::NOT_CARRIED_STATES`]) ので、既定の `NotConfigured` が
+    /// 返る = 「答えられない」と分かる形になる。
+    async fn fetch_rest_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        match &self.fallback {
+            Some(fb) => fb.fetch_rest_events_between(from, to, driver).await,
             None => Err(KintaiRepoError::NotConfigured),
         }
     }
