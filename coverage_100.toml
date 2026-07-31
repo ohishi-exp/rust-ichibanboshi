@@ -58,6 +58,10 @@ path = "src/kosoku.rs"
 [[files]]
 path = "src/kosoku_paper.rs"
 
+# 休息のずれの突合 (Refs #205 の 41)。DB も HTTP も触らない純粋関数
+[[files]]
+path = "src/kintai_rest_diff.rs"
+
 # --- 給与 (給与大臣) ---
 
 [[files]]
