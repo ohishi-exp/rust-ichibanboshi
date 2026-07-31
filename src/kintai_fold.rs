@@ -1389,6 +1389,20 @@ mod tests {
             ..Default::default()
         };
         assert!(!skipped.has_unexpected());
+
+        // 既知の skip だけでも、上流 warnings が乗れば「想定外」— 2 つの条件は独立
+        let skipped_with_warning = FoldReport {
+            skipped: vec![SkipReason::DegenerateShift {
+                start: "a".to_string(),
+                end: "a".to_string(),
+            }],
+            warnings: vec!["NoSuchKey".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            skipped_with_warning.has_unexpected(),
+            "known skip だけを免除しても warnings は免除しない"
+        );
     }
 
     #[test]
