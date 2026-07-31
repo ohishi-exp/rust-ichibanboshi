@@ -49,7 +49,8 @@
 //! **この口は「そのページで月まるごとを完結させたときだけ」gate を書く** —
 //! `apply` かつ `after_driver_cd` 無し (1 ページ目から) かつ `next_after_driver_cd`
 //! が無い (回りきった) かつ `stale_only` でない (母集団を狭めていない) かつ
-//! 上流 warnings が空 (R2 の分割遅れ中の欠けた入力を「最新」と刻まない) の
+//! warnings が空 (欠けた入力を「最新」と刻まない。上流の応答の横流しだけでなく、
+//! 指紋を取るときに自分で見つけた入力の欠けも含む — Refs #205 の 21) の
 //! 5 条件が揃ったときだけ。母集団 (実測 132 名) は `DEFAULT_MAX_FOLD_DRIVERS`
 //! (100) より上の `max_drivers` を渡せば 1 ページで収まる。書く digest は
 //! ページ処理の**冒頭**で判定した値のまま (fold の後に作り直さない —
@@ -204,26 +205,38 @@ async fn run(
     // 「変化無し」を返す ([`crate::kintai_fold::MonthGate`] docs)。miss / unavailable
     // なら通常どおり進む — miss の digest は末尾の書き込み判定まで運ぶ
     // (fold 後に作り直さない。理由は MonthGate::Miss の docs)
-    let gate = crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply)
-        .await
-        .map_err(map_push_err)?;
-    if let crate::kintai_fold::MonthGate::Hit(report) = &gate {
-        let months = [req.month.clone()];
-        let stale = stale_state(&st, &months, &params)
-            .await
-            .map_err(map_push_err)?;
-        let (n, w) = (report.drivers, report.drivers_written);
-        tracing::info!(n, w, "kintai recalc page done (gate)");
-        return Ok(Json(serde_json::json!({
-            "month": req.month,
-            "apply": req.apply,
-            "drivers": Vec::<i64>::new(),
-            "next_after_driver_cd": Option::<i64>::None,
-            "fold": report,
-            "stale": stale,
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-        })));
-    }
+    //
+    // **`with_warning_sink` で包むのは `fold_month` だけでは足りない** (Refs #205 の
+    // 21)。指紋を取る `fetch_etags` は入力の欠けを最初に見る場所で、そこが立てる
+    // warning は sink の外だと黙って捨てられる — 5 条件の `warnings.is_empty()` が
+    // 素通りし、欠けたままの月に「最新」の封をしてしまう
+    let (gate, gate_warnings) = crate::kintai_http_repo::with_warning_sink(
+        crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply),
+    )
+    .await;
+    let gate = match gate.map_err(map_push_err)? {
+        crate::kintai_fold::MonthGate::Hit(mut report) => {
+            let months = [req.month.clone()];
+            let stale = stale_state(&st, &months, &params)
+                .await
+                .map_err(map_push_err)?;
+            let (n, w) = (report.drivers, report.drivers_written);
+            tracing::info!(n, w, "kintai recalc page done (gate)");
+            // 読みを省いた回でも入力の欠けは応答に出す (指紋が同じ = 入力が増えて
+            // いないだけで、欠けが埋まったわけではない)
+            report.warnings = gate_warnings;
+            return Ok(Json(serde_json::json!({
+                "month": req.month,
+                "apply": req.apply,
+                "drivers": Vec::<i64>::new(),
+                "next_after_driver_cd": Option::<i64>::None,
+                "fold": report,
+                "stale": stale,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            })));
+        }
+        other => other,
+    };
 
     let max = req
         .max_drivers
@@ -239,6 +252,9 @@ async fn run(
     )
     .await;
     let all_units = all_units.map_err(map_push_err)?;
+    // 指紋を取ったときの warning も同じ列に混ぜる (Refs #205 の 21)
+    let mut warnings = warnings;
+    warnings.extend(gate_warnings);
     // rest-only 乗務員 (Postgres に 1 行も無い) を母集団に足すための集合
     // ([`recalc_driver_page`] docs)
     let extra: std::collections::BTreeSet<i64> = all_units
