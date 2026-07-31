@@ -202,6 +202,24 @@ pub enum SkipReason {
     PartBeforeShift { shift_start: String, date: String },
 }
 
+impl SkipReason {
+    /// **設計が処理を決めてある既知のデータ形か。**
+    ///
+    /// 既知の形は「想定外」に数えない ([`FoldReport::has_unexpected`]) —
+    /// 実データに常時 1 件混ざる零長勤務 (2026-06 の乗務員 1518) で毎回
+    /// 非 0 終了すると、本当に想定外が来たときの合図が埋もれる。
+    /// **数えないだけで表示は消さない** (`main.rs` の `print_fold` /
+    /// 応答の `skipped`) — 件数が急に増えたら人が気付ける形は残す。
+    ///
+    /// `match` を網羅で書くのは、variant を足した人にここでの分類を必ず
+    /// 迫るため。既定で「既知」に落ちると、新しい壊れ方が黙って消える。
+    pub fn is_known(&self) -> bool {
+        match self {
+            SkipReason::DegenerateShift { .. } | SkipReason::PartBeforeShift { .. } => true,
+        }
+    }
+}
+
 fn shift_source_str(s: ShiftSource) -> &'static str {
     match s {
         ShiftSource::Timecard => "timecard",
@@ -411,9 +429,13 @@ impl FoldReport {
         self.drivers_written > 0
     }
 
-    /// 想定外があったか。写せなかった行と上流 warnings の両方を見る。
+    /// 想定外があったか (呼び出し側が非 0 終了するのに使う)。
+    ///
+    /// [`SkipReason::is_known`] が真の skip は数えない — 落としたこと自体は
+    /// `skipped` に残るので、表示と応答からは消えない。上流 warnings は
+    /// 引き続き数える (欠けた入力で畳んだかもしれないシグナルなので)。
     pub fn has_unexpected(&self) -> bool {
-        !self.skipped.is_empty() || !self.warnings.is_empty()
+        self.skipped.iter().any(|s| !s.is_known()) || !self.warnings.is_empty()
     }
 }
 
@@ -1356,6 +1378,9 @@ mod tests {
         };
         assert!(warned.has_unexpected());
 
+        // 既知の skip (is_known) は「想定外」に数えない (Refs #205 の 09) —
+        // 2026-06 の乗務員 1518 のような零長勤務が毎月実在し、数えると CLI が
+        // 毎回 exit 3 になって本当の想定外のシグナルが埋もれる
         let skipped = FoldReport {
             skipped: vec![SkipReason::DegenerateShift {
                 start: "a".to_string(),
@@ -1363,7 +1388,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(skipped.has_unexpected());
+        assert!(!skipped.has_unexpected());
     }
 
     #[test]
@@ -1490,6 +1515,75 @@ mod tests {
         assert!(!r.wrote_anything());
         r.drivers_written = 1;
         assert!(r.wrote_anything());
+    }
+
+    /// 既知の skip は**報告に残るが非 0 終了にしない**。
+    ///
+    /// 2026-06 の乗務員 1518 (06-17 19:09、start = end) のような零長勤務は毎月
+    /// 実在する。数えると CLI が毎回 exit 3 になり、本当の想定外が埋もれる。
+    #[test]
+    fn known_skips_are_reported_but_not_unexpected() {
+        let degenerate = day("2026-06-17", "2026-06-17 19:09:00", "2026-06-17 19:09:00");
+        let mut early_part = day("2026-07-02", "2026-07-02 00:30:00", "2026-07-02 18:00:00");
+        early_part.parts = vec![part("2026-07-01", 5, 0, 0)];
+        let unit = fold_days(1518, &[degenerate, early_part]);
+
+        let report = FoldReport {
+            skipped: unit.skipped.clone(),
+            ..Default::default()
+        };
+        assert_eq!(report.skipped.len(), 2, "落としたことは報告に残す");
+        assert!(matches!(
+            report.skipped[0],
+            SkipReason::DegenerateShift { .. }
+        ));
+        assert!(matches!(
+            report.skipped[1],
+            SkipReason::PartBeforeShift { .. }
+        ));
+        assert!(!report.has_unexpected(), "既知の形は想定外に数えない");
+
+        let sync = SyncReport {
+            push: crate::kintai_push::PushReport::default(),
+            fold: report,
+        };
+        assert!(!sync.has_unexpected(), "sync も同じ");
+    }
+
+    /// 上流由来の想定外は引き続き数える (`sync` は push の判定をそのまま含む)。
+    #[test]
+    fn sync_still_counts_rejected_rows_and_unknown_states() {
+        let skipped = fold_days(
+            1,
+            &[day(
+                "2026-06-17",
+                "2026-06-17 19:09:00",
+                "2026-06-17 19:09:00",
+            )],
+        )
+        .skipped;
+        let fold = FoldReport {
+            skipped,
+            ..Default::default()
+        };
+        assert!(!fold.has_unexpected());
+
+        let mut push = crate::kintai_push::PushReport::default();
+        push.rejected
+            .insert(crate::kintai_push::RejectReason::NoDriver, 1);
+        let with_rejected = SyncReport {
+            push: push.clone(),
+            fold: fold.clone(),
+        };
+        assert!(with_rejected.has_unexpected(), "読み飛ばした行は想定外");
+
+        let mut push = crate::kintai_push::PushReport::default();
+        push.unknown_states.insert("知らない".to_string());
+        let with_unknown_state = SyncReport { push, fold };
+        assert!(
+            with_unknown_state.has_unexpected(),
+            "CHECK に無い state は想定外"
+        );
     }
 
     #[test]
