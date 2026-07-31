@@ -626,6 +626,50 @@ async fn a_dry_run_window_reports_the_fold_without_writing() {
     assert_eq!(events, 0, "打刻も書いていない");
 }
 
+/// **畳めなくても打刻の反映は成功として返す。**
+///
+/// `[kintai_events]` が未設定の instance では読み先が `NotConfigured` を返す
+/// (2026-07-31 の本番 revision 00008 が実際にこの状態だった)。ここで
+/// リクエスト全体を 5xx にすると relay は「窓ごと失敗」と読んで**同じ窓を再送し
+/// 続ける** — 打刻は毎回冪等に書き直され、fold は毎回同じ理由で落ちる。
+///
+/// 200 のまま `fold_error` に載せる。「push しただけで計算していない状態を
+/// 作らない」とは矛盾しない — **畳めなかったことが応答に明示される**のが、
+/// その状態を黙って作らないということ。
+#[tokio::test]
+async fn a_fold_failure_does_not_hide_a_successful_apply() {
+    let (store, pool) = require_db!();
+    // 読み先が無い instance (= 本番の KINTAI_EVENTS_* 未投入と同じ状態)
+    let dead: DynKintaiEventsRepo =
+        std::sync::Arc::new(rust_ichibanboshi::kintai_repo::DisabledKintaiEventsRepo);
+
+    let got = post_window(&store, &dead, Some(store.tenant_id()), window(false))
+        .await
+        .expect("窓ごと失敗にしない");
+
+    assert_eq!(got["days_written"], 1, "打刻は反映されている");
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM kintai.kintai_events WHERE tenant_id = $1")
+            .bind(store.tenant_id())
+            .fetch_one(&pool)
+            .await
+            .expect("count events");
+    assert_eq!(events, 2, "打刻はコミット済み");
+
+    // 畳めなかったことが応答に出ている
+    assert!(
+        got.get("fold").is_none(),
+        "畳めていないので報告は無い: {got}"
+    );
+    let err = got["fold_error"].as_str().expect("fold_error: {got}");
+    assert!(err.contains("kintai events"), "{err}");
+    assert_eq!(got["fold_error_status"], 502);
+
+    // stale は別の口なので生きている — 「畳み直しが要る」ことが読める
+    assert_eq!(got["stale"]["drivers"], 0, "まだ 1 行も畳んでいない");
+    assert_eq!(shift_count(&pool, store.tenant_id()).await, 0);
+}
+
 /// **読みと書きが別テナントなら、打刻を書く前に 403。**
 ///
 /// 書いてから断ると、書いた打刻だけが残って畳まれない状態ができる。

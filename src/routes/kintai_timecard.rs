@@ -382,6 +382,13 @@ fn window_bounds(months: &[String]) -> Option<(String, String)> {
 /// deploy や TOML 変更で**全乗務員が stale** になったときは、窓 1 往復では終わらない。
 /// 応答の `stale.drivers` がそれを示すので、呼び出し側はページングする
 /// `POST /api/kintai/recalc` ([`crate::routes::kintai_recalc`]) に回す。
+///
+/// ## 畳めなくても 200
+///
+/// 打刻を書いたあとに fold が落ちても**リクエスト全体は成功**で、応答の
+/// `fold_error` に理由が載る ([`fold_into`])。全体を 5xx にすると relay が
+/// 「窓ごと失敗」と読んで同じ窓を再送し続けるため。テナントの不一致だけは
+/// **書く前**に 403 で断つので、この形にならない。
 pub async fn receive_window(
     headers: HeaderMap,
     Extension(pg): Extension<DynKintaiPgStore>,
@@ -413,26 +420,79 @@ pub async fn receive_window(
     }
     let mut body = serde_json::json!(result);
     if window.fold {
-        let folded = fold_window(&repo, &st, &params, &window, &result).await?;
-        body["fold"] = folded.0;
-        body["stale"] = folded.1;
+        fold_into(&repo, &st, &params, &window, &result, &mut body).await;
     }
     Ok(Json(body))
 }
 
-/// 窓の apply 後に畳み直し、`(fold, stale)` の 2 つを JSON で返す。
+/// 窓の apply 後に畳み直し、結果を応答へ**書き足す**。
 ///
-/// **dry-run の窓では `apply = false` で回す。** 1 行も書かずに `logic_version` と
-/// 計算時刻を添えた報告だけを返す。ただし dry-run では打刻も書いていないので、
-/// 報告は「**保存済みの打刻で畳んだら**」であって「いま届いた窓を反映したら」では
-/// ない ([`crate::kintai_fold::recalc_drivers`])。
+/// ## fold の失敗で apply の成功を覆い隠さない
+///
+/// **`Result` を返さない。** ここへ来た時点で打刻は既にコミット済みなので、
+/// fold が落ちたからとリクエスト全体を 5xx にすると、relay は「窓ごと失敗」と読んで
+/// **同じ窓を再送し続ける** — 打刻は毎回冪等に書き直され、fold は毎回同じ理由で
+/// 落ちる。実際に起き得る形で、`[kintai_events]` が未設定の instance では
+/// 読み先が `NotConfigured` を返す。
+///
+/// 代わりに 200 のまま `fold_error` を応答に載せる。#205 のリスク欄の「push した
+/// だけで計算していない状態を作らない」とは矛盾しない — **畳めなかったことが
+/// 応答に明示される**のが、その状態を黙って作らないということ。
+///
+/// `fold` と `stale` は独立に試す。畳めたのに stale の集計だけ落ちたときに、
+/// 何を書いたかの報告まで失わないため。
+///
+/// ## dry-run の窓
+///
+/// `apply = false` で回すので 1 行も書かない。ただし dry-run では打刻も書いて
+/// いないので、報告は「**保存済みの打刻で畳んだら**」であって「いま届いた窓を
+/// 反映したら」ではない ([`crate::kintai_fold::recalc_drivers`])。
+async fn fold_into(
+    repo: &DynKintaiEventsRepo,
+    st: &KintaiPgStore,
+    params: &crate::kosoku::KosokuParams,
+    window: &TimecardWindow,
+    result: &crate::kintai_push::TimecardWindowResult,
+    body: &mut serde_json::Value,
+) {
+    match fold_window(repo, st, params, window, result).await {
+        Ok(folded) => {
+            // マクロは 1 行に収める (CLAUDE.md)
+            let (n, wr) = (folded.drivers, folded.drivers_written);
+            tracing::info!(n, wr, "timecard window folded");
+            body["fold"] = serde_json::json!(folded);
+        }
+        Err((code, msg)) => {
+            // 打刻は書けている。畳めなかったことを応答と log の両方で loud に
+            tracing::error!(status = code.as_u16(), "timecard window fold failed");
+            body["fold_error"] = serde_json::json!(msg);
+            body["fold_error_status"] = serde_json::json!(code.as_u16());
+        }
+    }
+    match crate::kintai_fold::stale_state(st, &window.months, params).await {
+        Ok(stale) => {
+            if stale.drivers > 0 {
+                tracing::warn!(s = stale.drivers, "fold is stale — run recalc");
+            }
+            body["stale"] = serde_json::json!(stale);
+        }
+        Err(e) => {
+            tracing::error!("timecard window stale check failed");
+            body["stale_error"] = serde_json::json!(e.to_string());
+        }
+    }
+}
+
+/// 窓ぶんを畳んで [`FoldReport`] を返す。
+///
+/// [`FoldReport`]: crate::kintai_fold::FoldReport
 async fn fold_window(
     repo: &DynKintaiEventsRepo,
     st: &KintaiPgStore,
     params: &crate::kosoku::KosokuParams,
     window: &TimecardWindow,
     result: &crate::kintai_push::TimecardWindowResult,
-) -> Result<(serde_json::Value, serde_json::Value), (StatusCode, String)> {
+) -> Result<crate::kintai_fold::FoldReport, (StatusCode, String)> {
     let drivers: Vec<u64> = result
         .drivers_changed
         .iter()
@@ -454,16 +514,7 @@ async fn fold_window(
     .await;
     let mut folded = folded.map_err(map_push_err)?;
     folded.warnings = warnings;
-    // マクロは 1 行に収める (CLAUDE.md)
-    let (n, wr) = (folded.drivers, folded.drivers_written);
-    tracing::info!(n, wr, "timecard window folded");
-    let stale = crate::kintai_fold::stale_state(st, &window.months, params)
-        .await
-        .map_err(map_push_err)?;
-    if stale.drivers > 0 {
-        tracing::warn!(s = stale.drivers, "fold is stale — run recalc");
-    }
-    Ok((serde_json::json!(folded), serde_json::json!(stale)))
+    Ok(folded)
 }
 
 /// 月ごとの [`FoldReport`] を足し合わせる。窓は複数月を覆う。
