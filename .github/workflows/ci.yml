@@ -1,10 +1,31 @@
 name: CI
 
+# feature branch への push でも走らせる (Refs: spawn_task 子セッション運用)。
+# 子セッションは「push までが仕事、PR は親が作る」ので、PR を作らないと CI が
+# 1 つも走らない状態だと「PR 前に確認したい」を満たすためにローカルで全体
+# テストを回すことになり、並行セッションが ~/.cargo/registry のロックと I/O を
+# 取り合って詰まる。
+#
+# この repo の ci.yml は postgres service 込みなので branch push でも重いが、
+# そのぶん価値がある — kintai_push_pg_test / kintai_fold_pg_test が
+# KINTAI_TEST_DATABASE_URL 付きで **skip されずに走る唯一の場所**。
+#
+# **Cloud Run への deploy は gcp-image.yml (main push) が持っている。あちらの
+# トリガは絶対に触らないこと。** この ci.yml 内の deploy (オンプレ CF Tunnel SSH)
+# と kintai-migrate は if で main push 限定なので branch push では発火しない。
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**', 'feat/**', 'perf/**', 'docs/**', 'chore/**', 'claude/**']
   pull_request:
     branches: [main]
+
+# 連続 push のたびに古い run が走り続けて runner を食い潰すのを防ぐ。
+# main と tag は途中でキャンセルするとデプロイ経路が切れるので絶対に止めない
+# (`github.ref != 'refs/heads/main'` だけだと tag ref は refs/tags/* なので
+# 式が true になってしまうため、tags/ を明示的に除外する)。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
