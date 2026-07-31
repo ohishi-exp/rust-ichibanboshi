@@ -1283,3 +1283,125 @@ async fn test_month_digest_does_not_warn_when_the_etags_route_is_absent() {
         "口が無いだけで欠けてはいない: {warnings:?}"
     );
 }
+
+// ── #205 の 32: 乗務員別の末尾検知 (driver_cds) と unsplit の素通し ──────────
+
+/// **本題。** 他の乗務員が窓の端まで在ると全体の `last` はそこに張り付き、1 名
+/// だけの末尾欠けが埋もれて沈黙する。alc が `driver_cds` を返すようになれば
+/// (前方互換フィールド)、実 HTTP 応答の JSON パースを通しても検出できる。
+///
+/// 月を 2026-01 に固定するのは、`today_jst()` (実行時の実日付) が
+/// `window_end` より後になることを保証して「進行中の月クランプ」に紛れさせない
+/// ため (他の `test_month_digest_*` と同じ方針)。
+#[tokio::test]
+async fn test_month_digest_catches_a_single_drivers_gap_via_real_json_driver_cds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-01-01", "date_to": "2026-02-01"},
+            "items": [
+                {"unko_no": "26010110000000000023021", "etag": "e1", "driver_cds": ["D1"]},
+                {"unko_no": "26013110000000000023021", "etag": "e2", "driver_cds": ["D1"]},
+                {"unko_no": "26012010000000000023023", "etag": "e3", "driver_cds": ["D3"]},
+            ],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (_, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await
+    })
+    .await;
+    // 期待 (窓の端) = 2026-02-01。D1 last=01-31 (gap 1、静か)。D3 last=01-20 (gap 12、鳴る)
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("乗務員1名の末尾が12日超"),
+        "{warnings:?}"
+    );
+}
+
+/// **1 運行に複数の `driver_cds` (主 / 副運転) が乗っても JSON からそのまま読める。**
+#[tokio::test]
+async fn test_month_digest_reads_multiple_driver_cds_on_one_operation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-01-01", "date_to": "2026-02-01"},
+            "items": [
+                {
+                    "unko_no": "26013110000000000023021",
+                    "etag": "e1",
+                    "driver_cds": ["D1", "D2"],
+                },
+            ],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (_, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-01")
+            .await
+    })
+    .await;
+    assert!(
+        warnings.is_empty(),
+        "D1/D2 とも窓の端まで在るので静か: {warnings:?}"
+    );
+}
+
+/// **`unsplit` は前方互換で受けて `with_unsplit_sink` の戻り値まで素通しする。**
+/// 判定には使わない — 応答から読めることだけを固定する (Refs #205 の 32)。
+#[tokio::test]
+async fn test_unsplit_passes_through_from_the_real_etags_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-06-01", "date_to": "2026-06-30"},
+            "items": [],
+            "warnings": [],
+            "unsplit": [
+                {"unko_no": "U1", "driver_cd": "D1", "reading_date": "2026-06-15"},
+            ],
+            "unsplit_total": 3,
+        })))
+        .mount(&server)
+        .await;
+    let (digest, items, total) = rust_ichibanboshi::kintai_http_repo::with_unsplit_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-06")
+            .await
+    })
+    .await;
+    assert!(digest.unwrap().is_some());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].unko_no, "U1");
+    assert_eq!(items[0].driver_cd, "D1");
+    assert_eq!(items[0].reading_date, "2026-06-15");
+    assert_eq!(total, 3);
+}
+
+/// alc がまだ `unsplit` を返さない環境 (現行) は空・0 のまま — 前方互換。
+#[tokio::test]
+async fn test_unsplit_defaults_to_empty_when_the_upstream_omits_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-06-01", "date_to": "2026-06-30"},
+            "items": [],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let (digest, items, total) = rust_ichibanboshi::kintai_http_repo::with_unsplit_sink(async {
+        repo(&server.uri())
+            .fetch_dtako_month_digest("2026-06")
+            .await
+    })
+    .await;
+    assert!(digest.unwrap().is_some());
+    assert!(items.is_empty());
+    assert_eq!(total, 0);
+}
