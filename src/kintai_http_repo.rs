@@ -417,6 +417,44 @@ fn key_trial(
     }
 }
 
+/// **オンプレの `unko_no` の末尾に付いている対象CD の桁数** (Refs #205 の 37)。
+///
+/// オンプレ (MariaDB `time_card_dtako`) は **運行NO + 対象CD** を key にしている
+/// (ユーザー、2026-07-31)。GCP (alc) 側は `運行NO` と `対象乗務員区分` を**別の列**で
+/// 持つので `unko_no` は運行NO そのもの — `ippoan/rust-alc-api` の
+/// `crates/alc-csv-parser/src/kudguri.rs:74` (`運行NO`) と `:92` (`対象乗務員区分`)、
+/// `migrations/054_dtako_tables.sql:53-54` の 2 列 + `:88` の
+/// `UNIQUE(tenant_id, unko_no, crew_role)`。**alc 側に切り詰めは存在しない**
+/// (`unko_no[..]` / `truncate` / `chars().take` の grep がヒット 0)。
+///
+/// 本番実測でも両側の桁は一様 (オンプレ 683 件すべて 23 / GCP 1,130 件すべて 22)。
+const ONPREM_CREW_SUFFIX_LEN: usize = 1;
+
+/// **オンプレの key から対象CD を落として運行NO にする** (Refs #205 の 37)。
+///
+/// 「先頭 22 桁」ではなく「末尾の対象CD ぶんを落とす」と書くのは、22 が
+/// どこから来た数字か読めるようにするため。短すぎる値は落とさずそのまま返す
+/// (一致しないだけで、静かに空文字にはしない)。
+fn onprem_unko_no(unko_no: &str) -> &str {
+    let kept = unko_no
+        .chars()
+        .count()
+        .saturating_sub(ONPREM_CREW_SUFFIX_LEN);
+    if kept == 0 {
+        return unko_no;
+    }
+    let cut: usize = unko_no.chars().take(kept).map(char::len_utf8).sum();
+    &unko_no[..cut]
+}
+
+/// `unko_no` を `YYYY-MM` の桶へ。読めなければ `"?"`。
+fn unko_no_month(unko_no: &str) -> String {
+    match unko_no_start_date(unko_no) {
+        Some(d) => d.format("%Y-%m").to_string(),
+        None => "?".to_string(),
+    }
+}
+
 /// 運行の突合の結果 (Refs #205 の 37)。**判定には使わない — 応答に載せるだけ。**
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UnkoDiff {
@@ -429,8 +467,20 @@ pub struct UnkoDiff {
     pub items: Vec<UnkoDiffItem>,
     /// 切る前の総数。
     pub total: usize,
-    /// **逆方向** (GCP に在ってオンプレに無い) の運行数。ゼロでなければ別の異常。
+    /// **逆方向** (GCP に在ってオンプレに無い) の運行数。**窓ぜんたい**で数えた値。
+    ///
+    /// **これは大きく出るのが正常。** GCP 側の etags は**読取日**で引くので窓の中に
+    /// 「ずっと前に始まった運行」が混ざる (本番 2026-06 の実測で `unko_no` の開始日が
+    /// 2026-04-20..2026-07-02)。一方オンプレ側は対象月のイベントしか持たないので、
+    /// 月の外の運行はすべてここに落ちる。**異常かどうかは
+    /// [`Self::gcp_only_in_month`] で見ること。**
     pub gcp_only: usize,
+    /// **対象月に始まった運行だけに絞った逆方向。** ここが 0 でなければ
+    /// 「GCP にしか無い対象月の運行」が実在する = 欠落とは逆向きの異常。
+    pub gcp_only_in_month: usize,
+    /// 逆方向を運行開始日の `YYYY-MM` で分けた件数。窓の差で説明が付くのか、
+    /// 対象月そのものが余っているのかを 1 目で見るため。
+    pub gcp_only_by_month: BTreeMap<String, usize>,
     /// 逆方向の実物 (辞書順の先頭 [`MAX_UNKO_DIFF_SAMPLE`] 件)。
     pub gcp_only_sample: Vec<UnkoSample>,
     /// **突き合わせた相手側**の実物 (オンプレの `unko_no`、同じく辞書順の先頭)。
@@ -439,30 +489,40 @@ pub struct UnkoDiff {
     /// 両側の**形**の実測 ([`UnkoShape`]) — 標本 10 件では言い切れない部分。
     pub onprem_shape: UnkoShape,
     pub gcp_shape: UnkoShape,
-    /// 突合キーの候補ごとの試算 ([`UnkoKeyTrial`])。**採用はしていない。**
+    /// 突合キーの候補ごとの試算 ([`UnkoKeyTrial`])。突合そのものは
+    /// [`onprem_unko_no`] (= `prefix22`) を採用済みなので、ここは**残る候補との
+    /// 比較を続けられるようにするための観測**。
     pub trials: Vec<UnkoKeyTrial>,
 }
 
-/// **オンプレの `(乗務員CD, unko_no)` 集合と etags の `unko_no` 集合を突き合わせる**
+/// **オンプレの `(乗務員CD, 運行NO)` と etags の `運行NO` を突き合わせる**
 /// (Refs #205 の 37)。
 ///
 /// GCP 側で畳んだ 2026-06 の勤怠がオンプレ基準より 143 行少ない件は、調査の結果
 /// 「乗務員ごとに最後の 1 本の `運行NO` がまるごと GCP 側の運行一覧に無い」形だと
 /// 分かっている。**どの運行が欠けているかを名指しできる**ようにするのがこの関数。
 ///
-/// - 突合の単位は **`(乗務員CD, unko_no)`** — 2 名乗務の運行は同じ `unko_no` が
-///   2 人に紐づくので、片方だけ欠けている形も見える
-/// - 逆方向は**件数と標本**。ゼロでないなら「オンプレに無い運行を GCP が持っている」
-///   という別の異常なので、名指しより先に気づけることが要る
-/// - **両側の標本を必ず対で返す** ([`UnkoSample`])。本番の初回実測で重なりがゼロ
-///   だった = キーが一度も一致していないので、片側だけでは何が違うのか分からない。
-///   標本は辞書順の先頭 — 呼ぶたびに違う 10 件が出ると比較にならないため
-///   (`HashSet` の反復順は不定)
-fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
+/// ## 2 つの集合を使い分ける
+///
+/// | 向き | 単位 | 理由 |
+/// |---|---|---|
+/// | 前 (オンプレ → GCP) | **`(乗務員CD, 運行NO)` のペア** | 2 名乗務は同じ運行NO が 2 人に紐づく。運行NO だけで畳むと**副運転手が消える** |
+/// | 逆 (GCP → オンプレ) | **`{運行NO}` の集合** | etags は運行NO 単位に dedup 済み (`alc dtako_events.rs:530-531`)。ペアと比べると全件が逆方向に落ちる |
+///
+/// **正規化するのは運行NO の部分だけで、`driver_cd` は落とさない。**
+///
+/// 標本は両側とも辞書順の先頭 — 呼ぶたびに違う 10 件が出ると比較にならないため
+/// (`HashSet` の反復順は不定)。
+fn diff_unko(
+    onprem: &[OnpremOperation],
+    gcp: &HashSet<String>,
+    month: Option<(i32, u32)>,
+) -> UnkoDiff {
     let mut items = Vec::new();
     let mut total = 0;
     for op in onprem {
-        if gcp.contains(&op.unko_no) {
+        // 判定は運行NO 部分だけ。2 名乗務なら 2 エントリとも同じ判定になり、2 件とも残る
+        if gcp.contains(onprem_unko_no(&op.unko_no)) {
             continue;
         }
         total += 1;
@@ -476,19 +536,33 @@ fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
             });
         }
     }
-    let seen: HashSet<&str> = onprem.iter().map(|o| o.unko_no.as_str()).collect();
+    // 逆方向は運行NO の集合同士 (乗務員CD で膨らませない)
+    let seen: HashSet<&str> = onprem.iter().map(|o| onprem_unko_no(&o.unko_no)).collect();
     let mut only: Vec<&str> = gcp
         .iter()
         .map(String::as_str)
         .filter(|u| !seen.contains(u))
         .collect();
     only.sort_unstable();
+    let mut by_month: BTreeMap<String, usize> = BTreeMap::new();
+    for u in &only {
+        *by_month.entry(unko_no_month(u)).or_default() += 1;
+    }
+    let gcp_only_in_month = match month {
+        Some((y, m)) => only
+            .iter()
+            .filter(|u| unko_no_start_date(u).is_some_and(|d| in_month(d, y, m)))
+            .count(),
+        None => 0,
+    };
     let mut mine: Vec<&str> = seen.into_iter().collect();
     mine.sort_unstable();
     UnkoDiff {
         items,
         total,
         gcp_only: only.len(),
+        gcp_only_in_month,
+        gcp_only_by_month: by_month,
         gcp_only_sample: sample(&only),
         onprem_sample: sample(&mine),
         onprem_shape: UnkoShape::measure(onprem.iter().map(|o| o.unko_no.as_str())),
@@ -498,6 +572,12 @@ fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
             .map(|(name, prefix)| key_trial(name, *prefix, onprem, gcp))
             .collect(),
     }
+}
+
+/// その日付が `(y, m)` の暦月に入っているか。
+fn in_month(d: NaiveDate, y: i32, m: u32) -> bool {
+    use chrono::Datelike;
+    d.year() == y && d.month() == m
 }
 
 /// 辞書順に並べ終わった一覧の頭 [`MAX_UNKO_DIFF_SAMPLE`] 件。
@@ -555,17 +635,38 @@ fn record_etag_unko_nos(unko_nos: HashSet<String>) {
 /// **突合して記録する** (Refs #205 の 37)。オンプレに在って GCP に無い運行が
 /// 1 件でもあれば `warnings` に 1 行足す — 欠けた入力のまま月ゲートに「最新」の
 /// 封をさせないため (`missing_input_warnings` と同じ安全側の倒し方)。
-pub fn record_unko_diff(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
-    let diff = diff_unko(onprem, gcp);
+///
+/// ## 正規化が効いていないことを静かに通さない
+///
+/// [`onprem_unko_no`] は「末尾 1 文字が対象CD」という**実測に乗った仮定**なので、
+/// 前提が崩れたら黙って全件不一致に戻る。それを検知するために 2 つ warning を出す:
+///
+/// 1. **GCP 側の桁が揃っていない** — 揃っている前提で末尾を落としているため
+/// 2. **正規化しても 1 件も一致しない** — 2026-07-31 に踏んだ形そのもの。
+///    「重なりゼロ」を `unko_diff_total` が大きいだけの状態と区別する
+pub fn record_unko_diff(
+    onprem: &[OnpremOperation],
+    gcp: &HashSet<String>,
+    month: Option<(i32, u32)>,
+) -> UnkoDiff {
+    let diff = diff_unko(onprem, gcp, month);
     if diff.total > 0 {
         let n = diff.total;
         let w = format!("dtako 入力欠け: オンプレに在って GCP に無い運行 {n} 件");
         record_warning(&w);
     }
-    if diff.gcp_only > 0 {
-        let gcp_only = diff.gcp_only;
-        tracing::warn!(gcp_only, "kintai dtako unko diff reverse");
+    if diff.gcp_shape.len_counts.len() > 1 {
+        let k = diff.gcp_shape.len_counts.len();
+        let w = format!("dtako 突合: GCP 側の運行NO の桁が揃っていない ({k} 種)");
+        record_warning(&w);
     }
+    if !onprem.is_empty() && !gcp.is_empty() && diff.total == onprem.len() {
+        let n = onprem.len();
+        let w = format!("dtako 突合: 正規化しても運行が 1 件も一致しない ({n} 件)");
+        record_warning(&w);
+    }
+    let (all, in_month) = (diff.gcp_only, diff.gcp_only_in_month);
+    tracing::info!(all, in_month, "kintai dtako unko diff reverse");
     let _ = UNKO_SINK.try_with(|s| s.borrow_mut().diff = Some(diff.clone()));
     diff
 }
@@ -2625,6 +2726,9 @@ mod tests {
     }
 
     // ── 運行の突合 (オンプレ × GCP、Refs #205 の 37) ────────────────────────
+    //
+    // オンプレ 23 桁 = 運行NO(22) + 対象CD(1) / GCP 22 桁 = 運行NO そのもの。
+    // 値はすべて本番の実物 (`/api/kintai/events` と etags 応答の標本)。
 
     fn op(driver_cd: i64, unko_no: &str) -> OnpremOperation {
         OnpremOperation {
@@ -2639,18 +2743,30 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// **末尾の対象CD ぶんだけ落とす。** 短すぎる値は落とさない (静かに空にしない)。
+    #[test]
+    fn onprem_unko_no_drops_only_the_crew_suffix() {
+        let real = onprem_unko_no("26062411400600000023021");
+        assert_eq!(real, "2606241140060000002302", "対象CD 1 桁が落ちる");
+        assert_eq!(onprem_unko_no("U1"), "U", "2 文字でも 1 文字は落とす");
+        assert_eq!(onprem_unko_no("X"), "X", "1 文字は落とさない");
+        assert_eq!(onprem_unko_no(""), "", "空も落とさない");
+    }
+
     /// **本題。** オンプレに在って GCP に無い運行が名指しで出る。
+    /// 判定は運行NO 部分だけで、応答に載るのは**生の `unko_no`** (対象CD 込み)。
     #[test]
     fn diff_unko_names_the_operations_missing_from_gcp() {
         let onprem = vec![
-            op(1078, "26062410055500000023021"),
-            op(1517, "26062610055500000023022"),
+            op(1078, "26062411400600000023021"),
+            op(1517, "26062606141000000042291"),
         ];
-        let diff = diff_unko(&onprem, &gcp_set(&["26062610055500000023022"]));
+        // GCP は 1517 の運行しか持っていない
+        let diff = diff_unko(&onprem, &gcp_set(&["2606260614100000004229"]), None);
         assert_eq!(diff.total, 1, "{diff:?}");
         assert_eq!(diff.items.len(), 1);
         assert_eq!(diff.items[0].driver_cd, 1078);
-        assert_eq!(diff.items[0].unko_no, "26062410055500000023021");
+        assert_eq!(diff.items[0].unko_no, "26062411400600000023021", "生の値");
         assert_eq!(diff.items[0].start_date.as_deref(), Some("2026-06-24"));
         assert_eq!(diff.items[0].first_date, "2026-06-24");
         assert_eq!(diff.items[0].last_date, "2026-06-26");
@@ -2658,30 +2774,120 @@ mod tests {
     }
 
     /// 両方揃っていれば「欠け」はゼロ。標本は突合が成立していても出す
-    /// (キーが噛み合っているかどうかを毎回目視できるようにするため)。
+    /// (キーが噛み合っているかを毎回目視できるようにするため)。
     #[test]
     fn diff_unko_is_empty_when_both_sides_agree() {
-        let onprem = vec![op(1078, "U1"), op(1517, "U2")];
-        let diff = diff_unko(&onprem, &gcp_set(&["U1", "U2"]));
+        let onprem = vec![
+            op(1078, "26062411400600000023021"),
+            op(1517, "26062606141000000042291"),
+        ];
+        let gcp = gcp_set(&["2606241140060000002302", "2606260614100000004229"]);
+        let diff = diff_unko(&onprem, &gcp, None);
         assert_eq!(diff.total, 0);
         assert_eq!(diff.gcp_only, 0);
         assert!(diff.items.is_empty());
         assert!(diff.gcp_only_sample.is_empty(), "逆方向が無いので空");
         let mine: Vec<&str> = diff.onprem_sample.iter().map(|s| &*s.unko_no).collect();
-        assert_eq!(mine, vec!["U1", "U2"], "自分側は辞書順で出る");
+        assert_eq!(mine.len(), 2, "自分側は正規化後の運行NO で出る: {mine:?}");
+    }
+
+    /// **★ 2 名乗務が正規化後も 2 エントリとして残る** (Refs #205 の 37)。
+    ///
+    /// 同じ運行NO が運転手 (対象CD=1) と副運転手 (対象CD=2) で**別の乗務員**に
+    /// 紐づく。正規化するのは運行NO の部分だけで `driver_cd` は落とさないので、
+    /// 2 人ぶんが 2 件とも出力に残る — ここを運行NO だけで畳むと副運転手が消える。
+    #[test]
+    fn diff_unko_keeps_both_crew_members_of_a_two_person_operation() {
+        let onprem = vec![
+            op(1078, "26062411400600000023021"),
+            op(1234, "26062411400600000023022"),
+        ];
+        let diff = diff_unko(&onprem, &gcp_set(&[]), None);
+        assert_eq!(diff.total, 2, "2 人ぶん残る: {diff:?}");
+        let drivers: Vec<i64> = diff.items.iter().map(|i| i.driver_cd).collect();
+        assert_eq!(drivers, vec![1078, 1234], "運転手と副運転手の両方");
+    }
+
+    /// **2 名乗務の判定は必ず両方一致する。**
+    ///
+    /// GCP 側は運行NO 単位に dedup 済み (alc `dtako_events.rs:530-531`) なので、
+    /// **「片方だけ GCP に在る」状態はそもそも表現できない** — この不変条件は
+    /// 「2 エントリの判定が揃う」ところまでしかテストで固定できない
+    /// (親の判断、2026-07-31)。alc が `driver_cds` を返すようになった今も、
+    /// 逆方向は運行NO の集合で比べている。
+    #[test]
+    fn diff_unko_judges_both_crew_members_the_same_way() {
+        let onprem = vec![
+            op(1078, "26062411400600000023021"),
+            op(1234, "26062411400600000023022"),
+        ];
+        let present = diff_unko(&onprem, &gcp_set(&["2606241140060000002302"]), None);
+        assert_eq!(present.total, 0, "在れば 2 件とも消える: {present:?}");
+        let absent = diff_unko(&onprem, &gcp_set(&[]), None);
+        assert_eq!(absent.total, 2, "無ければ 2 件とも残る");
+    }
+
+    /// **逆方向は運行NO の集合同士。** 乗務員CD で膨らませない — 2 名乗務で
+    /// オンプレが 2 行持っていても、GCP 側の 1 件と過不足なく突き合う。
+    #[test]
+    fn diff_unko_counts_the_reverse_direction_by_unko_no_not_by_pair() {
+        let onprem = vec![
+            op(1078, "26062411400600000023021"),
+            op(1234, "26062411400600000023022"),
+        ];
+        let gcp = gcp_set(&["2606241140060000002302", "2606260614100000004229"]);
+        let diff = diff_unko(&onprem, &gcp, None);
+        assert_eq!(diff.total, 0, "オンプレ側の欠けは無い");
+        assert_eq!(diff.gcp_only, 1, "GCP にしか無いのは 1517 の 1 本だけ");
+    }
+
+    /// **★ 逆方向は対象月で絞ってからでないと異常かどうか判定できない。**
+    ///
+    /// etags は**読取日**で引くので、窓の中に前月以前に始まった運行が混ざる
+    /// (本番 2026-06 の実測で開始日が 2026-04-20..2026-07-02、逆方向 478 件)。
+    /// 月の外はオンプレの当月分と一致しなくて当然なので、`gcp_only` そのものは
+    /// 大きく出る。**`gcp_only_in_month` が 0 でないときだけ異常。**
+    #[test]
+    fn the_reverse_direction_is_also_counted_within_the_target_month() {
+        let gcp = gcp_set(&[
+            "2604202128500000002536", // 4 月に始まり 6 月に読まれた運行
+            "2605060751400000002536", // 5 月
+            "2606241140060000002302", // 6 月 = 対象月
+        ]);
+        let diff = diff_unko(&[], &gcp, Some((2026, 6)));
+        assert_eq!(diff.gcp_only, 3, "窓ぜんたいでは 3 件");
+        assert_eq!(diff.gcp_only_in_month, 1, "対象月に始まったのは 1 件だけ");
+        let want = BTreeMap::from([
+            ("2026-04".to_string(), 1),
+            ("2026-05".to_string(), 1),
+            ("2026-06".to_string(), 1),
+        ]);
+        assert_eq!(diff.gcp_only_by_month, want, "月別の内訳で内訳が読める");
+    }
+
+    /// 月を渡さなければ月で絞った数は出さない (0 のまま)。読めない `unko_no` は
+    /// `"?"` の桶に落ちる。
+    #[test]
+    fn the_reverse_direction_without_a_month_reports_only_the_whole_window() {
+        let diff = diff_unko(&[], &gcp_set(&["U1"]), None);
+        assert_eq!(diff.gcp_only, 1);
+        assert_eq!(diff.gcp_only_in_month, 0, "月が無ければ絞れない");
+        assert_eq!(
+            diff.gcp_only_by_month,
+            BTreeMap::from([("?".to_string(), 1)])
+        );
     }
 
     /// **キーが 1 つも一致しないとき、両側の実物が対で返る** (Refs #205 の 37)。
-    /// 本番 2026-06 の初回実測がこの形だった (重なりゼロ)。標本は**辞書順**で、
-    /// `HashSet` の反復順に振り回されない (呼ぶたびに違う 10 件だと比較にならない)。
+    /// 標本は**辞書順**で、`HashSet` の反復順に振り回されない。
     #[test]
     fn diff_unko_samples_both_sides_in_a_stable_order() {
-        let onprem = vec![op(1078, "B2"), op(1517, "B1")];
-        let diff = diff_unko(&onprem, &gcp_set(&["A2", "A1", "A3"]));
+        let onprem = vec![op(1078, "B21"), op(1517, "B11")];
+        let diff = diff_unko(&onprem, &gcp_set(&["A2", "A1", "A3"]), None);
         let theirs: Vec<&str> = diff.gcp_only_sample.iter().map(|s| &*s.unko_no).collect();
         assert_eq!(theirs, vec!["A1", "A2", "A3"], "GCP 側は辞書順");
         let mine: Vec<&str> = diff.onprem_sample.iter().map(|s| &*s.unko_no).collect();
-        assert_eq!(mine, vec!["B1", "B2"], "オンプレ側も辞書順");
+        assert_eq!(mine, vec!["B1", "B2"], "オンプレ側も辞書順 (正規化後)");
         assert_eq!(diff.gcp_only, 3);
         assert_eq!(diff.total, 2);
     }
@@ -2692,14 +2898,14 @@ mod tests {
         let diff = diff_unko(
             &[op(1078, "26062411400600000023021")],
             &gcp_set(&[" 2606241140060000002302 "]),
+            None,
         );
-        assert_eq!(diff.onprem_sample[0].len, 23);
+        assert_eq!(diff.onprem_sample[0].len, 22, "対象CD を落とした後の長さ");
         assert_eq!(diff.gcp_only_sample[0].len, 24, "前後の空白を数える");
     }
 
-    /// **本番の実物で形を測る** (Refs #205 の 37)。オンプレ 23 桁 = 運行NO (22) +
-    /// **対象CD** (1)、GCP 22 桁 = 運行NO そのもの。運行NO の中身は
-    /// `YYMMDDHHMMSS` (12) + ゼロ埋めの車番 (10)。
+    /// **本番の実物で形を測る** (Refs #205 の 37)。`shape` は**生の値**で測る —
+    /// 正規化が効いているかどうかを、正規化の前の形から判断するため。
     ///
     /// 値は `/api/kintai/events` から引いた実データ (乗務員 1021 / 1078 / 1517 /
     /// 1688 / 1740 の 2026-06、31 運行) と、本番の etags 応答の標本そのもの。
@@ -2714,25 +2920,26 @@ mod tests {
             op(1740, "26061105351800000039751"),
             op(1740, "26061105351800000039752"),
         ];
-        let diff = diff_unko(&onprem, &gcp_set(&["2604202128500000002536"]));
+        let diff = diff_unko(&onprem, &gcp_set(&["2604202128500000002536"]), None);
         assert_eq!(diff.onprem_shape.len_counts, BTreeMap::from([(23, 4)]));
         assert_eq!(diff.gcp_shape.len_counts, BTreeMap::from([(22, 1)]));
         let last = &diff.onprem_shape.last_char_counts;
         let want = BTreeMap::from([("1".to_string(), 3), ("2".to_string(), 1)]);
-        assert_eq!(*last, want, "余分な 1 文字は定数ではない");
+        assert_eq!(*last, want, "対象CD は 1 とは限らない");
     }
 
-    /// **「先頭 22 桁で本当に重なるか」を推測ではなく数で返す** (Refs #205 の 37)。
-    /// `raw` では 1 件も一致せず、`prefix22` で全件一致する — 本番で疑っている形。
+    /// **候補ごとの試算は突合の採否と別に出し続ける** (Refs #205 の 37)。
+    /// `raw` (対象CD 込み) では 1 件も一致せず、`prefix22` で全件一致する —
+    /// 本番 2026-06 の実測がこの形 (raw 0/683、prefix22 654/683)。
     #[test]
-    fn the_key_trials_measure_each_candidate_without_adopting_it() {
+    fn the_key_trials_measure_each_candidate() {
         let onprem = vec![
             op(1078, "26062411400600000023021"),
             op(1517, "26062606141000000042291"),
         ];
         let gcp = gcp_set(&["2606241140060000002302", "2606260614100000004229"]);
-        let diff = diff_unko(&onprem, &gcp);
-        assert_eq!(diff.total, 2, "突合そのものは raw のまま = 全件不一致");
+        let diff = diff_unko(&onprem, &gcp, None);
+        assert_eq!(diff.total, 0, "突合は正規化済み = 全件一致");
 
         let by = |k: &str| {
             diff.trials
@@ -2752,8 +2959,8 @@ mod tests {
     /// 対象CD 1 / 2 の 2 行があり、先頭 22 桁では 1 つになる。
     ///
     /// **これは「運行が消える」ではない** — 対象CD 違いは同じ 1 本の運行なので、
-    /// 畳むのが正しい (struct docs の実測)。数えているのは「キーだけでは対象CD
-    /// 違いと別運行を区別できないので、0 でなければ中身を見よ」という合図。
+    /// 畳むのが正しい (`UnkoKeyTrial` の docs の実測)。本番でも `collisions` = 2 と
+    /// オンプレ側の末尾 `"2"` = 2 件がぴったり一致した。
     #[test]
     fn the_key_trials_count_operations_that_collapse_into_one_key() {
         let onprem = vec![
@@ -2761,7 +2968,7 @@ mod tests {
             op(1740, "26061105351800000039752"),
             op(1517, "26052106075900000042291"),
         ];
-        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        let diff = diff_unko(&onprem, &gcp_set(&[]), None);
         let by = |k: &str| diff.trials.iter().find(|t| t.key == k).unwrap().clone();
         assert_eq!(by("raw").collisions, 0, "生のキーは潰れない");
         assert_eq!(by("prefix22").collisions, 2, "1740 の 2 行が 1 つになる");
@@ -2782,30 +2989,11 @@ mod tests {
     #[test]
     fn the_sample_is_capped() {
         let onprem: Vec<OnpremOperation> = (0..MAX_UNKO_DIFF_SAMPLE + 3)
-            .map(|i| op(1000 + i as i64, &format!("U{i:03}")))
+            .map(|i| op(1000 + i as i64, &format!("U{i:03}x")))
             .collect();
-        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        let diff = diff_unko(&onprem, &gcp_set(&[]), None);
         assert_eq!(diff.onprem_sample.len(), MAX_UNKO_DIFF_SAMPLE);
-        assert_eq!(diff.onprem_sample[0].unko_no, "U000", "頭から");
-    }
-
-    /// **逆方向 (GCP に在ってオンプレに無い) は件数だけ数える。**
-    #[test]
-    fn diff_unko_counts_the_reverse_direction() {
-        let onprem = vec![op(1078, "U1")];
-        let diff = diff_unko(&onprem, &gcp_set(&["U1", "U2", "U3"]));
-        assert_eq!(diff.total, 0, "オンプレ側の欠けは無い");
-        assert_eq!(diff.gcp_only, 2, "U2 / U3");
-    }
-
-    /// 同じ運行が 2 名 (主 / 副運転) に紐づくときは **`(乗務員CD, unko_no)` 単位**で
-    /// 数える。`unko_no` が読めない形は `start_date` が `null` になるだけ。
-    #[test]
-    fn diff_unko_counts_per_driver_and_tolerates_an_unreadable_unko_no() {
-        let onprem = vec![op(1078, "U1"), op(1517, "U1")];
-        let diff = diff_unko(&onprem, &gcp_set(&[]));
-        assert_eq!(diff.total, 2, "2 名ぶん: {diff:?}");
-        assert_eq!(diff.items[0].start_date, None, "6 桁に満たない");
+        assert_eq!(diff.onprem_sample[0].unko_no, "U000", "頭から (正規化後)");
     }
 
     /// **上限 500 で切り、総数は実数のまま。** `unsplit` と同じ作法。
@@ -2814,9 +3002,17 @@ mod tests {
         let onprem: Vec<OnpremOperation> = (0..MAX_UNKO_DIFF + 5)
             .map(|i| op(1000 + i as i64, &format!("2606241005550000002{i:04}")))
             .collect();
-        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        let diff = diff_unko(&onprem, &gcp_set(&[]), None);
         assert_eq!(diff.items.len(), MAX_UNKO_DIFF, "頭 500 件だけ");
         assert_eq!(diff.total, MAX_UNKO_DIFF + 5, "総数は切らない");
+    }
+
+    /// `unko_no` が読めない形は `start_date` が `null` になるだけで落とさない。
+    #[test]
+    fn diff_unko_tolerates_an_unreadable_unko_no() {
+        let diff = diff_unko(&[op(1078, "U1")], &gcp_set(&[]), None);
+        assert_eq!(diff.total, 1);
+        assert_eq!(diff.items[0].start_date, None, "6 桁に満たない");
     }
 
     /// etags の一覧は sink の中でだけ拾える。外なら `None` (「無い」と区別する)。
@@ -2836,24 +3032,57 @@ mod tests {
     #[tokio::test]
     async fn record_unko_diff_reports_through_the_sink_and_the_warnings() {
         let ((out, warnings), diff) = with_unko_diff_sink(with_warning_sink(async {
-            let onprem = vec![op(1078, "26062410055500000023021"), op(1517, "U2")];
-            record_unko_diff(&onprem, &gcp_set(&["U9"]));
+            let onprem = vec![
+                op(1078, "26062411400600000023021"),
+                op(1517, "26062606141000000042291"),
+            ];
+            // GCP は別の運行 1 本しか持っていない (= 全件不一致ではない形にする)
+            record_unko_diff(&onprem, &gcp_set(&["2606241140060000002302"]), None);
             7
         }))
         .await;
         assert_eq!(out, 7);
-        assert_eq!(diff.total, 2);
-        assert_eq!(diff.gcp_only, 1, "U9 はオンプレに無い");
+        assert_eq!(diff.total, 1);
+        assert_eq!(diff.gcp_only, 0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let w = &warnings[0];
-        assert!(w.contains("オンプレに在って GCP に無い運行 2 件"), "{w}");
+        assert!(w.contains("オンプレに在って GCP に無い運行 1 件"), "{w}");
+    }
+
+    /// **正規化が効いていない状態を静かに通さない** (Refs #205 の 37)。
+    /// 2026-07-31 に踏んだ「重なりゼロ」を、ただ欠けが多いだけの状態と区別する。
+    #[tokio::test]
+    async fn record_unko_diff_warns_when_nothing_matches_at_all() {
+        let (((), warnings), _) = with_unko_diff_sink(with_warning_sink(async {
+            record_unko_diff(&[op(1078, "U1")], &gcp_set(&["ZZ"]), None);
+        }))
+        .await;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let hit = warnings.iter().any(|w| w.contains("1 件も一致しない"));
+        assert!(hit, "{warnings:?}");
+    }
+
+    /// **GCP 側の桁が揃っていなければ警告する。** 末尾を落とす正規化は
+    /// 「向こうは揃っている」前提に乗っているため。
+    #[tokio::test]
+    async fn record_unko_diff_warns_when_the_gcp_lengths_are_not_uniform() {
+        let (((), warnings), _) = with_unko_diff_sink(with_warning_sink(async {
+            let gcp = gcp_set(&["2606241140060000002302", "260626061410000000422"]);
+            record_unko_diff(&[op(1078, "26062411400600000023021")], &gcp, None);
+        }))
+        .await;
+        let hit = warnings
+            .iter()
+            .any(|w| w.contains("桁が揃っていない (2 種)"));
+        assert!(hit, "{warnings:?}");
     }
 
     /// 差が無ければ warning は立たない (月ゲートを無駄に開けない)。
     #[tokio::test]
     async fn record_unko_diff_is_silent_when_nothing_is_missing() {
         let ((_, warnings), diff) = with_unko_diff_sink(with_warning_sink(async {
-            record_unko_diff(&[op(1078, "U1")], &gcp_set(&["U1"]));
+            let gcp = gcp_set(&["2606241140060000002302"]);
+            record_unko_diff(&[op(1078, "26062411400600000023021")], &gcp, None);
         }))
         .await;
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -2864,7 +3093,7 @@ mod tests {
     /// **集めていないときは何も起きない** (`record_unsplit` と同じ扱い)。
     #[test]
     fn record_unko_diff_outside_a_sink_is_dropped() {
-        let diff = record_unko_diff(&[op(1078, "U1")], &gcp_set(&[]));
+        let diff = record_unko_diff(&[op(1078, "U1")], &gcp_set(&[]), None);
         assert_eq!(diff.total, 1, "戻り値は返る");
         assert_eq!(collected_etag_unko_nos(), None, "sink は立っていない");
     }
