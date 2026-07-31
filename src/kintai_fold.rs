@@ -94,8 +94,10 @@
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use sha2::{Digest, Sha256};
 
-use crate::kintai_push::{jst_day_bounds, KintaiPgStore, KintaiPushError, DATETIME_FORMAT};
-use crate::kintai_repo::{month_range, DynKintaiEventsRepo};
+use crate::kintai_push::{
+    jst_day_bounds, KintaiPgStore, KintaiPushError, DATETIME_FORMAT, PUSHED_SOURCES,
+};
+use crate::kintai_repo::{exact_month_range, month_range, DynKintaiEventsRepo};
 use crate::kosoku::{daily_summary, drop_duplicate_rows, DaySummary, KosokuParams, ShiftSource};
 
 /// `build.rs` が焼き込む「出力に効くコード」の内容ハッシュ (16 桁 hex)。
@@ -905,6 +907,64 @@ pub async fn write_unit(
     Ok(())
 }
 
+/// JST の今日。[`push_window_gap_warning`] が「はみ出した先がもう過ぎた日か」を
+/// 見るためだけに使う。
+fn today_jst() -> NaiveDate {
+    let jst = FixedOffset::east_opt(9 * 3600).expect("JST offset is in range");
+    chrono::Utc::now().with_timezone(&jst).date_naive()
+}
+
+/// **fold が読む窓のうち push が書かない 1 日**に打刻が 1 行も無ければ警告を返す
+/// (Refs #205 の 30)。
+///
+/// | | 関数 | 窓 |
+/// |---|---|---|
+/// | 書く ([`crate::kintai_push::push_month`]) | `exact_month_range` | `[月初, 翌月初)` |
+/// | 読む ([`fold_month`]) | [`month_range`] | `[月初, 翌月 2 日)` |
+///
+/// **ずれの 1 日 (`翌月 1 日`) は翌月の push でしか書かれない。** 翌月がまだ
+/// push されていなければ、6 月の fold は**月を跨いだ勤務の終業打刻を読めないまま
+/// 畳む**。窓が違うこと自体は意図どおり (日跨ぎ勤務の終業を拾うため) だが、
+/// **はみ出した先が push されているという前提はどこにも保証が無かった。**
+///
+/// 実測 (2026-06 / 乗務員 1021): `始業 06-21 06:12:34` の相手は
+/// `終業 07-01 14:54:29`。7 月が未 push で 6 月の fold から見えず、勤務が休息で
+/// 閉じて `shift_source` が 6 名 28 行ぶん反転していた。**値は 11 列とも同じだった
+/// ので突合するまで誰も気付けない** — だから鳴らす。
+///
+/// **窓は揃えない。** `exact_month_range` を選んだ理由 (翌月頭を「その日の一部しか
+/// 見ていない状態」で署名すると毎回書き直しになる) は
+/// `crate::kintai_push::push_month` の docs にあり、正当なので触らない。
+///
+/// - **翌月初がまだ過ぎていない月では黙る** — 当月を畳むときは、はみ出した先が
+///   未来なので打刻が無いのが正常。過ぎた日にだけ鳴らす (`spill < today`)
+/// - 判定に使うのは**既に読んだ行だけ**。往復は増やさない
+/// - 見るのは [`PUSHED_SOURCES`] (`timecard` / `dtako`) だけ。`dtako_events` は
+///   push を通らず alc から直に来るので、在っても push の証拠にならない
+fn push_window_gap_warning(
+    month: &str,
+    rows: &[serde_json::Value],
+    today: NaiveDate,
+) -> Option<String> {
+    let (_, spill_from) = exact_month_range(month)?;
+    let spill = NaiveDate::parse_from_str(spill_from.get(..10)?, "%Y-%m-%d").ok()?;
+    if spill >= today {
+        return None;
+    }
+    let pushed = |r: &serde_json::Value| {
+        let src = r.get("source").and_then(|v| v.as_str()).unwrap_or_default();
+        let at = r
+            .get("datetime")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        PUSHED_SOURCES.contains(&src) && at >= spill_from.as_str()
+    };
+    if rows.iter().any(pushed) {
+        return None;
+    }
+    Some(format!("push 窓ずれ: {month} の fold が読む {spill} に打刻が 0 行 — 翌月が未 push なら月跨ぎ勤務の終業打刻が欠ける"))
+}
+
 /// 対象月を**生イベント 1 回読み**で乗務員ごとに畳む。返すのは乗務員CD 昇順。
 ///
 /// 期間は [`month_range`] = `[月初, 翌月 2 日)`。読み出し経路と同じで、日跨ぎ勤務の
@@ -939,6 +999,11 @@ pub async fn fold_month(
         .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
     let rows = repo.fetch_all_events_between(&from, &to).await?;
     tracing::debug!("fold {month}: read {} rows in 1 fetch_all", rows.len());
+    // はみ出した先の 1 日が push されているかを確かめる (Refs #205 の 30)
+    if let Some(w) = push_window_gap_warning(month, &rows, today_jst()) {
+        tracing::warn!("{w}");
+        crate::kintai_http_repo::record_warning(&w);
+    }
     let mut units: Vec<(u64, FoldUnit, String)> = crate::kosoku::split_by_driver(rows)
         .into_iter()
         .filter(|(cd, _)| driver.is_none_or(|want| want == *cd))
@@ -2074,5 +2139,74 @@ mod tests {
         let (a, b) = day_bounds(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
         assert_eq!(a.to_rfc3339(), "2026-07-01T00:00:00+09:00");
         assert_eq!(b.to_rfc3339(), "2026-07-02T00:00:00+09:00");
+    }
+
+    // ── push 窓ずれの検知 (Refs #205 の 30) ──────────────────────────────
+
+    fn ev(source: &str, at: &str) -> serde_json::Value {
+        serde_json::json!({"datetime": at, "source": source, "state": "始業"})
+    }
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
+
+    #[test]
+    fn push_window_gap_warns_when_the_spill_day_has_no_punch() {
+        // 2026-06 の fold は 07-01 まで読むが、push が書くのは 06-30 まで。
+        // 07-01 に打刻が 1 行も無い = 7 月が未 push の疑い (実測の 1021 の形)
+        let rows = vec![ev("timecard", "2026-06-21 06:12:34")];
+        let w = push_window_gap_warning("2026-06", &rows, ymd(2026, 7, 15));
+        assert!(
+            w.is_some_and(|w| w.contains("2026-07-01")),
+            "07-01 を名指しする"
+        );
+    }
+
+    #[test]
+    fn push_window_gap_is_quiet_when_the_spill_day_has_a_punch() {
+        // 7 月が push 済み = はみ出した先に打刻が在る
+        let rows = vec![
+            ev("timecard", "2026-06-21 06:12:34"),
+            ev("timecard", "2026-07-01 14:54:29"),
+        ];
+        assert!(push_window_gap_warning("2026-06", &rows, ymd(2026, 7, 15)).is_none());
+    }
+
+    #[test]
+    fn push_window_gap_is_quiet_while_the_spill_day_is_still_ahead() {
+        // 当月を畳んでいる最中。はみ出した先が未来なので打刻が無いのが正常
+        let rows = vec![ev("timecard", "2026-06-21 06:12:34")];
+        assert!(push_window_gap_warning("2026-06", &rows, ymd(2026, 6, 25)).is_none());
+        // 翌月初そのものの日もまだ鳴らさない (その日はまだ進行中)
+        assert!(push_window_gap_warning("2026-06", &rows, ymd(2026, 7, 1)).is_none());
+    }
+
+    #[test]
+    fn push_window_gap_ignores_dtako_events_in_the_spill_day() {
+        // `dtako_events` は push を通らず alc から直に来るので push の証拠にならない
+        let rows = vec![
+            ev("timecard", "2026-06-21 06:12:34"),
+            ev("dtako_events", "2026-07-01 09:00:00"),
+        ];
+        assert!(push_window_gap_warning("2026-06", &rows, ymd(2026, 7, 15)).is_some());
+    }
+
+    #[test]
+    fn push_window_gap_counts_the_other_pushed_source() {
+        // `dtako` (運行開始/終了) も push が運ぶので、在れば push 済みの証拠になる
+        let rows = vec![ev("dtako", "2026-07-01 09:00:00")];
+        assert!(push_window_gap_warning("2026-06", &rows, ymd(2026, 7, 15)).is_none());
+    }
+
+    #[test]
+    fn push_window_gap_returns_none_for_a_bad_month() {
+        assert!(push_window_gap_warning("nope", &[], ymd(2026, 7, 15)).is_none());
+    }
+
+    #[test]
+    fn today_jst_is_a_real_date() {
+        // 呼べること自体の確認 (JST offset の expect が外れないこと)
+        assert!(today_jst() > ymd(2020, 1, 1));
     }
 }
