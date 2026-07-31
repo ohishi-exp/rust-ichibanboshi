@@ -12,11 +12,19 @@
 //!
 //! ## 読み出し経路と同じ手順で計算する
 //!
-//! `/api/kintai/kosoku-daily` の全乗務員経路 (`routes/kintai.rs`) と**同じ順序**で
-//! 呼ぶ — 違う手順で畳むと、画面と保存値が食い違ったときに原因が追えない。
+//! `/api/kintai/kosoku-daily` の全乗務員経路 (`routes/kintai.rs` の
+//! `kosoku_daily_all`) と**同じ順序**で呼ぶ — 違う手順で畳むと、画面と保存値が
+//! 食い違ったときに原因が追えない。
 //!
-//! 1. `drop_duplicate_rows` (取り込みが 2 回走った重複を落とす)
-//! 2. `daily_summary`
+//! 1. `fetch_all_events_between` (対象月を**全乗務員まとめて 1 回**読む)
+//! 2. `split_by_driver` (`daily_summary` は乗務員を知らない純粋関数なので先に分ける)
+//! 3. `drop_duplicate_rows` (取り込みが 2 回走った重複を落とす)
+//! 4. `daily_summary`
+//!
+//! **1 と 2 を「乗務員ごとに 1 回読む」に置き換えない。** GCP の HTTP 実装
+//! ([`crate::kintai_http_repo`]) では 1 乗務員 1 往復が `rust-alc-api` への
+//! 1 往復 (裏で R2 の GET 群) になる。95 名 × 2 か月で約 190 往復、しかも乗務員の
+//! 列挙で全量をもう 1 周読んでいた。読みは月 1 回に畳み、分けるのは in-process でやる。
 //!
 //! **フェリー控除 (`apply_ferry_minus`) は呼ばない。** あれが埋めるのは
 //! `ferry_minus_minutes` だけで、これは 3 表のどこにも列が無い (紙との差を説明する
@@ -43,6 +51,26 @@
 //!   `drop_duplicate_rows` は行の完全一致で重複を判定するので、列が増えれば
 //!   結果が変わり得る。**広い方に倒す** — 余分に再計算するのは安全側で、
 //!   取りこぼしだけが危ない
+//!
+//! ### 材料の行は**全乗務員版の形**
+//!
+//! 全乗務員版の行は `unko_no` / `vehicle` を**キーごと持たない**
+//! (`kintai_repo::all_row_to_json` / `kintai_http_repo::event_to_all_json`)。
+//! 単一乗務員版 (`/api/kintai/events`) は持つので、**同じ打刻でも行 JSON が経路で
+//! 違い、指紋も違う値になる。**
+//!
+//! 畳んだ値そのものは変わらない。[`crate::kosoku::parse_events`] が読むのは
+//! `datetime` / `end_datetime` / `source` / `state` の 4 キーだけで、
+//! [`crate::kosoku::Event`] に運行NO の場所が無い。効くのは
+//! [`crate::kosoku::drop_duplicate_rows`] の判定材料としてだけ —
+//! 「同時刻・同イベントで運行NO だけ違う 2 行」(実測 1526 の `…011` / `…012`) が、
+//! 全乗務員版では区別が付かず 1 行に潰れる。潰れても拘束・実働・深夜は動かない
+//! (休憩も休息も `merge_intervals` / `windows(2)` で畳むので重複に強い)。
+//!
+//! **だから fold は `driver` 指定の有無にかかわらず常に全乗務員版で読む。**
+//! 経路によって形を変えると、同じ (乗務員, 月) の指紋が読み方で割れ、
+//! 単一指定の再計算と月次バッチが**互いに相手の書いた行を stale と見て毎回書き直す**。
+//! 指紋を跨いで比べてよいのは「同じ読み方をした指紋」だけ。
 //!
 //! ## 単位は (乗務員, 月)
 //!
@@ -557,11 +585,61 @@ pub async fn write_unit(
     Ok(())
 }
 
-/// 対象月を再計算して保存する (実装計画 05)。
+/// 対象月を**生イベント 1 回読み**で乗務員ごとに畳む。返すのは乗務員CD 昇順。
 ///
 /// 期間は [`month_range`] = `[月初, 翌月 2 日)`。読み出し経路と同じで、日跨ぎ勤務の
 /// 終業打刻を拾うために翌月へはみ出す (push の `exact_month_range` とは違う —
 /// あちらは「その日の全部を見た上で署名する」必要があるため)。
+///
+/// 読みは [`KintaiEventsApi::fetch_all_events_between`] **1 回だけ**。乗務員で分ける
+/// のは [`crate::kosoku::split_by_driver`] で、これは in-process の純粋関数なので
+/// 往復が増えない。`driver` を指定してもこの読み方を変えない — 理由は
+/// モジュール docs の「材料の行は全乗務員版の形」。
+///
+/// **打刻 2 表だけの読み ([`crate::kintai_push::read_driver_events`]) を使わない。**
+/// あれは #225 で push / diff 用に絞ったもので `dtako_events` が落ちている。
+/// [`daily_summary`] は休息イベントで勤務を切るので、渡すと休息由来の勤務が
+/// 丸ごと消える (2026-07-31 の回帰、#234)。全乗務員版は 3 表を `UNION ALL` した
+/// ものなので、この穴が構造的に開かない。
+///
+/// **`driver` 指定でその乗務員の行が 1 つも無くても単位を 1 つ返す。** 空の
+/// [`FoldUnit`] を返すことで、呼び出し側が「保存済みの行が余っている」と気付いて
+/// 消せる。ここで黙って 0 件にすると、退職などで打刻が消えた乗務員の古い行が残る。
+/// (`driver` 未指定のとき同じことが起きないのは、そもそも行が無い乗務員を
+/// 列挙できないため — こちらは別途 #205 の宿題)
+///
+/// [`KintaiEventsApi::fetch_all_events_between`]: crate::kintai_repo::KintaiEventsApi::fetch_all_events_between
+pub async fn fold_month(
+    repo: &DynKintaiEventsRepo,
+    params: &KosokuParams,
+    month: &str,
+    driver: Option<u64>,
+) -> Result<Vec<(u64, FoldUnit, String)>, KintaiPushError> {
+    let (from, to) = month_range(month)
+        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
+    let rows = repo.fetch_all_events_between(&from, &to).await?;
+    tracing::debug!("fold {month}: read {} rows in 1 fetch_all", rows.len());
+    let mut units: Vec<(u64, FoldUnit, String)> = crate::kosoku::split_by_driver(rows)
+        .into_iter()
+        .filter(|(cd, _)| driver.is_none_or(|want| want == *cd))
+        .map(|(cd, rows)| {
+            let (unit, fp) = fold_driver_month(cd as i64, month, params, rows);
+            (cd, unit, fp)
+        })
+        .collect();
+    if let Some(cd) = driver {
+        if units.is_empty() {
+            let (unit, fp) = fold_driver_month(cd as i64, month, params, Vec::new());
+            units.push((cd, unit, fp));
+        }
+    }
+    Ok(units)
+}
+
+/// 対象月を再計算して保存する (実装計画 05)。
+///
+/// 畳むのは [`fold_month`] (生イベントの読みは月 1 回)。ここがやるのは
+/// 保存済みの姿との突き合わせと書き込みだけ。
 pub async fn recalc_month(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,
@@ -570,24 +648,8 @@ pub async fn recalc_month(
     driver: Option<u64>,
     apply: bool,
 ) -> Result<FoldReport, KintaiPushError> {
-    let (from, to) = month_range(month)
-        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
-    let drivers: Vec<u64> = match driver {
-        Some(d) => vec![d],
-        None => crate::kosoku::split_by_driver(repo.fetch_all_events_between(&from, &to).await?)
-            .into_iter()
-            .map(|(d, _)| d)
-            .collect(),
-    };
-
     let mut report = FoldReport::default();
-    for driver_cd in drivers {
-        // **`kintai_push::read_driver_events` を呼ばない。** あれは #225 で
-        // 「打刻 2 表だけ」に絞られた push / diff 用の読みで、`dtako_events` が
-        // 落ちている。`daily_summary` は休息イベントで勤務を切るので、渡すと
-        // 休息由来の勤務が丸ごと消える (2026-07-31 の回帰)
-        let rows = repo.fetch_events_between(&from, &to, driver_cd).await?;
-        let (unit, fp) = fold_driver_month(driver_cd as i64, month, params, rows);
+    for (driver_cd, unit, fp) in fold_month(repo, params, month, driver).await? {
         report.drivers += 1;
         report.skipped.extend(unit.skipped.iter().cloned());
 

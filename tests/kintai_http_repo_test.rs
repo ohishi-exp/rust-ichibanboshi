@@ -575,6 +575,102 @@ async fn test_same_operation_is_not_counted_twice() {
     assert_eq!(rows[1]["driver_id"], 1740);
 }
 
+// ── 畳むときの往復数 (Refs #205 実装計画 05) ───────────────────────────────
+
+/// 月を畳んでも上流への往復は**全乗務員版の読み 1 回ぶん**しか起きない。
+///
+/// 乗務員ごとに読んでいた頃は、この 1 回に加えて**乗務員 1 名につき 1 往復**が
+/// 乗っていた (95 名 × 2 か月で約 190 往復)。HTTP 実装では 1 往復が `rust-alc-api`
+/// への 1 往復 = 裏で R2 の GET 群になるので、ここが効く。
+///
+/// 「1 回ぶん」が 2 リクエストなのは上流の期間上限 (全乗務員 31 日) で
+/// [`month_range`] の 34 日が 2 つに割れるため — 乗務員の数では増えない。
+#[tokio::test]
+async fn test_folding_a_month_costs_one_all_drivers_read() {
+    use rust_ichibanboshi::kintai_fold::fold_month;
+    use rust_ichibanboshi::kosoku::KosokuParams;
+
+    let server = MockServer::start().await;
+    // 休息 2 本で勤務が 1 本立つ形を 2 名ぶん。乗務員の数が往復に効かないことを見る
+    let op = |unko_no: &str, driver: &str| {
+        operation(
+            unko_no,
+            &[
+                "運行NO",
+                "対象乗務員CD",
+                "開始日時",
+                "終了日時",
+                "イベント名",
+            ],
+            vec![
+                vec![
+                    unko_no,
+                    driver,
+                    "2026/07/03 02:00:00",
+                    "2026/07/03 11:00:00",
+                    "休息",
+                ],
+                vec![
+                    unko_no,
+                    driver,
+                    "2026/07/03 13:00:00",
+                    "2026/07/03 18:00:00",
+                    "運転",
+                ],
+                vec![
+                    unko_no,
+                    driver,
+                    "2026/07/04 02:00:00",
+                    "2026/07/04 11:00:00",
+                    "休息",
+                ],
+            ],
+        )
+    };
+    Mock::given(method("GET"))
+        .and(query_param_is_missing("driver_cd"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "x", "date_to": "y"},
+            "drivers": [
+                {"driver": {"cd": "1130", "name": "a"}, "operations": [op("OP-1130", "1130")]},
+                {"driver": {"cd": "1740", "name": "b"}, "operations": [op("OP-1740", "1740")]},
+            ],
+            "next_after_driver_cd": null,
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+
+    let repo: DynKintaiEventsRepo = Arc::new(repo(&server.uri()));
+    let units = fold_month(&repo, &KosokuParams::default(), "2026-07", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        units.iter().map(|(cd, ..)| *cd).collect::<Vec<_>>(),
+        vec![1130, 1740],
+        "2 名とも畳めている"
+    );
+    assert!(
+        units.iter().all(|(_, u, _)| !u.shifts.is_empty()),
+        "勤務が立っていないと往復数だけ見ても意味が無い"
+    );
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "期間分割の 2 回だけ (乗務員の数では増えない)"
+    );
+    for r in &reqs {
+        assert!(
+            !r.url.query_pairs().any(|(k, _)| k == "driver_cd"),
+            "乗務員を名指しした読みが混ざっている: {}",
+            r.url
+        );
+    }
+}
+
 // ── 失敗の伝え方 ──────────────────────────────────────────────────────────
 
 #[tokio::test]
