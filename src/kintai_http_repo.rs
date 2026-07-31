@@ -240,17 +240,34 @@ fn record_unsplit(items: Vec<UnsplitOperation>, total: usize) {
 /// (`unsplit` / `unsplit_total` と同じ作法)。
 pub const MAX_UNKO_DIFF: usize = 500;
 
-/// **オンプレ側が持っている運行 1 本** (Refs #205 の 37)。
+/// **突合の左辺 — 「押し込み済みの運行」1 本** (Refs #205 の 37)。
 ///
-/// 実体は Postgres の `kintai.kintai_events` — オンプレの MariaDB
-/// (`time_card_dtako`) から押し込んだ打刻で、`dtako` 由来の行だけが `unko_no` を
-/// 持つ ([`crate::kintai_push::PUSHED_SOURCES`])。**新しい口は作らない** —
-/// 突合の両側とも既に fold が読んでいるものだけで組む。
+/// ## 「オンプレの運行」ではない。射程はこれより狭い
+///
+/// 実体は Postgres の `kintai.kintai_events` で、**オンプレ MariaDB の写しでは
+/// なく押し込み済みのぶんだけ**。`unko_no` を持つのは `dtako`
+/// (= `time_card_dtako`) 由来の行に限られ ([`crate::kintai_push::PUSHED_SOURCES`])、
+/// **`dtako_events` は決定 5 で push していない** (R2 に永続化済みのため)。
+/// `timecard` は `unko_no` が NULL なので落ちる。
+///
+/// **`dtako_events` にしか出てこない運行はここに 1 本も現れない。** 実測
+/// (`/api/kintai/events`、2026-06 の 5 乗務員 31 運行) で **8 本 (26%) が
+/// `time_card_dtako` に 1 行も持たず**、うち 8 本すべてが乗務員 1688 だった —
+/// **1688 の運行はこの突合の射程外**。名前に引かれて「オンプレ全部と比べている」と
+/// 読まないこと (2026-07-31 に監督とユーザーが数ラウンド誤読した)。
+///
+/// **新しい口は作らない** — 突合の両側とも既に fold が読んでいるものだけで組む。
+/// GCP 側の instance から MariaDB へは届かないので、射程を広げるなら別経路が要る。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnpremOperation {
     pub driver_cd: i64,
     pub unko_no: String,
-    /// その運行のイベントが覆う暦日 (JST) の最小 / 最大。
+    /// **`kintai_events` に押し込み済みの行**が覆う暦日 (JST) の最小 / 最大。
+    ///
+    /// **運行そのものの広がりではない。** 数えるのは `dtako` 由来の行だけなので、
+    /// MariaDB では 6 日にまたがる運行でも、押し込み済みが初日ぶんしか無ければ
+    /// 1 日に見える (実測: 1078 の `26062411…23021` は MariaDB で 91 行 /
+    /// 06-24〜07-01 だが `first`=`last`=06-24)。**この値で運行の期間を判断しない。**
     pub first_date: NaiveDate,
     pub last_date: NaiveDate,
 }
@@ -262,7 +279,8 @@ pub struct UnkoDiffItem {
     pub unko_no: String,
     /// `unko_no` の先頭 6 桁 (`YYMMDD`) から読んだ運行開始日。読めなければ `null`。
     pub start_date: Option<String>,
-    /// オンプレのイベントが覆う暦日 (JST) の範囲。
+    /// **押し込み済みの行**が覆う暦日 (JST) の範囲 ([`OnpremOperation::first_date`]
+    /// の注意書き — 運行そのものの広がりではない)。
     pub first_date: String,
     pub last_date: String,
 }
@@ -652,7 +670,7 @@ pub fn record_unko_diff(
     let diff = diff_unko(onprem, gcp, month);
     if diff.total > 0 {
         let n = diff.total;
-        let w = format!("dtako 入力欠け: オンプレに在って GCP に無い運行 {n} 件");
+        let w = format!("dtako 入力欠け: 押し込み済みに在って GCP に無い運行 {n} 件");
         record_warning(&w);
     }
     if diff.gcp_shape.len_counts.len() > 1 {
@@ -2753,7 +2771,7 @@ mod tests {
         assert_eq!(onprem_unko_no(""), "", "空も落とさない");
     }
 
-    /// **本題。** オンプレに在って GCP に無い運行が名指しで出る。
+    /// **本題。** 押し込み済みに在って GCP に無い運行が名指しで出る。
     /// 判定は運行NO 部分だけで、応答に載るのは**生の `unko_no`** (対象CD 込み)。
     #[test]
     fn diff_unko_names_the_operations_missing_from_gcp() {
@@ -3046,7 +3064,10 @@ mod tests {
         assert_eq!(diff.gcp_only, 0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let w = &warnings[0];
-        assert!(w.contains("オンプレに在って GCP に無い運行 1 件"), "{w}");
+        assert!(
+            w.contains("押し込み済みに在って GCP に無い運行 1 件"),
+            "{w}"
+        );
     }
 
     /// **正規化が効いていない状態を静かに通さない** (Refs #205 の 37)。
