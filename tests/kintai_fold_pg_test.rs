@@ -10,12 +10,14 @@
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_ichibanboshi::kintai_fold::{
-    fold_driver_month, fold_month, recalc_driver_page, recalc_drivers, recalc_month, stale_state,
-    sync_month, write_unit, DayPartRow, DaySummaryRow, FoldUnit, ShiftRow,
+    fold_driver_month, fold_month, month_gate_report, recalc_driver_page, recalc_drivers,
+    recalc_month, stale_state, sync_month, write_unit, DayPartRow, DaySummaryRow, FoldUnit,
+    MonthGate, ShiftRow,
 };
 use rust_ichibanboshi::kintai_push::{KintaiPgStore, PushOptions, TimecardWindow};
 use rust_ichibanboshi::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
 use rust_ichibanboshi::kosoku::{KosokuParams, RestraintRounding};
+use rust_ichibanboshi::routes::kintai_recalc::{recalc, RecalcRequest};
 use rust_ichibanboshi::routes::kintai_timecard::{receive_window, ReadTenant};
 use serde_json::json;
 
@@ -1216,4 +1218,601 @@ async fn driver_filter_touches_only_that_driver() {
             .await
             .expect("drivers");
     assert_eq!(drivers, vec![DRIVER as i64]);
+}
+
+// ── 13: 月ゲート ─────────────────────────────────────────────────────────
+//
+// `StubRepo` は `fetch_dtako_month_digest` の既定実装 (`Ok(None)`) のままなので、
+// 上のテストは全て「alc に口が無い環境」を通しており、月ゲートに一切触れない
+// (既存の回帰を壊さないことの裏付けでもある)。ここだけ `GatedRepo` に差し替えて
+// gate の hit / miss を作る。
+
+/// [`StubRepo`] + 差し替え可能な dtako 側 digest。`fetch_all_events_between` の
+/// 呼び出し回数を数え、gate が刺さったときに本当に**読みそのものを省いているか**
+/// (指紋が一致して書かないだけでなく、fold_month の R2 相当の読みも通らないか) を
+/// 確かめられるようにする。
+struct GatedRepo {
+    inner: StubRepo,
+    digest: std::sync::Mutex<String>,
+    read_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl GatedRepo {
+    fn new(rows: Vec<serde_json::Value>, digest: &str) -> Self {
+        Self {
+            inner: StubRepo::new(rows),
+            digest: std::sync::Mutex::new(digest.to_string()),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn set_digest(&self, digest: &str) {
+        *self.digest.lock().unwrap() = digest.to_string();
+    }
+
+    fn read_calls(&self) -> usize {
+        self.read_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl KintaiEventsApi for GatedRepo {
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_events_between(from, to, driver).await
+    }
+
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.read_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.fetch_all_events_between(from, to).await
+    }
+
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_ferry_between(from, to, driver).await
+    }
+
+    async fn fetch_dtako_month_digest(
+        &self,
+        _month: &str,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        Ok(Some(self.digest.lock().unwrap().clone()))
+    }
+}
+
+/// `Arc<GatedRepo>` (呼び出し回数・digest 差し替え用) と、そこから作った
+/// `DynKintaiEventsRepo` (recalc_month / recalc_drivers に渡す trait object) の組。
+/// 呼び出し先が要求する型がトレイトオブジェクトなので、具体型のまま渡せない。
+fn gated(
+    rows: Vec<serde_json::Value>,
+    digest: &str,
+) -> (std::sync::Arc<GatedRepo>, DynKintaiEventsRepo) {
+    let r = std::sync::Arc::new(GatedRepo::new(rows, digest));
+    let dyn_r: DynKintaiEventsRepo = r.clone();
+    (r, dyn_r)
+}
+
+/// テスト用の疑似 digest。**実物 (sha256 hex) と同じ 64 桁固定長**にしておく —
+/// `kintai.fold_gate.dtako_digest` は `CHAR(64)` (`shifts.fingerprint` と同じ規約)
+/// なので、64 桁に満たない値は Postgres が読み出し時に空白パディングして返す。
+/// 実物の sha256 hex は常にちょうど 64 桁なのでこの罠を踏まないが、短い偽値の
+/// ままだと `==` 比較がテストの都合だけで落ちる。
+fn digest(label: &str) -> String {
+    format!("{label:0<64}")
+}
+
+async fn stored_gate_digest(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    month: &str,
+) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT dtako_digest FROM kintai.fold_gate WHERE tenant_id = $1 AND month = $2",
+    )
+    .bind(tenant)
+    .bind(month)
+    .fetch_optional(pool)
+    .await
+    .expect("fold_gate query")
+}
+
+/// **月ゲートが刺さると、2 回目以降は fold_month の読みそのものを省く。**
+///
+/// 打刻 (Pg) 側は 1 回目も 2 回目も未変更 (どちらのテストも push を挟まないので
+/// `kintai.kintai_events` は空のまま) なので、punch_digest は両方とも同じ固定値。
+/// dtako 側の digest だけを操作して gate の hit / miss を作る。
+#[tokio::test]
+async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
+    let (store, pool) = require_db!();
+    let (repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-14 08:00:00", "始業"),
+            punch("2026-07-14 18:00:00", "終業"),
+        ],
+        &digest("v1"),
+    );
+
+    let first = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("1st");
+    assert_eq!(
+        first.drivers_written, 1,
+        "初回は gate が無いので普通に読んで書く"
+    );
+    assert_eq!(repo.read_calls(), 1);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("v1")),
+        "apply=true の全量再計算は gate を書く"
+    );
+
+    // 同じ digest で 2 回目 — gate が刺さり、fold_month の読みが増えない
+    let second = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("2nd");
+    assert_eq!(
+        repo.read_calls(),
+        1,
+        "gate が刺さったら fold_month の読みを丸ごと省く"
+    );
+    assert_eq!(second.drivers, 0, "母集団の列挙すらしていない");
+    assert!(!second.wrote_anything());
+
+    // dtako 側が変わった (alc の etag が変化) — gate が外れて読み直す
+    repo.set_digest(&digest("v2"));
+    let third = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("3rd");
+    assert_eq!(repo.read_calls(), 2, "digest が変われば読み直す");
+    assert_eq!(
+        third.drivers_written, 0,
+        "行の中身自体は変わっていないので書かない"
+    );
+    assert_eq!(third.drivers_unchanged, 1);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("v2")),
+        "外れて読み直したら gate も新しい digest に更新する"
+    );
+}
+
+/// **`apply = false` (dry-run) の全量再計算は gate を書かない。**
+///
+/// dry-run はそもそも 1 行も保存しないので、「この digest で最新」を主張する
+/// 権利が無い — 書いてしまうと次の本当の (apply=true) 再計算が誤って gate に
+/// 引っかかり、1 行も書かれていない状態を「最新」としてスキップしてしまう。
+#[tokio::test]
+async fn month_gate_is_not_written_on_a_dry_run() {
+    let (store, pool) = require_db!();
+    let (repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-15 08:00:00", "始業"),
+            punch("2026-07-15 18:00:00", "終業"),
+        ],
+        &digest("dry"),
+    );
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, false)
+        .await
+        .expect("dry-run");
+    assert_eq!(
+        repo.read_calls(),
+        1,
+        "dry-run でも読みそのものは行う (preview のため)"
+    );
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "1 行も書いていないので gate も書かない"
+    );
+}
+
+/// **[`recalc_drivers`] は月ゲートを読むだけで書かない。**
+///
+/// ページングされた再計算 (`POST /api/kintai/recalc` の 1 ページ) が gate を
+/// 書いてしまうと、1 ページ目だけ処理した時点で「この月は最新」になり、
+/// 未処理のページの乗務員が古い fingerprint のまま取り残される
+/// (#225 / #234 と同型の事故) — それが起きていないことを確かめる。
+#[tokio::test]
+async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
+    let (store, pool) = require_db!();
+    let (repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-16 08:00:00", "始業"),
+            punch("2026-07-16 18:00:00", "終業"),
+        ],
+        &digest("a"),
+    );
+
+    // recalc_month (driver 省略) だけが gate を書ける。ここで最初の gate を立てる
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("establish gate");
+    assert_eq!(repo.read_calls(), 1);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("a"))
+    );
+
+    // 同じ digest のまま recalc_drivers — gate が刺さり、読みを増やさず即返る
+    let hit = recalc_drivers(&dyn_repo, &store, &params(), "2026-07", &[DRIVER], true)
+        .await
+        .expect("recalc_drivers hit");
+    assert_eq!(repo.read_calls(), 1, "gate 一致で fold_month を呼ばない");
+    assert_eq!(hit.drivers, 1);
+    assert_eq!(hit.drivers_unchanged, 1);
+    assert!(!hit.wrote_anything());
+
+    // dtako 側が変わった状態で recalc_drivers — gate は外れて読み直すが、
+    // **書くのは recalc_month だけ**なので gate 自体は "a" のまま動かない
+    repo.set_digest(&digest("b"));
+    let miss = recalc_drivers(&dyn_repo, &store, &params(), "2026-07", &[DRIVER], true)
+        .await
+        .expect("recalc_drivers miss");
+    assert_eq!(
+        repo.read_calls(),
+        2,
+        "digest が変われば recalc_drivers も読み直す"
+    );
+    assert_eq!(miss.drivers, 1);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("a")),
+        "recalc_drivers は gate を書かない — 古い digest のまま残る"
+    );
+
+    // recalc_month が改めて全量を通れば、そのときだけ gate が新しい digest に動く
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("recalc_month catches up");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("b"))
+    );
+}
+
+/// **`driver` を指定した `recalc_month` は月ゲートを使わない。**
+///
+/// 1 名だけの呼び出しは「月まるごと処理した」ことにならないので、gate の対象外
+/// (読み・書きどちらもしない) — 対象外であることそのものが検査になる。
+#[tokio::test]
+async fn month_gate_is_skipped_when_a_single_driver_is_named() {
+    let (store, pool) = require_db!();
+    let (repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-17 08:00:00", "始業"),
+            punch("2026-07-17 18:00:00", "終業"),
+        ],
+        &digest("single"),
+    );
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", Some(DRIVER), true)
+        .await
+        .expect("single-driver recalc");
+    assert_eq!(repo.read_calls(), 1);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "driver 指定は月まるごとではないので gate を書かない"
+    );
+
+    // gate に何も書かれていないので、2 回目も普通に読む (省かれない)
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", Some(DRIVER), true)
+        .await
+        .expect("single-driver recalc again");
+    assert_eq!(repo.read_calls(), 2);
+}
+
+/// **[`month_gate_report`] はページングされた HTTP 経路が読むだけの公開口。**
+///
+/// `crate::routes::kintai_recalc::run` が `fold_month` を直接呼ぶ (#205-12 の
+/// 統合で母集団の決定と畳みを 1 回読みで済ませるようになったため) ので、
+/// `recalc_drivers` を経由しないこの経路にも同じ判定を独立して提供する。
+#[tokio::test]
+async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
+    let (store, _pool) = require_db!();
+    let (repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-18 08:00:00", "始業"),
+            punch("2026-07-18 18:00:00", "終業"),
+        ],
+        &digest("report"),
+    );
+
+    // gate がまだ無い — Miss (「判定できない」ではなく「一致しない」= 通常どおり進め)
+    let first = month_gate_report(&dyn_repo, &store, &params(), "2026-07", true)
+        .await
+        .expect("no gate yet");
+    assert!(matches!(first, MonthGate::Miss { .. }));
+    assert_eq!(
+        repo.read_calls(),
+        0,
+        "月ゲートの判定自体は fold_month を呼ばない"
+    );
+
+    // recalc_month (driver 省略) だけが gate を書ける
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("establish gate");
+    assert_eq!(repo.read_calls(), 1);
+
+    // 同じ digest — 刺さる。fold_month はやはり呼ばれない
+    let hit = month_gate_report(&dyn_repo, &store, &params(), "2026-07", true)
+        .await
+        .expect("hit");
+    match hit {
+        MonthGate::Hit(report) => assert!(!report.wrote_anything()),
+        other => panic!("gate should hit, got {other:?}"),
+    }
+    assert_eq!(repo.read_calls(), 1, "gate の判定だけでは読みが増えない");
+
+    // dtako 側が変わった — 外れる
+    repo.set_digest(&digest("report-v2"));
+    let miss = month_gate_report(&dyn_repo, &store, &params(), "2026-07", true)
+        .await
+        .expect("miss");
+    assert!(
+        matches!(miss, MonthGate::Miss { .. }),
+        "digest が変われば Miss (呼び出し側が通常どおり読みに進む)"
+    );
+    assert_eq!(repo.read_calls(), 1, "判定だけなら外れても読みには進まない");
+}
+
+// ── 13b: HTTP 経路 (routes::kintai_recalc) が gate を書く条件 ────────────────
+//
+// #205 親の決定 (2026-07-31): GCP 本番で gate に 1 行でも入る経路は
+// `POST /api/kintai/recalc` の 1 ページが月まるごとを完結させたときだけ
+// (`recalc_month` を呼ぶのは封印済みのオンプレ CLI だけなので、本番では
+// この経路が無いと fold_gate が永久に空のまま = 定常ゼロ読みが 1 度も成立しない)。
+
+async fn call_recalc(
+    store: &KintaiPgStore,
+    repo: &DynKintaiEventsRepo,
+    params: &KosokuParams,
+    req: RecalcRequest,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "X-Tenant-ID",
+        store.tenant_id().to_string().parse().unwrap(),
+    );
+    // pin は nil (多テナント構成) — ヘッダの X-Tenant-ID がそのまま書き先になる
+    let pg: rust_ichibanboshi::routes::kintai_timecard::DynKintaiPgStore =
+        Some(std::sync::Arc::new(KintaiPgStore::from_pool(
+            store.pool().clone(),
+            uuid::Uuid::nil(),
+        )));
+    let resp = recalc(
+        headers,
+        axum::Extension(pg),
+        axum::Extension(repo.clone()),
+        axum::Extension(std::sync::Arc::new(*params)),
+        axum::Extension(ReadTenant(None)),
+        axum::Json(req),
+    )
+    .await?;
+    Ok(resp.0)
+}
+
+fn recalc_req(month: &str, apply: bool) -> RecalcRequest {
+    RecalcRequest {
+        month: month.to_string(),
+        after_driver_cd: None,
+        max_drivers: None,
+        stale_only: false,
+        apply,
+    }
+}
+
+/// **書く: apply + 1 ページ目から + 回りきる + stale_only でない + warnings 空。**
+/// 母集団が `DEFAULT_MAX_FOLD_DRIVERS` (100) 未満の 1 名だけなので必ず 1 ページで終わる。
+#[tokio::test]
+async fn http_recalc_writes_the_gate_when_the_whole_month_completes_in_one_page() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-20 08:00:00", "始業"),
+            punch("2026-07-20 18:00:00", "終業"),
+        ],
+        &digest("http-write"),
+    );
+
+    let resp = call_recalc(&store, &dyn_repo, &params(), recalc_req("2026-07", true))
+        .await
+        .expect("recalc");
+    assert!(
+        resp["next_after_driver_cd"].is_null(),
+        "1 名だけの母集団は 1 ページで回りきる: {resp}"
+    );
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("http-write")),
+        "月まるごと完結したページは gate を書く"
+    );
+
+    // 2 回目の同じ呼び出しは gate hit — fold_month (全量読み) を経ずに終わる
+    let second = call_recalc(&store, &dyn_repo, &params(), recalc_req("2026-07", true))
+        .await
+        .expect("recalc again");
+    assert_eq!(second["drivers"], serde_json::json!([]));
+    assert!(second["next_after_driver_cd"].is_null());
+}
+
+/// **書かない: `apply=false` (dry-run/preview)。**
+#[tokio::test]
+async fn http_recalc_does_not_write_the_gate_on_dry_run() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-21 08:00:00", "始業"),
+            punch("2026-07-21 18:00:00", "終業"),
+        ],
+        &digest("http-dry"),
+    );
+    call_recalc(&store, &dyn_repo, &params(), recalc_req("2026-07", false))
+        .await
+        .expect("preview");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "apply=false は書かない"
+    );
+}
+
+/// **書かない: `after_driver_cd` 指定あり (1 ページ目からではない)。**
+#[tokio::test]
+async fn http_recalc_does_not_write_the_gate_mid_walk() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-22 08:00:00", "始業"),
+            punch("2026-07-22 18:00:00", "終業"),
+        ],
+        &digest("http-mid"),
+    );
+    let mut req = recalc_req("2026-07", true);
+    req.after_driver_cd = Some(0);
+    call_recalc(&store, &dyn_repo, &params(), req)
+        .await
+        .expect("recalc");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "1 ページ目からでなければ書かない"
+    );
+}
+
+/// **書かない: 回りきらない (`next_after_driver_cd` が残る)。**
+/// `max_drivers` を母集団 (2 名) より小さくして 2 ページ以上に割る。
+#[tokio::test]
+async fn http_recalc_does_not_write_the_gate_when_more_pages_remain() {
+    let (store, pool) = require_db!();
+    let other = |at: &str, state: &str| {
+        serde_json::json!({"datetime": at, "end_datetime": null, "driver_id": 1195,
+            "source": "timecard", "state": state, "unko_no": null})
+    };
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-23 08:00:00", "始業"),
+            punch("2026-07-23 18:00:00", "終業"),
+            other("2026-07-23 08:00:00", "始業"),
+            other("2026-07-23 18:00:00", "終業"),
+        ],
+        &digest("http-more-pages"),
+    );
+    let mut req = recalc_req("2026-07", true);
+    req.max_drivers = Some(1);
+    let resp = call_recalc(&store, &dyn_repo, &params(), req)
+        .await
+        .expect("recalc");
+    assert!(
+        !resp["next_after_driver_cd"].is_null(),
+        "1 ページ 1 名では 2 名の母集団が回りきらない: {resp}"
+    );
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "回りきっていないので書かない"
+    );
+}
+
+/// **書かない: `stale_only=true` (母集団を現行版未達だけに絞っている)。**
+#[tokio::test]
+async fn http_recalc_does_not_write_the_gate_when_stale_only() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-24 08:00:00", "始業"),
+            punch("2026-07-24 18:00:00", "終業"),
+        ],
+        &digest("http-stale-only"),
+    );
+    let mut req = recalc_req("2026-07", true);
+    req.stale_only = true;
+    call_recalc(&store, &dyn_repo, &params(), req)
+        .await
+        .expect("recalc");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "stale_only は月全体を畳んでいないので書かない"
+    );
+}
+
+/// **書かない: 上流 warnings が非空 (R2 の分割遅れ等)。**
+struct WarningRepo {
+    inner: GatedRepo,
+}
+
+#[async_trait]
+impl KintaiEventsApi for WarningRepo {
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_events_between(from, to, driver).await
+    }
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        // 上流 warnings を模す — 実物 (HttpKintaiEventsRepo) は R2 の分割遅れ中に
+        // これを task-local sink 経由で呼び出し側へ運ぶ
+        rust_ichibanboshi::kintai_http_repo::record_warning_for_test("NoSuchKey: U1/KUDGIVT.csv");
+        self.inner.fetch_all_events_between(from, to).await
+    }
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        self.inner.fetch_ferry_between(from, to, driver).await
+    }
+    async fn fetch_dtako_month_digest(
+        &self,
+        month: &str,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        self.inner.fetch_dtako_month_digest(month).await
+    }
+}
+
+#[tokio::test]
+async fn http_recalc_does_not_write_the_gate_when_upstream_warnings_are_non_empty() {
+    let (store, pool) = require_db!();
+    let dyn_repo: DynKintaiEventsRepo = std::sync::Arc::new(WarningRepo {
+        inner: GatedRepo::new(
+            vec![
+                punch("2026-07-25 08:00:00", "始業"),
+                punch("2026-07-25 18:00:00", "終業"),
+            ],
+            &digest("http-warnings"),
+        ),
+    });
+    let resp = call_recalc(&store, &dyn_repo, &params(), recalc_req("2026-07", true))
+        .await
+        .expect("recalc");
+    assert!(
+        resp["next_after_driver_cd"].is_null(),
+        "1 名の母集団は回りきる: {resp}"
+    );
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "warnings が非空なら (回りきっていても) 書かない"
+    );
 }

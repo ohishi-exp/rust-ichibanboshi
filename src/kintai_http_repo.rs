@@ -78,12 +78,19 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::config::KintaiEventsConfig;
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
 
 /// 上流の endpoint path。
 const EVENTS_PATH: &str = "/api/dtako/events";
+
+/// 上流の月ゲート用 etags endpoint (Refs #205 実装計画 13)。R2 の LIST だけで
+/// `{unko_no, etag}` を返す — CSV は読まない。alc に口が無い環境 (404) では
+/// [`HttpKintaiEventsRepo::fetch_etags`] が `Ok(None)` を返し、呼び出し側が
+/// 月ゲートを諦めて従来どおり全量読みへ degrade する。
+const ETAGS_PATH: &str = "/api/dtako/events/etags";
 
 /// 上流の期間上限 (単一乗務員、閉区間の日数)。`MAX_RANGE_DAYS_SINGLE` と同値。
 const MAX_RANGE_DAYS_SINGLE: i64 = 366;
@@ -165,6 +172,14 @@ fn record_warning(w: &str) {
             v.push(w.to_string());
         }
     });
+}
+
+/// テスト専用の [`record_warning`] 穴あけ (実装計画 13)。`record_warning` 自体は
+/// private なので、他モジュールの `KintaiEventsApi` スタブ実装 (pg 統合テストの
+/// 上流 warnings 疑似発火など) から呼べない。それだけの理由で公開する薄い口。
+#[doc(hidden)]
+pub fn record_warning_for_test(w: &str) {
+    record_warning(w);
 }
 
 // ── 認証 token の取り方 (設定で与える。コードに焼かない) ────────────────────
@@ -436,6 +451,24 @@ struct UpstreamAll {
     warnings: Vec<String>,
 }
 
+/// `GET /api/dtako/events/etags` の 1 件。`etag` が無い (R2 に無い / upload 未完了)
+/// 運行は `None` のまま持ち出す — 呼び出し側 (digest 計算) が空文字と区別できるように
+/// する。
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamEtagItem {
+    unko_no: String,
+    #[serde(default)]
+    etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamEtags {
+    #[serde(default)]
+    items: Vec<UpstreamEtagItem>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
 // ── 列の解決 ──────────────────────────────────────────────────────────────
 
 /// 1 運行の `headers` から要る列の位置を引く。
@@ -589,6 +622,42 @@ fn is_borrowed_source(v: &serde_json::Value) -> bool {
 
 // ── 期間の分割 ────────────────────────────────────────────────────────────
 
+/// 月ゲート用の etags 取得範囲 `[月初, 翌月初]` (両端含む NaiveDate)。
+///
+/// **[`crate::kintai_repo::month_range`] が読む窓と同じものを覆う。** あちらは
+/// `[月初 00:00, 翌月2日 00:00)` = 「暦月 + 翌月 1 日ぶん」を読むので、月ゲートの
+/// digest がこの範囲を漏れなく覆っていないと、月末に日跨ぎする勤務の変化を見逃して
+/// 「変わっていない」と誤判定しうる (安全側に倒せていない = 一番危ない形の bug)。
+/// 閉区間なので上端は「翌月**初日**」(month_range の排他境界 翌月2日の 1 日前)。
+fn month_etags_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let year: i32 = month.get(..4)?.parse().ok()?;
+    let mm: u32 = month.get(5..7)?.parse().ok()?;
+    let first = NaiveDate::from_ymd_opt(year, mm, 1)?;
+    let next_first = if mm == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(year, mm + 1, 1)?
+    };
+    Some((first, next_first))
+}
+
+/// `(unko_no, etag)` の一覧から月ゲートの dtako 側 digest を作る。
+///
+/// `etag` が `None` (R2 に無い / upload 未完了) の運行は空文字として畳む —
+/// 存在しない扱いにして無視すると、**upload 中の運行がこっそり digest から
+/// 抜け落ち**、揃った後もゲートが「変わっていない」と誤判定しうる。空文字で
+/// 織り込めば、揃った瞬間に digest が変わってゲートが必ず外れる (安全側)。
+fn digest_from_pairs(pairs: &[(String, Option<String>)]) -> String {
+    let mut lines: Vec<String> = pairs
+        .iter()
+        .map(|(unko_no, etag)| format!("{unko_no}:{}", etag.as_deref().unwrap_or("")))
+        .collect();
+    lines.sort();
+    let mut h = Sha256::new();
+    h.update(lines.join("\n").as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 /// 日付の閉区間 `from..=to` を `max_days` 日以内の閉区間へ割る。`from > to` なら空。
 fn date_chunks(from: NaiveDate, to: NaiveDate, max_days: i64) -> Vec<(NaiveDate, NaiveDate)> {
     let mut out = Vec::new();
@@ -625,6 +694,8 @@ pub struct HttpKintaiEventsRepo {
     /// `{base_url}/api/dtako/events`。**const にせず struct フィールドに持つ** —
     /// テストが wiremock の URL を差し込めるようにするため。
     url: String,
+    /// `{base_url}/api/dtako/events/etags`。同じ理由で struct フィールドに持つ。
+    etags_url: String,
     tenant_id: String,
     token: Arc<dyn KintaiTokenProvider>,
     /// 上流に口が無い読み出し (打刻 / 運行の確定イベント / フェリー) の委譲先。
@@ -641,9 +712,11 @@ impl HttpKintaiEventsRepo {
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()
             .map_err(|e| format!("kintai events http client: {e}"))?;
+        let base = cfg.base_url.trim_end_matches('/');
         Ok(Self {
             client,
-            url: format!("{}{EVENTS_PATH}", cfg.base_url.trim_end_matches('/')),
+            url: format!("{base}{EVENTS_PATH}"),
+            etags_url: format!("{base}{ETAGS_PATH}"),
             tenant_id: cfg.tenant_id.clone(),
             token: build_token_provider(cfg)?,
             fallback,
@@ -783,6 +856,59 @@ impl HttpKintaiEventsRepo {
         }
         Ok(out)
     }
+
+    /// dtako 側の月ゲート材料を 1 往復で取る (Refs #205 実装計画 13)。
+    ///
+    /// **`Ok(None)` は「口が無い」の意味。** alc がまだ `GET /api/dtako/events/etags`
+    /// を持たない環境 (404) では月ゲートそのものを諦める — 呼び出し側
+    /// ([`crate::kintai_fold`]) が loud に warn した上で従来どおり全量読みへ degrade する。
+    /// それ以外の失敗 (接続断・5xx・応答が壊れている) は `Err` にする — こちらは
+    /// 「口はあるはずなのに読めなかった」なので、`None` に潰さず区別して伝える。
+    async fn fetch_etags(
+        &self,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<Option<Vec<(String, Option<String>)>>, KintaiRepoError> {
+        let mut req = self
+            .client
+            .get(&self.etags_url)
+            .query(&[
+                ("date_from", date_from.to_string()),
+                ("date_to", date_to.to_string()),
+            ])
+            .header("X-Tenant-ID", &self.tenant_id);
+        if let Some(token) = self.token.token().await? {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-etags request: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-etags body: {e}")))?;
+        if !status.is_success() {
+            let excerpt: String = body.chars().take(200).collect();
+            return Err(KintaiRepoError::QueryFailed(format!(
+                "alc dtako-etags status {status}: {excerpt}"
+            )));
+        }
+        let parsed: UpstreamEtags = serde_json::from_str(&body)
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-etags parse: {e}")))?;
+        Self::log_warnings(&parsed.warnings);
+        Ok(Some(
+            parsed
+                .items
+                .into_iter()
+                .map(|it| (it.unko_no, it.etag))
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -830,6 +956,16 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
             Some(fb) => fb.fetch_ferry_between(from, to, driver).await,
             None => Err(KintaiRepoError::NotConfigured),
         }
+    }
+
+    async fn fetch_dtako_month_digest(
+        &self,
+        month: &str,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        let (from, to) = month_etags_bounds(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        let pairs = self.fetch_etags(from, to).await?;
+        Ok(pairs.map(|p| digest_from_pairs(&p)))
     }
 }
 
@@ -1129,6 +1265,66 @@ mod tests {
     }
 
     #[test]
+    fn month_etags_bounds_covers_month_range_exactly() {
+        // month_range("2026-07") は [07-01 00:00, 08-02 00:00) = 7 月 + 翌月 1 日ぶん。
+        // 閉区間の date_to は排他境界の 1 日前 = 08-01
+        let (from, to) = month_etags_bounds("2026-07").unwrap();
+        assert_eq!(from, d(2026, 7, 1));
+        assert_eq!(to, d(2026, 8, 1));
+    }
+
+    #[test]
+    fn month_etags_bounds_rolls_over_the_year() {
+        let (from, to) = month_etags_bounds("2026-12").unwrap();
+        assert_eq!(from, d(2026, 12, 1));
+        assert_eq!(to, d(2027, 1, 1));
+    }
+
+    #[test]
+    fn month_etags_bounds_rejects_garbage() {
+        assert!(month_etags_bounds("").is_none());
+        assert!(month_etags_bounds("2026-13").is_none());
+        assert!(month_etags_bounds("nope").is_none());
+    }
+
+    #[test]
+    fn digest_from_pairs_is_order_independent() {
+        // 入力の並びが違っても sort してから畳むので同じ digest になる
+        let a = digest_from_pairs(&[
+            ("U1".to_string(), Some("etag1".to_string())),
+            ("U2".to_string(), Some("etag2".to_string())),
+        ]);
+        let b = digest_from_pairs(&[
+            ("U2".to_string(), Some("etag2".to_string())),
+            ("U1".to_string(), Some("etag1".to_string())),
+        ]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn digest_from_pairs_changes_when_an_etag_changes() {
+        let before = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()))]);
+        let after = digest_from_pairs(&[("U1".to_string(), Some("etag1-new".to_string()))]);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn digest_from_pairs_treats_missing_etag_as_distinct_from_present() {
+        // None (R2 に未着) と Some("") はどちらも空文字として畳まれるが、
+        // None と Some(other) は必ず違う digest になる (揃った瞬間に gate が外れる)
+        let missing = digest_from_pairs(&[("U1".to_string(), None)]);
+        let present = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()))]);
+        assert_ne!(missing, present);
+        let empty_string = digest_from_pairs(&[("U1".to_string(), Some(String::new()))]);
+        assert_eq!(missing, empty_string, "None は空文字と同じ畳み方");
+    }
+
+    #[test]
+    fn digest_from_pairs_of_empty_input_is_deterministic() {
+        assert_eq!(digest_from_pairs(&[]), digest_from_pairs(&[]));
+    }
+
+    #[test]
     fn query_dates_widens_backwards_and_excludes_the_upper_bound() {
         let (f, t) = query_dates(dt("2026-07-01 00:00:00"), dt("2026-08-02 00:00:00"));
         // 期間内に終わる区間 (開始は期間より前) を拾うため 2 日遡る
@@ -1354,6 +1550,18 @@ mod tests {
     fn warnings_outside_a_sink_are_dropped() {
         HttpKintaiEventsRepo::log_warnings(&["orphan".to_string()]);
         assert!(collected_warnings().is_empty());
+    }
+
+    /// [`record_warning_for_test`] は private な [`record_warning`] へそのまま
+    /// 委譲するだけ — 実装計画 13 のテストが他モジュールから warnings を
+    /// 疑似発火するための穴。
+    #[tokio::test]
+    async fn record_warning_for_test_delegates_to_the_real_sink() {
+        let (_, warnings) = with_warning_sink(async {
+            record_warning_for_test("from another module");
+        })
+        .await;
+        assert_eq!(warnings, vec!["from another module".to_string()]);
     }
 
     #[test]

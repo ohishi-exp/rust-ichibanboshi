@@ -187,15 +187,16 @@ expect_eq "kintai_reader は NOINHERIT" \
 expect_eq "kintai_reader は superuser ではない" \
   "$(as "$SUPER_URL" "SELECT rolsuper FROM pg_roles WHERE rolname='kintai_reader'")" "f"
 
-echo "== RLS が 6 表とも有効で、テナント分離ポリシーが 1 本ずつある"
+echo "== RLS が 7 表とも有効で、テナント分離ポリシーが 1 本ずつある"
+# 6 -> 7 は 004 (kintai.fold_gate、Refs #205 実装計画 13) を足した分。
 expect_eq "relrowsecurity = true の表の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "6"
+       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "7"
 expect_eq "policy の数" \
-  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "6"
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "7"
 expect_eq "WITH CHECK を明示していない (= USING が WITH CHECK として効く) policy の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies
-       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "6"
+       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "7"
 
 # ── 3. reader / writer で実際に繋ぐ ────────────────────────────────────
 # migration はパスワードを持たないので、検証用にここで付ける (テスト scaffolding)。
