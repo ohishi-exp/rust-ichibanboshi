@@ -74,8 +74,13 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # base_url / tenant_id が無ければ**起動を失敗させる** ([database] enabled と同じ流儀)。
 #
 # 上流に口が無い読み出し (始業/終業の打刻・運行の確定イベント・フェリー) は
-# [mariadb] が設定されていればそちらへ委譲する。委譲先が無い形態では打刻が読めず、
-# 拘束は休息イベント由来の勤務しか組めない (#205 の 04 / 05 が埋める穴)。
+# [mariadb] が設定されていればそちらへ委譲する。**MariaDB が無く [kintai_push] が
+# 有効なら、打刻だけは kintai.kintai_events から読み返す** (Refs #205 の G6)。
+# どちらも無い形態では打刻が読めず、拘束は休息イベント由来の勤務しか組めない。
+# フェリーは MariaDB 専用のまま (突合はオンプレ専用、#205 の決定 8)。
+#
+# tenant_id は打刻の読み返しにも使う。読みはこの 1 つで固定され、書き先を決める
+# X-Tenant-ID とは別経路で来る — **両者が一致しているのは暗黙の前提**。
 #
 # 認証 token は 2 経路のどちらか片方だけを指定する (両方指定は起動失敗):
 #   auth_token         — 静的な Bearer (device JWT を注入する 07 の受け皿)
@@ -104,9 +109,15 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # 落ちる — 「設定を忘れたまま走って 0 件成功に見える」を作らない ([database] enabled と
 # 同じ流儀)。宣言したのに接続先や tenant_id が無ければ**起動を失敗させる**。
 #
-# **書くのは常にオンプレ側** (ohishi-data の rust-ichibanboshi)。GCP からオンプレへは
-# 到達できないので push 方向しか無い (#205 の決定 8)。読む側 (Cloud Run) はこの設定を
-# 持たず、畳んだ 3 層を kintai_reader で読むだけ。ここで使うロールは kintai_writer。
+# **畳んで書くのは GCP 側** (2026-07-30 の決定)。オンプレは MariaDB から打刻を読んで
+# relay に返すだけで、書くのは Cloud Run 側。オンプレ直書き (#217 の形) も残してあるので、
+# 両方の形態でこの宣言が生きる。ここで使うロールは kintai_writer。
+#
+# **この pool は打刻の読み返しにも使う** (Refs #205 の G6)。[kintai_events] source = "http"
+# で MariaDB が無い形態 (= GCP) では、上流 (rust-alc-api) に打刻の口が無いぶんを
+# kintai.kintai_events から読み返す。宣言していないと打刻が 1 件も読めず
+# shifts_from_timecard が空になる — /health の backends.kintai_events で見分けられる
+# ("http" = 打刻を読む先が無い / "http+pg" = 読み返しが挿さっている)。
 #
 # **接続は session mode の pooler (5432) を使う。** transaction mode (6543) は prepared
 # statement の扱いが違い、sqlx の既定 (文を準備して使い回す) と噛み合わない —
@@ -163,9 +174,15 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # 落ちる — 「設定を忘れたまま走って 0 件成功に見える」を作らない ([database] enabled と
 # 同じ流儀)。宣言したのに接続先や tenant_id が無ければ**起動を失敗させる**。
 #
-# **書くのは常にオンプレ側** (ohishi-data の rust-ichibanboshi)。GCP からオンプレへは
-# 到達できないので push 方向しか無い (#205 の決定 8)。読む側 (Cloud Run) はこの設定を
-# 持たず、畳んだ 3 層を kintai_reader で読むだけ。ここで使うロールは kintai_writer。
+# **畳んで書くのは GCP 側** (2026-07-30 の決定)。オンプレは MariaDB から打刻を読んで
+# relay に返すだけで、書くのは Cloud Run 側。オンプレ直書き (#217 の形) も残してあるので、
+# 両方の形態でこの宣言が生きる。ここで使うロールは kintai_writer。
+#
+# **この pool は打刻の読み返しにも使う** (Refs #205 の G6)。[kintai_events] source = "http"
+# で MariaDB が無い形態 (= GCP) では、上流 (rust-alc-api) に打刻の口が無いぶんを
+# kintai.kintai_events から読み返す。宣言していないと打刻が 1 件も読めず
+# shifts_from_timecard が空になる — /health の backends.kintai_events で見分けられる
+# ("http" = 打刻を読む先が無い / "http+pg" = 読み返しが挿さっている)。
 #
 # **接続は session mode の pooler (5432) を使う。** transaction mode (6543) は prepared
 # statement の扱いが違い、sqlx の既定 (文を準備して使い回す) と噛み合わない —

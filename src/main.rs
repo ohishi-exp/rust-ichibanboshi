@@ -143,13 +143,17 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
         println!("[dry-run] --apply が無いので 1 行も書きません");
     }
 
-    let (repo, backend) = build_kintai_events_repo(&config)?;
     let params = build_kosoku_params(&config);
+
+    // **書き先を先に繋いでから読み先を組む** (Refs #205 の G6)。MariaDB が無い形態
+    // では打刻の読み返しがこの pool を共有するので、server.rs と同じ順序にする —
+    // 順序が違うと「画面と CLI で読み先が違う」が生まれる
+    let rt = tokio::runtime::Runtime::new()?;
+    let store = std::sync::Arc::new(rt.block_on(KintaiPgStore::connect(&config.kintai_push))?);
+    let (repo, backend) = build_kintai_events_repo(&config, Some(store.clone()))?;
     println!("kintai events backend: {backend}");
 
-    let rt = tokio::runtime::Runtime::new()?;
     let unexpected = rt.block_on(async move {
-        let store = KintaiPgStore::connect(&config.kintai_push).await?;
         let unexpected = match command {
             Command::Push(_) => {
                 let r = push_month(&repo, &store, &opts).await?;

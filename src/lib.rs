@@ -4,6 +4,7 @@ pub mod db;
 pub mod kintai_diff;
 pub mod kintai_fold;
 pub mod kintai_http_repo;
+pub mod kintai_pg_repo;
 pub mod kintai_push;
 pub mod kintai_repo;
 pub mod kintai_store;
