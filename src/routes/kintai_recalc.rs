@@ -293,6 +293,9 @@ async fn run(
                 "unko_diff_gcp_only": unko_diff.gcp_only,
                 "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
                 "unko_diff_onprem_sample": unko_diff.onprem_sample,
+                "unko_diff_onprem_shape": unko_diff.onprem_shape,
+                "unko_diff_gcp_shape": unko_diff.gcp_shape,
+                "unko_diff_trials": unko_diff.trials,
             })));
         }
         other => other,
@@ -387,6 +390,9 @@ async fn run(
         "unko_diff_gcp_only": unko_diff.gcp_only,
         "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
         "unko_diff_onprem_sample": unko_diff.onprem_sample,
+        "unko_diff_onprem_shape": unko_diff.onprem_shape,
+        "unko_diff_gcp_shape": unko_diff.gcp_shape,
+        "unko_diff_trials": unko_diff.trials,
     })))
 }
 
