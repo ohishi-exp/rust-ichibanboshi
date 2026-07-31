@@ -934,3 +934,78 @@ async fn a_dry_run_window_reports_without_writing() {
     assert_eq!(applied.days_written, planned.days_written);
     assert_eq!(count_events(&pool, store.tenant_id()).await, 2);
 }
+
+/// **多数の乗務員・多数の日を 1 トランザクションで書く。**
+///
+/// 1 日 1 DELETE・1 イベント 1 INSERT で往復していた頃は、2 か月 95 名の初回投入が
+/// 10,157 往復になり Cloudflare の 524 (100 秒) を超えた。畳んだあとも同じ結果に
+/// なることを実 DB で確かめる (件数・中身・署名の一致)。
+#[tokio::test]
+async fn a_wide_window_is_written_in_one_go() {
+    let (store, pool) = require_db!();
+    let mut events = Vec::new();
+    for driver in 0..40_i64 {
+        for day in 1..=28_u32 {
+            events.push(win_punch(
+                2000 + driver,
+                &format!("2026-06-{day:02} 08:00:00"),
+                "始業",
+            ));
+            events.push(win_punch(
+                2000 + driver,
+                &format!("2026-06-{day:02} 18:00:00"),
+                "終業",
+            ));
+        }
+    }
+    let drivers: Vec<i64> = (0..40).map(|d| 2000 + d).collect();
+    let w = window_of(&["2026-06"], &drivers, events);
+
+    let r = apply_timecard_window(&store, &w).await.expect("apply");
+    assert_eq!(r.drivers_written, 40);
+    assert_eq!(r.days_written, 40 * 28);
+    assert_eq!(r.events_written, 40 * 28 * 2);
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 40 * 28 * 2);
+
+    // 署名も 1 名ずつ書いたときと同じ = 畳んでも中身が変わらない
+    let (from, _) = jst_day_bounds(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+    let (to, _) = jst_day_bounds(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+    let sigs = store
+        .stored_window_signatures(&drivers, from, to)
+        .await
+        .expect("signatures");
+    assert_eq!(sigs.len(), 40);
+    assert_eq!(sigs[&2000].len(), 28);
+
+    // 送り直しても 1 行も書かない (差分が出ない)
+    let again = apply_timecard_window(&store, &w).await.expect("2nd");
+    assert_eq!(again.days_written, 0);
+    assert_eq!(again.drivers_written, 0);
+}
+
+/// **INSERT の刻みを跨いでも落ちない。** `raw` を積むと 1 文が数 MB に育つので
+/// `INSERT_CHUNK` 行で刻んでいるが、刻んでも同じトランザクションの中に居る。
+#[tokio::test]
+async fn writes_survive_crossing_the_insert_chunk() {
+    let (store, pool) = require_db!();
+    // 2 名 × 28 日 × 40 件 = 2240 行 (INSERT_CHUNK = 2000 を跨ぐ)
+    let mut events = Vec::new();
+    for driver in [3001_i64, 3002] {
+        for day in 1..=28_u32 {
+            for i in 0..40_u32 {
+                events.push(win_punch(
+                    driver,
+                    &format!("2026-06-{day:02} {:02}:{:02}:00", 8 + i / 60, i % 60),
+                    if i % 2 == 0 { "始業" } else { "終業" },
+                ));
+            }
+        }
+    }
+    let total = events.len() as i64;
+    assert!(total > 2000, "刻みを跨がないテストになっている: {total}");
+    let w = window_of(&["2026-06"], &[3001, 3002], events);
+
+    let r = apply_timecard_window(&store, &w).await.expect("apply");
+    assert_eq!(r.events_written as i64, total);
+    assert_eq!(count_events(&pool, store.tenant_id()).await, total);
+}
