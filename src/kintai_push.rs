@@ -915,6 +915,14 @@ pub struct TimecardWindow {
     /// 生行。乗務員も日も混ざったまま。束ねるのは受け側。
     #[serde(default)]
     pub events: Vec<serde_json::Value>,
+    /// **`true` なら 1 行も書かない。** 計画だけ立てて件数を返す。
+    ///
+    /// 既定が `false` (= 書く) なのは、この口が「窓を渡す」以外の意味を持たない
+    /// から。dry-run は呼び出し側が明示する — CLI の `--apply` とは既定が逆で、
+    /// **口の外 (relay / MCP tool) が「apply が無ければ dry_run を立てる」**形で
+    /// 安全側を作る。
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// [`apply_timecard_window`] の結果。
@@ -934,6 +942,10 @@ pub struct TimecardWindowResult {
     pub unknown_states: BTreeSet<String>,
     /// 窓の外 / 名乗っていない乗務員の行。**0 でないなら送り側が壊れている**。
     pub misplaced: usize,
+    /// **`true` なら件数は計画であって実績ではない** (1 行も書いていない)。
+    ///
+    /// 応答に出さないと、dry-run の `days_written` を書けたものと読み違える。
+    pub dry_run: bool,
     pub elapsed_ms: u64,
 }
 
@@ -979,10 +991,13 @@ pub async fn apply_timecard_window(
         .await?;
 
     let (plans, mut result) = plan_window(&spans, &declared, &window.events, &remote);
-    for (driver, plan) in &plans {
-        store
-            .replace_days(*driver, &plan.changed, &plan.deleted)
-            .await?;
+    result.dry_run = window.dry_run;
+    if !window.dry_run {
+        for (driver, plan) in &plans {
+            store
+                .replace_days(*driver, &plan.changed, &plan.deleted)
+                .await?;
+        }
     }
     result.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(result)
