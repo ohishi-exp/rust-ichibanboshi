@@ -112,7 +112,17 @@
 //! | `unko_diff` / `unko_diff_total` | **押し込み済み (`kintai.kintai_events`) に在って GCP に無い運行** (#205 の 37) |
 //! | `unko_diff_gcp_only` | 逆方向 (GCP に在ってオンプレに無い) の件数。窓ぜんたい |
 //! | `unko_diff_gcp_only_in_month` / `..._by_month` | **対象月に始まった運行だけ**の逆方向と、月別の内訳 |
+//! | `unko_diff_gcp_only_in_month_by_day` | 対象月の逆方向を**運行開始日**で割った件数 (#205 の 39) |
+//! | `unko_diff_gcp_only_in_month_by_driver` | 同じく**乗務員別** ([`crate::kintai_http_repo::UnkoDiffDriver`])。alc が `driver_cds` を返さない環境では空 |
+//! | `unko_diff_gcp_only_in_month_unknown_driver` | そのうち**乗務員を引けなかった**件数。内訳が空なのが「居ない」か「引けていない」かの区別 |
+//! | `unko_diff_gcp_only_driver_split` | 「射程外」と「欠落」の 3 桶 ([`crate::kintai_http_repo::UnkoDiffDriverSplit`]) |
 //! | `unko_diff_gcp_only_sample` / `unko_diff_onprem_sample` | **突合キーの実物**を両側 10 件ずつ |
+//!
+//! **逆方向が大きいことは、それ自体では勤怠が間違っている証拠にならない**
+//! (#205 の 39)。fold の入力は etags を一切通らない — [`crate::kintai_fold::fold_month`]
+//! が `fetch_all_events_between` で alc の生イベントを直に読み、その乗務員は
+//! `extra` として母集団に足される (下の `all_units` / `extra`)。**「突合で見えない」
+//! と「勤怠が間違っている」を混同しないこと。**
 //!
 //! `unko_diff` の突合は「押し込み済みの `kintai.kintai_events` の
 //! `(乗務員CD, unko_no)`」対「etags の `unko_no`」。**左辺は「オンプレ全部」では
@@ -295,6 +305,10 @@ async fn run(
                 "unko_diff_gcp_only": unko_diff.gcp_only,
                 "unko_diff_gcp_only_in_month": unko_diff.gcp_only_in_month,
                 "unko_diff_gcp_only_by_month": unko_diff.gcp_only_by_month,
+                "unko_diff_gcp_only_in_month_by_day": unko_diff.gcp_only_in_month_by_day,
+                "unko_diff_gcp_only_in_month_by_driver": unko_diff.gcp_only_in_month_by_driver,
+                "unko_diff_gcp_only_in_month_unknown_driver": unko_diff.gcp_only_in_month_unknown_driver,
+                "unko_diff_gcp_only_driver_split": unko_diff.gcp_only_driver_split,
                 "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
                 "unko_diff_onprem_sample": unko_diff.onprem_sample,
                 "unko_diff_onprem_shape": unko_diff.onprem_shape,
@@ -394,6 +408,10 @@ async fn run(
         "unko_diff_gcp_only": unko_diff.gcp_only,
         "unko_diff_gcp_only_in_month": unko_diff.gcp_only_in_month,
         "unko_diff_gcp_only_by_month": unko_diff.gcp_only_by_month,
+        "unko_diff_gcp_only_in_month_by_day": unko_diff.gcp_only_in_month_by_day,
+        "unko_diff_gcp_only_in_month_by_driver": unko_diff.gcp_only_in_month_by_driver,
+        "unko_diff_gcp_only_in_month_unknown_driver": unko_diff.gcp_only_in_month_unknown_driver,
+        "unko_diff_gcp_only_driver_split": unko_diff.gcp_only_driver_split,
         "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
         "unko_diff_onprem_sample": unko_diff.onprem_sample,
         "unko_diff_onprem_shape": unko_diff.onprem_shape,

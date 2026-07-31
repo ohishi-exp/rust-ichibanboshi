@@ -1446,7 +1446,12 @@ async fn test_unko_diff_names_the_operations_missing_from_the_real_etags_respons
                 last_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
             },
         ];
-        rust_ichibanboshi::kintai_http_repo::record_unko_diff(&onprem, &gcp, Some((2026, 1)));
+        rust_ichibanboshi::kintai_http_repo::record_unko_diff(
+            &onprem,
+            &gcp,
+            &Default::default(),
+            Some((2026, 1)),
+        );
         d
     })
     .await;
