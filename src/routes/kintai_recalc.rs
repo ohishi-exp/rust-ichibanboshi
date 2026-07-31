@@ -228,10 +228,15 @@ async fn run(
     // 21)。指紋を取る `fetch_etags` は入力の欠けを最初に見る場所で、そこが立てる
     // warning は sink の外だと黙って捨てられる — 5 条件の `warnings.is_empty()` が
     // 素通りし、欠けたままの月に「最新」の封をしてしまう
-    let (gate, gate_warnings) = crate::kintai_http_repo::with_warning_sink(
-        crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply),
-    )
-    .await;
+    //
+    // `with_unsplit_sink` を重ねて包むのは `unsplit` (Refs #205 の 32、alc の
+    // `has_kudgivt = FALSE` 一覧) も同じ `fetch_etags` の応答から拾うため。判定には
+    // 使わない素通しで、142 行差の仮説検証用に応答へそのまま載せるだけ
+    let ((gate, gate_warnings), unsplit, unsplit_total) =
+        crate::kintai_http_repo::with_unsplit_sink(crate::kintai_http_repo::with_warning_sink(
+            crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply),
+        ))
+        .await;
     let gate = match gate.map_err(map_push_err)? {
         crate::kintai_fold::MonthGate::Hit(mut report) => {
             let months = [req.month.clone()];
@@ -251,6 +256,8 @@ async fn run(
                 "fold": report,
                 "stale": stale,
                 "elapsed_ms": started.elapsed().as_millis() as u64,
+                "unsplit": unsplit,
+                "unsplit_total": unsplit_total,
             })));
         }
         other => other,
@@ -338,6 +345,8 @@ async fn run(
         "fold": folded,
         "stale": stale,
         "elapsed_ms": started.elapsed().as_millis() as u64,
+        "unsplit": unsplit,
+        "unsplit_total": unsplit_total,
     })))
 }
 

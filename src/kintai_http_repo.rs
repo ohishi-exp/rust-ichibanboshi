@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::KintaiEventsConfig;
@@ -188,6 +188,46 @@ pub fn record_warning_for_test(w: &str) {
 /// [`with_warning_sink`] の戻り値の warnings がここで空にならないよう `borrow` だけ。
 pub fn warnings_seen() -> Option<bool> {
     WARNING_SINK.try_with(|s| !s.borrow().is_empty()).ok()
+}
+
+// ── `unsplit` (has_kudgivt = FALSE) の素通し (Refs #205 の 32) ──────────────
+
+tokio::task_local! {
+    /// いま集めている最中の `unsplit`。[`with_unsplit_sink`] の中だけで立つ。
+    /// `warnings` (件数無制限で毎運行 1 本) と違い 1 回の etags 応答につき
+    /// 高々 1 組なので `Option` — 上書きでよい (蓄積・重複排除は要らない)。
+    static UNSPLIT_SINK: std::cell::RefCell<Option<(Vec<UnsplitOperation>, usize)>>;
+}
+
+/// **`unsplit` を集めながら `fut` を走らせる。** `with_warning_sink` と同じ
+/// task-local パターン (docs 参照) — ここでは判定に使わず素通しするだけなので、
+/// [`fetch_dtako_month_digest`] を包む呼び出し側がこの戻り値をそのまま応答に載せる。
+pub async fn with_unsplit_sink<F: std::future::Future>(
+    fut: F,
+) -> (F::Output, Vec<UnsplitOperation>, usize) {
+    UNSPLIT_SINK
+        .scope(std::cell::RefCell::new(None), async move {
+            let out = fut.await;
+            let (items, total) = collected_unsplit();
+            (out, items, total)
+        })
+        .await
+}
+
+/// いま集まっている `unsplit`。sink が無い/未記録なら空。
+fn collected_unsplit() -> (Vec<UnsplitOperation>, usize) {
+    UNSPLIT_SINK
+        .try_with(|sink| sink.borrow().clone())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// 集めている最中なら記録する (上書き)。
+fn record_unsplit(items: Vec<UnsplitOperation>, total: usize) {
+    let _ = UNSPLIT_SINK.try_with(|sink| {
+        *sink.borrow_mut() = Some((items, total));
+    });
 }
 
 // ── 認証 token の取り方 (設定で与える。コードに焼かない) ────────────────────
@@ -462,11 +502,36 @@ struct UpstreamAll {
 /// `GET /api/dtako/events/etags` の 1 件。`etag` が無い (R2 に無い / upload 未完了)
 /// 運行は `None` のまま持ち出す — 呼び出し側 (digest 計算) が空文字と区別できるように
 /// する。
+///
+/// `driver_cds` は Refs #205 の 32 で足す前方互換フィールド。alc がまだ返さない
+/// (現行) 環境では常に空 — その場合 [`InputCoverage`] は全 item を 1 グループ
+/// として扱い、既存の (粒度が粗い) 判定にそのまま揃う。alc 側が `driver_cds` を
+/// 返すようになった時点で乗務員別の検知が自動的に有効化される。
+///
+/// **複数形なのは 1 運行に複数の乗務員 (主 / 副運転) が付き得るため** —
+/// `list_operations_for_drivers` は `DISTINCT ON (driver_id, unko_no)` なので同じ
+/// `unko_no` が複数の `driver_id` に紐づく。この場合その運行の開始日は
+/// `driver_cds` 全員の `last` に寄与させる (親の判断、2026-07-31)。
 #[derive(Debug, Clone, Deserialize)]
 struct UpstreamEtagItem {
     unko_no: String,
     #[serde(default)]
     etag: Option<String>,
+    #[serde(default)]
+    driver_cds: Vec<String>,
+}
+
+/// `has_kudgivt = FALSE` (=読み取り側 3 クエリの母集団からも欠け検知からも同時に
+/// 消えている運行) の 1 件。Refs #205 の 32 で alc (#205-36) が足す前方互換フィールド。
+///
+/// **判定には使わない — `run_kintai_recalc` の応答まで素通しするだけ。**
+/// #205 の 142 行差の仮説 (`has_kudgivt = FALSE` が原因) を検証するための実データ
+/// 突き合わせ材料で、判定ロジックへの組み込みは実データを見てから別途決める。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UnsplitOperation {
+    pub unko_no: String,
+    pub driver_cd: String,
+    pub reading_date: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -475,6 +540,10 @@ struct UpstreamEtags {
     items: Vec<UpstreamEtagItem>,
     #[serde(default)]
     warnings: Vec<String>,
+    #[serde(default)]
+    unsplit: Vec<UnsplitOperation>,
+    #[serde(default)]
+    unsplit_total: usize,
 }
 
 // ── 列の解決 ──────────────────────────────────────────────────────────────
@@ -695,34 +764,68 @@ fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
 /// ずれていて毎月立ち続けたとしても、**その場のログに実測 gap が出ていれば
 /// 1 回の追い PR で締められる**。「外したときに自己診断できる」形にしておくのが
 /// 閾値を先に入れる条件 (親の判断、2026-07-31)。
+///
+/// ## 末尾検知は乗務員別 (Refs #205 の 32)
+///
+/// 検知は月ぶん・全乗務員を跨いだ「たった 1 つの `last`」で測っていたため、132 名
+/// のうち 1 人でも窓の端まで運行があれば `last` がそこに張り付き、故障している他の
+/// 乗務員が埋もれて沈黙した (2026-06 本番、49 名影響・8 回計測して warnings 0)。
+/// **粒度を `driver_cd` 別に割り、乗務員ごとに `gap = expected - last` を出して
+/// 閾値超えを数える。** `driver_cd` が無い item (alc がまだ返さない環境) は空文字
+/// キーの 1 グループにまとまり、旧実装 (全体で 1 つの `last`) と同じ結果になる —
+/// alc が `driver_cd` を返し始めた時点で自動的に乗務員別の検知に切り替わる。
 struct InputCoverage {
     /// etags の item 数 (= 窓の中の運行数)。
     items: usize,
     /// `etag` が `null` の item 数 (R2 に CSV が無い)。
     no_etag: usize,
-    /// 運行開始日の最小 / 最大。1 件も読めなければ `None`。
+    /// 運行開始日の最小 / 最大 (全乗務員通し、summary 表示用)。1 件も読めなければ `None`。
     first: Option<NaiveDate>,
     last: Option<NaiveDate>,
     /// 末尾がここまで届いていてほしい日 (進行中の月は `today - 1 日` に切り下げ)。
     expected: NaiveDate,
+    /// `driver_cds` (無ければ空文字 1 本) → その乗務員の運行開始日の最大値。
+    per_driver_last: std::collections::HashMap<String, NaiveDate>,
+    /// `driver_cds` を持つ item が 1 件でもあったか。`false` なら alc がまだ
+    /// `driver_cds` を返さない環境 — 乗務員別ではなく全体 1 グループの粗い判定に
+    /// フォールバックしている、という意味 (Refs #205 の 32)。
+    driver_cd_source: bool,
 }
 
 impl InputCoverage {
     /// `pairs` を 1 度だけ走査して測る (応答は実測 1,100 件、O(n) に収める)。
+    ///
+    /// **1 運行が複数の `driver_cds` を持つ場合、その運行開始日は全員の `last` に
+    /// 寄与する** — `unko_no` が主 / 副運転で複数の乗務員に紐づき得るため
+    /// (`list_operations_for_drivers` の `DISTINCT ON (driver_id, unko_no)`)。
     fn measure(
-        pairs: &[(String, Option<String>)],
+        pairs: &[(String, Option<String>, Vec<String>)],
         window_end: NaiveDate,
         today: NaiveDate,
     ) -> Self {
         let mut no_etag = 0;
         let (mut first, mut last) = (None, None);
-        for (unko_no, etag) in pairs {
+        let mut per_driver_last: std::collections::HashMap<String, NaiveDate> =
+            std::collections::HashMap::new();
+        let mut driver_cd_source = false;
+        for (unko_no, etag, driver_cds) in pairs {
             if etag.is_none() {
                 no_etag += 1;
             }
             if let Some(d) = unko_no_start_date(unko_no) {
                 first = Some(first.map_or(d, |f: NaiveDate| f.min(d)));
                 last = Some(last.map_or(d, |l: NaiveDate| l.max(d)));
+                driver_cd_source = driver_cd_source || !driver_cds.is_empty();
+                let keys = match driver_cds.is_empty() {
+                    true => vec![String::new()],
+                    false => driver_cds.clone(),
+                };
+                for key in keys {
+                    per_driver_last
+                        .entry(key)
+                        .and_modify(|l: &mut NaiveDate| *l = (*l).max(d))
+                        .or_insert(d);
+                }
             }
         }
         let expected = window_end.min(today - chrono::Duration::days(1));
@@ -733,12 +836,28 @@ impl InputCoverage {
             first,
             last,
             expected,
+            per_driver_last,
+            driver_cd_source,
         }
     }
 
-    /// 末尾の不足日数。運行開始日が 1 件も読めなければ `None`。
+    /// 末尾の不足日数 (全乗務員通し)。運行開始日が 1 件も読めなければ `None`。
+    /// ログの `gap` フィールドと `gap_days` 系テストが使う互換値 — 実際の警告判定は
+    /// [`Self::tail_gap`] (乗務員別) が行う。
     fn gap_days(&self) -> Option<i64> {
         self.last.map(|l| (self.expected - l).num_days())
+    }
+
+    /// 閾値 ([`MAX_TAIL_GAP_DAYS`]) を超えた乗務員数と、その中の最大不足日数。
+    /// 1 人も超えていなければ `None`。
+    fn tail_gap(&self) -> Option<(usize, i64)> {
+        let over: Vec<i64> = self
+            .per_driver_last
+            .values()
+            .map(|l| (self.expected - *l).num_days())
+            .filter(|g| *g > MAX_TAIL_GAP_DAYS)
+            .collect();
+        over.iter().max().map(|&max_gap| (over.len(), max_gap))
     }
 
     /// ログにも警告本文にも載せる 1 行の実測値。
@@ -778,12 +897,10 @@ fn missing_input_warnings(cov: &InputCoverage) -> Vec<String> {
         let n = cov.no_etag;
         out.push(format!("dtako 入力欠け: R2 に CSV の無い運行 {n} 件 ({s})"));
     }
-    match cov.gap_days() {
-        None => out.push(format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})")),
-        Some(g) if g > MAX_TAIL_GAP_DAYS => {
-            out.push(format!("dtako 入力欠け: 末尾が {g} 日不足 ({s})"));
-        }
-        Some(_) => {}
+    if cov.last.is_none() {
+        out.push(format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})"));
+    } else if let Some((n, g)) = cov.tail_gap() {
+        out.push(format!("dtako 入力欠け: 乗務員{n}名の末尾が{g}日超 ({s})"));
     }
     out
 }
@@ -796,16 +913,20 @@ fn today_jst() -> NaiveDate {
         .date_naive()
 }
 
-/// `(unko_no, etag)` の一覧から月ゲートの dtako 側 digest を作る。
+/// `(unko_no, etag, driver_cds)` の一覧から月ゲートの dtako 側 digest を作る。
 ///
 /// `etag` が `None` (R2 に無い / upload 未完了) の運行は空文字として畳む —
 /// 存在しない扱いにして無視すると、**upload 中の運行がこっそり digest から
 /// 抜け落ち**、揃った後もゲートが「変わっていない」と誤判定しうる。空文字で
 /// 織り込めば、揃った瞬間に digest が変わってゲートが必ず外れる (安全側)。
-fn digest_from_pairs(pairs: &[(String, Option<String>)]) -> String {
+///
+/// `driver_cds` は digest に**含めない** — alc が新たに返し始めた時点で全月の
+/// gate がいっせいに外れる (無駄な全量読み直し) のを避けるため。乗務員の同定は
+/// [`InputCoverage`] の検知だけに使う。
+fn digest_from_pairs(pairs: &[(String, Option<String>, Vec<String>)]) -> String {
     let mut lines: Vec<String> = pairs
         .iter()
-        .map(|(unko_no, etag)| format!("{unko_no}:{}", etag.as_deref().unwrap_or("")))
+        .map(|(unko_no, etag, _driver_cds)| format!("{unko_no}:{}", etag.as_deref().unwrap_or("")))
         .collect();
     lines.sort();
     let mut h = Sha256::new();
@@ -1023,7 +1144,7 @@ impl HttpKintaiEventsRepo {
         &self,
         date_from: NaiveDate,
         date_to: NaiveDate,
-    ) -> Result<Option<Vec<(String, Option<String>)>>, KintaiRepoError> {
+    ) -> Result<Option<Vec<(String, Option<String>, Vec<String>)>>, KintaiRepoError> {
         let mut req = self
             .client
             .get(&self.etags_url)
@@ -1056,11 +1177,12 @@ impl HttpKintaiEventsRepo {
         let parsed: UpstreamEtags = serde_json::from_str(&body)
             .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-etags parse: {e}")))?;
         Self::log_warnings(&parsed.warnings);
+        record_unsplit(parsed.unsplit, parsed.unsplit_total);
         Ok(Some(
             parsed
                 .items
                 .into_iter()
-                .map(|it| (it.unko_no, it.etag))
+                .map(|it| (it.unko_no, it.etag, it.driver_cds))
                 .collect(),
         ))
     }
@@ -1129,6 +1251,10 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
             // マクロは 1 行に収める (CLAUDE.md — 折り返すと行カバレッジに乗らない)
             let (gap, cover) = (cov.gap_days().unwrap_or(-1), cov.summary());
             tracing::info!(gap, %cover, "kintai dtako input coverage");
+            // alc がまだ driver_cds を返さない環境の切り分け用 (Refs #205 の 32)
+            if !cov.driver_cd_source {
+                tracing::info!("kintai dtako driver_cds 未対応: 月ぜんたい判定にフォールバック");
+            }
             for w in missing_input_warnings(&cov) {
                 tracing::warn!(warning = %w, "kintai dtako input gap");
                 record_warning(&w);
@@ -1460,20 +1586,20 @@ mod tests {
     fn digest_from_pairs_is_order_independent() {
         // 入力の並びが違っても sort してから畳むので同じ digest になる
         let a = digest_from_pairs(&[
-            ("U1".to_string(), Some("etag1".to_string())),
-            ("U2".to_string(), Some("etag2".to_string())),
+            ("U1".to_string(), Some("etag1".to_string()), vec![]),
+            ("U2".to_string(), Some("etag2".to_string()), vec![]),
         ]);
         let b = digest_from_pairs(&[
-            ("U2".to_string(), Some("etag2".to_string())),
-            ("U1".to_string(), Some("etag1".to_string())),
+            ("U2".to_string(), Some("etag2".to_string()), vec![]),
+            ("U1".to_string(), Some("etag1".to_string()), vec![]),
         ]);
         assert_eq!(a, b);
     }
 
     #[test]
     fn digest_from_pairs_changes_when_an_etag_changes() {
-        let before = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()))]);
-        let after = digest_from_pairs(&[("U1".to_string(), Some("etag1-new".to_string()))]);
+        let before = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()), vec![])]);
+        let after = digest_from_pairs(&[("U1".to_string(), Some("etag1-new".to_string()), vec![])]);
         assert_ne!(before, after);
     }
 
@@ -1481,11 +1607,24 @@ mod tests {
     fn digest_from_pairs_treats_missing_etag_as_distinct_from_present() {
         // None (R2 に未着) と Some("") はどちらも空文字として畳まれるが、
         // None と Some(other) は必ず違う digest になる (揃った瞬間に gate が外れる)
-        let missing = digest_from_pairs(&[("U1".to_string(), None)]);
-        let present = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()))]);
+        let missing = digest_from_pairs(&[("U1".to_string(), None, vec![])]);
+        let present = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()), vec![])]);
         assert_ne!(missing, present);
-        let empty_string = digest_from_pairs(&[("U1".to_string(), Some(String::new()))]);
+        let empty_string = digest_from_pairs(&[("U1".to_string(), Some(String::new()), vec![])]);
         assert_eq!(missing, empty_string, "None は空文字と同じ畳み方");
+    }
+
+    /// digest は `driver_cds` を含めない — alc が新たに返し始めても、既存の gate が
+    /// いっせいに外れて無駄な全量読み直しが起きないようにするため (Refs #205 の 32)。
+    #[test]
+    fn digest_from_pairs_ignores_driver_cds() {
+        let without = digest_from_pairs(&[("U1".to_string(), Some("etag1".to_string()), vec![])]);
+        let with = digest_from_pairs(&[(
+            "U1".to_string(),
+            Some("etag1".to_string()),
+            vec!["D1".to_string()],
+        )]);
+        assert_eq!(without, with, "driver_cds の有無で digest が変わらない");
     }
 
     #[test]
@@ -1753,6 +1892,44 @@ mod tests {
         assert_eq!(seen_some, Some(true));
     }
 
+    // ── `unsplit` の素通し (Refs #205 の 32) ────────────────────────────────
+
+    fn unsplit_op(unko_no: &str, driver_cd: &str, reading_date: &str) -> UnsplitOperation {
+        UnsplitOperation {
+            unko_no: unko_no.to_string(),
+            driver_cd: driver_cd.to_string(),
+            reading_date: reading_date.to_string(),
+        }
+    }
+
+    /// `record_unsplit` で記録した内容がそのまま `with_unsplit_sink` の戻り値に乗る。
+    #[tokio::test]
+    async fn unsplit_recorded_inside_the_sink_comes_back_to_the_caller() {
+        let (out, items, total) = with_unsplit_sink(async {
+            record_unsplit(vec![unsplit_op("U1", "D1", "2026-06-15")], 3);
+            42
+        })
+        .await;
+        assert_eq!(out, 42, "中身の戻り値はそのまま");
+        assert_eq!(items, vec![unsplit_op("U1", "D1", "2026-06-15")]);
+        assert_eq!(total, 3);
+    }
+
+    /// 記録しなければ空・0 のまま (alc がまだ `unsplit` を返さない環境相当)。
+    #[tokio::test]
+    async fn unsplit_sink_defaults_to_empty_when_nothing_is_recorded() {
+        let (_, items, total) = with_unsplit_sink(async {}).await;
+        assert!(items.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    /// **集めていないときは何も起きない。**
+    #[test]
+    fn record_unsplit_outside_a_sink_is_dropped() {
+        record_unsplit(vec![unsplit_op("U1", "D1", "2026-06-15")], 1);
+        assert_eq!(collected_unsplit(), (Vec::new(), 0));
+    }
+
     // ── 入力欠けの検知 (Refs #205 の 21) ──────────────────────────────────
 
     /// `unko_no` の実物 (23 桁) / テスト fixture の 22 桁 / 読めない形。
@@ -1767,11 +1944,28 @@ mod tests {
         assert_eq!(unko_no_start_date("26060X10055500"), None, "数字でない");
     }
 
-    fn pair(unko_no: &str, etag: Option<&str>) -> (String, Option<String>) {
-        (unko_no.to_string(), etag.map(str::to_string))
+    /// `driver_cds` 無し (alc がまだ返さない現行環境相当)。
+    fn pair(unko_no: &str, etag: Option<&str>) -> Pair {
+        (unko_no.to_string(), etag.map(str::to_string), Vec::new())
     }
 
-    fn warns(pairs: &[(String, Option<String>)], end: NaiveDate, today: NaiveDate) -> Vec<String> {
+    /// `driver_cds` 1 名 (Refs #205 の 32 が alc に足す前方互換フィールド)。
+    fn driver_pair(unko_no: &str, etag: Option<&str>, driver_cd: &str) -> Pair {
+        crew_pair(unko_no, etag, &[driver_cd])
+    }
+
+    /// `driver_cds` 複数名 — 1 運行に主 / 副運転が付くケース (Refs #205 の 32)。
+    fn crew_pair(unko_no: &str, etag: Option<&str>, driver_cds: &[&str]) -> Pair {
+        (
+            unko_no.to_string(),
+            etag.map(str::to_string),
+            driver_cds.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    type Pair = (String, Option<String>, Vec<String>);
+
+    fn warns(pairs: &[Pair], end: NaiveDate, today: NaiveDate) -> Vec<String> {
         missing_input_warnings(&InputCoverage::measure(pairs, end, today))
     }
 
@@ -1804,7 +1998,11 @@ mod tests {
         ];
         let w = warns(&pairs, d(2026, 7, 1), d(2026, 7, 20));
         assert_eq!(w.len(), 1, "末尾 7 日ぶんの欠け: {w:?}");
-        assert!(w[0].contains("末尾が 7 日不足"), "不足日数を書く: {w:?}");
+        // driver_cd 無しなので全員 1 グループにまとまり、その 1 グループが超過する
+        assert!(
+            w[0].contains("乗務員1名の末尾が7日超"),
+            "不足日数を書く: {w:?}"
+        );
         assert!(w[0].contains("2026-06-01..2026-06-24"), "範囲を書く: {w:?}");
         assert!(
             w[0].contains("期待=2026-07-01"),
@@ -1819,6 +2017,100 @@ mod tests {
         // 7 月を 07-04 に畳む — 窓の端 (08-01) はまだ来ていない
         let w = warns(&pairs, d(2026, 8, 1), d(2026, 7, 4));
         assert!(w.is_empty(), "当月の末尾の空きは欠けではない: {w:?}");
+    }
+
+    /// **#205-32 の本題。** 他の乗務員が窓の端まで在ると、月・全乗務員通しの
+    /// `last` はそこに張り付き、1 名だけの末尾欠けが埋もれて沈黙する。
+    /// `driver_cd` 無し (現行相当) では鳴らず、`driver_cd` 有り (乗務員別) では鳴る。
+    #[test]
+    fn missing_input_warnings_catches_a_single_drivers_tail_gap_when_others_cover_the_window() {
+        // D1 / D2 は窓の端 (06-30) まで在る。D3 は 06-20 で切れている (10 日不足)。
+        let no_driver = vec![
+            pair("26063010000000000023021", Some("e1")),
+            pair("26063010000000000023022", Some("e2")),
+            pair("26062010000000000023023", Some("e3")),
+        ];
+        let w_old = warns(&no_driver, d(2026, 6, 30), d(2026, 7, 5));
+        assert!(
+            w_old.is_empty(),
+            "driver_cd 無し (現行相当) は沈黙: {w_old:?}"
+        );
+
+        let with_driver = vec![
+            driver_pair("26063010000000000023021", Some("e1"), "D1"),
+            driver_pair("26063010000000000023022", Some("e2"), "D2"),
+            driver_pair("26062010000000000023023", Some("e3"), "D3"),
+        ];
+        let w_new = warns(&with_driver, d(2026, 6, 30), d(2026, 7, 5));
+        assert_eq!(w_new.len(), 1, "{w_new:?}");
+        assert!(
+            w_new[0].contains("乗務員1名の末尾が10日超"),
+            "D3 だけ検出する: {w_new:?}"
+        );
+    }
+
+    /// 全乗務員が窓の端まで揃っていれば (driver_cd 有りでも) 鳴らない。
+    #[test]
+    fn missing_input_warnings_is_silent_when_every_driver_covers_the_window() {
+        let pairs = vec![
+            driver_pair("26063010000000000023021", Some("e1"), "D1"),
+            driver_pair("26063010000000000023022", Some("e2"), "D2"),
+            // 1 日の空きは実測の自然な揺らぎとして許容範囲内 (MAX_TAIL_GAP_DAYS = 2)
+            driver_pair("26062910000000000023023", Some("e3"), "D3"),
+        ];
+        let w = warns(&pairs, d(2026, 6, 30), d(2026, 7, 5));
+        assert!(w.is_empty(), "全員揃っているので静か: {w:?}");
+    }
+
+    /// 進行中の月の `today - 1 日` への切り下げは、乗務員別に割っても効く。
+    #[test]
+    fn missing_input_warnings_clamps_the_expectation_to_yesterday_per_driver() {
+        // 7 月を対象、today=07-04 → 期待は 07-03 に切り下がる。D1/D2 とも
+        // そこまで在るので静か (1 名だけの窓だと偶然揃うのと区別が付かないため 2 名で確認)。
+        let pairs = vec![
+            driver_pair("26070310000000000023021", Some("e1"), "D1"),
+            driver_pair("26070310000000000023022", Some("e2"), "D2"),
+        ];
+        let w = warns(&pairs, d(2026, 8, 1), d(2026, 7, 4));
+        assert!(w.is_empty(), "乗務員別でも当月クランプが効く: {w:?}");
+    }
+
+    /// **1 運行に複数の乗務員 (主 / 副運転) が付く場合、その開始日は両方の `last`
+    /// に寄与する。** `list_operations_for_drivers` の `DISTINCT ON (driver_id,
+    /// unko_no)` により同じ `unko_no` が複数 `driver_cd` に紐づき得るため。
+    #[test]
+    fn missing_input_warnings_lets_one_operation_cover_multiple_crew_drivers() {
+        // D1/D2 は同じ運行 (主/副運転) で窓の端まで在る。D3 は単独で 06-20 止まり。
+        let pairs = vec![
+            crew_pair("26063010000000000023021", Some("e1"), &["D1", "D2"]),
+            driver_pair("26062010000000000023023", Some("e3"), "D3"),
+        ];
+        let w = warns(&pairs, d(2026, 6, 30), d(2026, 7, 5));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("乗務員1名の末尾が10日超"),
+            "D1/D2 は揃っているので D3 だけ: {w:?}"
+        );
+    }
+
+    /// `InputCoverage::driver_cd_source` は `driver_cds` を持つ item が 1 件でも
+    /// あれば `true`。alc がまだ返さない環境と、乗務員別検知が効いている環境の
+    /// 切り分けに使う (Refs #205 の 32)。
+    #[test]
+    fn input_coverage_reports_whether_driver_cds_were_present() {
+        let none = InputCoverage::measure(
+            &[pair("26063010000000000023021", Some("e1"))],
+            d(2026, 6, 30),
+            d(2026, 7, 5),
+        );
+        assert!(!none.driver_cd_source, "driver_cds 無しはフォールバック");
+
+        let some = InputCoverage::measure(
+            &[driver_pair("26063010000000000023021", Some("e1"), "D1")],
+            d(2026, 6, 30),
+            d(2026, 7, 5),
+        );
+        assert!(some.driver_cd_source, "driver_cds 有りは乗務員別判定");
     }
 
     /// **1 件も日付が読めなければ「判定できない」ではなく警告。** 安全側。
