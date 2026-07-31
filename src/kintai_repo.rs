@@ -240,6 +240,43 @@ pub trait KintaiEventsApi: Send + Sync {
         self.fetch_ferry_between(&from, &to, driver).await
     }
 
+    /// 任意の期間 `[from, to)` の**休息だけ**を、`運行NO` 付きで両表から読む
+    /// (Refs #205 の 41)。`driver` を省略すると全乗務員。
+    ///
+    /// [`crate::kintai_rest_diff`] が `time_card_dtako` (`source = "dtako"`) と
+    /// `dtako_events` (`source = "dtako_events"`) の休息を突き合わせ、書き戻しが
+    /// 追従していない運行を名指しするための読み出し口。
+    ///
+    /// **`fetch_all_events_between` では代わりにならない。** あちらは速さのために
+    /// `運行NO` を落としており ([`ALL_EVENTS_SQL`])、運行を鍵にした突合ができない。
+    /// 1 名ずつ [`fetch_events_between`] を叩けば `運行NO` は付くが、94 名で 33.6 秒
+    /// かかる ([`TIMECARD_WINDOW_SQL`] の実測) ので月まるごとの診断には使えない。
+    ///
+    /// **既定は `NotConfigured` = 503。** フェリー ([`fetch_ferry_between`]) と同じ
+    /// オンプレ専用の口で、`dtako_events` を持たない実行形態では答えようがない。
+    ///
+    /// [`fetch_events_between`]: KintaiEventsApi::fetch_events_between
+    /// [`fetch_ferry_between`]: KintaiEventsApi::fetch_ferry_between
+    async fn fetch_rest_events_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        Err(KintaiRepoError::NotConfigured)
+    }
+
+    /// 対象月 (`YYYY-MM`) の休息。範囲は [`month_range`] (イベントと同じ窓)。
+    async fn fetch_rest_events(
+        &self,
+        month: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let (from, to) = month_range(month)
+            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        self.fetch_rest_events_between(&from, &to, driver).await
+    }
+
     /// 対象月の dtako 側 (alc) 指紋材料 (Refs #205 実装計画 13、月ゲート)。
     ///
     /// `fetch_all_events_between` を実際に読まなくても「前回 fold したときと入力が
@@ -564,6 +601,82 @@ SELECT t.driver_id
  ORDER BY driver_id
 "#;
 
+/// 休息だけを `運行NO` 付きで両表から読む (Refs #205 の 41)。
+///
+/// [`EVENTS_SQL`] から **`timecard` のブランチと `dtako_cars` の JOIN を落とし、
+/// `休息` に絞った**もの。列は 6 つで `vehicle` を持たない — 突合に要るのは
+/// 「どの運行の休息が何時か」だけで、車輌名は使わない。
+///
+/// - **`ALL_EVENTS_SQL` と違い `運行NO` を返す。** これが鍵なので落とせない。
+///   代わりに `dtako_cars` の引き当てを外し、`休息` で絞って行数を落とす
+///   (`ALL_EVENTS_SQL` の実測で支配的だったのは JOIN と全イベントの転送)
+/// - **絞りは解決後の名前で行う** (`COALESCE(t.event_name, s.name) = '休息'`)。
+///   `state` の番号で絞ると「state 20 だが別の名前」の行を取り違える
+///   ([`crate::kintai_push::NOT_CARRIED_STATES`] と同じ理由)
+/// - `dtako_events` を 2 ブランチに分ける理由・`COALESCE` で 1 本にまとめては
+///   いけない理由は [`EVENTS_SQL`] と同じ
+/// - `:driver` が NULL なら全乗務員 (`fetch_rest_events_between` の `driver: None`)
+const REST_EVENTS_SQL: &str = r#"
+SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
+       NULL                                         AS end_datetime,
+       t.driver_id                                  AS driver_id,
+       'dtako'                                      AS source,
+       COALESCE(t.event_name, s.name)               AS state,
+       t.unko_no                                    AS unko_no
+  FROM time_card_dtako t
+  LEFT JOIN time_card_dtako_state s ON s.id = t.state
+ WHERE t.datetime >= :from AND t.datetime < :to
+   AND (:driver IS NULL OR t.driver_id = :driver)
+   AND COALESCE(t.event_name, s.name) = '休息'
+UNION ALL
+SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
+       DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
+       e.`対象乗務員CD`,
+       'dtako_events',
+       e.`イベント名`,
+       e.`運行NO`
+  FROM dtako_events e
+ WHERE e.`開始日時` >= :from AND e.`開始日時` < :to
+   AND (:driver IS NULL OR e.`対象乗務員CD` = :driver)
+   AND e.`イベント名` = '休息'
+UNION ALL
+SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
+       DATE_FORMAT(e.`終了日時`, '%Y-%m-%d %H:%i:%s'),
+       e.`対象乗務員CD`,
+       'dtako_events',
+       e.`イベント名`,
+       e.`運行NO`
+  FROM dtako_events e
+ WHERE e.`終了日時` >= :from AND e.`終了日時` < :to
+   AND e.`開始日時` < :from
+   AND (:driver IS NULL OR e.`対象乗務員CD` = :driver)
+   AND e.`イベント名` = '休息'
+ ORDER BY unko_no, datetime, source
+"#;
+
+/// `REST_EVENTS_SQL` の 1 行 (列の順序と 1:1)。
+type RestEventRow = (
+    String,
+    Option<String>,
+    Option<i64>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// 休息の 1 行を JSON へ。`vehicle` は**キーごと出さない** (読んでいないため)。
+fn rest_row_to_json(row: RestEventRow) -> serde_json::Value {
+    let (datetime, end_datetime, driver_id, source, state, unko_no) = row;
+    serde_json::json!({
+        "datetime": datetime,
+        "end_datetime": end_datetime,
+        "driver_id": driver_id,
+        "source": source,
+        "state": state,
+        "unko_no": unko_no,
+    })
+}
+
 /// フェリー区間 (Refs #146)。
 ///
 /// - **`dtako_ferry_rows` は 3 列しか読めない** (`運行NO` / `開始日時` / `終了日時`)。
@@ -725,6 +838,32 @@ impl KintaiEventsApi for MariadbKintaiEventsRepo {
             .await
             .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
         Ok(rows.into_iter().map(row_to_json).collect())
+    }
+
+    /// 休息だけを `運行NO` 付きで両表から読む (Refs #205 の 41、[`REST_EVENTS_SQL`])。
+    async fn fetch_rest_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let rows: Vec<RestEventRow> = conn
+            .exec(
+                REST_EVENTS_SQL,
+                params! {
+                    "from" => from,
+                    "to" => to,
+                    "driver" => driver,
+                },
+            )
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(rest_row_to_json).collect())
     }
 
     async fn fetch_all_events_between(

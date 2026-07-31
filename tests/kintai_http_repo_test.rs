@@ -795,6 +795,19 @@ impl KintaiEventsApi for FallbackStub {
         Ok(vec![json!({"start_datetime": "2026-07-02 10:00:00",
                        "end_datetime": "2026-07-02 14:00:00", "driver_id": 1130})])
     }
+
+    async fn fetch_rest_events_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        Ok(vec![
+            json!({"datetime": "2026-07-02 10:00:00", "end_datetime": null,
+                       "driver_id": 1130, "source": "dtako", "state": "休息",
+                       "unko_no": "26070208000000000011301"}),
+        ])
+    }
 }
 
 fn repo_with_fallback(base_url: &str) -> HttpKintaiEventsRepo {
@@ -879,6 +892,26 @@ async fn test_ferry_needs_the_fallback_and_is_fail_closed_without_it() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["driver_id"], 1130);
+}
+
+/// 休息のずれの突合もオンプレ専用 (Refs #205 の 41)。左辺の `time_card_dtako` は
+/// 上流に口が無いので、フェリーと同じく委譲先が無ければ 503。
+#[tokio::test]
+async fn test_rest_events_need_the_fallback_and_are_fail_closed_without_it() {
+    let server = MockServer::start().await;
+    let err = repo(&server.uri())
+        .fetch_rest_events("2026-07", Some(1130))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, KintaiRepoError::NotConfigured));
+
+    let rows = repo_with_fallback(&server.uri())
+        .fetch_rest_events("2026-07", Some(1130))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["source"], "dtako");
+    assert_eq!(rows[0]["state"], "休息");
 }
 
 // ── token の渡し方 ────────────────────────────────────────────────────────
