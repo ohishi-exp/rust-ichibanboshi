@@ -317,6 +317,23 @@ SELECT (occurred_at AT TIME ZONE 'Asia/Tokyo')::date AS d,
  GROUP BY 1
 "#;
 
+/// 打刻側の月ゲート材料 (Refs #205 実装計画 13)。[`STORED_SIGNATURES_SQL`] と
+/// 同じ列の組み立てを月まるごと 1 行の sha256 へ畳む — 乗務員ごと・暦日ごとの
+/// 表を Rust 側へ引いてから畳み直さず、集計そのものを Postgres の 1 クエリで
+/// 終わらせる。`coalesce(string_agg(...), '')` は打刻が 1 件も無い月でも
+/// `sha256('')` の固定値を返すため (`string_agg` は行が無いと NULL になり、
+/// `sha256(NULL)` も NULL — `fold_gate.punch_digest` は NOT NULL なのでここで潰す)。
+pub const MONTH_PUNCH_DIGEST_SQL: &str = r#"
+SELECT encode(sha256(convert_to(coalesce(string_agg(
+           driver_cd || '|' ||
+           to_char(occurred_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
+             || '|' || state || '|' || source || '|' || coalesce(unko_no, ''),
+           E'\n' ORDER BY driver_cd, occurred_at, state COLLATE "C", source COLLATE "C"), ''),
+         'UTF8')), 'hex') AS digest
+  FROM kintai.kintai_events
+ WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3 AND source = ANY($4)
+"#;
+
 /// [`STORED_SIGNATURES_SQL`] の**複数乗務員版**。式は 1 文字も変えない。
 ///
 /// 署名の突き合わせを**受け側の中**でやるための口 (Refs #205 の 04b)。送り側が
@@ -585,6 +602,29 @@ impl KintaiPgStore {
                 .insert(r.get::<NaiveDate, _>("d"), r.get::<String, _>("sig"));
         }
         Ok(out)
+    }
+
+    /// 打刻側 (Pg) の月ゲート材料。対象月まるごとを 1 行の sha256 に畳んだもの
+    /// (Refs #205 実装計画 13、[`MONTH_PUNCH_DIGEST_SQL`])。
+    ///
+    /// 索引 `kintai_events_driver_time (tenant_id, driver_cd, occurred_at)
+    /// INCLUDE (state, source, unko_no)` の tenant_id 部分だけを使う index-only
+    /// scan になる (driver_cd を等値で絞らないので occurred_at の範囲条件はここでは
+    /// leaf を絞れないが、必要な列は全て INCLUDE 済みなのでヒープへは行かない)。
+    pub async fn stored_month_punch_digest(
+        &self,
+        from: DateTime<FixedOffset>,
+        to: DateTime<FixedOffset>,
+    ) -> Result<String, KintaiPushError> {
+        use sqlx::Row;
+        let row = sqlx::query(MONTH_PUNCH_DIGEST_SQL)
+            .bind(self.tenant_id)
+            .bind(from)
+            .bind(to)
+            .bind(&PUSHED_SOURCES[..])
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<String, _>("digest"))
     }
 
     /// 差分のあった日だけを delete-then-insert する。**1 トランザクション**。

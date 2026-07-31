@@ -950,3 +950,213 @@ async fn test_empty_token_command_is_rejected_at_construction() {
     // 空白だけの command は「無指定」と同じ (token 無しで組める)
     assert!(HttpKintaiEventsRepo::new(&c, None).is_ok());
 }
+
+// ── 月ゲート: dtako 側 digest (Refs #205 実装計画 13) ────────────────────────
+
+#[tokio::test]
+async fn test_month_digest_hits_the_etags_endpoint_with_the_right_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/dtako/events/etags"))
+        // month_etags_bounds("2026-07") = [07-01, 08-01] (両端含む)
+        .and(query_param("date_from", "2026-07-01"))
+        .and(query_param("date_to", "2026-08-01"))
+        .and(header(
+            "x-tenant-id",
+            "11111111-2222-3333-4444-555555555555",
+        ))
+        .and(header("authorization", "Bearer test-id-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-07-01", "date_to": "2026-08-01"},
+            "items": [
+                {"unko_no": "U1", "etag": "etag1"},
+                {"unko_no": "U2", "etag": "etag2"},
+            ],
+            "warnings": [],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let digest = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+    assert!(digest.is_some());
+}
+
+#[tokio::test]
+async fn test_month_digest_is_stable_regardless_of_item_order() {
+    let server = MockServer::start().await;
+    let body = |items: Value| {
+        json!({
+            "period": {"date_from": "2026-07-01", "date_to": "2026-08-01"},
+            "items": items,
+            "warnings": [],
+        })
+    };
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body(json!([
+            {"unko_no": "U1", "etag": "etag1"},
+            {"unko_no": "U2", "etag": "etag2"},
+        ]))))
+        .mount(&server)
+        .await;
+    let a = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+
+    let server2 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body(json!([
+            {"unko_no": "U2", "etag": "etag2"},
+            {"unko_no": "U1", "etag": "etag1"},
+        ]))))
+        .mount(&server2)
+        .await;
+    let b = repo(&server2.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+    assert_eq!(a, b, "並び順は digest に影響しない");
+}
+
+#[tokio::test]
+async fn test_month_digest_changes_when_an_etag_changes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-07-01", "date_to": "2026-08-01"},
+            "items": [{"unko_no": "U1", "etag": "etag1"}],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let before = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+
+    let server2 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-07-01", "date_to": "2026-08-01"},
+            "items": [{"unko_no": "U1", "etag": "etag1-changed"}],
+            "warnings": [],
+        })))
+        .mount(&server2)
+        .await;
+    let after = repo(&server2.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+    assert_ne!(before, after, "etag が変われば digest も変わる");
+}
+
+/// **alc に口が無い環境 (404) では `Ok(None)`** — エラーにせず「使えない」を表す。
+/// 呼び出し側 (月ゲート) はこれを見て安全側 (従来どおり全量読み) に degrade する。
+#[tokio::test]
+async fn test_month_digest_is_none_when_upstream_has_no_etags_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&server)
+        .await;
+    let digest = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+    assert!(digest.is_none());
+}
+
+/// 404 以外の失敗は `None` に潰さず `Err` にする — 「口はあるはずなのに読めなかった」
+/// ことを呼び出し側から見えるようにするため。
+#[tokio::test]
+async fn test_month_digest_non_404_failure_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    let err = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("500"), "{msg}");
+    assert!(msg.contains("boom"), "{msg}");
+}
+
+#[tokio::test]
+async fn test_month_digest_malformed_body_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>nope</html>"))
+        .mount(&server)
+        .await;
+    let err = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("parse"), "{err}");
+}
+
+#[tokio::test]
+async fn test_month_digest_unreachable_upstream_is_an_error() {
+    let err = repo("http://127.0.0.1:1")
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("request"), "{err}");
+}
+
+#[tokio::test]
+async fn test_month_digest_broken_month_fails_before_any_request() {
+    let server = MockServer::start().await;
+    let err = repo(&server.uri())
+        .fetch_dtako_month_digest("nope")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("bad month"), "{err}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+/// 上流の warnings は握り潰さず、成功した digest と一緒に持ち出せる
+/// ([`with_warning_sink`] 経由)。他の read 系と同じ配線であることの固定。
+#[tokio::test]
+async fn test_month_digest_upstream_warnings_do_not_fail_the_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-07-01", "date_to": "2026-08-01"},
+            "items": [{"unko_no": "U1", "etag": "etag1"}],
+            "warnings": ["U2: KUDGIVT 取得失敗 (NoSuchKey)"],
+        })))
+        .mount(&server)
+        .await;
+    let digest = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+    assert!(digest.is_some());
+}
+
+/// 一覧が空でも `Some(digest)` — 「対象が無い」と「判定できない」を混ぜない
+/// (空は `digest_from_pairs(&[])` の固定値、`None` は口が無い/失敗のときだけ)。
+#[tokio::test]
+async fn test_month_digest_of_an_empty_month_is_still_some() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "2026-07-01", "date_to": "2026-08-01"},
+            "items": [],
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let digest = repo(&server.uri())
+        .fetch_dtako_month_digest("2026-07")
+        .await
+        .unwrap();
+    assert!(digest.is_some());
+}

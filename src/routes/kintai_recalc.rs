@@ -38,6 +38,50 @@
 //! `elapsed_ms` (全体) と `fold.elapsed_ms` (fold だけ) の差で読める
 //! — 見積もりで上限を決めない、が [`crate::kintai_diff`] と同じ方針。
 //!
+//! ## 月ゲート (実装計画 13) — 変化が無ければ全量読みそのものを省く
+//!
+//! 上の実測は「毎回 R2 から読み直す」前提。前回 fold 時から dtako 側 (alc の
+//! etag) も打刻側 (Pg) も変わっていなければ、`month_gate_report` が刺さり、
+//! `fold_month` を 1 回も呼ばずに「変化無し」を返す (25〜55 秒 → 索引参照だけの
+//! 数十ミリ秒)。定常時 (当日以外) はほぼこちら。当月は毎日データが増えるので、
+//! 日 1 回程度は上の実測どおり全量読みになる。
+//!
+//! **この口は「そのページで月まるごとを完結させたときだけ」gate を書く** —
+//! `apply` かつ `after_driver_cd` 無し (1 ページ目から) かつ `next_after_driver_cd`
+//! が無い (回りきった) かつ `stale_only` でない (母集団を狭めていない) かつ
+//! 上流 warnings が空 (R2 の分割遅れ中の欠けた入力を「最新」と刻まない) の
+//! 5 条件が揃ったときだけ。母集団 (実測 132 名) は `DEFAULT_MAX_FOLD_DRIVERS`
+//! (100) より上の `max_drivers` を渡せば 1 ページで収まる。書く digest は
+//! ページ処理の**冒頭**で判定した値のまま (fold の後に作り直さない —
+//! [`crate::kintai_fold::MonthGate::Miss`] の docs)。それ以外のページ (2 ページ目
+//! 以降・stale_only・dry-run 等) は読むだけで書かない — 1 ページ目だけ処理した
+//! 時点で「この月は最新」と刻むと、未処理ページの乗務員が古い fingerprint の
+//! まま取り残される (#225 / #234 と同型の事故) ため。
+//!
+//! ### 運用: `kosoku.rs` deploy 直後の gate 書き込みは**2 段構え**
+//!
+//! `kosoku.rs` を deploy すると `logic_version` が変わり全乗務員が stale になる
+//! (モジュール冒頭の表)。この直後に**いきなり 1 ページで全員 apply しようとしない
+//! こと** — #205-15 の本番実測 (2026-06、137 名) では、実際に書き込みが乗ると
+//! 1 ページ 100 名で応答 109 秒 (fold だけで 82.6 秒)。137 名を 1 ページに収めて
+//! 全員書かせようとすると 150 秒超が見込まれ、auth-worker proxy の 100 秒上限に
+//! 触りうる。
+//!
+//! 収束済ませてから封をする、の 2 回に分ける:
+//!
+//! 1. **収束させる**: 既定のページング (`max_drivers` 既定 100) のまま
+//!    `apply=true` を最後のページ (`next_after_driver_cd` が `null` になる) まで
+//!    回す。実際の書き込みはここで終わる (137 名なら 2 ページ、実測 109 秒 + 57 秒)
+//! 2. **封をする**: 続けて `max_drivers=150` (母集団を 1 ページに収める) +
+//!    `apply=true` を**もう 1 回**。1 で全員書き終えた直後なので全員 unchanged —
+//!    fold だけで済み (実測 fold 23.5 秒、応答 50 秒程度)、上の 5 条件
+//!    (1 ページ目・回りきる・stale_only でない・warnings 空) を満たして
+//!    **その回が gate の初回書き込みを兼ねる**
+//!
+//! 以後は月ゲートが刺さり続け、次に `kosoku.rs` や TOML を変えるまで実質ゼロ読み
+//! になる。**5 条件は「そのページで実際に何か書いたか」を問わない** — 2 の呼び出しが
+//! 全員 unchanged でも、月まるごと 1 ページで回りきっていれば gate は書かれる。
+//!
 //! ## GET は絶対に書かない
 //!
 //! `GET` は `apply` を持たない。「読むだけのつもりが全乗務員を書き直していた」を
@@ -154,6 +198,33 @@ async fn run(
     let st = store_for(&pg, &headers)?;
     // 読みと書きが別テナントのまま畳まない (窓の受け口と同じ検査)
     assert_same_tenant(read_tenant, st.tenant_id())?;
+
+    // 月ゲート (実装計画 13) — 前回 fold 時から dtako 側 (alc) / 打刻側 (Pg) の
+    // どちらも変わっていなければ、fold_month の全量読みを 1 バイトも払わずに
+    // 「変化無し」を返す ([`crate::kintai_fold::MonthGate`] docs)。miss / unavailable
+    // なら通常どおり進む — miss の digest は末尾の書き込み判定まで運ぶ
+    // (fold 後に作り直さない。理由は MonthGate::Miss の docs)
+    let gate = crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply)
+        .await
+        .map_err(map_push_err)?;
+    if let crate::kintai_fold::MonthGate::Hit(report) = &gate {
+        let months = [req.month.clone()];
+        let stale = stale_state(&st, &months, &params)
+            .await
+            .map_err(map_push_err)?;
+        let (n, w) = (report.drivers, report.drivers_written);
+        tracing::info!(n, w, "kintai recalc page done (gate)");
+        return Ok(Json(serde_json::json!({
+            "month": req.month,
+            "apply": req.apply,
+            "drivers": Vec::<i64>::new(),
+            "next_after_driver_cd": Option::<i64>::None,
+            "fold": report,
+            "stale": stale,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })));
+    }
+
     let max = req
         .max_drivers
         .unwrap_or(DEFAULT_MAX_FOLD_DRIVERS)
@@ -193,6 +264,34 @@ async fn run(
         false => page.last().copied(),
     };
     let (folded, stale) = fold_page(&st, &params, &req, &page, all_units, warnings).await?;
+
+    // 月ゲート (実装計画 13) — このページで月まるごとを完結させたときだけ書く。
+    // 5 条件は crate::kintai_fold::month_gate_report の呼び出し元向け docs 参照。
+    // digest は呼び出し冒頭で判定した値のまま (fold 後に作り直さない)
+    if let crate::kintai_fold::MonthGate::Miss {
+        dtako_digest,
+        punch_digest,
+        logic_version,
+    } = gate
+    {
+        let completed_the_whole_month = req.apply
+            && req.after_driver_cd.is_none()
+            && next.is_none()
+            && !req.stale_only
+            && folded.warnings.is_empty();
+        if completed_the_whole_month {
+            crate::kintai_fold::write_fold_gate(
+                &st,
+                &req.month,
+                &dtako_digest,
+                &punch_digest,
+                &logic_version,
+            )
+            .await
+            .map_err(map_push_err)?;
+        }
+    }
+
     // マクロは 1 行に収める (CLAUDE.md)
     let (n, w) = (folded.drivers, folded.drivers_written);
     tracing::info!(n, w, "kintai recalc page done");

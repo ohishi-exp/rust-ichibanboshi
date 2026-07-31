@@ -878,10 +878,191 @@ pub async fn fold_month(
     Ok(units)
 }
 
+// ── 13: 月ゲート ─────────────────────────────────────────────────────────
+
+/// 前回 fold したときの入力の指紋 (Refs #205 実装計画 13、`kintai.fold_gate`)。
+struct FoldGateRow {
+    dtako_digest: String,
+    punch_digest: String,
+    logic_version: String,
+}
+
+const FOLD_GATE_SELECT_SQL: &str = r#"
+SELECT dtako_digest, punch_digest, logic_version
+  FROM kintai.fold_gate
+ WHERE tenant_id = $1 AND month = $2
+"#;
+
+/// 書いてよいのは「月まるごとを 1 呼び出しで完結させた」ときだけ。
+/// [`recalc_month`] (`driver` 省略) と、それを満たした
+/// [`crate::routes::kintai_recalc::run`] の 1 ページが両方これに当たる —
+/// 判定条件はそれぞれの docs 参照。
+const FOLD_GATE_UPSERT_SQL: &str = r#"
+INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version, folded_at)
+VALUES ($1, $2, $3, $4, $5, now())
+ON CONFLICT (tenant_id, month) DO UPDATE
+   SET dtako_digest = EXCLUDED.dtako_digest,
+       punch_digest = EXCLUDED.punch_digest,
+       logic_version = EXCLUDED.logic_version,
+       folded_at = EXCLUDED.folded_at
+"#;
+
+async fn read_fold_gate(
+    store: &KintaiPgStore,
+    month: &str,
+) -> Result<Option<FoldGateRow>, KintaiPushError> {
+    use sqlx::Row;
+    let row = sqlx::query(FOLD_GATE_SELECT_SQL)
+        .bind(store.tenant_id())
+        .bind(month)
+        .fetch_optional(store.pool())
+        .await?;
+    Ok(row.map(|r| FoldGateRow {
+        dtako_digest: r.get::<String, _>("dtako_digest"),
+        punch_digest: r.get::<String, _>("punch_digest"),
+        logic_version: r.get::<String, _>("logic_version"),
+    }))
+}
+
+/// `pub(crate)` — [`crate::routes::kintai_recalc::run`] からも直接呼ぶ (実装計画 13)。
+///
+/// TODO(#205 別タスク、対象外と決定 2026-07-31): [`recalc_month`] 経由 (CLI の
+/// `Recalc` / `Sync`) は `apply` なら warnings の有無を見ずに書いている。R2 の
+/// 分割遅れ中に「最新」と刻む同種のリスクがあるが、この経路はオンプレ CLI 専用
+/// (`main.rs` の `--allow-onprem-fold` 無しでは既定拒否、GCP 本番の定常経路には
+/// 乗らない) なので本 PR のスコープ外とした。
+pub(crate) async fn write_fold_gate(
+    store: &KintaiPgStore,
+    month: &str,
+    dtako_digest: &str,
+    punch_digest: &str,
+    logic_version: &str,
+) -> Result<(), KintaiPushError> {
+    sqlx::query(FOLD_GATE_UPSERT_SQL)
+        .bind(store.tenant_id())
+        .bind(month)
+        .bind(dtako_digest)
+        .bind(punch_digest)
+        .bind(logic_version)
+        .execute(store.pool())
+        .await?;
+    Ok(())
+}
+
+/// いまの月の入力から指紋を作る。**`Ok(None)` は「判定できない」の意味** —
+/// alc に `GET /api/dtako/events/etags` の口が無い環境や、上流エラーがこれになる。
+/// どちらも呼び出し側は安全側 (従来どおり全量読み) に倒す。**loud** — 呼び出し元の
+/// 応答を握り潰さないよう、ここで tracing::warn しておく。
+///
+/// 打刻側 ([`KintaiPgStore::stored_month_punch_digest`]) の窓は [`fold_month`] が
+/// 実際に読む [`month_range`] と**同じ**にする。窓がずれると、fold の入力が
+/// 変わっているのに月ゲートだけ古い窓を見て「変わっていない」と誤判定しうる。
+async fn compute_month_digests(
+    repo: &DynKintaiEventsRepo,
+    store: &KintaiPgStore,
+    month: &str,
+) -> Result<Option<(String, String)>, KintaiPushError> {
+    let dtako_digest = match repo.fetch_dtako_month_digest(month).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            tracing::info!(month = %month, "kintai month-gate unavailable (no alc etags endpoint)");
+            return Ok(None);
+        }
+        Err(e) => {
+            tracing::warn!(month = %month, error = %e, "kintai month-gate dtako digest failed");
+            return Ok(None);
+        }
+    };
+    let (from_s, to_s) = month_range(month)
+        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
+    let bad_month = || KintaiPushError::NotConfigured(format!("bad month: {month}"));
+    let from = tz(parse_dt(&from_s).ok_or_else(bad_month)?);
+    let to = tz(parse_dt(&to_s).ok_or_else(bad_month)?);
+    let punch_digest = store.stored_month_punch_digest(from, to).await?;
+    Ok(Some((dtako_digest, punch_digest)))
+}
+
+/// 保存済みの指紋がいまの指紋と一致するか (= 読み・畳みを省いてよいか)。
+async fn month_gate_hit(
+    store: &KintaiPgStore,
+    month: &str,
+    version: &str,
+    dtako_digest: &str,
+    punch_digest: &str,
+) -> Result<bool, KintaiPushError> {
+    let stored = read_fold_gate(store, month).await?;
+    Ok(stored.is_some_and(|g| {
+        g.logic_version == version
+            && g.dtako_digest == dtako_digest
+            && g.punch_digest == punch_digest
+    }))
+}
+
+/// 月ゲートの判定結果 (実装計画 13)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonthGate {
+    /// 一致した — 呼び出し側はこの [`FoldReport`] をそのまま返してよい。
+    /// [`fold_month`] の読みを 1 バイトも払っていない。
+    Hit(FoldReport),
+    /// 一致しなかった (gate が未確立な場合も含む) — 通常どおり読み・畳みへ進む。
+    ///
+    /// **digest は「判定した瞬間の値」。** 月まるごとを完結させたときに書き戻すのは
+    /// 必ずこの値のまま — fold の後に作り直さない。処理中に入力が増えても、
+    /// 古い digest を書く方が安全側 (次回また miss して読み直すだけ)。新しい
+    /// digest を書くと、増えた分が畳まれないまま「最新」として取り残される
+    /// (静かに間違う側の事故)。
+    Miss {
+        dtako_digest: String,
+        punch_digest: String,
+        logic_version: String,
+    },
+    /// 判定できない (alc に口が無い / 上流エラー)。gate を諦めて常に読みに進む。
+    Unavailable,
+}
+
+/// 月ゲートを判定する (実装計画 13)。**読むだけで書かない** — 書くかどうかは
+/// 呼び出し側が「月まるごとを 1 呼び出しで完結させたか」を見て決める
+/// ([`recalc_month`] / [`crate::routes::kintai_recalc::run`] の docs 参照)。
+pub async fn month_gate_report(
+    repo: &DynKintaiEventsRepo,
+    store: &KintaiPgStore,
+    params: &KosokuParams,
+    month: &str,
+    apply: bool,
+) -> Result<MonthGate, KintaiPushError> {
+    let Some((dtako_digest, punch_digest)) = compute_month_digests(repo, store, month).await?
+    else {
+        return Ok(MonthGate::Unavailable);
+    };
+    let version = logic_version(params);
+    if month_gate_hit(store, month, &version, &dtako_digest, &punch_digest).await? {
+        tracing::info!(month = %month, "kintai month-gate skip");
+        return Ok(MonthGate::Hit(new_report(params, apply)));
+    }
+    Ok(MonthGate::Miss {
+        dtako_digest,
+        punch_digest,
+        logic_version: version,
+    })
+}
+
 /// 対象月を再計算して保存する (実装計画 05)。
 ///
 /// 畳むのは [`fold_month`] (生イベントの読みは月 1 回)。ここがやるのは
 /// 保存済みの姿との突き合わせと書き込みだけ。
+///
+/// ## 月ゲート (実装計画 13、`driver` 省略時だけ)
+///
+/// `driver` を指定しない呼び出しは**月まるごとを 1 回で完結させる**経路の 1 つ
+/// (CLI の `Recalc` / `Sync`、systemd timer が呼ぶのはこちら。もう 1 つは
+/// [`crate::routes::kintai_recalc::run`] が全ページ回りきったとき)。前回 fold
+/// 時の指紋といまの指紋が一致すれば、[`fold_month`] の読み (R2 GET が運行数ぶん)
+/// もその後の乗務員ごとの `stored_state` 突き合わせも**まるごと省く**。
+///
+/// **[`recalc_drivers`] はこの gate を読むだけで書かない。** ページングされた
+/// 再計算の 1 ページだけが書いてしまうと、1 ページ目の乗務員だけ処理した時点で
+/// gate が「この月は最新」になり、未処理のページの乗務員が古い fingerprint の
+/// まま取り残される — #225 / #234 と同型の「静かに一部が消える」事故になる。
 pub async fn recalc_month(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,
@@ -890,6 +1071,25 @@ pub async fn recalc_month(
     driver: Option<u64>,
     apply: bool,
 ) -> Result<FoldReport, KintaiPushError> {
+    if driver.is_none() {
+        match month_gate_report(repo, store, params, month, apply).await? {
+            MonthGate::Hit(report) => return Ok(report),
+            MonthGate::Miss {
+                dtako_digest,
+                punch_digest,
+                logic_version,
+            } => {
+                let units = fold_month(repo, params, month, driver).await?;
+                let report = store_units(store, params, month, units, apply).await?;
+                if apply {
+                    write_fold_gate(store, month, &dtako_digest, &punch_digest, &logic_version)
+                        .await?;
+                }
+                return Ok(report);
+            }
+            MonthGate::Unavailable => {}
+        }
+    }
     let units = fold_month(repo, params, month, driver).await?;
     store_units(store, params, month, units, apply).await
 }
@@ -924,6 +1124,16 @@ pub async fn recalc_drivers(
 ) -> Result<FoldReport, KintaiPushError> {
     if drivers.is_empty() {
         return Ok(new_report(params, apply));
+    }
+    // 月ゲート (実装計画 13) — **読むだけで書かない** (理由は recalc_month docs)。
+    // ここで一致すれば、名指しした乗務員が全員すでに最新の指紋で保存済みという
+    // ことなので、fold_month の全量読みごと省いて "unchanged" 扱いで返す
+    if let MonthGate::Hit(_) = month_gate_report(repo, store, params, month, apply).await? {
+        tracing::info!(month = %month, n = drivers.len(), "kintai month-gate skip");
+        let mut report = new_report(params, apply);
+        report.drivers = drivers.len();
+        report.drivers_unchanged = drivers.len();
+        return Ok(report);
     }
     let all = fold_month(repo, params, month, None).await?;
     recalc_drivers_from_units(store, params, month, drivers, all, apply).await
