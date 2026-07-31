@@ -329,6 +329,16 @@ pub async fn run(
             get(routes::kintai_timecard::drivers),
         )
         .route("/kintai/timecard/diff", post(routes::kintai_timecard::diff))
+        // 窓ぶんをまるごと運ぶ経路 (Refs #205 の 04b)。**1 往復ずつで済む** —
+        // 乗務員ごとの署名引きが 94 名で 33.6 秒だったのを畳んだもの
+        .route(
+            "/kintai/timecard/events",
+            get(routes::kintai_timecard::window_events),
+        )
+        .route(
+            "/kintai/timecard/window",
+            post(routes::kintai_timecard::receive_window),
+        )
         .route("/kyuyo/companies", get(routes::kyuyo::companies))
         .route("/kyuyo/databases", get(routes::kyuyo::databases))
         .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
