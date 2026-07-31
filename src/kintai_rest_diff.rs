@@ -67,10 +67,61 @@ pub const SOURCE_DTAKO: &str = "dtako";
 /// 右辺 (`dtako_events` 由来) の `source`。
 pub const SOURCE_DTAKO_EVENTS: &str = "dtako_events";
 
+/// 食い違いの**形**。「押す対象」と「押しても無駄な対象」を分けるためにある。
+///
+/// **2026-06 の本番実測 (2026-07-31) で分けることになった。** 239 件出た食い違いが
+/// **全部 [`RestDiffKind::DtakoMissing`]** で、[`RestDiffKind::Mismatch`] は
+/// **0 件**だった。形を分けずに `total` だけ返すと「239 運行がずれている」と読めて
+/// しまうが、**「勤務時間再登録」を押す対象は 0 件**だった。
+/// 誤読する出力は、出力しないより悪いことがある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestDiffKind {
+    /// **両側に休息があって食い違う。** 書き戻しが追従していない疑い —
+    /// `yhonda-ohishi/nginx` PR #792 の「勤務時間再登録」を押す対象はこれだけ。
+    Mismatch,
+    /// `time_card_dtako` に休息が**1 行も無い**。書き戻しが一度も走っていないか、
+    /// その乗務員が打刻系に居ない (実測: `dtako_events` だけの乗務員が居る)。
+    /// **押しても直る保証が無い**ので [`RestDiffKind::Mismatch`] と混ぜない。
+    DtakoMissing,
+    /// `dtako_events` 側に休息が無く `time_card_dtako` にだけある。
+    /// デジタコ側から消えた休息が残っている形。
+    EventsMissing,
+}
+
+impl RestDiffKind {
+    /// 全ての形。`total_by_kind` を 0 込みで埋めるために持つ。
+    pub const ALL: [RestDiffKind; 3] = [
+        RestDiffKind::Mismatch,
+        RestDiffKind::DtakoMissing,
+        RestDiffKind::EventsMissing,
+    ];
+
+    /// JSON のキー (`serde` の `snake_case` と同じ綴り)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestDiffKind::Mismatch => "mismatch",
+            RestDiffKind::DtakoMissing => "dtako_missing",
+            RestDiffKind::EventsMissing => "events_missing",
+        }
+    }
+
+    /// 並べ替えの優先順。**`Mismatch` が最小** = 上限で切られても残る。
+    fn rank(self) -> u8 {
+        match self {
+            RestDiffKind::Mismatch => 0,
+            RestDiffKind::DtakoMissing => 1,
+            RestDiffKind::EventsMissing => 2,
+        }
+    }
+}
+
 /// 休息が食い違っている運行 1 本。
 #[derive(Debug, Serialize)]
 pub struct RestDiffUnko {
     pub unko_no: String,
+    /// 食い違いの形。**押す対象は [`RestDiffKind::Mismatch`] だけ** (enum の docs)。
+    pub kind: RestDiffKind,
     /// この運行で見えた乗務員CD (昇順・重複無し)。2 名乗務や表ごとの割れで
     /// 2 つ以上になることがある (モジュール docs)。
     pub driver_cds: Vec<i64>,
@@ -93,7 +144,16 @@ pub struct RestDiff {
     /// 食い違っている運行 (先頭 [`MAX_REST_DIFF`] 件)。
     pub items: Vec<RestDiffUnko>,
     /// 食い違っている運行の**総数**。`items` が切られたことが分かるように別に返す。
+    ///
+    /// **この数を「押す対象の数」と読まないこと** — 内訳は [`RestDiff::total_by_kind`]。
     pub total: usize,
+    /// **押す対象の数** ([`RestDiffKind::Mismatch`] の件数)。`total_by_kind` にも
+    /// 入っているが、**読み手の目に最初に入る位置に単独で置く** — 実測では
+    /// `total` 239 に対してこれが 0 で、混ぜると必ず読み違える。
+    pub mismatch_total: usize,
+    /// 形ごとの件数 ([`RestDiffKind`])。**`items` の上限では切られない総数**。
+    /// 出ない形のキーも 0 で必ず出す (「無い」と「数えていない」を分けるため)。
+    pub total_by_kind: BTreeMap<String, usize>,
     /// 乗務員CD → 食い違っている運行数。**`items` の上限では切られない** ので、
     /// 「どの乗務員が対象か」は総数のまま読める。
     pub by_driver: BTreeMap<String, usize>,
@@ -155,22 +215,38 @@ pub fn rest_diff(rows: &[serde_json::Value], from: &str, to: &str) -> RestDiff {
         .into_iter()
         .filter_map(|(unko_no, b)| to_item(unko_no, b))
         .collect();
-    // 乗務員別の内訳は上限で切る前に数える (切られても対象が読めるように)
+    // 乗務員別と形別の内訳は上限で切る前に数える (切られても対象が読めるように)。
+    // 出ない形も 0 で置く — 「無い」と「数えていない」を分けるため
     let mut by_driver: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total_by_kind: BTreeMap<String, usize> = RestDiffKind::ALL
+        .iter()
+        .map(|k| (k.as_str().to_string(), 0))
+        .collect();
     for it in &items {
         for cd in &it.driver_cds {
             *by_driver.entry(cd.to_string()).or_default() += 1;
         }
+        *total_by_kind
+            .entry(it.kind.as_str().to_string())
+            .or_default() += 1;
     }
-    // 並びは乗務員CD → 運行NO (画面で乗務員ごとに読めるように)
+    let mismatch_total = total_by_kind[RestDiffKind::Mismatch.as_str()];
+    // 並びは **形 → 乗務員CD → 運行NO**。`Mismatch` (押す対象) を先頭に置くのは、
+    // 上限で切られたときに真っ先に消えるのが押す対象では意味が無いため
     items.sort_by(|a, b| {
-        (a.driver_cds.first(), &a.unko_no).cmp(&(b.driver_cds.first(), &b.unko_no))
+        (a.kind.rank(), a.driver_cds.first(), &a.unko_no).cmp(&(
+            b.kind.rank(),
+            b.driver_cds.first(),
+            &b.unko_no,
+        ))
     });
     let total = items.len();
     items.truncate(MAX_REST_DIFF);
     RestDiff {
         items,
         total,
+        mismatch_total,
+        total_by_kind,
         by_driver,
         scanned_unko,
         skipped_rows,
@@ -235,8 +311,16 @@ fn to_item(unko_no: String, b: Bucket) -> Option<RestDiffUnko> {
         return None;
     }
     let run_date = crate::kintai_http_repo::unko_no_start_date(&unko_no).map(|d| d.to_string());
+    // 片側が丸ごと空なら「食い違い」ではなく「片側が無い」— 押しても直る保証が無い
+    // ので分ける (`RestDiffKind` の docs、2026-06 の実測で 239/239 がこちらだった)
+    let kind = match (b.dtako_rows, b.dtako_intervals) {
+        (0, _) => RestDiffKind::DtakoMissing,
+        (_, 0) => RestDiffKind::EventsMissing,
+        _ => RestDiffKind::Mismatch,
+    };
     Some(RestDiffUnko {
         unko_no,
+        kind,
         driver_cds: b.driver_cds.into_iter().collect(),
         run_date,
         dtako_rest_rows: b.dtako_rows,
@@ -295,6 +379,11 @@ mod tests {
         assert_eq!(d.scanned_unko, 1);
         assert_eq!(d.skipped_rows, 0);
         assert!(d.by_driver.is_empty());
+        // 出ない形も 0 で必ず出す (「無い」と「数えていない」を分ける)
+        assert_eq!(d.mismatch_total, 0);
+        assert_eq!(d.total_by_kind.get("mismatch"), Some(&0));
+        assert_eq!(d.total_by_kind.get("dtako_missing"), Some(&0));
+        assert_eq!(d.total_by_kind.get("events_missing"), Some(&0));
     }
 
     /// 実証された事故の形 — 古い `time_card_dtako` が残り、`dtako_events` の
@@ -326,6 +415,67 @@ mod tests {
             vec!["2026-06-17 13:32:38", "2026-06-19 13:22:00"]
         );
         assert_eq!(d.by_driver.get("1445"), Some(&1));
+        // 両側に休息があって食い違う = 「勤務時間再登録」を押す対象
+        assert_eq!(it.kind, RestDiffKind::Mismatch);
+        assert_eq!(d.mismatch_total, 1);
+        assert_eq!(d.total_by_kind.get("mismatch"), Some(&1));
+    }
+
+    /// **2026-06 の実測がこの形だった** — `time_card_dtako` に休息が 1 行も無い
+    /// 運行が 239 件。押しても直る保証が無いので `Mismatch` と混ぜない。
+    #[test]
+    fn a_run_with_no_time_card_dtako_rest_is_not_a_mismatch() {
+        let unko = "26060403504800000011011";
+        let rows = vec![ev(unko, 1742, "2026-06-04 17:47:01", "2026-06-05 02:45:32")];
+        let d = rest_diff(&rows, FROM, TO);
+        assert_eq!(d.total, 1);
+        assert_eq!(d.items[0].kind, RestDiffKind::DtakoMissing);
+        assert_eq!(d.items[0].dtako_rest_rows, 0);
+        // **押す対象は 0 件**。`total` (1) と混ぜて読まないための数字
+        assert_eq!(d.mismatch_total, 0);
+        assert_eq!(d.total_by_kind.get("dtako_missing"), Some(&1));
+        assert_eq!(d.total_by_kind.get("mismatch"), Some(&0));
+    }
+
+    /// 鏡像 — `dtako_events` 側だけ休息が無い形。
+    #[test]
+    fn a_run_with_no_dtako_events_rest_is_its_own_kind() {
+        let unko = "26060403504800000011011";
+        let rows = vec![tc(unko, 1742, "2026-06-04 17:47:01")];
+        let d = rest_diff(&rows, FROM, TO);
+        assert_eq!(d.items[0].kind, RestDiffKind::EventsMissing);
+        assert_eq!(d.mismatch_total, 0);
+        assert_eq!(d.total_by_kind.get("events_missing"), Some(&1));
+    }
+
+    /// **上限で切られても押す対象は残る。** `Mismatch` を先頭に並べているため。
+    #[test]
+    fn the_item_cap_never_drops_a_mismatch() {
+        let mut rows = Vec::new();
+        // 押す対象 1 件 — 乗務員CD も運行NO も最後に来る値にしておく
+        let hot = "99999999999999999999999";
+        rows.push(ev(hot, 9999, "2026-06-10 10:00:00", "2026-06-10 12:00:00"));
+        rows.push(tc(hot, 9999, "2026-06-10 10:00:01"));
+        // 押しても無駄な対象を上限より多く積む
+        for i in 0..(MAX_REST_DIFF + 20) {
+            rows.push(ev(&format!("260602{i:017}"), 1, "2026-06-02 08:00:00", ""));
+        }
+        let d = rest_diff(&rows, FROM, TO);
+        assert_eq!(d.items.len(), MAX_REST_DIFF);
+        assert_eq!(d.total, MAX_REST_DIFF + 21);
+        assert_eq!(d.mismatch_total, 1);
+        // 切られても先頭に残る
+        assert_eq!(d.items[0].kind, RestDiffKind::Mismatch);
+        assert_eq!(d.items[0].unko_no, hot);
+    }
+
+    /// JSON のキーと `serde` の綴りが割れない (`total_by_kind` の鍵と `kind` の値)。
+    #[test]
+    fn the_kind_keys_match_their_serde_spelling() {
+        for k in RestDiffKind::ALL {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(json, format!("\"{}\"", k.as_str()));
+        }
     }
 
     /// **窓の外の端は両側とも数えない。** 月末に始まって窓の先で終わる休息が
@@ -457,7 +607,7 @@ mod tests {
         assert_eq!(d.scanned_unko, n);
     }
 
-    /// 並びは乗務員CD → 運行NO。
+    /// 同じ形どうしの並びは乗務員CD → 運行NO。
     #[test]
     fn items_are_ordered_by_driver_then_unko_no() {
         let rows = vec![

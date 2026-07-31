@@ -141,9 +141,16 @@ async fn a_stale_run_is_named_with_its_driver_and_date() {
     assert_eq!(v["month"], "2026-06");
     assert_eq!(v["driver"], Value::Null);
     assert_eq!(v["total"], 1);
+    // **押す対象の数**は `total` と別に出す (2026-06 の実測では total 239 / mismatch 0)
+    assert_eq!(v["mismatch_total"], 1);
+    assert_eq!(
+        v["total_by_kind"],
+        json!({"mismatch": 1, "dtako_missing": 0, "events_missing": 0})
+    );
     assert_eq!(v["scanned_unko"], 1);
     assert_eq!(v["skipped_rows"], 0);
     let it = &v["items"][0];
+    assert_eq!(it["kind"], "mismatch");
     assert_eq!(it["unko_no"], UNKO);
     assert_eq!(it["driver_cds"], json!([1445]));
     assert_eq!(it["run_date"], "2026-06-14");
@@ -182,6 +189,27 @@ async fn a_run_whose_two_tables_agree_is_not_listed() {
     assert_eq!(v["total"], 0);
     assert_eq!(v["items"], json!([]));
     assert_eq!(v["by_driver"], json!({}));
+    assert_eq!(v["mismatch_total"], 0);
+}
+
+/// **2026-06 の本番実測がこの形**だった — `time_card_dtako` に休息が 1 行も無い
+/// 運行が 239 件で、`mismatch` は 0 件。`total` だけ見ると「239 運行がずれている」と
+/// 読めてしまうので、**押す対象の数を別に出す**。
+#[tokio::test]
+async fn a_run_with_no_writeback_is_not_counted_as_something_to_fix() {
+    let repo = MockRestRepo::with_rows(vec![ev("2026-06-17 13:32:38", "2026-06-19 13:22:00")]);
+    let (status, body) = call(repo, "/api/kintai/rest-diff?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["total"], 1);
+    // **押す対象は 0 件**
+    assert_eq!(v["mismatch_total"], 0);
+    assert_eq!(
+        v["total_by_kind"],
+        json!({"mismatch": 0, "dtako_missing": 1, "events_missing": 0})
+    );
+    assert_eq!(v["items"][0]["kind"], "dtako_missing");
+    assert_eq!(v["items"][0]["dtako_rest_rows"], 0);
 }
 
 /// **乗務員は省略可** (`kosoku-daily` と同じ)。指定すれば repo までそのまま届く。
