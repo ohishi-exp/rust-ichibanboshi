@@ -9,7 +9,10 @@
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
-use rust_ichibanboshi::kintai_fold::{recalc_month, sync_month};
+use rust_ichibanboshi::kintai_fold::{
+    fold_driver_month, recalc_month, sync_month, write_unit, DayPartRow, DaySummaryRow, FoldUnit,
+    ShiftRow,
+};
 use rust_ichibanboshi::kintai_push::{KintaiPgStore, PushOptions};
 use rust_ichibanboshi::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
 use rust_ichibanboshi::kosoku::{KosokuParams, RestraintRounding};
@@ -144,6 +147,17 @@ fn punch(at: &str, state: &str) -> serde_json::Value {
     json!({"datetime": at, "end_datetime": null, "driver_id": DRIVER, "source": "timecard", "state": state, "unko_no": null})
 }
 
+/// `dtako_events` の休息区間。**`source` が `timecard` / `dtako` のどちらでもない**
+/// ので、push / diff 用の読み (`fetch_timecard_events_between`) からは落ちる。
+fn rest(start: &str, end: &str) -> serde_json::Value {
+    json!({"datetime": start, "end_datetime": end, "driver_id": DRIVER, "source": "dtako_events", "state": "休息", "unko_no": null})
+}
+
+/// `time_card_dtako` の運行イベント。
+fn run(at: &str, state: &str, unko: &str) -> serde_json::Value {
+    json!({"datetime": at, "end_datetime": null, "driver_id": DRIVER, "source": "dtako", "state": state, "unko_no": unko})
+}
+
 fn repo(rows: Vec<serde_json::Value>) -> DynKintaiEventsRepo {
     std::sync::Arc::new(StubRepo::new(rows))
 }
@@ -158,6 +172,38 @@ async fn shift_count(pool: &sqlx::PgPool, t: uuid::Uuid) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count shifts")
+}
+
+// ── 畳む側は全イベントを読む ───────────────────────────────────────────────
+
+/// **打刻が 1 件も無くても休息イベントで勤務が立つ** (Refs #118 / #205)。
+///
+/// 畳む側が `kintai_push::read_driver_events` を呼ぶと、#225 で「打刻 2 表だけ」に
+/// 絞られた読みが返り `dtako_events` の休息が落ちる。`kosoku::daily_summary` は
+/// それで勤務を切るので、休息由来の勤務 (長距離・日跨ぎの乗務員はこちらしか無い)
+/// が**丸ごと消えて静かに 0 になる**。ここが 0 に戻ったらその回帰。
+#[tokio::test]
+async fn rest_events_still_produce_shifts_after_the_fold() {
+    let (store, pool) = require_db!();
+    // 打刻は 1 件も無い。休息の終了 = 始業、次の休息の開始 = 終業
+    let repo = repo(vec![
+        rest("2026-07-01 16:19:00", "2026-07-02 04:42:00"),
+        run("2026-07-02 06:00:00", "運行開始", "A"),
+        run("2026-07-02 14:10:00", "運行終了", "A"),
+        rest("2026-07-02 16:18:00", "2026-07-03 06:01:00"),
+    ]);
+    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("recalc");
+    assert_eq!(r.shifts, 1, "休息で切った勤務が立つ");
+
+    let source: String =
+        sqlx::query_scalar("SELECT shift_source FROM kintai.shifts WHERE tenant_id = $1")
+            .bind(store.tenant_id())
+            .fetch_one(&pool)
+            .await
+            .expect("shift_source");
+    assert_eq!(source, "rest", "打刻ではなく休息が境界を決めた");
 }
 
 // ── 日跨ぎ・長時間拘束が DB の制約を通るか ─────────────────────────────────
@@ -454,6 +500,229 @@ async fn deleting_a_shift_cascades_to_the_derived_rows() {
         .expect("left");
         assert_eq!(left, 0, "{table} が残った");
     }
+}
+
+// ── 書き込みを unnest に畳む (Refs #231 と同型) ─────────────────────────────
+
+/// `day_summaries` の分の列 1 本。DB の列名と、畳んだ行から同じ値を取る関数。
+type MinuteColumn = (&'static str, fn(&DaySummaryRow) -> i64);
+
+/// **列ごとの配列に畳んでも 1 行 1 INSERT と同じものが入る。**
+///
+/// `unnest` は列を配列に分解して渡すので、**並べる順を 1 本間違えると
+/// 「実働の列に休憩が入る」ような静かな取り違え**になる。型が全部 `int4` なので
+/// DB も気付かない。畳む前の [`FoldUnit`] と DB の中身を列ごとに突き合わせる。
+#[tokio::test]
+async fn the_unnest_write_matches_the_folded_unit_column_by_column() {
+    use sqlx::Row;
+
+    let (store, pool) = require_db!();
+    // 1 か月ぶん。日ごとに終業をずらして、全列が日ごとに違う値になるようにする
+    let mut rows = Vec::new();
+    for d in 1..=28_u32 {
+        rows.push(punch(&format!("2026-07-{d:02} 08:00:00"), "始業"));
+        rows.push(punch(&format!("2026-07-{d:02} 18:{:02}:00", d), "終業"));
+    }
+    let repo = repo(rows.clone());
+    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("recalc");
+    assert_eq!(r.shifts, 28);
+
+    // 畳んだ結果そのもの。DB に入った姿と 1 列ずつ比べる
+    let (unit, _fp) = fold_driver_month(DRIVER as i64, "2026-07", &params(), rows);
+    assert_eq!(unit.day_summaries.len(), 28);
+
+    let stored = sqlx::query(
+        "SELECT date::text AS d,
+                to_char(shift_start_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') AS s,
+                shift_source, restraint_minutes, working_minutes, break_minutes,
+                rest_minus_minutes, statutory_minutes, within_statutory_overtime_minutes,
+                overtime_minutes, legal_holiday_minutes, night_minutes,
+                overtime_night_minutes, legal_holiday_night_minutes
+           FROM kintai.day_summaries WHERE tenant_id = $1 ORDER BY shift_start_at",
+    )
+    .bind(store.tenant_id())
+    .fetch_all(&pool)
+    .await
+    .expect("day_summaries");
+    assert_eq!(stored.len(), unit.day_summaries.len());
+
+    let minutes: [MinuteColumn; 11] = [
+        ("restraint_minutes", |d| d.restraint_minutes),
+        ("working_minutes", |d| d.working_minutes),
+        ("break_minutes", |d| d.break_minutes),
+        ("rest_minus_minutes", |d| d.rest_minus_minutes),
+        ("statutory_minutes", |d| d.statutory_minutes),
+        ("within_statutory_overtime_minutes", |d| {
+            d.within_statutory_overtime_minutes
+        }),
+        ("overtime_minutes", |d| d.overtime_minutes),
+        ("legal_holiday_minutes", |d| d.legal_holiday_minutes),
+        ("night_minutes", |d| d.night_minutes),
+        ("overtime_night_minutes", |d| d.overtime_night_minutes),
+        ("legal_holiday_night_minutes", |d| {
+            d.legal_holiday_night_minutes
+        }),
+    ];
+    for (got, want) in stored.iter().zip(&unit.day_summaries) {
+        assert_eq!(got.get::<String, _>("d"), want.date.to_string());
+        assert_eq!(
+            got.get::<String, _>("s"),
+            want.shift_start_at.format("%Y-%m-%d %H:%M:%S").to_string()
+        );
+        assert_eq!(got.get::<String, _>("shift_source"), want.shift_source);
+        for (col, f) in minutes {
+            assert_eq!(got.get::<i32, _>(col) as i64, f(want), "{col} が食い違う");
+        }
+    }
+
+    // 拘束が日ごとに違う = 列を取り違えたら必ず落ちるだけの分散がある
+    let distinct: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT restraint_minutes) FROM kintai.day_summaries WHERE tenant_id = $1",
+    )
+    .bind(store.tenant_id())
+    .fetch_one(&pool)
+    .await
+    .expect("distinct");
+    assert!(distinct > 1, "全日同じ値では取り違えを検知できない");
+
+    // 2 回目は指紋が一致して 1 行も書かない
+    let again = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("2nd");
+    assert_eq!(again.drivers_written, 0, "unnest 化しても据え置きになる");
+    assert_eq!(again.drivers_unchanged, 1);
+    assert!(!again.wrote_anything());
+}
+
+/// **INSERT の刻みを跨いでも落ちない。**
+///
+/// [`write_unit`] は push 側と同じ `INSERT_CHUNK` (2000) 行で刻む。刻んでも同じ
+/// トランザクションの中に居るので、全か無かは変わらない。`kosoku.rs` を通すと
+/// 2000 勤務は作れないので、畳んだ形を直に渡す。
+#[tokio::test]
+async fn write_unit_survives_crossing_the_insert_chunk() {
+    let (store, pool) = require_db!();
+    const N: i64 = 2100; // INSERT_CHUNK = 2000 を跨ぐ
+    let base = NaiveDate::from_ymd_opt(2026, 7, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+
+    let mut unit = FoldUnit {
+        driver_cd: DRIVER as i64,
+        ..Default::default()
+    };
+    for i in 0..N {
+        let start = base + chrono::Duration::minutes(i * 2);
+        let end = start + chrono::Duration::minutes(1);
+        unit.shifts.push(ShiftRow {
+            driver_cd: DRIVER as i64,
+            start_at: start,
+            end_at: end,
+            shift_source: "timecard",
+        });
+        unit.day_summaries.push(DaySummaryRow {
+            driver_cd: DRIVER as i64,
+            date: start.date(),
+            shift_start_at: start,
+            shift_source: "timecard",
+            restraint_minutes: i,
+            working_minutes: 0,
+            break_minutes: 0,
+            rest_minus_minutes: 0,
+            statutory_minutes: 0,
+            within_statutory_overtime_minutes: 0,
+            overtime_minutes: 0,
+            legal_holiday_minutes: 0,
+            night_minutes: 0,
+            overtime_night_minutes: 0,
+            legal_holiday_night_minutes: 0,
+        });
+        unit.day_parts.push(DayPartRow {
+            driver_cd: DRIVER as i64,
+            shift_start_at: start,
+            date: start.date(),
+            restraint_minutes: 1,
+            working_minutes: 1,
+            night_minutes: 0,
+        });
+    }
+
+    write_unit(&store, "2026-07", &unit, &"a".repeat(64))
+        .await
+        .expect("write");
+
+    assert_eq!(shift_count(&pool, store.tenant_id()).await, N);
+    for table in ["day_summaries", "day_parts"] {
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM kintai.{table} WHERE tenant_id = $1"
+        ))
+        .bind(store.tenant_id())
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(n, N, "{table} が刻みを跨げていない");
+    }
+    // 刻みの境目 (2000 行目の前後) が取り違わっていない
+    let last: i32 = sqlx::query_scalar(
+        "SELECT restraint_minutes FROM kintai.day_summaries
+          WHERE tenant_id = $1 ORDER BY shift_start_at DESC LIMIT 1",
+    )
+    .bind(store.tenant_id())
+    .fetch_one(&pool)
+    .await
+    .expect("last");
+    assert_eq!(last as i64, N - 1);
+}
+
+// ── 畳めるものが無い乗務員 ─────────────────────────────────────────────────
+
+/// **勤務が 1 本も立たない乗務員は「書いた」に数えない。**
+///
+/// 空の単位は指紋を 1 つも保存しないので、指紋の一致だけで判定すると毎回
+/// stale になる。毎回 `drivers_written` に乗ると [`FoldReport::wrote_anything`]
+/// が誤検知し、`sync` が「何か書いた」と言い続ける。
+#[tokio::test]
+async fn a_driver_with_nothing_to_fold_is_not_counted_as_written() {
+    let (store, pool) = require_db!();
+    let repo = repo(Vec::new());
+    for pass in ["1st", "2nd"] {
+        let r = recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
+            .await
+            .expect(pass);
+        assert_eq!(r.drivers, 1, "{pass}: 対象には数える");
+        assert_eq!(r.drivers_written, 0, "{pass}: 書くものが無い");
+        assert_eq!(r.drivers_unchanged, 1, "{pass}");
+        assert!(!r.wrote_anything(), "{pass}");
+    }
+    assert_eq!(shift_count(&pool, store.tenant_id()).await, 0);
+}
+
+/// **保存済みの行が残っているなら、今回が空でも消しに行く。**
+///
+/// 「空 = 空は current」を入れたときに、消す側まで黙らせていないことの確認。
+#[tokio::test]
+async fn an_emptied_month_still_clears_the_stored_rows() {
+    let (store, pool) = require_db!();
+    let stub = std::sync::Arc::new(StubRepo::new(vec![
+        punch("2026-07-28 08:00:00", "始業"),
+        punch("2026-07-28 18:00:00", "終業"),
+    ]));
+    let repo: DynKintaiEventsRepo = stub.clone();
+    recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
+        .await
+        .expect("1st");
+    assert_eq!(shift_count(&pool, store.tenant_id()).await, 1);
+
+    // 上流からイベントが消えた (取り込みの取り消し等)
+    stub.rows.lock().unwrap().clear();
+    let r = recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
+        .await
+        .expect("2nd");
+    assert_eq!(r.drivers_written, 1, "空にするのも書き込み");
+    assert_eq!(shift_count(&pool, store.tenant_id()).await, 0);
 }
 
 // ── 06: sync ──────────────────────────────────────────────────────────────

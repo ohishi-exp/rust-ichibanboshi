@@ -693,7 +693,10 @@ impl KintaiPgStore {
 }
 
 /// 1 文に載せる INSERT の行数。`raw` を積むので本文サイズで刻む。
-const INSERT_CHUNK: usize = 2000;
+///
+/// 畳む側 ([`crate::kintai_fold::write_unit`]) も同じ数で刻む — 刻み幅を 2 つ
+/// 持つと、片方だけ直したときに「どちらの経路で 524 が出たか」が分からなくなる。
+pub(crate) const INSERT_CHUNK: usize = 2000;
 
 /// 消す日を **1 文で**。`unnest` で (乗務員, 日の境界) の並びを行に開く。
 ///
@@ -777,6 +780,13 @@ async fn target_drivers(
 }
 
 /// 1 乗務員 1 か月ぶんの打刻を読む。
+///
+/// **push / diff 専用。畳む側 ([`crate::kintai_fold`]) から呼んではいけない。**
+/// ここは `dtako_events` を落とした「打刻 2 表だけ」なので、畳むのに要る休息
+/// イベントが入っていない。`kosoku::daily_summary` はそれで勤務を切るため、
+/// これを渡すと休息由来の勤務が丸ごと消える。畳む側は
+/// `repo.fetch_events_between` を直に呼ぶこと (#225 の絞りを fold へ広げた
+/// 2026-07-31 の回帰)。
 ///
 /// **全乗務員版ではなく単一乗務員版を使う。** 全乗務員版の SQL は速さのために
 /// `運行NO` を落としている (`ALL_EVENTS_SQL`) ので、入力層に残したい
