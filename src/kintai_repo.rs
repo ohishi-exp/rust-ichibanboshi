@@ -71,6 +71,30 @@ impl std::fmt::Display for KintaiRepoError {
 
 impl std::error::Error for KintaiRepoError {}
 
+/// push 対象の `source` (`timecard` / `dtako`) の行か。
+///
+/// **`dtako_events` を落とすための判定。** 表を分けて読めない実装 (HTTP 版) 向けの
+/// 保険で、MariaDB 実装は SQL 側で落とすのでここを通らない。
+fn is_pushed_source(row: &serde_json::Value) -> bool {
+    row.get("source")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| crate::kintai_push::PUSHED_SOURCES.contains(&s))
+}
+
+/// 打刻の行から乗務員CD を昇順・重複無しで拾う。
+///
+/// **0 以下は捨てる。** 乗務員CD ではない — 空の乗務員が 0 として出てきて、
+/// 1 ページぶんの枠を食っていた (2026-06 の dry-run で実測)。
+fn timecard_driver_cds(rows: Vec<serde_json::Value>) -> Vec<u64> {
+    rows.iter()
+        .filter(|r| is_pushed_source(r))
+        .filter_map(|r| r.get("driver_id").and_then(|v| v.as_u64()))
+        .filter(|d| *d > 0)
+        .collect::<std::collections::BTreeSet<u64>>()
+        .into_iter()
+        .collect()
+}
+
 /// 生イベントの読み出し口。DB 実装と mock を差し替えるための trait
 /// (`DynRepo` と同じ形 — route のテストを DB 無しで回すため)。
 #[async_trait]
@@ -118,6 +142,44 @@ pub trait KintaiEventsApi: Send + Sync {
         let (from, to) = month_range(month)
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
         self.fetch_all_events_between(&from, &to).await
+    }
+
+    /// 任意の期間 `[from, to)` × 乗務員CD の**打刻 2 表だけ** (Refs #205 の 04b)。
+    ///
+    /// GCP へ渡すのは打刻だけ ([`crate::kintai_push::PUSHED_SOURCES`]) なので、
+    /// `dtako_events` は読むだけ無駄になる — [`crate::kintai_push::parse_row`] が
+    /// `NotPushedSource` で全部捨てる。**畳むのに要るデジタコ生イベントは GCP が
+    /// alc から直接引く**ので、この経路が運ぶ必要はない (#205 の決定 5)。
+    ///
+    /// 既定は [`fetch_events_between`] を `source` で絞ったもの。MariaDB 実装は
+    /// SQL 側で落とすので、そもそも読まない。
+    ///
+    /// [`fetch_events_between`]: KintaiEventsApi::fetch_events_between
+    async fn fetch_timecard_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let rows = self.fetch_events_between(from, to, driver).await?;
+        Ok(rows.into_iter().filter(is_pushed_source).collect())
+    }
+
+    /// 対象期間に**打刻がある**乗務員CD を昇順で返す (Refs #205 の 04b)。
+    ///
+    /// 乗務員の洗い出しに [`fetch_all_events_between`] を使うと、行を 1 つも使わない
+    /// のに月ぶんの `dtako_events` を JSON にして捨てることになる。**要るのは CD の
+    /// 集合だけ**なので、MariaDB 実装は `SELECT ... UNION` 1 本で済ませる。
+    ///
+    /// [`fetch_all_events_between`]: KintaiEventsApi::fetch_all_events_between
+    async fn fetch_timecard_driver_cds_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<u64>, KintaiRepoError> {
+        Ok(timecard_driver_cds(
+            self.fetch_all_events_between(from, to).await?,
+        ))
     }
 
     /// 対象月の**フェリー区間** (Refs #146、yhonda-ohishi/nginx#788 からの引き継ぎ)。
@@ -347,6 +409,65 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
  ORDER BY driver_id, datetime, source
 "#;
 
+/// 打刻 2 表だけを 1 乗務員ぶん読む (Refs #205 の 04b)。
+///
+/// [`EVENTS_SQL`] から **`dtako_events` の 2 ブランチと `dtako_cars` の JOIN を
+/// 落とした**もの。列は [`EventRow`] と同じ 7 列のままで、`vehicle` は常に NULL —
+/// 車輌名は `dtako_events` 側にしか無く、打刻には最初から付いていない。
+///
+/// 落としてよい理由は [`crate::kintai_push::PUSHED_SOURCES`] が
+/// `timecard` / `dtako` の 2 つだけだから。`dtako_events` の行は読んでも
+/// [`crate::kintai_push::parse_row`] が `NotPushedSource` で捨てるので、
+/// **捨てる行のために月ぶんの最大表を読んで Tunnel 越しに転送していた**ことになる。
+/// `ALL_EVENTS_SQL` の実測 (1.20 秒 → 0.25 秒) が示すとおり、支配的なのは
+/// `dtako_cars` の引き当てと 23 桁の `運行NO` の転送。
+///
+/// `unko_no` は残す — `time_card_dtako.unko_no` から取れるので、
+/// 「どの運行のイベントか」は失われない。
+const TIMECARD_EVENTS_SQL: &str = r#"
+SELECT DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s') AS datetime,
+       NULL                                         AS end_datetime,
+       d.id                                         AS driver_id,
+       'timecard'                                   AS source,
+       s.name                                       AS state,
+       NULL                                         AS unko_no,
+       NULL                                         AS vehicle
+  FROM time_card_dstate d
+  LEFT JOIN time_card_dtako_state s ON s.id = d.state
+ WHERE d.id = :driver AND d.datetime >= :from AND d.datetime < :to
+UNION ALL
+SELECT DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'),
+       NULL,
+       t.driver_id,
+       'dtako',
+       COALESCE(t.event_name, s.name),
+       t.unko_no,
+       NULL
+  FROM time_card_dtako t
+  LEFT JOIN time_card_dtako_state s ON s.id = t.state
+ WHERE t.driver_id = :driver AND t.datetime >= :from AND t.datetime < :to
+ ORDER BY datetime, source
+"#;
+
+/// 対象期間に打刻がある乗務員CD だけを昇順で返す (Refs #205 の 04b)。
+///
+/// **行を返さない。** 乗務員の洗い出しに `ALL_EVENTS_SQL` を使うと、CD の集合しか
+/// 使わないのに月ぶんの全行を JSON にして捨てることになる。`UNION` (`UNION ALL`
+/// ではない) が重複を潰すので、呼び出し側での dedup も要らない。
+///
+/// **`> 0` で絞る。** 乗務員CD を持たない行が 0 として出てきて、relay の
+/// 1 ページぶんの枠を食っていた (2026-06 の dry-run で実測)。
+const TIMECARD_DRIVERS_SQL: &str = r#"
+SELECT d.id AS driver_id
+  FROM time_card_dstate d
+ WHERE d.datetime >= :from AND d.datetime < :to AND d.id > 0
+UNION
+SELECT t.driver_id
+  FROM time_card_dtako t
+ WHERE t.datetime >= :from AND t.datetime < :to AND t.driver_id > 0
+ ORDER BY driver_id
+"#;
+
 /// フェリー区間 (Refs #146)。
 ///
 /// - **`dtako_ferry_rows` は 3 列しか読めない** (`運行NO` / `開始日時` / `終了日時`)。
@@ -532,6 +653,54 @@ impl KintaiEventsApi for MariadbKintaiEventsRepo {
             .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
         Ok(rows.into_iter().map(all_row_to_json).collect())
     }
+
+    /// 既定実装 (読んでから捨てる) を上書きし、**`dtako_events` を読まない**。
+    async fn fetch_timecard_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let rows: Vec<EventRow> = conn
+            .exec(
+                TIMECARD_EVENTS_SQL,
+                params! {
+                    "driver" => driver,
+                    "from" => from,
+                    "to" => to,
+                },
+            )
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))?;
+        Ok(rows.into_iter().map(row_to_json).collect())
+    }
+
+    /// 既定実装 (全行を読んで CD だけ拾う) を上書きし、**CD しか転送しない**。
+    async fn fetch_timecard_driver_cds_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<u64>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        conn.exec(
+            TIMECARD_DRIVERS_SQL,
+            params! {
+                "from" => from,
+                "to" => to,
+            },
+        )
+        .await
+        .map_err(|e| KintaiRepoError::QueryFailed(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -636,5 +805,110 @@ mod tests {
         assert!(KintaiRepoError::QueryFailed("boom".into())
             .to_string()
             .contains("boom"));
+    }
+
+    /// 打刻が無い instance でも**打刻専用の口は fail-closed**。
+    /// 空配列を返すと「その月は誰も打刻していない」と区別が付かない。
+    #[tokio::test]
+    async fn disabled_repo_fails_closed_on_the_timecard_routes() {
+        let err = DisabledKintaiEventsRepo
+            .fetch_timecard_events_between("2026-07-01 00:00:00", "2026-08-01 00:00:00", 1130)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KintaiRepoError::NotConfigured));
+        let err = DisabledKintaiEventsRepo
+            .fetch_timecard_driver_cds_between("2026-07-01 00:00:00", "2026-08-01 00:00:00")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KintaiRepoError::NotConfigured));
+    }
+
+    fn row(driver: Option<i64>, source: &str) -> serde_json::Value {
+        let mut v = serde_json::json!({ "source": source });
+        if let Some(d) = driver {
+            v["driver_id"] = serde_json::json!(d);
+        }
+        v
+    }
+
+    /// push する 2 つの `source` だけを通す。
+    #[test]
+    fn only_the_pushed_sources_survive() {
+        assert!(is_pushed_source(&row(Some(1130), "timecard")));
+        assert!(is_pushed_source(&row(Some(1130), "dtako")));
+        // デジタコ生イベントは R2 にあるので運ばない (#205 の決定 5)
+        assert!(!is_pushed_source(&row(Some(1130), "dtako_events")));
+        assert!(!is_pushed_source(&serde_json::json!({})));
+    }
+
+    /// 乗務員CD は昇順・重複無し。**0 と乗務員の無い行は落ちる。**
+    #[test]
+    fn driver_cds_are_sorted_deduped_and_positive() {
+        let cds = timecard_driver_cds(vec![
+            row(Some(1300), "timecard"),
+            row(Some(1130), "dtako"),
+            row(Some(1130), "timecard"),
+            // 乗務員CD ではない値 — ページの枠を食っていた実物
+            row(Some(0), "timecard"),
+            row(Some(-1), "timecard"),
+            row(None, "timecard"),
+            // 打刻を持たない乗務員は対象外
+            row(Some(9999), "dtako_events"),
+        ]);
+        assert_eq!(cds, vec![1130, 1300]);
+    }
+
+    /// 既定実装は `dtako_events` を**読んでから**落とす (SQL を分けられない実装向け)。
+    #[tokio::test]
+    async fn the_default_timecard_read_filters_by_source() {
+        struct Mixed;
+        #[async_trait]
+        impl KintaiEventsApi for Mixed {
+            async fn fetch_events_between(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+                Ok(vec![
+                    row(Some(1130), "timecard"),
+                    row(Some(1130), "dtako_events"),
+                    row(Some(1130), "dtako"),
+                ])
+            }
+            async fn fetch_all_events_between(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+                Ok(vec![
+                    row(Some(1130), "timecard"),
+                    row(Some(9999), "dtako_events"),
+                ])
+            }
+            async fn fetch_ferry_between(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<u64>,
+            ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+                unreachable!()
+            }
+        }
+        let got = Mixed
+            .fetch_timecard_events_between("a", "b", 1130)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![row(Some(1130), "timecard"), row(Some(1130), "dtako")]
+        );
+        assert_eq!(
+            Mixed
+                .fetch_timecard_driver_cds_between("a", "b")
+                .await
+                .unwrap(),
+            vec![1130]
+        );
     }
 }
