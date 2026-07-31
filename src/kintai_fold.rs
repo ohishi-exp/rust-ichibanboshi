@@ -470,6 +470,43 @@ SELECT (SELECT coalesce(array_agg(DISTINCT fingerprint), '{}')
            AND s.date_start >= $3 AND s.date_start < $4) AS n_parts
 "#;
 
+/// [`STORED_STATE_SQL`] の**複数乗務員版**。式は 1 文字も変えない。
+///
+/// 単数版は乗務員 1 人につき 1 往復で、全量再計算では**往復回数がそのまま時間**に
+/// なる (1 ページ 50 人なら 50 往復、137 名なら約 137 往復)。しかも Pg 読みは
+/// `[kintai_push]` の pool を共有していて `max_connections=1` — 完全に直列で、
+/// 窓の受け口が書いている間はその 1 本を待つ。#231 (10,157 往復を `unnest` で
+/// 畳んだ) と [`crate::kintai_push::STORED_WINDOW_SIGNATURES_SQL`] (乗務員ごとの
+/// `GET /signatures` 94 名 33.6 秒を 1 発に畳んだ) と同じ型の話で、**費用は
+/// 往復回数で転送量ではない**。
+///
+/// 単数版の `driver_cd = $2` を `driver_cd = q.driver_cd` に読み替え、乗務員を
+/// `unnest($2::int8[])` から供給するだけ。**乗務員は等値・日付は範囲比較のまま**
+/// なので索引の使われ方も単数版と同じ (`::date = ANY(...)` にすると索引が効かない)。
+/// 保存が 1 件も無い乗務員も `unnest` 側の行として残るので、単数版が
+/// `fetch_one` で必ず 1 行返すのと**同じく全乗務員ぶんの行が返る**。
+///
+/// **式を写し間違えると「中身は同じなのに毎回全乗務員が stale」**になり、
+/// 静かに毎回全書き直しになる。2 つが同じであることはテストで縛る
+/// (`the_states_sql_matches_the_single_driver_one` と、実 Postgres で単数版と
+/// 複数版の結果が一致することを確かめる `kintai_fold_pg_test.rs` の口)。
+const STORED_STATES_SQL: &str = r#"
+SELECT q.driver_cd,
+       (SELECT coalesce(array_agg(DISTINCT fingerprint), '{}')
+          FROM kintai.shifts
+         WHERE tenant_id = $1 AND driver_cd = q.driver_cd AND date_start >= $3 AND date_start < $4) AS fps,
+       (SELECT count(*) FROM kintai.shifts
+         WHERE tenant_id = $1 AND driver_cd = q.driver_cd AND date_start >= $3 AND date_start < $4) AS n_shifts,
+       (SELECT count(*) FROM kintai.day_summaries
+         WHERE tenant_id = $1 AND driver_cd = q.driver_cd AND date >= $3 AND date < $4) AS n_days,
+       (SELECT count(*) FROM kintai.day_parts p
+          JOIN kintai.shifts s ON s.tenant_id = p.tenant_id AND s.driver_cd = p.driver_cd
+                              AND s.start_at = p.shift_start_at
+         WHERE p.tenant_id = $1 AND p.driver_cd = q.driver_cd
+           AND s.date_start >= $3 AND s.date_start < $4) AS n_parts
+  FROM unnest($2::int8[]) AS q(driver_cd)
+"#;
+
 /// 期間に載っている `logic_version` と、古い版を 1 行でも持つ乗務員数。
 ///
 /// `day_summaries` だけを見る — 3 表は同じトランザクションで同じ版を書くので、
@@ -622,6 +659,47 @@ pub async fn stored_state(
         day_summaries: row.get::<i64, _>("n_days"),
         day_parts: row.get::<i64, _>("n_parts"),
     })
+}
+
+/// [`stored_state`] の**複数乗務員版** — ページの全乗務員を 1 往復で読む。
+///
+/// 返すのは `driver_cd → StoredState`。**保存が 1 件も無い乗務員も
+/// [`StoredState::is_empty`] な値で必ず入る** ([`STORED_STATES_SQL`] の
+/// `unnest` 側の行が残るため)。呼び出し側は「鍵が無い = 保存が無い」と
+/// 「鍵が無い = 読めていない」を混同せずに済む。
+///
+/// `drivers` が空なら**1 往復もしない**。
+pub async fn stored_states(
+    store: &KintaiPgStore,
+    drivers: &[i64],
+    month: &str,
+) -> Result<std::collections::BTreeMap<i64, StoredState>, KintaiPushError> {
+    use sqlx::Row;
+    let (m0, m1) = month_date_bounds(month)
+        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
+    if drivers.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let rows = sqlx::query(STORED_STATES_SQL)
+        .bind(store.tenant_id())
+        .bind(drivers)
+        .bind(m0)
+        .bind(m1)
+        .fetch_all(store.pool())
+        .await?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        out.insert(
+            row.get::<i64, _>("driver_cd"),
+            StoredState {
+                fingerprints: row.get::<Vec<String>, _>("fps"),
+                shifts: row.get::<i64, _>("n_shifts"),
+                day_summaries: row.get::<i64, _>("n_days"),
+                day_parts: row.get::<i64, _>("n_parts"),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// 期間に載っている `logic_version` を数える (stale 検知)。
@@ -1240,6 +1318,14 @@ pub async fn recalc_drivers_from_units(
 ///
 /// [`recalc_month`] と [`recalc_drivers`] の共通部分。**読み方だけが違って
 /// 書き方は同じ**であることをここで担保する。
+///
+/// ## 保存済みの姿は 1 往復でまとめて読む (Refs #205 の 25)
+///
+/// 乗務員ごとに [`stored_state`] を呼ぶと**乗務員の数だけ往復**する。Pg 読みは
+/// 窓の受け口と pool (`max_connections=1`) を共有しているので完全に直列で、
+/// 137 名なら 137 回ぶんの待ちがそのまま全量再計算の時間に乗る。[`stored_states`]
+/// で先に全員ぶんを引き、突き合わせは Rust の中で回す — 判定そのもの
+/// ([`StoredState::is_current`]) は 1 行も変えない。
 async fn store_units(
     store: &KintaiPgStore,
     params: &KosokuParams,
@@ -1249,12 +1335,17 @@ async fn store_units(
 ) -> Result<FoldReport, KintaiPushError> {
     let started = std::time::Instant::now();
     let mut report = new_report(params, apply);
+    let cds: Vec<i64> = units.iter().map(|(cd, _, _)| *cd as i64).collect();
+    let stored_all = stored_states(store, &cds, month).await?;
     for (driver_cd, unit, fp) in units {
         report.drivers += 1;
         report.skipped.extend(unit.skipped.iter().cloned());
 
-        let stored = stored_state(store, driver_cd as i64, month).await?;
-        if stored.is_current(&unit, &fp) {
+        // 引けなかった乗務員 (`unnest` が行を残すので実際には来ない) は「保存が
+        // 無い」ではなく **stale 側に倒す** — 書き直すだけなら壊れないが、逆に
+        // 倒すと畳んだ結果が静かに落ちる
+        let stored = stored_all.get(&(driver_cd as i64));
+        if stored.is_some_and(|s| s.is_current(&unit, &fp)) {
             report.drivers_unchanged += 1;
             continue;
         }
@@ -1722,6 +1813,25 @@ mod tests {
         let s = now_jst();
         assert!(s.ends_with("+09:00"), "{s}");
         assert!(chrono::DateTime::parse_from_rfc3339(&s).is_ok(), "{s}");
+    }
+
+    /// 複数乗務員版の SQL は単数版と**式が 1 文字も違わない**
+    /// (`crate::kintai_push` の窓署名 SQL と同じ縛り)。写し間違えると
+    /// 「中身は同じなのに毎回全乗務員が stale」になり、静かに毎回全書き直しになる。
+    #[test]
+    fn the_states_sql_matches_the_single_driver_one() {
+        let normalise = |s: &str| {
+            s.replace("driver_cd = q.driver_cd", "driver_cd = $2")
+                .replace(
+                    "SELECT q.driver_cd,\n       (SELECT coalesce",
+                    "SELECT (SELECT coalesce",
+                )
+                .replace("\n  FROM unnest($2::int8[]) AS q(driver_cd)", "")
+        };
+        assert_eq!(
+            normalise(STORED_STATES_SQL).replace([' ', '\n'], ""),
+            STORED_STATE_SQL.replace([' ', '\n'], "")
+        );
     }
 
     #[test]
