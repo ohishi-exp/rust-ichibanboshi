@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_ichibanboshi::kintai_fold::{
     fold_driver_month, fold_month, month_gate_report, recalc_driver_page, recalc_drivers,
-    recalc_month, stale_state, sync_month, write_unit, DayPartRow, DaySummaryRow, FoldUnit,
-    MonthGate, ShiftRow,
+    recalc_month, stale_state, stored_state, stored_states, sync_month, write_unit, DayPartRow,
+    DaySummaryRow, FoldUnit, MonthGate, ShiftRow,
 };
 use rust_ichibanboshi::kintai_http_repo::with_warning_sink;
 use rust_ichibanboshi::kintai_push::{KintaiPgStore, PushOptions, TimecardWindow};
@@ -2036,5 +2036,180 @@ async fn http_recalc_does_not_write_the_gate_when_the_digest_saw_missing_input()
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
         None,
         "指紋側だけが立てた warning でも封をしない (Refs #205 の 21)"
+    );
+}
+
+// ── 保存済みの姿を 1 往復で読む (Refs #205 の 25) ──────────────────────────
+
+/// 任意の乗務員の打刻。[`punch`] は `DRIVER` 固定なので複数名を並べるときはこちら。
+fn punch_of(driver: u64, at: &str, state: &str) -> serde_json::Value {
+    json!({"datetime": at, "end_datetime": null, "driver_id": driver, "source": "timecard", "state": state, "unko_no": null})
+}
+
+/// 1 日ぶんの始業/終業を人数ぶん並べる。
+fn punches_for(drivers: &[u64]) -> Vec<serde_json::Value> {
+    drivers
+        .iter()
+        .flat_map(|d| {
+            vec![
+                punch_of(*d, "2026-07-06 08:00:00", "始業"),
+                punch_of(*d, "2026-07-06 18:00:00", "終業"),
+            ]
+        })
+        .collect()
+}
+
+/// 複数乗務員版が単数版と**1 名ずつ突き合わせて完全に同じ**か。
+///
+/// 式を写し間違えると「中身は同じなのに毎回全乗務員が stale」になり、静かに
+/// 毎回全書き直しになる (`kintai_push` の窓署名 SQL と同じ縛り)。SQL の文字列
+/// 一致は lib 側の単体テストで縛ってあるので、ここは**実 Postgres で返る値**を見る。
+#[tokio::test]
+async fn stored_states_matches_stored_state_driver_by_driver() {
+    let (store, _pool) = require_db!();
+    let saved = [1101_u64, 1102, 1103];
+    let repo = repo(punches_for(&saved));
+    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("fold");
+
+    // 空: 1 往復もせず空の map
+    assert!(
+        stored_states(&store, &[], "2026-07")
+            .await
+            .expect("empty")
+            .is_empty(),
+        "空の乗務員リストは空の map"
+    );
+
+    // 1 名 / 複数名 / **保存が 1 件も無い乗務員が混ざる** の 3 通り。
+    // 9999 はどの表にも 1 行も無い — 単数版が「空の姿」を返すのと同じく、
+    // 複数版でも鍵ごと落ちずに残らないといけない
+    for want in [
+        vec![1101_i64],
+        vec![1101, 1102, 1103],
+        vec![9999, 1102, 8888],
+    ] {
+        let batch = stored_states(&store, &want, "2026-07")
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), want.len(), "全乗務員ぶんの行が返る: {want:?}");
+        for cd in &want {
+            let one = stored_state(&store, *cd, "2026-07").await.expect("single");
+            assert_eq!(batch[cd], one, "driver {cd} の姿が単数版と違う");
+        }
+    }
+
+    // 保存が無い乗務員は「空の姿」で入る (鍵が無い = 読めていない、と混同しない)
+    let batch = stored_states(&store, &[9999], "2026-07")
+        .await
+        .expect("gap");
+    assert!(
+        batch[&9999].is_empty(),
+        "保存の無い乗務員は空の姿: {batch:?}"
+    );
+}
+
+/// 保存が無い乗務員が混ざっても**畳んだ結果は 1 人ぶんも落ちない**。
+///
+/// 複数乗務員版が「保存の無い乗務員の行ごと落とす」形だと、`store_units` から
+/// 見て姿が引けず、is_current の判定が壊れる (どちらへ倒しても静かに間違う)。
+#[tokio::test]
+async fn a_driver_with_no_stored_rows_still_gets_folded_in_a_batch() {
+    let (store, pool) = require_db!();
+    // 1104 は打刻あり、1105 は打刻ゼロ (畳んでも書くものが無い)
+    let repo = repo(punches_for(&[1104]));
+    let r = recalc_drivers(&repo, &store, &params(), "2026-07", &[1104, 1105], true)
+        .await
+        .expect("fold");
+    assert_eq!(r.drivers, 2, "2 名とも数える");
+    assert_eq!(r.drivers_written, 1, "書くものがあるのは 1104 だけ");
+    assert_eq!(shift_count(&pool, store.tenant_id()).await, 1);
+
+    // 2 回目は 2 名とも据え置き — 打刻ゼロの 1105 が毎回 stale に見えると
+    // `wrote_anything` が誤検知し続ける (StoredState::is_current の「空 = 空」)
+    let again = recalc_drivers(&repo, &store, &params(), "2026-07", &[1104, 1105], true)
+        .await
+        .expect("again");
+    assert_eq!(again.drivers_written, 0, "2 回目は 1 行も書かない");
+    assert_eq!(again.drivers_unchanged, 2);
+}
+
+/// sqlx が 1 クエリごとに出す `sqlx::query` の tracing event を数える層。
+///
+/// **往復回数が費用**なので、往復が減ったことを機械で確かめられる形にしておく。
+#[derive(Clone, Default)]
+struct QueryCounter(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl QueryCounter {
+    /// 保存済みの姿を読んだクエリの回数 (単数版・複数版のどちらも `n_parts` を持つ)。
+    fn stored_state_reads(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.contains("n_parts"))
+            .count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "sqlx::query" {
+            return;
+        }
+        struct Collect<'a>(&'a mut String);
+        impl tracing::field::Visit for Collect<'_> {
+            fn record_debug(&mut self, _f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{v:?}"));
+            }
+            fn record_str(&mut self, _f: &tracing::field::Field, v: &str) {
+                self.0.push_str(v);
+            }
+        }
+        let mut sql = String::new();
+        event.record(&mut Collect(&mut sql));
+        self.0.lock().unwrap().push(sql);
+    }
+}
+
+/// **乗務員が何人でも保存済みの姿を読むのは 1 クエリ**。
+///
+/// 元は乗務員 1 人につき 1 往復で、Pg 読みは窓の受け口と pool
+/// (`max_connections=1`) を共有しているため完全に直列 — 137 名なら 137 回ぶんの
+/// 待ちがそのまま全量再計算の時間に乗っていた。
+#[tokio::test]
+async fn the_stored_state_read_is_one_query_however_many_drivers() {
+    let (store, _pool) = require_db!();
+
+    async fn count_reads(store: &KintaiPgStore, drivers: &[u64]) -> usize {
+        use tracing_subscriber::layer::SubscriberExt;
+        let repo = repo(punches_for(drivers));
+        let counter = QueryCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        // `#[tokio::test]` は current-thread runtime なので、この future は
+        // このスレッドで進む = スレッド局所の subscriber で拾える
+        let guard = tracing::subscriber::set_default(subscriber);
+        // **callsite の interest は process 大域にキャッシュされる。** subscriber の
+        // 無いまま sqlx が 1 度でも走ると「never」で焼き付き、後から subscriber を
+        // 挿しても event が飛ばない (数え方の側の罠で、0 と出る)
+        tracing::callsite::rebuild_interest_cache();
+        recalc_drivers(&repo, store, &params(), "2026-07", drivers, true)
+            .await
+            .expect("fold");
+        drop(guard);
+        counter.stored_state_reads()
+    }
+
+    // 1 名でも 8 名でも 1 回。**人数に比例しない**ことがこの PR の全て
+    assert_eq!(count_reads(&store, &[1201]).await, 1, "1 名で 1 クエリ");
+    assert_eq!(
+        count_reads(&store, &[1301, 1302, 1303, 1304, 1305, 1306, 1307, 1308]).await,
+        1,
+        "8 名でも 1 クエリ (乗務員ごとに読んでいたら 8)"
     );
 }
