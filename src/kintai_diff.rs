@@ -114,6 +114,8 @@ pub struct DriversPage {
     pub drivers: Vec<u64>,
     /// 続きの位置。`None` なら回りきった。
     pub next_after_driver_cd: Option<u64>,
+    /// 洗い出しにかかった時間 (ms)。ページごとに毎回払う費用なので出す。
+    pub elapsed_ms: u64,
 }
 
 /// `POST /api/kintai/timecard/diff` の応答。
@@ -127,6 +129,13 @@ pub struct DiffReport {
     pub events: usize,
     /// DDL の CHECK に無かった `state` の実値。**空でないと上流に知らない値が来ている**。
     pub unknown_states: BTreeSet<String>,
+    /// この差分の取り出しにかかった時間 (ms)。
+    ///
+    /// **見積もりで上限を決めない**ための実測値。`max_drivers` の既定は「1 乗務員
+    /// あたり 0.2 秒」という見積もりで置かれていたが、本番では 10 人で Cloudflare の
+    /// 524 (100 秒) を超えていた (#225)。応答に出しておけば、次に遅くなったときに
+    /// コードを読み直さずに `elapsed_ms / drivers` で当たりが付く。
+    pub elapsed_ms: u64,
 }
 
 impl DiffReport {
@@ -153,6 +162,7 @@ pub async fn drivers_page(
     let (from, to) = exact_month_range(month)
         .ok_or_else(|| KintaiDiffError::BadRequest(format!("bad month: {month}")))?;
     let max = max.clamp(1, MAX_MAX_DRIVERS);
+    let started = std::time::Instant::now();
     let all = repo.fetch_timecard_driver_cds_between(&from, &to).await?;
     let rest: Vec<u64> = match after {
         Some(a) => all.into_iter().filter(|d| *d > a).collect(),
@@ -162,6 +172,7 @@ pub async fn drivers_page(
     Ok(DriversPage {
         drivers: rest.into_iter().take(max).collect(),
         next_after_driver_cd: next,
+        elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
 
@@ -185,6 +196,7 @@ pub async fn diff_month(
         )));
     }
 
+    let started = std::time::Instant::now();
     let mut report = DiffReport::default();
     for (driver, remote_sigs) in remote {
         let rows = read_driver_events(repo, *driver, &from, &to).await?;
@@ -205,6 +217,7 @@ pub async fn diff_month(
         report.events += batch.days.values().map(Vec::len).sum::<usize>();
         report.batches.push(batch);
     }
+    report.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(report)
 }
 
