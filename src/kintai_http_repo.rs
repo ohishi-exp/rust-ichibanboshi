@@ -263,6 +263,35 @@ pub struct UnkoDiffItem {
     pub last_date: String,
 }
 
+/// 突合が噛み合わないときに**両側の生の文字列を並べて見る**ための標本の件数
+/// (Refs #205 の 37)。
+///
+/// 本番 2026-06 の初回実測で `gcp_only` が etags の item 総数 (1,130) と一致した
+/// = **2 集合の重なりがゼロ**だった。データの欠落ではなく突合キーが一度も一致して
+/// いないので、まず「どう違うか」を実物で見る。10 件あれば形は分かる。
+pub const MAX_UNKO_DIFF_SAMPLE: usize = 10;
+
+/// 突合キーの標本 1 件 (Refs #205 の 37)。
+///
+/// **`len` を添えるのは推測を挟まないため。** 桁が違うのか・前後に空白が付いて
+/// いるのか・そもそも別物なのかは、生の文字列と長さを並べれば数えずに分かる
+/// (JSON では前後の空白が読み飛ばされやすい)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnkoSample {
+    pub unko_no: String,
+    /// 文字数 (前後の空白も数える)。
+    pub len: usize,
+}
+
+impl UnkoSample {
+    fn new(unko_no: &str) -> Self {
+        Self {
+            unko_no: unko_no.to_string(),
+            len: unko_no.chars().count(),
+        }
+    }
+}
+
 /// 運行の突合の結果 (Refs #205 の 37)。**判定には使わない — 応答に載せるだけ。**
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UnkoDiff {
@@ -272,6 +301,11 @@ pub struct UnkoDiff {
     pub total: usize,
     /// **逆方向** (GCP に在ってオンプレに無い) の運行数。ゼロでなければ別の異常。
     pub gcp_only: usize,
+    /// 逆方向の実物 (辞書順の先頭 [`MAX_UNKO_DIFF_SAMPLE`] 件)。
+    pub gcp_only_sample: Vec<UnkoSample>,
+    /// **突き合わせた相手側**の実物 (オンプレの `unko_no`、同じく辞書順の先頭)。
+    /// 片側だけ見ても違いは分からないので、必ず対で返す。
+    pub onprem_sample: Vec<UnkoSample>,
 }
 
 /// **オンプレの `(乗務員CD, unko_no)` 集合と etags の `unko_no` 集合を突き合わせる**
@@ -283,8 +317,12 @@ pub struct UnkoDiff {
 ///
 /// - 突合の単位は **`(乗務員CD, unko_no)`** — 2 名乗務の運行は同じ `unko_no` が
 ///   2 人に紐づくので、片方だけ欠けている形も見える
-/// - 逆方向は**件数だけ**。ゼロでないなら「オンプレに無い運行を GCP が持っている」
+/// - 逆方向は**件数と標本**。ゼロでないなら「オンプレに無い運行を GCP が持っている」
 ///   という別の異常なので、名指しより先に気づけることが要る
+/// - **両側の標本を必ず対で返す** ([`UnkoSample`])。本番の初回実測で重なりがゼロ
+///   だった = キーが一度も一致していないので、片側だけでは何が違うのか分からない。
+///   標本は辞書順の先頭 — 呼ぶたびに違う 10 件が出ると比較にならないため
+///   (`HashSet` の反復順は不定)
 fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
     let mut items = Vec::new();
     let mut total = 0;
@@ -304,12 +342,30 @@ fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
         }
     }
     let seen: HashSet<&str> = onprem.iter().map(|o| o.unko_no.as_str()).collect();
-    let gcp_only = gcp.iter().filter(|u| !seen.contains(u.as_str())).count();
+    let mut only: Vec<&str> = gcp
+        .iter()
+        .map(String::as_str)
+        .filter(|u| !seen.contains(u))
+        .collect();
+    only.sort_unstable();
+    let mut mine: Vec<&str> = seen.into_iter().collect();
+    mine.sort_unstable();
     UnkoDiff {
         items,
         total,
-        gcp_only,
+        gcp_only: only.len(),
+        gcp_only_sample: sample(&only),
+        onprem_sample: sample(&mine),
     }
+}
+
+/// 辞書順に並べ終わった一覧の頭 [`MAX_UNKO_DIFF_SAMPLE`] 件。
+fn sample(sorted: &[&str]) -> Vec<UnkoSample> {
+    sorted
+        .iter()
+        .take(MAX_UNKO_DIFF_SAMPLE)
+        .map(|u| UnkoSample::new(u))
+        .collect()
 }
 
 /// [`with_unko_diff_sink`] が抱える 2 つの値。
@@ -2412,12 +2468,55 @@ mod tests {
         assert_eq!(diff.gcp_only, 0, "逆方向は無い");
     }
 
-    /// 両方揃っていれば空。
+    /// 両方揃っていれば「欠け」はゼロ。標本は突合が成立していても出す
+    /// (キーが噛み合っているかどうかを毎回目視できるようにするため)。
     #[test]
     fn diff_unko_is_empty_when_both_sides_agree() {
         let onprem = vec![op(1078, "U1"), op(1517, "U2")];
         let diff = diff_unko(&onprem, &gcp_set(&["U1", "U2"]));
-        assert_eq!(diff, UnkoDiff::default());
+        assert_eq!(diff.total, 0);
+        assert_eq!(diff.gcp_only, 0);
+        assert!(diff.items.is_empty());
+        assert!(diff.gcp_only_sample.is_empty(), "逆方向が無いので空");
+        let mine: Vec<&str> = diff.onprem_sample.iter().map(|s| &*s.unko_no).collect();
+        assert_eq!(mine, vec!["U1", "U2"], "自分側は辞書順で出る");
+    }
+
+    /// **キーが 1 つも一致しないとき、両側の実物が対で返る** (Refs #205 の 37)。
+    /// 本番 2026-06 の初回実測がこの形だった (重なりゼロ)。標本は**辞書順**で、
+    /// `HashSet` の反復順に振り回されない (呼ぶたびに違う 10 件だと比較にならない)。
+    #[test]
+    fn diff_unko_samples_both_sides_in_a_stable_order() {
+        let onprem = vec![op(1078, "B2"), op(1517, "B1")];
+        let diff = diff_unko(&onprem, &gcp_set(&["A2", "A1", "A3"]));
+        let theirs: Vec<&str> = diff.gcp_only_sample.iter().map(|s| &*s.unko_no).collect();
+        assert_eq!(theirs, vec!["A1", "A2", "A3"], "GCP 側は辞書順");
+        let mine: Vec<&str> = diff.onprem_sample.iter().map(|s| &*s.unko_no).collect();
+        assert_eq!(mine, vec!["B1", "B2"], "オンプレ側も辞書順");
+        assert_eq!(diff.gcp_only, 3);
+        assert_eq!(diff.total, 2);
+    }
+
+    /// **`len` は前後の空白も数える。** 桁違いと空白混入をその場で見分けるため。
+    #[test]
+    fn the_sample_reports_the_length_including_padding() {
+        let diff = diff_unko(
+            &[op(1078, "26062411400600000023021")],
+            &gcp_set(&[" 2606241140060000002302 "]),
+        );
+        assert_eq!(diff.onprem_sample[0].len, 23);
+        assert_eq!(diff.gcp_only_sample[0].len, 24, "前後の空白を数える");
+    }
+
+    /// 標本は 10 件で切る (実物の形が分かればよく、全量は `total` で足りる)。
+    #[test]
+    fn the_sample_is_capped() {
+        let onprem: Vec<OnpremOperation> = (0..MAX_UNKO_DIFF_SAMPLE + 3)
+            .map(|i| op(1000 + i as i64, &format!("U{i:03}")))
+            .collect();
+        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        assert_eq!(diff.onprem_sample.len(), MAX_UNKO_DIFF_SAMPLE);
+        assert_eq!(diff.onprem_sample[0].unko_no, "U000", "頭から");
     }
 
     /// **逆方向 (GCP に在ってオンプレに無い) は件数だけ数える。**
@@ -2488,7 +2587,8 @@ mod tests {
         }))
         .await;
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(diff, UnkoDiff::default());
+        assert_eq!(diff.total, 0);
+        assert_eq!(diff.gcp_only, 0);
     }
 
     /// **集めていないときは何も起きない** (`record_unsplit` と同じ扱い)。
