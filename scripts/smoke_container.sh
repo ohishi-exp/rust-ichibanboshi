@@ -68,10 +68,14 @@ readonly DUMMY_KINTAI_BASE_URL="http://alc-api.invalid"
 readonly DUMMY_KINTAI_TENANT_ID="00000000-0000-0000-0000-000000000000"
 
 CONTAINERS=()
+NETWORKS=()
 cleanup() {
-  local c
+  local c n
   for c in "${CONTAINERS[@]+"${CONTAINERS[@]}"}"; do
     docker rm -f "$c" >/dev/null 2>&1 || true
+  done
+  for n in "${NETWORKS[@]+"${NETWORKS[@]}"}"; do
+    docker network rm "$n" >/dev/null 2>&1 || true
   done
 }
 trap cleanup EXIT
@@ -140,6 +144,25 @@ wait_health() {
   done
   dump_logs "$container"
   fail "${container}: /health did not return 200 within ${READY_TIMEOUT_SECS}s (last code=${code:-none})"
+}
+
+# 使い捨て Postgres が接続を受け付けるまで poll する (container-internal
+# pg_isready を叩くので host 側にポートを publish しなくてよい)。
+wait_postgres() {
+  local container="$1" deadline
+  deadline=$(( $(date +%s) + READY_TIMEOUT_SECS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! container_running "$container"; then
+      dump_logs "$container"
+      fail "${container} exited before postgres became ready"
+    fi
+    if docker exec "$container" pg_isready -U postgres >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  dump_logs "$container"
+  fail "${container}: postgres did not become ready within ${READY_TIMEOUT_SECS}s"
 }
 
 # JSON の 1 フィールドを取り出して期待値と照合する
@@ -346,9 +369,77 @@ note "ok: exited ${EXIT_D} naming the missing kintai_events setting"
 
 docker rm -f "$C_D" >/dev/null
 
+# ---------------------------------------------------------------------------
+# case E — 本番の形 (GCP #205-26): MariaDB 無し + KINTAI_PUSH_ENABLED=true で
+# 打刻の読み先が Supabase 読み返し (http+pg) に切り替わること
+# ---------------------------------------------------------------------------
+# case A は「GCP の形」を名乗りながら DUMMY_MARIADB_* を宣言しており、実際の本番
+# (Cloud Run) には MariaDB が無い形態を一度も起動していなかった (#205-26)。
+# 現在の Cloud Run revision の実測 env (2026-07-31) はこれ:
+#   DATABASE_ENABLED=false / SQLITE_PATH=(空) / KINTAI_PUSH_ENABLED=true /
+#   KINTAI_EVENTS_SOURCE=http / KINTAI_EVENTS_BASE_URL=<alc の Cloud Run URL> /
+#   KINTAI_EVENTS_TENANT_ID=<uuid> / KINTAI_EVENTS_AUTH_TOKEN_METADATA=true /
+#   secret kintai-push-database-url (= KINTAI_PUSH_DATABASE_URL)
+# `KINTAI_PUSH_TENANT_ID` は設定しない (#222 の決定 — 空なら受け口が
+# X-Tenant-ID から決める。設定すると [kintai_events] tenant_id との一致検査に
+# 巻き込まれるだけで本番はそうしていない)。
+#
+# src/server.rs の build_kintai_events_repo は「MariaDB 無し + kintai_push 有効」
+# のときだけ backends.kintai_events を "http+pg" にする (それ以外は "http" のまま
+# 打刻が読めない、または "disabled")。ここが本タスクの中核の assert。
+#
+# KintaiPgStore::connect は lazy ではなく起動時に実際に 1 本繋ぐので、使い捨ての
+# Postgres を container 間ネットワークで用意する (host にポートは publish しない
+# — pg_isready は docker exec で container 内から確認する)。
+NET_E="$(name_for 205-26-net)"
+docker network create "$NET_E" >/dev/null || fail "case E: docker network create failed"
+NETWORKS+=("$NET_E")
+
+readonly CASE_E_PG_PASSWORD="smoke-205-26-not-a-real-password"
+PG_E="$(name_for 205-26-pg)"
+CONTAINERS+=("$PG_E")
+note "case E: starting throwaway postgres (${PG_E}) for KINTAI_PUSH_DATABASE_URL"
+docker run -d --name "$PG_E" --network "$NET_E" \
+  -e POSTGRES_PASSWORD="$CASE_E_PG_PASSWORD" \
+  postgres:17 >/dev/null || fail "case E: postgres docker run failed"
+wait_postgres "$PG_E"
+
+C_E="$(name_for 205-26-prod-shape)"
+CONTAINERS+=("$C_E")
+note "case E: production shape (GCP, no MariaDB, KINTAI_PUSH_ENABLED=true)"
+docker run -d --name "$C_E" --network "$NET_E" \
+  -e DATABASE_ENABLED=false \
+  -e SQLITE_PATH= \
+  -e KINTAI_PUSH_ENABLED=true \
+  -e KINTAI_PUSH_DATABASE_URL="postgres://postgres:${CASE_E_PG_PASSWORD}@${PG_E}:5432/postgres" \
+  -e KINTAI_EVENTS_SOURCE=http \
+  -e KINTAI_EVENTS_BASE_URL="$DUMMY_KINTAI_BASE_URL" \
+  -e KINTAI_EVENTS_TENANT_ID="$DUMMY_KINTAI_TENANT_ID" \
+  -e KINTAI_EVENTS_AUTH_TOKEN_METADATA=true \
+  -p 127.0.0.1::8080 \
+  "$IMAGE" >/dev/null || fail "case E: docker run failed"
+
+BASE_E="http://$(host_addr "$C_E" 8080)"
+note "case E: base = ${BASE_E}"
+wait_health "$C_E" "${BASE_E}/health"
+
+BODY_E="$(http_body "${BASE_E}/health")"
+note "case E: /health = ${BODY_E}"
+assert_json "$BODY_E" '.status' 'ok'
+assert_json "$BODY_E" '.backends.sqlserver' 'disabled'
+assert_json "$BODY_E" '.backends.mariadb' 'disabled'
+# 本タスク (#205-26) の中核: MariaDB 無し + KINTAI_PUSH 有効なら打刻の読み先が
+# Supabase 読み返しに切り替わる。"http" のままなら打刻が読めておらず、
+# "disabled" なら kintai_events 自体の設定が届いていない。
+assert_json "$BODY_E" '.backends.kintai_events' 'http+pg'
+
+docker rm -f "$C_E" "$PG_E" >/dev/null
+docker network rm "$NET_E" >/dev/null
+
 echo
 echo "SMOKE OK — both forms behave as declared:"
 echo "  GCP form     : starts, /health 200, sqlserver=disabled, mariadb=declared, kintai_events=http, sales 503, injected PORT honored"
 echo "  ENV defaults : reachable on 8080 from outside the container (ENV PORT / BIND_ADDR in effect)"
 echo "  on-prem form : refuses to start without SQL Server (exit ${EXIT_CODE}, no listener)"
 echo "  misconfig    : refuses to start when a declared backend is missing its settings (exit ${EXIT_D})"
+echo "  prod shape   : no MariaDB + KINTAI_PUSH_ENABLED=true -> kintai_events=http+pg (#205-26)"
