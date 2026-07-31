@@ -614,7 +614,8 @@ pub struct PushOptions {
 
 /// 対象月の対象乗務員を洗い出す。
 ///
-/// 全乗務員版の読み出しを 1 回だけ叩いて `driver_id` を集める。
+/// **打刻がある乗務員だけ。** ここで `dtako_events` しか無い乗務員を拾っても、
+/// [`parse_row`] が全行 `NotPushedSource` で捨てるので空の batch にしかならない。
 async fn target_drivers(
     repo: &DynKintaiEventsRepo,
     opts: &PushOptions,
@@ -624,25 +625,25 @@ async fn target_drivers(
     if let Some(d) = opts.driver {
         return Ok(vec![d]);
     }
-    let rows = repo.fetch_all_events_between(from, to).await?;
-    Ok(crate::kosoku::split_by_driver(rows)
-        .into_iter()
-        .map(|(d, _)| d)
-        .collect())
+    Ok(repo.fetch_timecard_driver_cds_between(from, to).await?)
 }
 
-/// 1 乗務員 1 か月ぶんの生イベントを読む。
+/// 1 乗務員 1 か月ぶんの打刻を読む。
 ///
 /// **全乗務員版ではなく単一乗務員版を使う。** 全乗務員版の SQL は速さのために
 /// `運行NO` を落としている (`ALL_EVENTS_SQL`) ので、入力層に残したい
 /// 「どの運行のイベントか」が消える。バッチなので往復の回数より情報量を採る。
+///
+/// **`dtako_events` は読まない** ([`PUSHED_SOURCES`])。押し出さない行なので、
+/// 読めば [`parse_row`] が捨てるだけ。畳むのに要るデジタコ生イベントは GCP が
+/// alc から直接引く (#205 の決定 5) ので、この経路が運ぶ必要もない。
 pub async fn read_driver_events(
     repo: &DynKintaiEventsRepo,
     driver: u64,
     from: &str,
     to: &str,
 ) -> Result<Vec<serde_json::Value>, KintaiPushError> {
-    Ok(repo.fetch_events_between(from, to, driver).await?)
+    Ok(repo.fetch_timecard_events_between(from, to, driver).await?)
 }
 
 /// 対象月の打刻を push する (実装計画 04)。
