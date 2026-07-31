@@ -687,6 +687,71 @@ fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(unko_no.get(..UNKO_NO_DATE_DIGITS)?, "%y%m%d").ok()
 }
 
+/// etags の一覧から測った「入力がどこまで届いているか」(Refs #205 の 21)。
+///
+/// **警告が立つかどうかに関わらず毎回 `tracing::info!` に出す** — 閾値
+/// ([`MAX_TAIL_GAP_DAYS`]) は実測で決めたが、母集団は alc の `dtako_operations` を
+/// `reading_date` で引いたもので、その分布はこちらから観測できない。ベースラインが
+/// ずれていて毎月立ち続けたとしても、**その場のログに実測 gap が出ていれば
+/// 1 回の追い PR で締められる**。「外したときに自己診断できる」形にしておくのが
+/// 閾値を先に入れる条件 (親の判断、2026-07-31)。
+struct InputCoverage {
+    /// etags の item 数 (= 窓の中の運行数)。
+    items: usize,
+    /// `etag` が `null` の item 数 (R2 に CSV が無い)。
+    no_etag: usize,
+    /// 運行開始日の最小 / 最大。1 件も読めなければ `None`。
+    first: Option<NaiveDate>,
+    last: Option<NaiveDate>,
+    /// 末尾がここまで届いていてほしい日 (進行中の月は `today - 1 日` に切り下げ)。
+    expected: NaiveDate,
+}
+
+impl InputCoverage {
+    /// `pairs` を 1 度だけ走査して測る (応答は実測 1,100 件、O(n) に収める)。
+    fn measure(
+        pairs: &[(String, Option<String>)],
+        window_end: NaiveDate,
+        today: NaiveDate,
+    ) -> Self {
+        let mut no_etag = 0;
+        let (mut first, mut last) = (None, None);
+        for (unko_no, etag) in pairs {
+            if etag.is_none() {
+                no_etag += 1;
+            }
+            if let Some(d) = unko_no_start_date(unko_no) {
+                first = Some(first.map_or(d, |f: NaiveDate| f.min(d)));
+                last = Some(last.map_or(d, |l: NaiveDate| l.max(d)));
+            }
+        }
+        let expected = window_end.min(today - chrono::Duration::days(1));
+        let items = pairs.len();
+        Self {
+            items,
+            no_etag,
+            first,
+            last,
+            expected,
+        }
+    }
+
+    /// 末尾の不足日数。運行開始日が 1 件も読めなければ `None`。
+    fn gap_days(&self) -> Option<i64> {
+        self.last.map(|l| (self.expected - l).num_days())
+    }
+
+    /// ログにも警告本文にも載せる 1 行の実測値。
+    fn summary(&self) -> String {
+        let f = self
+            .first
+            .map_or_else(|| "?".to_string(), |d| d.to_string());
+        let l = self.last.map_or_else(|| "?".to_string(), |d| d.to_string());
+        let (n, z, e) = (self.items, self.no_etag, self.expected);
+        format!("n={n} etag無={z} {f}..{l} 期待={e}")
+    }
+}
+
 /// **入力の欠けを etags の一覧から見つける** (Refs #205 の 21)。
 ///
 /// `fetch_etags` は月ゲートのために毎回引いているので、**追加の往復ゼロ・alc の
@@ -701,29 +766,22 @@ fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
 /// **進行中の月**は末尾に運行が無くて当然なので、期待する末尾は `today - 1 日`
 /// までに切り下げる (`today` 当日は読み取りがまだ上がっていないのが普通)。
 ///
+/// 文面には**実測値 ([`InputCoverage::summary`]) を必ず入れる** —
+/// `FoldReport::warnings` は応答に出るので、呼び出し側がそれだけ見て判断できる形にする。
+///
 /// 誤検知は**安全側**に倒れる — warning が立つと月ゲートが封をしないので、最悪でも
 /// 「毎回全量読みに戻る (遅いが正しい)」で済む。逆 (見逃し) は静かに間違う。
-fn missing_input_warnings(
-    pairs: &[(String, Option<String>)],
-    window_end: NaiveDate,
-    today: NaiveDate,
-) -> Vec<String> {
+fn missing_input_warnings(cov: &InputCoverage) -> Vec<String> {
     let mut out = Vec::new();
-    let no_etag = pairs.iter().filter(|(_, etag)| etag.is_none()).count();
-    if no_etag > 0 {
-        out.push(format!("dtako 入力欠け: R2 に CSV の無い運行 {no_etag} 件"));
+    let s = cov.summary();
+    if cov.no_etag > 0 {
+        let n = cov.no_etag;
+        out.push(format!("dtako 入力欠け: R2 に CSV の無い運行 {n} 件 ({s})"));
     }
-    let expected = window_end.min(today - chrono::Duration::days(1));
-    match pairs
-        .iter()
-        .filter_map(|(u, _)| unko_no_start_date(u))
-        .max()
-    {
-        None => out.push("dtako 入力欠け: 運行開始日を読めた運行が 0 件".to_string()),
-        Some(last) if (expected - last).num_days() > MAX_TAIL_GAP_DAYS => {
-            // マクロは 1 行に収める (CLAUDE.md — 折り返すと行カバレッジに乗らない)
-            let m = format!("dtako 入力欠け: 運行が {last} まで (期待 {expected})");
-            out.push(m);
+    match cov.gap_days() {
+        None => out.push(format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})")),
+        Some(g) if g > MAX_TAIL_GAP_DAYS => {
+            out.push(format!("dtako 入力欠け: 末尾が {g} 日不足 ({s})"));
         }
         Some(_) => {}
     }
@@ -1066,7 +1124,12 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
         // 引いてきた一覧の形から自分で見つけて `record_warning` へ流す (Refs #205 の 21)
         // `None` (alc に口が無い) は「欠けている」ではなく「判定できない」— 検知しない
         if let Some(p) = pairs.as_deref() {
-            for w in missing_input_warnings(p, to, today_jst()) {
+            let cov = InputCoverage::measure(p, to, today_jst());
+            // **警告の有無に関わらず毎回出す** (閾値を後から締めるための実測値)。
+            // マクロは 1 行に収める (CLAUDE.md — 折り返すと行カバレッジに乗らない)
+            let (gap, cover) = (cov.gap_days().unwrap_or(-1), cov.summary());
+            tracing::info!(gap, %cover, "kintai dtako input coverage");
+            for w in missing_input_warnings(&cov) {
                 tracing::warn!(warning = %w, "kintai dtako input gap");
                 record_warning(&w);
             }
@@ -1708,6 +1771,10 @@ mod tests {
         (unko_no.to_string(), etag.map(str::to_string))
     }
 
+    fn warns(pairs: &[(String, Option<String>)], end: NaiveDate, today: NaiveDate) -> Vec<String> {
+        missing_input_warnings(&InputCoverage::measure(pairs, end, today))
+    }
+
     /// **揃っている月は静か。** 窓の端まで運行開始が届いていれば warning ゼロ。
     #[test]
     fn missing_input_warnings_is_silent_when_the_window_is_covered() {
@@ -1715,7 +1782,7 @@ mod tests {
             pair("26060110000000000023021", Some("e1")),
             pair("26070110000000000023021", Some("e2")),
         ];
-        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        let w = warns(&pairs, d(2026, 7, 1), d(2026, 7, 20));
         assert!(w.is_empty(), "窓の端 (07-01) まで在るので静か: {w:?}");
     }
 
@@ -1723,24 +1790,26 @@ mod tests {
     #[test]
     fn missing_input_warnings_tolerates_the_measured_natural_tail_gap() {
         let pairs = vec![pair("25123110000000000023021", Some("e1"))];
-        let w = missing_input_warnings(&pairs, d(2026, 1, 1), d(2026, 1, 20));
+        let w = warns(&pairs, d(2026, 1, 1), d(2026, 1, 20));
         assert!(w.is_empty(), "年末の 1 日空きは自然: {w:?}");
     }
 
     /// **#205-19 が実証した形。** 末尾の運行が丸ごと欠けたら立つ。
+    /// 文面には実測値 (不足日数と covered の範囲) が入る。
     #[test]
     fn missing_input_warnings_fires_when_the_tail_of_the_month_is_missing() {
         let pairs = vec![
             pair("26060110000000000023021", Some("e1")),
             pair("26062410000000000023021", Some("e2")),
         ];
-        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        let w = warns(&pairs, d(2026, 7, 1), d(2026, 7, 20));
         assert_eq!(w.len(), 1, "末尾 7 日ぶんの欠け: {w:?}");
+        assert!(w[0].contains("末尾が 7 日不足"), "不足日数を書く: {w:?}");
+        assert!(w[0].contains("2026-06-01..2026-06-24"), "範囲を書く: {w:?}");
         assert!(
-            w[0].contains("2026-06-24"),
-            "どこまでしか無いかを書く: {w:?}"
+            w[0].contains("期待=2026-07-01"),
+            "期待した末尾も書く: {w:?}"
         );
-        assert!(w[0].contains("2026-07-01"), "期待した末尾も書く: {w:?}");
     }
 
     /// **進行中の月は末尾に運行が無くて当然。** 期待値を `today - 1` に切り下げる。
@@ -1748,7 +1817,7 @@ mod tests {
     fn missing_input_warnings_clamps_the_expectation_to_yesterday() {
         let pairs = vec![pair("26070310000000000023021", Some("e1"))];
         // 7 月を 07-04 に畳む — 窓の端 (08-01) はまだ来ていない
-        let w = missing_input_warnings(&pairs, d(2026, 8, 1), d(2026, 7, 4));
+        let w = warns(&pairs, d(2026, 8, 1), d(2026, 7, 4));
         assert!(w.is_empty(), "当月の末尾の空きは欠けではない: {w:?}");
     }
 
@@ -1756,9 +1825,13 @@ mod tests {
     #[test]
     fn missing_input_warnings_fires_when_no_unko_no_carries_a_date() {
         let pairs = vec![pair("U1", Some("e1")), pair("U2", Some("e2"))];
-        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        let w = warns(&pairs, d(2026, 7, 1), d(2026, 7, 20));
         assert_eq!(w.len(), 1);
-        assert!(w[0].contains("0 件"), "{w:?}");
+        assert!(w[0].contains("1 件も読めない"), "{w:?}");
+        assert!(
+            w[0].contains("n=2 etag無=0 ?..?"),
+            "実測値は ? で埋める: {w:?}"
+        );
     }
 
     /// **`etag: null` は閾値の要らない確実な欠け** (R2 に CSV がまだ無い)。
@@ -1768,7 +1841,7 @@ mod tests {
             pair("26060110000000000023021", Some("e1")),
             pair("26070110000000000023021", None),
         ];
-        let w = missing_input_warnings(&pairs, d(2026, 7, 1), d(2026, 7, 20));
+        let w = warns(&pairs, d(2026, 7, 1), d(2026, 7, 20));
         assert_eq!(w.len(), 1, "末尾は埋まっているので etag の 1 本だけ: {w:?}");
         assert!(w[0].contains("R2 に CSV の無い運行 1 件"), "{w:?}");
     }
@@ -1776,8 +1849,13 @@ mod tests {
     /// 空の一覧は「末尾が欠けている」ではなく「1 件も読めない」で立つ。
     #[test]
     fn missing_input_warnings_fires_on_an_empty_list() {
-        let w = missing_input_warnings(&[], d(2026, 7, 1), d(2026, 7, 20));
+        let w = warns(&[], d(2026, 7, 1), d(2026, 7, 20));
         assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(
+            InputCoverage::measure(&[], d(2026, 7, 1), d(2026, 7, 20)).gap_days(),
+            None,
+            "gap は測れない"
+        );
     }
 
     /// `today_jst` は UTC 深夜の前後で日付がずれない (JST 固定オフセット)。
