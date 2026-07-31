@@ -116,6 +116,16 @@ pub struct FoldUnit {
     pub skipped: Vec<SkipReason>,
 }
 
+impl FoldUnit {
+    /// 3 表のどれにも行が立たなかったか。
+    ///
+    /// 対象月に畳める勤務が 1 本も無い乗務員がこれになる。打刻も休息も無い月、
+    /// 退職して以降の月、勤務が全部 [`SkipReason`] で落ちた月。
+    pub fn is_empty(&self) -> bool {
+        self.shifts.is_empty() && self.day_summaries.is_empty() && self.day_parts.is_empty()
+    }
+}
+
 /// 3 表に写せなかったもの。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
@@ -270,12 +280,28 @@ pub struct StoredState {
 }
 
 impl StoredState {
+    /// 3 表に 1 行も載っていないか。指紋も当然 1 つも無い。
+    pub fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
+            && self.shifts == 0
+            && self.day_summaries == 0
+            && self.day_parts == 0
+    }
+
     /// 書かなくてよいか。
     ///
     /// 指紋が 1 種類でそれが今回の指紋と同じ、**かつ** 3 表の行数が今回と同じとき
     /// だけスキップする。行数まで見るのは、前回が途中で落ちて一部だけ書けている
     /// 状態を「同じ指紋だから」で見逃さないため。
+    ///
+    /// **空 = 空は current。** 畳める勤務が 1 本も無い乗務員は書くものが無いので
+    /// 指紋も載らず、指紋の一致だけで判定すると毎回 stale になる。毎回
+    /// `drivers_written` に乗って [`FoldReport::wrote_anything`] が誤検知し、
+    /// `sync` が「何か書いた」と報告し続ける。
     pub fn is_current(&self, unit: &FoldUnit, fp: &str) -> bool {
+        if self.is_empty() && unit.is_empty() {
+            return true;
+        }
         self.fingerprints.len() == 1
             && self.fingerprints[0] == fp
             && self.shifts == unit.shifts.len() as i64
@@ -323,27 +349,52 @@ DELETE FROM kintai.shifts
  WHERE tenant_id = $1 AND driver_cd = $2 AND date_start >= $3 AND date_start < $4
 "#;
 
-const INSERT_SHIFT_SQL: &str = r#"
+/// 入れる勤務を **1 文で**。列ごとの配列を `unnest` で行に開く。
+///
+/// `fingerprint` / `logic_version` は単位ぜんたいで 1 つなので配列にしない。
+const INSERT_SHIFTS_SQL: &str = r#"
 INSERT INTO kintai.shifts
        (tenant_id, driver_cd, start_at, end_at, shift_source, fingerprint, logic_version)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+SELECT $1, d.driver_cd, d.start_at, d.end_at, d.shift_source, $6, $7
+  FROM unnest($2::int8[], $3::timestamptz[], $4::timestamptz[], $5::text[])
+       AS d(driver_cd, start_at, end_at, shift_source)
 "#;
 
-const INSERT_DAY_SUMMARY_SQL: &str = r#"
+/// 入れる日別サマリを **1 文で**。分の列は 11 本あるが全部 `int4` の配列。
+const INSERT_DAY_SUMMARIES_SQL: &str = r#"
 INSERT INTO kintai.day_summaries
        (tenant_id, driver_cd, date, shift_start_at, shift_source,
         restraint_minutes, working_minutes, break_minutes, rest_minus_minutes,
         statutory_minutes, within_statutory_overtime_minutes, overtime_minutes,
         legal_holiday_minutes, night_minutes, overtime_night_minutes,
         legal_holiday_night_minutes, fingerprint, logic_version)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+SELECT $1, d.driver_cd, d.date, d.shift_start_at, d.shift_source,
+       d.restraint_minutes, d.working_minutes, d.break_minutes, d.rest_minus_minutes,
+       d.statutory_minutes, d.within_statutory_overtime_minutes, d.overtime_minutes,
+       d.legal_holiday_minutes, d.night_minutes, d.overtime_night_minutes,
+       d.legal_holiday_night_minutes, $17, $18
+  FROM unnest($2::int8[], $3::date[], $4::timestamptz[], $5::text[],
+              $6::int4[], $7::int4[], $8::int4[], $9::int4[],
+              $10::int4[], $11::int4[], $12::int4[],
+              $13::int4[], $14::int4[], $15::int4[], $16::int4[])
+       AS d(driver_cd, date, shift_start_at, shift_source,
+            restraint_minutes, working_minutes, break_minutes, rest_minus_minutes,
+            statutory_minutes, within_statutory_overtime_minutes, overtime_minutes,
+            legal_holiday_minutes, night_minutes, overtime_night_minutes,
+            legal_holiday_night_minutes)
 "#;
 
-const INSERT_DAY_PART_SQL: &str = r#"
+/// 入れる暦日ビューを **1 文で**。
+const INSERT_DAY_PARTS_SQL: &str = r#"
 INSERT INTO kintai.day_parts
        (tenant_id, driver_cd, shift_start_at, date,
         restraint_minutes, working_minutes, night_minutes)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+SELECT $1, d.driver_cd, d.shift_start_at, d.date,
+       d.restraint_minutes, d.working_minutes, d.night_minutes
+  FROM unnest($2::int8[], $3::timestamptz[], $4::date[],
+              $5::int4[], $6::int4[], $7::int4[])
+       AS d(driver_cd, shift_start_at, date,
+            restraint_minutes, working_minutes, night_minutes)
 "#;
 
 /// JST の壁時計を `TIMESTAMPTZ` へ。
@@ -397,12 +448,25 @@ pub async fn stored_state(
 ///
 /// `shifts` を先に消してから入れ直す — `day_summaries` / `day_parts` は
 /// `shifts` への FK を `ON DELETE CASCADE` で持つので、消し忘れが起きない。
+///
+/// ## 行ごとに往復しない
+///
+/// 1 行 1 INSERT で回すと、初回 fold (2 か月・95 名で `shifts` 約 1,900 +
+/// `day_summaries` 数千 + `day_parts`) が数千往復になり、push 側が #231 で潰した
+/// 「10,157 往復 → Cloudflare の 524 (100 秒)」と同型になる。
+/// [`crate::kintai_push::KintaiPgStore::replace_window`] と同じく `unnest` で
+/// **DELETE 1 文 + 表ごとに INSERT 数文**に畳む。
+///
+/// 刻み幅は push と同じ [`crate::kintai_push::INSERT_CHUNK`]。刻んでも同じ
+/// トランザクションの中に居るので、全か無かは変わらない。
 pub async fn write_unit(
     store: &KintaiPgStore,
     month: &str,
     unit: &FoldUnit,
     fingerprint: &str,
 ) -> Result<(), KintaiPushError> {
+    use crate::kintai_push::INSERT_CHUNK;
+
     let (m0, m1) = month_date_bounds(month)
         .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
     let tenant = store.tenant_id();
@@ -419,53 +483,76 @@ pub async fn write_unit(
         .bind(m1)
         .execute(&mut *tx)
         .await?;
-    for s in &unit.shifts {
-        sqlx::query(INSERT_SHIFT_SQL)
+
+    for chunk in unit.shifts.chunks(INSERT_CHUNK) {
+        let driver: Vec<i64> = chunk.iter().map(|s| s.driver_cd).collect();
+        let start: Vec<DateTime<FixedOffset>> = chunk.iter().map(|s| tz(s.start_at)).collect();
+        let end: Vec<DateTime<FixedOffset>> = chunk.iter().map(|s| tz(s.end_at)).collect();
+        let source: Vec<&str> = chunk.iter().map(|s| s.shift_source).collect();
+        sqlx::query(INSERT_SHIFTS_SQL)
             .bind(tenant)
-            .bind(s.driver_cd)
-            .bind(tz(s.start_at))
-            .bind(tz(s.end_at))
-            .bind(s.shift_source)
+            .bind(&driver)
+            .bind(&start)
+            .bind(&end)
+            .bind(&source)
             .bind(fingerprint)
             .bind(version)
             .execute(&mut *tx)
             .await?;
     }
-    for d in &unit.day_summaries {
-        sqlx::query(INSERT_DAY_SUMMARY_SQL)
+
+    for chunk in unit.day_summaries.chunks(INSERT_CHUNK) {
+        let driver: Vec<i64> = chunk.iter().map(|d| d.driver_cd).collect();
+        let date: Vec<NaiveDate> = chunk.iter().map(|d| d.date).collect();
+        let start: Vec<DateTime<FixedOffset>> =
+            chunk.iter().map(|d| tz(d.shift_start_at)).collect();
+        let source: Vec<&str> = chunk.iter().map(|d| d.shift_source).collect();
+        let col = |f: fn(&DaySummaryRow) -> i64| -> Vec<i32> {
+            chunk.iter().map(|d| f(d) as i32).collect()
+        };
+        sqlx::query(INSERT_DAY_SUMMARIES_SQL)
             .bind(tenant)
-            .bind(d.driver_cd)
-            .bind(d.date)
-            .bind(tz(d.shift_start_at))
-            .bind(d.shift_source)
-            .bind(d.restraint_minutes as i32)
-            .bind(d.working_minutes as i32)
-            .bind(d.break_minutes as i32)
-            .bind(d.rest_minus_minutes as i32)
-            .bind(d.statutory_minutes as i32)
-            .bind(d.within_statutory_overtime_minutes as i32)
-            .bind(d.overtime_minutes as i32)
-            .bind(d.legal_holiday_minutes as i32)
-            .bind(d.night_minutes as i32)
-            .bind(d.overtime_night_minutes as i32)
-            .bind(d.legal_holiday_night_minutes as i32)
+            .bind(&driver)
+            .bind(&date)
+            .bind(&start)
+            .bind(&source)
+            .bind(col(|d| d.restraint_minutes))
+            .bind(col(|d| d.working_minutes))
+            .bind(col(|d| d.break_minutes))
+            .bind(col(|d| d.rest_minus_minutes))
+            .bind(col(|d| d.statutory_minutes))
+            .bind(col(|d| d.within_statutory_overtime_minutes))
+            .bind(col(|d| d.overtime_minutes))
+            .bind(col(|d| d.legal_holiday_minutes))
+            .bind(col(|d| d.night_minutes))
+            .bind(col(|d| d.overtime_night_minutes))
+            .bind(col(|d| d.legal_holiday_night_minutes))
             .bind(fingerprint)
             .bind(version)
             .execute(&mut *tx)
             .await?;
     }
-    for p in &unit.day_parts {
-        sqlx::query(INSERT_DAY_PART_SQL)
+
+    for chunk in unit.day_parts.chunks(INSERT_CHUNK) {
+        let driver: Vec<i64> = chunk.iter().map(|p| p.driver_cd).collect();
+        let start: Vec<DateTime<FixedOffset>> =
+            chunk.iter().map(|p| tz(p.shift_start_at)).collect();
+        let date: Vec<NaiveDate> = chunk.iter().map(|p| p.date).collect();
+        let restraint: Vec<i32> = chunk.iter().map(|p| p.restraint_minutes as i32).collect();
+        let working: Vec<i32> = chunk.iter().map(|p| p.working_minutes as i32).collect();
+        let night: Vec<i32> = chunk.iter().map(|p| p.night_minutes as i32).collect();
+        sqlx::query(INSERT_DAY_PARTS_SQL)
             .bind(tenant)
-            .bind(p.driver_cd)
-            .bind(tz(p.shift_start_at))
-            .bind(p.date)
-            .bind(p.restraint_minutes as i32)
-            .bind(p.working_minutes as i32)
-            .bind(p.night_minutes as i32)
+            .bind(&driver)
+            .bind(&start)
+            .bind(&date)
+            .bind(&restraint)
+            .bind(&working)
+            .bind(&night)
             .execute(&mut *tx)
             .await?;
     }
+
     tx.commit().await?;
     Ok(())
 }
@@ -495,7 +582,11 @@ pub async fn recalc_month(
 
     let mut report = FoldReport::default();
     for driver_cd in drivers {
-        let rows = crate::kintai_push::read_driver_events(repo, driver_cd, &from, &to).await?;
+        // **`kintai_push::read_driver_events` を呼ばない。** あれは #225 で
+        // 「打刻 2 表だけ」に絞られた push / diff 用の読みで、`dtako_events` が
+        // 落ちている。`daily_summary` は休息イベントで勤務を切るので、渡すと
+        // 休息由来の勤務が丸ごと消える (2026-07-31 の回帰)
+        let rows = repo.fetch_events_between(&from, &to, driver_cd).await?;
         let (unit, fp) = fold_driver_month(driver_cd as i64, month, params, rows);
         report.drivers += 1;
         report.skipped.extend(unit.skipped.iter().cloned());
@@ -852,6 +943,36 @@ mod tests {
             day_parts: 0,
         };
         assert!(!empty.is_current(&unit, "fp"), "1 行も無いなら書く");
+    }
+
+    #[test]
+    fn stored_state_treats_empty_against_empty_as_current() {
+        // 畳める勤務が 1 本も無い乗務員。書くものが無いので指紋も載らず、
+        // stale 扱いにすると毎回 drivers_written に乗る
+        let empty_unit = fold_days(1, &[]);
+        assert!(empty_unit.is_empty());
+        let empty = StoredState {
+            fingerprints: vec![],
+            shifts: 0,
+            day_summaries: 0,
+            day_parts: 0,
+        };
+        assert!(empty.is_empty());
+        assert!(empty.is_current(&empty_unit, "fp"));
+        // 指紋が何であっても当たる — 突き合わせる行がそもそも無い
+        assert!(empty.is_current(&empty_unit, "other"));
+
+        // 前回書いた行が残っているなら、今回が空でも消しに行く
+        let stored = StoredState {
+            fingerprints: vec!["fp".to_string()],
+            shifts: 1,
+            day_summaries: 1,
+            day_parts: 0,
+        };
+        assert!(
+            !stored.is_current(&empty_unit, "fp"),
+            "空にするのも書き込み"
+        );
     }
 
     #[test]
