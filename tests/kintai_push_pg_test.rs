@@ -1009,3 +1009,82 @@ async fn writes_survive_crossing_the_insert_chunk() {
     assert_eq!(r.events_written as i64, total);
     assert_eq!(count_events(&pool, store.tenant_id()).await, total);
 }
+
+/// **この経路が作っていない行を巻き添えで消さない。**
+///
+/// DDL は `source IN ('timecard','dtako','alc_app')` を許すが、ここが作るのは
+/// 前 2 つだけ。日ごと消して入れ直すときに絞らないと、他が書いた `alc_app` の行が
+/// 消えて二度と戻せない (手元の payload から再生できない)。
+#[tokio::test]
+async fn the_window_leaves_rows_from_other_sources_alone() {
+    let (store, pool) = require_db!();
+    let tenant = store.tenant_id();
+    // 他の書き手が入れた行を 1 件仕込む (同じ乗務員・同じ日)
+    sqlx::query(
+        "INSERT INTO kintai.kintai_events
+                (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw)
+         VALUES ($1, 4001, $2, '始業', 'alc_app', NULL, '{}'::jsonb)",
+    )
+    .bind(tenant)
+    .bind(jst_day_bounds(NaiveDate::from_ymd_opt(2026, 6, 9).unwrap()).0)
+    .execute(&pool)
+    .await
+    .expect("seed alc_app row");
+
+    // 同じ日を this 経路で 2 回書く (1 回目で入れ、2 回目で入れ直す)
+    let w = window_of(
+        &["2026-06"],
+        &[4001],
+        vec![win_punch(4001, "2026-06-09 08:00:00", "始業")],
+    );
+    apply_timecard_window(&store, &w).await.expect("1st");
+    // 中身を変えて、その日を確実に書き直させる
+    let w2 = window_of(
+        &["2026-06"],
+        &[4001],
+        vec![win_punch(4001, "2026-06-09 07:30:00", "始業")],
+    );
+    let again = apply_timecard_window(&store, &w2).await.expect("2nd");
+    assert_eq!(again.days_written, 1, "書き直しが起きていない");
+
+    let survivors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kintai.kintai_events
+          WHERE tenant_id = $1 AND source = 'alc_app'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("count alc_app");
+    assert_eq!(survivors, 1, "alc_app の行が巻き添えで消えた");
+}
+
+/// **署名も同じ `source` で絞る。** 片方だけ絞ると、他の書き手の行が署名に混ざって
+/// 「中身は同じなのに毎回全日が違う」に倒れ、静かに全件を書き直し続ける。
+#[tokio::test]
+async fn other_sources_do_not_leak_into_the_signature() {
+    let (store, pool) = require_db!();
+    let tenant = store.tenant_id();
+    let w = window_of(
+        &["2026-06"],
+        &[4002],
+        vec![win_punch(4002, "2026-06-12 08:00:00", "始業")],
+    );
+    apply_timecard_window(&store, &w).await.expect("seed");
+
+    // 同じ日に別の書き手が 1 件足す
+    sqlx::query(
+        "INSERT INTO kintai.kintai_events
+                (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw)
+         VALUES ($1, 4002, $2, '終業', 'alc_app', NULL, '{}'::jsonb)",
+    )
+    .bind(tenant)
+    .bind(jst_day_bounds(NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()).1)
+    .execute(&pool)
+    .await
+    .expect("seed alc_app row");
+
+    // 署名は変わらない = 差分が出ない
+    let again = apply_timecard_window(&store, &w).await.expect("re-send");
+    assert_eq!(again.days_written, 0, "他の書き手の行で差分が出た");
+    assert_eq!(again.drivers_written, 0);
+}
