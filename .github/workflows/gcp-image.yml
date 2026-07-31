@@ -293,6 +293,26 @@ jobs:
   # runtime SA は**あえて渡さない** — 渡さなければ現状 (既定の compute SA、
   # `kintai-push-database-url` の per-secret grant はそこに付いている) が保たれる。
   #
+  # ── 生イベントの読み先 (KINTAI_EVENTS_*、Refs #205 の 02 / G6) ──────────────
+  # 宣言が 1 つも無いと `build_kintai_events_repo` が最終分岐へ落ちて
+  # `/health` の `backends.kintai_events` が `disabled` になる。GCP には MariaDB が
+  # 無いので、dtako は `rust-alc-api` の HTTP、打刻は Supabase の
+  # `kintai.kintai_events` を読み返す (`http+pg`) のが**この形態の正しい姿**。
+  #
+  # - `TENANT_ID` は repo variable。UUID は資格情報ではないが git 履歴には焼かない。
+  #   値の正は relay の KV `dtako-relay-config` の `dtako_accounts`
+  #   (comp_id 27324455 = 大石運輸倉庫)。**skip 条件には足さない** — 空なら
+  #   `validate()` が起動を失敗させ、deploy job が赤く落ちて traffic は前の
+  #   revision に残る。skip に足すと announce job も鳴らず静かに何も出なくなる
+  # - `AUTH_TOKEN_METADATA=true` は Cloud Run 内では一択。image に gcloud も curl も
+  #   無いので `_AUTH_TOKEN_COMMAND` は使えない (#218)
+  # - alc は lockdown 済みなので、runtime SA (既定の compute SA) が `rust-alc-api`
+  #   への `roles/run.invoker` を持っていないと token を積んでも 403 になる
+  #
+  # `[kintai_push] tenant_id` (KINTAI_PUSH_TENANT_ID) は #222 のとおり**空のまま**。
+  # 受け口は X-Tenant-ID で名乗らせる。片方だけ設定なら validate の一致検査は
+  # 素通りするので、ここの `KINTAI_EVENTS_TENANT_ID` とは衝突しない。
+  #
   # ── 未設定なら skip する。ただし黙らない ───────────────────────────────────
   # org variable が消えたときに「deploy したつもりで何も出ていない」を作らない
   # ため、skip したことを announce job が必ず 1 行残す。
@@ -318,7 +338,7 @@ jobs:
       ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/ghcr.io/ohishi-exp/rust-ichibanboshi
       workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
       service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
-      set_env_vars: '^@^DATABASE_ENABLED=false@SQLITE_PATH=@KINTAI_PUSH_ENABLED=true'
+      set_env_vars: '^@^DATABASE_ENABLED=false@SQLITE_PATH=@KINTAI_PUSH_ENABLED=true@KINTAI_EVENTS_SOURCE=http@KINTAI_EVENTS_BASE_URL=https://rust-alc-api-747065218280.asia-northeast1.run.app@KINTAI_EVENTS_TENANT_ID=${{ vars.KINTAI_EVENTS_TENANT_ID }}@KINTAI_EVENTS_AUTH_TOKEN_METADATA=true'
       update_secrets: 'KINTAI_PUSH_DATABASE_URL=kintai-push-database-url:latest'
 
   # ---------------------------------------------------------------------------
