@@ -206,6 +206,67 @@ ALTER ROLE kintai_reader PASSWORD :'pw';
 ALTER ROLE kintai_writer PASSWORD :'pw';
 SQL
 
+# ── 3b. GRANT の網羅 (Refs #205 の 20) ────────────────────────────────
+#
+# `GRANT ... ON ALL TABLES IN SCHEMA` は**その時点の表にしか効かない**。001 以降に
+# 作られた表は `ALTER DEFAULT PRIVILEGES` (005) が入るまで権限ゼロで生まれていた。
+# 004 の `kintai.fold_gate` がそれを踏み、本番の `POST /api/kintai/recalc` が
+# `permission denied for table fold_gate` → 502 で落ちた (2026-07-31)。
+#
+# **表を名指しせず「1 表でも権限の欠けたものがあれば落ちる」形にする** — 次に表が
+# 増えたときも同じ漏れを CI が捕まえる。
+echo "== 全表に writer / reader の GRANT が行き渡っている"
+expect_eq "writer の 4 権限が欠けた表の数" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='kintai' AND c.relkind='r'
+         AND NOT (has_table_privilege('kintai_writer', c.oid, 'SELECT')
+              AND has_table_privilege('kintai_writer', c.oid, 'INSERT')
+              AND has_table_privilege('kintai_writer', c.oid, 'UPDATE')
+              AND has_table_privilege('kintai_writer', c.oid, 'DELETE'))")" "0"
+expect_eq "reader の SELECT が欠けた表の数" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='kintai' AND c.relkind='r'
+         AND NOT has_table_privilege('kintai_reader', c.oid, 'SELECT')")" "0"
+
+# `ALTER DEFAULT PRIVILEGES` (005) は**それを実行したロールが作る表にしか効かない**
+# (`FOR ROLE` を省くと `current_role`)。migration を流すロールと将来 `CREATE TABLE`
+# するロールが同じ、という前提が崩れたらここで落ちる — 前提を人の記憶ではなく
+# 検査で持つ。probe は作って測って必ず落とす。
+echo "== 005 以降に作る表へ GRANT が自動で付く (ALTER DEFAULT PRIVILEGES)"
+as "$SUPER_URL" "CREATE TABLE kintai.probe_default_acl (x int)" >/dev/null
+expect_eq "新しい表に writer の 4 権限が自動で付く" \
+  "$(as "$SUPER_URL" "SELECT has_table_privilege('kintai_writer','kintai.probe_default_acl','SELECT')
+       AND has_table_privilege('kintai_writer','kintai.probe_default_acl','INSERT')
+       AND has_table_privilege('kintai_writer','kintai.probe_default_acl','UPDATE')
+       AND has_table_privilege('kintai_writer','kintai.probe_default_acl','DELETE')")" "t"
+expect_eq "新しい表に reader の SELECT が自動で付く" \
+  "$(as "$SUPER_URL" "SELECT has_table_privilege('kintai_reader','kintai.probe_default_acl','SELECT')")" "t"
+as "$SUPER_URL" "DROP TABLE kintai.probe_default_acl" >/dev/null
+
+# paper_drift だけ writer で 1 度も触られていなかった (他 6 表は下で触る)。
+# 「触っていない表は権限が壊れていても気付けない」を残さない。
+echo "== paper_drift も writer で往復できる"
+expect_ok_sql "writer が paper_drift を INSERT" "$WRITER_URL" "
+INSERT INTO kintai.paper_drift (tenant_id, driver_cd, date, paper_minutes, drift_minutes)
+VALUES ('$TENANT_A', 1001, '2026-07-01', 480, -12);"
+expect_eq "writer が paper_drift を SELECT" \
+  "$(as "$WRITER_URL" "SELECT drift_minutes FROM kintai.paper_drift WHERE tenant_id='$TENANT_A'")" "-12"
+as "$SUPER_URL" "DELETE FROM kintai.paper_drift" >/dev/null
+
+echo "== 月ゲート (fold_gate) を writer が実際に読み書きできる"
+expect_ok_sql "writer が fold_gate を UPSERT" "$WRITER_URL" "
+INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version)
+VALUES ('$TENANT_A', '2026-06', repeat('a',64), repeat('b',64), '0123456789abcdef')
+ON CONFLICT (tenant_id, month) DO UPDATE SET folded_at = now();"
+expect_eq "writer が fold_gate を SELECT" \
+  "$(as "$WRITER_URL" "SELECT logic_version FROM kintai.fold_gate WHERE tenant_id='$TENANT_A'")" \
+  "0123456789abcdef"
+expect_err "reader は fold_gate に書けない" "$READER_URL" "
+INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version)
+VALUES ('$TENANT_A', '2026-05', repeat('c',64), repeat('d',64), '0123456789abcdef');" \
+  "permission denied"
+as "$SUPER_URL" "DELETE FROM kintai.fold_gate" >/dev/null
+
 echo "== writer が 2 テナント分を書く (BYPASSRLS なので app.current_tenant_id 不要)"
 expect_ok_sql "writer INSERT (2 tenants)" "$WRITER_URL" "
 INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no)
