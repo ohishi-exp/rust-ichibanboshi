@@ -1,5 +1,10 @@
 -- 004 が作った kintai.fold_gate に GRANT を足す (Refs #205 の 20)
 --
+-- ⚠️ **merge しただけでは本番は直らない。** migration は CI/CD に乗っていないので、
+--    merge 後に `make kintai-migrate` を人が流すまで本番の `POST /api/kintai/recalc`
+--    は 502 のまま (コード側の degrade は「gate が使えないときに口を落とさない」
+--    ための保険で、gate を成立させるのはこのファイルの GRANT)。
+--
 -- ## 何が起きていたか
 --
 -- 004 の 61〜62 行のコメントは**誤っている**:
@@ -29,6 +34,13 @@
 -- 表を足すたびに GRANT を書き忘れる形を残さない。**これは「今後この migration を
 -- 流したロールが作る表」にだけ効く**ので、004 の fold_gate には遡って効かない —
 -- だから下の明示 GRANT も両方要る (片方だけでは直らない)。
+--
+-- `FOR ROLE` を省いているので対象は `current_role` = **この migration を流すロール**。
+-- migration は必ず `scripts/migrate_kintai.sh` (`KINTAI_DATABASE_URL` の 1 ロール)
+-- 経由で流すので、将来 `CREATE TABLE` するのも同じロールになる。この前提が崩れたら
+-- 新しい表がまた権限ゼロで生まれるため、**前提そのものを検査で持つ**:
+-- `scripts/verify_kintai_rls.sh` が probe 表を 1 枚作って
+-- 「writer / reader の GRANT が自動で付くか」を実測し、付かなければ落ちる。
 --
 -- 001 / 002 / 003 / 004 は 1 バイトも書き換えない (適用済み migration の改変は
 -- ledger の checksum 照合で loud fail する。004 のコメントも直せないので、

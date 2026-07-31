@@ -228,6 +228,31 @@ expect_eq "reader の SELECT が欠けた表の数" \
        WHERE n.nspname='kintai' AND c.relkind='r'
          AND NOT has_table_privilege('kintai_reader', c.oid, 'SELECT')")" "0"
 
+# `ALTER DEFAULT PRIVILEGES` (005) は**それを実行したロールが作る表にしか効かない**
+# (`FOR ROLE` を省くと `current_role`)。migration を流すロールと将来 `CREATE TABLE`
+# するロールが同じ、という前提が崩れたらここで落ちる — 前提を人の記憶ではなく
+# 検査で持つ。probe は作って測って必ず落とす。
+echo "== 005 以降に作る表へ GRANT が自動で付く (ALTER DEFAULT PRIVILEGES)"
+as "$SUPER_URL" "CREATE TABLE kintai.probe_default_acl (x int)" >/dev/null
+expect_eq "新しい表に writer の 4 権限が自動で付く" \
+  "$(as "$SUPER_URL" "SELECT has_table_privilege('kintai_writer','kintai.probe_default_acl','SELECT')
+       AND has_table_privilege('kintai_writer','kintai.probe_default_acl','INSERT')
+       AND has_table_privilege('kintai_writer','kintai.probe_default_acl','UPDATE')
+       AND has_table_privilege('kintai_writer','kintai.probe_default_acl','DELETE')")" "t"
+expect_eq "新しい表に reader の SELECT が自動で付く" \
+  "$(as "$SUPER_URL" "SELECT has_table_privilege('kintai_reader','kintai.probe_default_acl','SELECT')")" "t"
+as "$SUPER_URL" "DROP TABLE kintai.probe_default_acl" >/dev/null
+
+# paper_drift だけ writer で 1 度も触られていなかった (他 6 表は下で触る)。
+# 「触っていない表は権限が壊れていても気付けない」を残さない。
+echo "== paper_drift も writer で往復できる"
+expect_ok_sql "writer が paper_drift を INSERT" "$WRITER_URL" "
+INSERT INTO kintai.paper_drift (tenant_id, driver_cd, date, paper_minutes, drift_minutes)
+VALUES ('$TENANT_A', 1001, '2026-07-01', 480, -12);"
+expect_eq "writer が paper_drift を SELECT" \
+  "$(as "$WRITER_URL" "SELECT drift_minutes FROM kintai.paper_drift WHERE tenant_id='$TENANT_A'")" "-12"
+as "$SUPER_URL" "DELETE FROM kintai.paper_drift" >/dev/null
+
 echo "== 月ゲート (fold_gate) を writer が実際に読み書きできる"
 expect_ok_sql "writer が fold_gate を UPSERT" "$WRITER_URL" "
 INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version)
