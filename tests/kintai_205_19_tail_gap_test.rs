@@ -80,7 +80,10 @@ fn rest_span(start: &str, end: &str) -> Value {
 
 /// 早い時期の完全に対になった打刻勤務 (control、影響を受けない)。
 fn paired_timecard_shift() -> Vec<Value> {
-    vec![tc("2026-06-05 08:00:00", "始業"), tc("2026-06-05 17:00:00", "終業")]
+    vec![
+        tc("2026-06-05 08:00:00", "始業"),
+        tc("2026-06-05 17:00:00", "終業"),
+    ]
 }
 
 /// 月末の「打刻の無い勤務」(休息 2 本に挟まれるだけの rest 系)。
@@ -113,7 +116,10 @@ fn all_three_shapes_present_when_dtako_events_is_complete() {
     let days = daily_summary(&rows, MONTH, &KosokuParams::default());
     assert_eq!(days.len(), 3, "{days:#?}");
     assert!(find(&days, "2026-06-05").is_some(), "対になった打刻勤務");
-    assert!(find(&days, "2026-06-26").is_some(), "休息に挟まれた rest 勤務");
+    assert!(
+        find(&days, "2026-06-26").is_some(),
+        "休息に挟まれた rest 勤務"
+    );
     assert!(find(&days, "2026-06-29").is_some(), "対の無い始業");
 }
 
