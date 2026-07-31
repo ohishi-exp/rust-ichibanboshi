@@ -313,6 +313,7 @@ SELECT (occurred_at AT TIME ZONE 'Asia/Tokyo')::date AS d,
   FROM kintai.kintai_events
  WHERE tenant_id = $1 AND driver_cd = $2
    AND occurred_at >= $3 AND occurred_at < $4
+   AND source = ANY($5)
  GROUP BY 1
 "#;
 
@@ -335,6 +336,7 @@ SELECT driver_cd,
   FROM kintai.kintai_events
  WHERE tenant_id = $1 AND driver_cd = ANY($2)
    AND occurred_at >= $3 AND occurred_at < $4
+   AND source = ANY($5)
  GROUP BY 1, 2
 "#;
 
@@ -546,6 +548,7 @@ impl KintaiPgStore {
             .bind(driver_cd)
             .bind(from)
             .bind(to)
+            .bind(&PUSHED_SOURCES[..])
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -572,6 +575,7 @@ impl KintaiPgStore {
             .bind(drivers)
             .bind(from)
             .bind(to)
+            .bind(&PUSHED_SOURCES[..])
             .fetch_all(&self.pool)
             .await?;
         let mut out: BTreeMap<i64, BTreeMap<NaiveDate, String>> = BTreeMap::new();
@@ -642,6 +646,7 @@ impl KintaiPgStore {
             .bind(&d_drivers)
             .bind(&d_from)
             .bind(&d_to)
+            .bind(&PUSHED_SOURCES[..])
             .execute(&mut *tx)
             .await?;
 
@@ -695,6 +700,12 @@ const INSERT_CHUNK: usize = 2000;
 /// 範囲比較のままなので `kintai_events_driver_time` の索引に乗る。
 /// `(occurred_at AT TIME ZONE 'Asia/Tokyo')::date = ANY(...)` と書くと関数適用で
 /// 索引が効かなくなる (`kintai_repo` の `COALESCE` で同じ罠を踏んでいる)。
+/// **この経路が作った行しか消さない。** DDL は `alc_app` も許すが
+/// ([`PUSHED_SOURCES`] のとおり) ここは作らない。絞らずに日ごと消すと、他が書いた
+/// 行を巻き添えで消して二度と戻せない — 手元の payload から再生できないため。
+///
+/// [`STORED_SIGNATURES_SQL`] 側も同じ `source` で絞る。**片方だけ絞ると
+/// 「中身は同じなのに毎回全日が違う」に倒れる。**
 const DELETE_DAYS_SQL: &str = r#"
 DELETE FROM kintai.kintai_events e
  USING unnest($2::int8[], $3::timestamptz[], $4::timestamptz[]) AS d(driver_cd, from_ts, to_ts)
@@ -702,6 +713,7 @@ DELETE FROM kintai.kintai_events e
    AND e.driver_cd = d.driver_cd
    AND e.occurred_at >= d.from_ts
    AND e.occurred_at < d.to_ts
+   AND e.source = ANY($5)
 "#;
 
 /// 入れる行を **1 文で**。列ごとの配列を `unnest` で行に開く。
