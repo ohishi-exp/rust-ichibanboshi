@@ -1,61 +1,44 @@
 name: GCP image
 
-# CI から GCP へ出す成果物は **コンテナイメージまで**。実行はオンプレ
-# (ohishi-data / systemd) のままで、この workflow は `gcloud run deploy` を
-# 一切実行しない。ci.yml の deploy job (CF Tunnel SSH → ohishi-data) が
-# 引き続き本番反映の唯一の経路で、この workflow はそこに手を触れない。
+# main の image を build して GHCR に push し、**Cloud Run へ deploy する**。
 #
-# ── なぜ「まだ」Cloud Run に traffic を向けないのか ─────────────────────────
+# ── オンプレと GCP の 2 経路が両方とも本番 ─────────────────────────────────
 # rust-ichibanboshi はオンプレ (ohishi-data / systemd) と GCP (Cloud Run) の
-# **両方を一級の実行形態として恒久的に持つ**方針。ただし今の時点で GCP 側に
-# 向けられる traffic が無い。残っている理由は 2 つだけ:
+# **両方を一級の実行形態として恒久的に持つ**方針。反映経路も 2 本ある:
 #
-# (a) 到達性 [未解決・今回の対象外]: 本体は tiberius でオンプレの SQL Server
-#     (CAPE#01、172.18.21.102\softec) を読む。MariaDB (127.0.0.1:3306) と CakePHP
-#     (127.0.0.1:120) も同一ホストの loopback。ohishi-exp/rust-ichibanboshi#205 の
-#     実装計画 04 が「push 方向のみ (GCP からオンプレへは到達できない)」と明記して
-#     おり、GCP 側からこれらへ到達する経路は無い。読み先が Supabase へ移る
-#     (#205 の 03〜05) までは GCP 側の instance が返せる内容が無い。
-#     ネットワークで到達性を作る (VPN / Interconnect / 逆トンネル) のは対象外。
-# (d) ローカル状態 [棚卸し済み・未着手]: SQLite (state.db / kyuyo_local /
-#     restraint_local / kintai_local) と raw NDJSON.gz が /opt/ichibanboshi の
-#     ローカルディスク前提。Cloud Run の FS はインスタンスごとに揮発するため、
-#     保存先を 2 つ持つか 1 つに寄せるかの判断が要る。
+#   ci.yml の deploy job (CF Tunnel SSH)      → ohishi-data。MariaDB / SQL Server を読む側
+#   この workflow の deploy-cloud-run job     → Cloud Run。Supabase へ打刻を書く側
 #
-# ── アプリ側の阻害要因は解消済み ────────────────────────────────────────────
-# (b) 起動不能 [解決]: 「使うと宣言したバックエンドに繋がらなければ落ちる」形に
-#     した。`[database] enabled` (env: DATABASE_ENABLED) で宣言し、true なら従来
-#     どおり起動時に SELECT 1 を打って失敗すれば起動失敗 (オンプレの既定)。
-#     false なら pool を作らず SQL Server 依存ルートは 503 fail-closed、/health は
-#     200 + backends.sqlserver="disabled" を返す (静かな degraded を作らない)。
-# (c) 設定注入 [解決]: TOML と環境変数が対等な入力経路になった
-#     (src/config.rs の Config::apply_env_overrides)。優先順位は
-#     CLI 引数 > 環境変数 > TOML > 既定値。Secret Manager + secretKeyRef が
-#     入れる env var だけで起動でき、値をイメージに焼く必要が無い。
+# **どちらか一方だけ deploy すると静かに割れる。** 実際に踏んだ (2026-07-31):
+# 打刻の運び方を #225〜#229 で作り替えたが CI は オンプレにしか deploy しておらず、
+# Cloud Run は #221 の image (`4e9944a`) のまま 8 コミット遅れていた。新しい受け口
+# `POST /api/kintai/timecard/window` が無いので本番が 404 で止まった。
+# **CI が両方を deploy するのが正しい** — 手で `gcloud run services update` を
+# 打つ運用に戻さないこと。
 #
-# この 2 つが解けたことは smoke-both-forms job (#205 の G9) が毎回検証している —
-# GCP の形なら起動して /health が backends.sqlserver="disabled" を返し、オンプレ
-# の形 (既定) なら SQL Server が居ないので起動を拒否する、を同じイメージで確認する。
+# ── かつて deploy しなかった理由と、それが解けた経緯 ───────────────────────
+# (a) 到達性: 本体は tiberius でオンプレの SQL Server を読む。GCP からそこへは
+#     到達できない。**解けていないが問題ではなくなった** — 読み先が要らない役割
+#     (打刻の受け口 = Supabase へ書く) を GCP 側が持つようになり、SQL Server 依存
+#     ルートは `DATABASE_ENABLED=false` で 503 fail-closed になる (#208)
+# (b) 起動不能 [解決] 宣言したバックエンドに繋がらなければ落ちる形にした (#208)
+# (c) 設定注入 [解決] TOML と環境変数が対等な入力経路になった (#208)
+# (d) ローカル状態 [解決] `SQLITE_PATH=""` = 置き場を持たない宣言 (#223)。
+#     Cloud Run の揮発 FS に依存しない
 #
-# ── よって今 GCP に置くのはイメージだけ ─────────────────────────────────────
-# #205 の 02 (生イベントの読み先を Cloud Run の rust-alc-api へ) と #199 の
-# Phase 7 (api を Cloud Run へ) はどちらも「GCP 側に実体を置く」前提で、その
-# 前提条件が SHA で固定された pull 可能なイメージ。(a)(d) が解けた時点で
-# `gcloud run deploy` (または rust-alc-api の cloudrun/render.sh 相当) を
-# 足すだけになる。
+# (b)(c) は smoke-both-forms job が毎回検証している (#205 の G9) — 同じイメージが
+# GCP の形なら起動し、オンプレの形なら SQL Server が居ないので起動を拒否する。
 #
 # ── イメージの置き場所 (rust-alc-api の流儀に合わせる) ──────────────────────
-# rust-alc-api は image を GHCR に push し、Cloud Run は Artifact Registry の
-# **remote repository** (pull-through cache、asia-northeast1-docker.pkg.dev/
-# cloudsql-sv/ghcr) 経由で pull している。ここも同じにする — GHCR に push し、
-# AR 側からその sha が解決できることを **読み取りだけ** で確認する。
-# AR に直接 push しないのは、そのために新しい standard repository と push 権限
-# (roles/artifactregistry.writer) を切る必要があり、alc と別流儀になるため。
+# GHCR に push し、Cloud Run は Artifact Registry の **remote repository**
+# (pull-through cache、asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr) 経由で
+# pull する。AR に直接 push しないのは、そのために standard repository と push 権限
+# を切る必要があり alc と別流儀になるため。`ghcr.io/` が二重に見えるのは正しい。
 #
-# ── GCP 側が未整備のうちは verify job ごと skip する ─────────────────────────
-# vars.GCP_PROJECT / vars.GCP_AR_REMOTE_PREFIX が両方入るまで
-# verify-artifact-registry は起動しない (= main が赤にならない)。人間が用意する
-# ものの一覧は下の verify-artifact-registry job のコメントを読むこと。
+# ── 切り戻し ────────────────────────────────────────────────────────────────
+# reusable は latest revision に 100% traffic を向ける。戻すときは revision 指定:
+#   gcloud run services update-traffic rust-ichibanboshi \
+#     --project cloudsql-sv --region asia-northeast1 --to-revisions <revision>=100
 
 on:
   push:
@@ -284,3 +267,75 @@ jobs:
             exit 1
           fi
           echo "::notice::${AR_IMAGE} is pullable from GCP"
+
+  # ---------------------------------------------------------------------------
+  # Cloud Run へ deploy する (main のみ)
+  # ---------------------------------------------------------------------------
+  # **smoke を通ったイメージだけを出す。** needs に smoke-both-forms を入れて
+  # あるのは、GHCR に push された成果物そのものが起動することを確かめてから
+  # traffic を向けるため。
+  #
+  # ── 認証は WIF。鍵は使わない ───────────────────────────────────────────────
+  # `vars.GCP_WIF_PROVIDER` / `vars.GCP_WIF_SERVICE_ACCOUNT_STAGING` は ohishi-exp
+  # の org variable で、同じ org の nuxt-dtako-admin が secret-verify で既に使って
+  # いる。実体の `staging-deploy@cloudsql-sv` は `roles/run.admin` /
+  # `roles/iam.serviceAccountUser` / `roles/artifactregistry.reader` /
+  # `roles/secretmanager.secretAccessor` を持つので、**新しい SA も JSON key も
+  # 要らない** (2026-07-31 に inventory で確認)。
+  #
+  # ── env は宣言的に全部書く ─────────────────────────────────────────────────
+  # reusable の `set_env_vars` は **declarative replace** (ここに書いた env が
+  # 全てになる) なので、1 つでも落とすと本番から消える。`SQLITE_PATH` は
+  # **空文字が意味を持つ** (= 置き場を持たない宣言、#223) ので、値がカンマを
+  # 含まないことに依存しない `^@^` 区切りで渡す。
+  #
+  # `update_secrets` は additive なので、ここに書いたものだけ張り替わる。
+  # runtime SA は**あえて渡さない** — 渡さなければ現状 (既定の compute SA、
+  # `kintai-push-database-url` の per-secret grant はそこに付いている) が保たれる。
+  #
+  # ── 未設定なら skip する。ただし黙らない ───────────────────────────────────
+  # org variable が消えたときに「deploy したつもりで何も出ていない」を作らない
+  # ため、skip したことを announce job が必ず 1 行残す。
+  deploy-cloud-run:
+    name: Deploy to Cloud Run
+    needs: [build-image, smoke-both-forms]
+    if: >-
+      github.ref == 'refs/heads/main'
+      && vars.GCP_WIF_PROVIDER != ''
+      && vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != ''
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: rust-ichibanboshi
+      region: asia-northeast1
+      project: cloudsql-sv
+      ghcr_image: ghcr.io/ohishi-exp/rust-ichibanboshi
+      # build-image が push した sha tag。フル 40 桁でしか push していない
+      image_tag: ${{ github.sha }}
+      ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/ghcr.io/ohishi-exp/rust-ichibanboshi
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+      set_env_vars: '^@^DATABASE_ENABLED=false@SQLITE_PATH=@KINTAI_PUSH_ENABLED=true'
+      update_secrets: 'KINTAI_PUSH_DATABASE_URL=kintai-push-database-url:latest'
+
+  # ---------------------------------------------------------------------------
+  # deploy を skip したことを必ず 1 行残す
+  # ---------------------------------------------------------------------------
+  # 「緑だから出ている」と読み違えるのが一番危ない。org variable が欠けて
+  # deploy-cloud-run が skip されたときだけ warning を出す。
+  announce-cloud-run-skip:
+    name: Announce Cloud Run deploy skip
+    needs: [build-image]
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (vars.GCP_WIF_PROVIDER == '' || vars.GCP_WIF_SERVICE_ACCOUNT_STAGING == '')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Warn that the image was published but not deployed
+        run: |
+          echo "::warning::image は publish したが Cloud Run へ deploy していない (vars.GCP_WIF_PROVIDER / vars.GCP_WIF_SERVICE_ACCOUNT_STAGING が未設定)。Cloud Run は前の revision のまま。"
+          echo "### Cloud Run deploy skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "org variable \`GCP_WIF_PROVIDER\` / \`GCP_WIF_SERVICE_ACCOUNT_STAGING\` が未設定のため deploy していない。Cloud Run は前の revision のまま。" >> "$GITHUB_STEP_SUMMARY"
