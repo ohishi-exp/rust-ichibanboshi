@@ -230,6 +230,149 @@ fn record_unsplit(items: Vec<UnsplitOperation>, total: usize) {
     });
 }
 
+// ── 運行の突合 (オンプレ × GCP、Refs #205 の 37) ────────────────────────────
+
+/// 応答に載せる `unko_diff` の上限。総数は [`UnkoDiff::total`] に別に返す
+/// (`unsplit` / `unsplit_total` と同じ作法)。
+pub const MAX_UNKO_DIFF: usize = 500;
+
+/// **オンプレ側が持っている運行 1 本** (Refs #205 の 37)。
+///
+/// 実体は Postgres の `kintai.kintai_events` — オンプレの MariaDB
+/// (`time_card_dtako`) から押し込んだ打刻で、`dtako` 由来の行だけが `unko_no` を
+/// 持つ ([`crate::kintai_push::PUSHED_SOURCES`])。**新しい口は作らない** —
+/// 突合の両側とも既に fold が読んでいるものだけで組む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnpremOperation {
+    pub driver_cd: i64,
+    pub unko_no: String,
+    /// その運行のイベントが覆う暦日 (JST) の最小 / 最大。
+    pub first_date: NaiveDate,
+    pub last_date: NaiveDate,
+}
+
+/// **オンプレに在って GCP (alc の etags) に無い運行** 1 件 (Refs #205 の 37)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnkoDiffItem {
+    pub driver_cd: i64,
+    pub unko_no: String,
+    /// `unko_no` の先頭 6 桁 (`YYMMDD`) から読んだ運行開始日。読めなければ `null`。
+    pub start_date: Option<String>,
+    /// オンプレのイベントが覆う暦日 (JST) の範囲。
+    pub first_date: String,
+    pub last_date: String,
+}
+
+/// 運行の突合の結果 (Refs #205 の 37)。**判定には使わない — 応答に載せるだけ。**
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct UnkoDiff {
+    /// オンプレに在って GCP に無い運行 (先頭 [`MAX_UNKO_DIFF`] 件)。
+    pub items: Vec<UnkoDiffItem>,
+    /// 切る前の総数。
+    pub total: usize,
+    /// **逆方向** (GCP に在ってオンプレに無い) の運行数。ゼロでなければ別の異常。
+    pub gcp_only: usize,
+}
+
+/// **オンプレの `(乗務員CD, unko_no)` 集合と etags の `unko_no` 集合を突き合わせる**
+/// (Refs #205 の 37)。
+///
+/// GCP 側で畳んだ 2026-06 の勤怠がオンプレ基準より 143 行少ない件は、調査の結果
+/// 「乗務員ごとに最後の 1 本の `運行NO` がまるごと GCP 側の運行一覧に無い」形だと
+/// 分かっている。**どの運行が欠けているかを名指しできる**ようにするのがこの関数。
+///
+/// - 突合の単位は **`(乗務員CD, unko_no)`** — 2 名乗務の運行は同じ `unko_no` が
+///   2 人に紐づくので、片方だけ欠けている形も見える
+/// - 逆方向は**件数だけ**。ゼロでないなら「オンプレに無い運行を GCP が持っている」
+///   という別の異常なので、名指しより先に気づけることが要る
+fn diff_unko(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
+    let mut items = Vec::new();
+    let mut total = 0;
+    for op in onprem {
+        if gcp.contains(&op.unko_no) {
+            continue;
+        }
+        total += 1;
+        if items.len() < MAX_UNKO_DIFF {
+            items.push(UnkoDiffItem {
+                driver_cd: op.driver_cd,
+                unko_no: op.unko_no.clone(),
+                start_date: unko_no_start_date(&op.unko_no).map(|d| d.to_string()),
+                first_date: op.first_date.to_string(),
+                last_date: op.last_date.to_string(),
+            });
+        }
+    }
+    let seen: HashSet<&str> = onprem.iter().map(|o| o.unko_no.as_str()).collect();
+    let gcp_only = gcp.iter().filter(|u| !seen.contains(u.as_str())).count();
+    UnkoDiff {
+        items,
+        total,
+        gcp_only,
+    }
+}
+
+/// [`with_unko_diff_sink`] が抱える 2 つの値。
+///
+/// **etags の一覧と突合の結果を 1 つの task local に相乗りさせている。** 集める
+/// 場所 ([`HttpKintaiEventsRepo::fetch_etags`]) と突き合わせる場所
+/// ([`crate::kintai_fold`] — Postgres に触れるのはあちら) が別モジュールなので、
+/// scope を 2 重に張らずに済ませるため。
+#[derive(Debug, Clone, Default)]
+struct UnkoSink {
+    etags: Option<HashSet<String>>,
+    diff: Option<UnkoDiff>,
+}
+
+tokio::task_local! {
+    /// いま集めている最中の運行の突合。[`with_unko_diff_sink`] の中だけで立つ。
+    static UNKO_SINK: std::cell::RefCell<UnkoSink>;
+}
+
+/// **運行の突合を集めながら `fut` を走らせる** (Refs #205 の 37)。
+/// `with_warning_sink` / `with_unsplit_sink` と同じ task-local パターン。
+pub async fn with_unko_diff_sink<F: std::future::Future>(fut: F) -> (F::Output, UnkoDiff) {
+    UNKO_SINK
+        .scope(std::cell::RefCell::new(UnkoSink::default()), async move {
+            let out = fut.await;
+            let diff = UNKO_SINK.with(|s| s.borrow().diff.clone());
+            (out, diff.unwrap_or_default())
+        })
+        .await
+}
+
+/// etags から引いた `unko_no` の集合。sink の外 / 未記録なら `None`
+/// (「無い」と「引けていない」を混同しない)。
+pub fn collected_etag_unko_nos() -> Option<HashSet<String>> {
+    UNKO_SINK
+        .try_with(|s| s.borrow().etags.clone())
+        .ok()
+        .flatten()
+}
+
+/// 集めている最中なら etags の一覧を控える (上書き)。
+fn record_etag_unko_nos(unko_nos: HashSet<String>) {
+    let _ = UNKO_SINK.try_with(|s| s.borrow_mut().etags = Some(unko_nos));
+}
+
+/// **突合して記録する** (Refs #205 の 37)。オンプレに在って GCP に無い運行が
+/// 1 件でもあれば `warnings` に 1 行足す — 欠けた入力のまま月ゲートに「最新」の
+/// 封をさせないため (`missing_input_warnings` と同じ安全側の倒し方)。
+pub fn record_unko_diff(onprem: &[OnpremOperation], gcp: &HashSet<String>) -> UnkoDiff {
+    let diff = diff_unko(onprem, gcp);
+    if diff.total > 0 {
+        let n = diff.total;
+        let w = format!("dtako 入力欠け: オンプレに在って GCP に無い運行 {n} 件");
+        record_warning(&w);
+    }
+    if diff.gcp_only > 0 {
+        let gcp_only = diff.gcp_only;
+        tracing::warn!(gcp_only, "kintai dtako unko diff reverse");
+    }
+    let _ = UNKO_SINK.try_with(|s| s.borrow_mut().diff = Some(diff.clone()));
+    diff
+}
+
 // ── 認証 token の取り方 (設定で与える。コードに焼かない) ────────────────────
 
 /// 上流に付ける Bearer token の供給元。
@@ -774,6 +917,21 @@ fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
 /// 閾値超えを数える。** `driver_cd` が無い item (alc がまだ返さない環境) は空文字
 /// キーの 1 グループにまとまり、旧実装 (全体で 1 つの `last`) と同じ結果になる —
 /// alc が `driver_cd` を返し始めた時点で自動的に乗務員別の検知に切り替わる。
+///
+/// ## 母集団は「その月に運行が始まった乗務員」だけ (Refs #205 の 37)
+///
+/// etags は**読み取り日**で引くので、窓の中に「ずっと前に始まった運行」が混ざる
+/// (2026-06 の本番実測で窓の下端が 2026-04-20)。その古い運行しか窓に無い乗務員を
+/// 母集団に入れると、`last` が 2 か月前に張り付いて全員が「末尾が欠けている」に
+/// なる — 本番で `乗務員73名の末尾が37日超` と鳴っていたのがこれで、実データには
+/// 37 日超の乗務員はオンプレにも GCP にも 1 人も居ない。**運行が無いのは「末尾が
+/// 欠けた」ではなく「そもそも稼働していない」**なので、窓の月に始まった運行を
+/// 1 件も持たない乗務員は `per_driver_last` に入れない。
+///
+/// **「その乗務員の運行が丸ごと全部消えた」形はこの検知では見えなくなる** が、
+/// そちらは [`diff_unko`] (オンプレの `(乗務員CD, unko_no)` との突合) が名指しで
+/// 拾う — etags だけを見ていては「働いていない」と原理的に区別が付かない。
+/// `no_etag` (R2 に CSV が無い) の検知は母集団に関係なく従来どおり。
 struct InputCoverage {
     /// etags の item 数 (= 窓の中の運行数)。
     items: usize,
@@ -785,6 +943,7 @@ struct InputCoverage {
     /// 末尾がここまで届いていてほしい日 (進行中の月は `today - 1 日` に切り下げ)。
     expected: NaiveDate,
     /// `driver_cds` (無ければ空文字 1 本) → その乗務員の運行開始日の最大値。
+    /// **窓の月に始まった運行を持つ乗務員だけ** (struct docs の母集団の節)。
     per_driver_last: std::collections::HashMap<String, NaiveDate>,
     /// `driver_cds` を持つ item が 1 件でもあったか。`false` なら alc がまだ
     /// `driver_cds` を返さない環境 — 乗務員別ではなく全体 1 グループの粗い判定に
@@ -798,8 +957,13 @@ impl InputCoverage {
     /// **1 運行が複数の `driver_cds` を持つ場合、その運行開始日は全員の `last` に
     /// 寄与する** — `unko_no` が主 / 副運転で複数の乗務員に紐づき得るため
     /// (`list_operations_for_drivers` の `DISTINCT ON (driver_id, unko_no)`)。
+    ///
+    /// **`window_start` より前に始まった運行は `per_driver_last` に入れない**
+    /// (母集団の節)。`first` / `last` / `no_etag` は窓の中ぜんぶを見たままにする —
+    /// summary の実測値と `no_etag` の検知は母集団の話ではないため。
     fn measure(
         pairs: &[(String, Option<String>, Vec<String>)],
+        window_start: NaiveDate,
         window_end: NaiveDate,
         today: NaiveDate,
     ) -> Self {
@@ -816,6 +980,10 @@ impl InputCoverage {
                 first = Some(first.map_or(d, |f: NaiveDate| f.min(d)));
                 last = Some(last.map_or(d, |l: NaiveDate| l.max(d)));
                 driver_cd_source = driver_cd_source || !driver_cds.is_empty();
+                // 窓の月より前に始まった運行は末尾検知の母集団に入れない (#205 の 37)
+                if d < window_start {
+                    continue;
+                }
                 let keys = match driver_cds.is_empty() {
                     true => vec![String::new()],
                     false => driver_cds.clone(),
@@ -861,13 +1029,18 @@ impl InputCoverage {
     }
 
     /// ログにも警告本文にも載せる 1 行の実測値。
+    ///
+    /// **`対象` = 末尾検知の母集団** (その月に運行が始まった乗務員の数)。本番で
+    /// 過剰発火したとき「何名を測っているのか」がログから読めなかったので足した
+    /// (Refs #205 の 37)。
     fn summary(&self) -> String {
         let f = self
             .first
             .map_or_else(|| "?".to_string(), |d| d.to_string());
         let l = self.last.map_or_else(|| "?".to_string(), |d| d.to_string());
         let (n, z, e) = (self.items, self.no_etag, self.expected);
-        format!("n={n} etag無={z} {f}..{l} 期待={e}")
+        let m = self.per_driver_last.len();
+        format!("n={n} etag無={z} {f}..{l} 期待={e} 対象={m}名")
     }
 }
 
@@ -1178,13 +1351,15 @@ impl HttpKintaiEventsRepo {
             .map_err(|e| KintaiRepoError::QueryFailed(format!("alc dtako-etags parse: {e}")))?;
         Self::log_warnings(&parsed.warnings);
         record_unsplit(parsed.unsplit, parsed.unsplit_total);
-        Ok(Some(
-            parsed
-                .items
-                .into_iter()
-                .map(|it| (it.unko_no, it.etag, it.driver_cds))
-                .collect(),
-        ))
+        let pairs: Vec<(String, Option<String>, Vec<String>)> = parsed
+            .items
+            .into_iter()
+            .map(|it| (it.unko_no, it.etag, it.driver_cds))
+            .collect();
+        // 突合 (Refs #205 の 37) 用に GCP 側の運行一覧を控える。**`items` の使い方も
+        // digest の材料も変えない** — 読むだけで、月ゲートの指紋には一切触らない
+        record_etag_unko_nos(pairs.iter().map(|(u, _, _)| u.clone()).collect());
+        Ok(Some(pairs))
     }
 }
 
@@ -1246,7 +1421,7 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
         // 引いてきた一覧の形から自分で見つけて `record_warning` へ流す (Refs #205 の 21)
         // `None` (alc に口が無い) は「欠けている」ではなく「判定できない」— 検知しない
         if let Some(p) = pairs.as_deref() {
-            let cov = InputCoverage::measure(p, to, today_jst());
+            let cov = InputCoverage::measure(p, from, to, today_jst());
             // **警告の有無に関わらず毎回出す** (閾値を後から締めるための実測値)。
             // マクロは 1 行に収める (CLAUDE.md — 折り返すと行カバレッジに乗らない)
             let (gap, cover) = (cov.gap_days().unwrap_or(-1), cov.summary());
@@ -1965,8 +2140,15 @@ mod tests {
 
     type Pair = (String, Option<String>, Vec<String>);
 
+    /// 母集団の絞り込み (Refs #205 の 37) を効かせない旧来の呼び方。窓の下端を
+    /// 十分古い日に置くので、末尾検知そのものの規則だけを見る形になる。
     fn warns(pairs: &[Pair], end: NaiveDate, today: NaiveDate) -> Vec<String> {
-        missing_input_warnings(&InputCoverage::measure(pairs, end, today))
+        warns_in(pairs, d(2000, 1, 1), end, today)
+    }
+
+    /// 窓 `[start, end]` を明示する版 (母集団の確認用)。
+    fn warns_in(pairs: &[Pair], start: NaiveDate, end: NaiveDate, today: NaiveDate) -> Vec<String> {
+        missing_input_warnings(&InputCoverage::measure(pairs, start, end, today))
     }
 
     /// **揃っている月は静か。** 窓の端まで運行開始が届いていれば warning ゼロ。
@@ -2100,6 +2282,7 @@ mod tests {
     fn input_coverage_reports_whether_driver_cds_were_present() {
         let none = InputCoverage::measure(
             &[pair("26063010000000000023021", Some("e1"))],
+            d(2026, 6, 1),
             d(2026, 6, 30),
             d(2026, 7, 5),
         );
@@ -2107,6 +2290,7 @@ mod tests {
 
         let some = InputCoverage::measure(
             &[driver_pair("26063010000000000023021", Some("e1"), "D1")],
+            d(2026, 6, 1),
             d(2026, 6, 30),
             d(2026, 7, 5),
         );
@@ -2144,10 +2328,175 @@ mod tests {
         let w = warns(&[], d(2026, 7, 1), d(2026, 7, 20));
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!(
-            InputCoverage::measure(&[], d(2026, 7, 1), d(2026, 7, 20)).gap_days(),
+            InputCoverage::measure(&[], d(2026, 6, 1), d(2026, 7, 1), d(2026, 7, 20)).gap_days(),
             None,
             "gap は測れない"
         );
+    }
+
+    /// **#205 の 37 の本題 (その 2)。** 末尾検知の母集団は「その月に運行が始まった
+    /// 乗務員」だけ。etags は読み取り日で引くので窓の中に 2 か月前に始まった運行が
+    /// 混ざり、それしか無い乗務員を数えると全員が「末尾が欠けている」になる
+    /// (本番 2026-06 の `乗務員73名の末尾が37日超`)。
+    #[test]
+    fn tail_gap_ignores_drivers_without_an_operation_started_in_the_month() {
+        // 窓は 2026-06。D1 は月内を端まで走っている。D2 は 04-20 に始まった運行が
+        // 6 月に読まれただけで、6 月には 1 本も走っていない
+        let pairs = vec![
+            driver_pair("26063010000000000023021", Some("e1"), "D1"),
+            driver_pair("26042010000000000023022", Some("e2"), "D2"),
+        ];
+        let w = warns_in(&pairs, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        assert!(w.is_empty(), "稼働していない D2 は末尾欠けではない: {w:?}");
+
+        // 母集団を絞らなければ D2 が 71 日の末尾欠けとして鳴っていた (旧挙動)
+        let old = warns(&pairs, d(2026, 6, 30), d(2026, 7, 5));
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert!(old[0].contains("乗務員1名の末尾が71日超"), "{old:?}");
+    }
+
+    /// 母集団から外れた乗務員が居ても `no_etag` の検知は従来どおり
+    /// (R2 に CSV が無いのは閾値も母集団も関係ない確実な欠け)。
+    #[test]
+    fn tail_gap_population_does_not_touch_the_no_etag_check() {
+        let pairs = vec![driver_pair("26042010000000000023022", None, "D2")];
+        let w = warns_in(&pairs, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        assert_eq!(w.len(), 1, "etag 無しの 1 本だけ: {w:?}");
+        assert!(w[0].contains("R2 に CSV の無い運行 1 件"), "{w:?}");
+    }
+
+    /// summary に末尾検知の母集団 (`対象`) が出る — 過剰発火したときに
+    /// 「何名を測っているのか」をログから読めるようにするため (Refs #205 の 37)。
+    #[test]
+    fn the_summary_reports_the_tail_gap_population() {
+        let pairs = vec![
+            driver_pair("26063010000000000023021", Some("e1"), "D1"),
+            driver_pair("26042010000000000023022", Some("e2"), "D2"),
+        ];
+        let cov = InputCoverage::measure(&pairs, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        let s = cov.summary();
+        assert!(s.contains("n=2"), "{s}");
+        assert!(s.contains("対象=1名"), "母集団は D1 だけ: {s}");
+    }
+
+    // ── 運行の突合 (オンプレ × GCP、Refs #205 の 37) ────────────────────────
+
+    fn op(driver_cd: i64, unko_no: &str) -> OnpremOperation {
+        OnpremOperation {
+            driver_cd,
+            unko_no: unko_no.to_string(),
+            first_date: d(2026, 6, 24),
+            last_date: d(2026, 6, 26),
+        }
+    }
+
+    fn gcp_set(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **本題。** オンプレに在って GCP に無い運行が名指しで出る。
+    #[test]
+    fn diff_unko_names_the_operations_missing_from_gcp() {
+        let onprem = vec![
+            op(1078, "26062410055500000023021"),
+            op(1517, "26062610055500000023022"),
+        ];
+        let diff = diff_unko(&onprem, &gcp_set(&["26062610055500000023022"]));
+        assert_eq!(diff.total, 1, "{diff:?}");
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].driver_cd, 1078);
+        assert_eq!(diff.items[0].unko_no, "26062410055500000023021");
+        assert_eq!(diff.items[0].start_date.as_deref(), Some("2026-06-24"));
+        assert_eq!(diff.items[0].first_date, "2026-06-24");
+        assert_eq!(diff.items[0].last_date, "2026-06-26");
+        assert_eq!(diff.gcp_only, 0, "逆方向は無い");
+    }
+
+    /// 両方揃っていれば空。
+    #[test]
+    fn diff_unko_is_empty_when_both_sides_agree() {
+        let onprem = vec![op(1078, "U1"), op(1517, "U2")];
+        let diff = diff_unko(&onprem, &gcp_set(&["U1", "U2"]));
+        assert_eq!(diff, UnkoDiff::default());
+    }
+
+    /// **逆方向 (GCP に在ってオンプレに無い) は件数だけ数える。**
+    #[test]
+    fn diff_unko_counts_the_reverse_direction() {
+        let onprem = vec![op(1078, "U1")];
+        let diff = diff_unko(&onprem, &gcp_set(&["U1", "U2", "U3"]));
+        assert_eq!(diff.total, 0, "オンプレ側の欠けは無い");
+        assert_eq!(diff.gcp_only, 2, "U2 / U3");
+    }
+
+    /// 同じ運行が 2 名 (主 / 副運転) に紐づくときは **`(乗務員CD, unko_no)` 単位**で
+    /// 数える。`unko_no` が読めない形は `start_date` が `null` になるだけ。
+    #[test]
+    fn diff_unko_counts_per_driver_and_tolerates_an_unreadable_unko_no() {
+        let onprem = vec![op(1078, "U1"), op(1517, "U1")];
+        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        assert_eq!(diff.total, 2, "2 名ぶん: {diff:?}");
+        assert_eq!(diff.items[0].start_date, None, "6 桁に満たない");
+    }
+
+    /// **上限 500 で切り、総数は実数のまま。** `unsplit` と同じ作法。
+    #[test]
+    fn diff_unko_caps_the_items_but_keeps_the_real_total() {
+        let onprem: Vec<OnpremOperation> = (0..MAX_UNKO_DIFF + 5)
+            .map(|i| op(1000 + i as i64, &format!("2606241005550000002{i:04}")))
+            .collect();
+        let diff = diff_unko(&onprem, &gcp_set(&[]));
+        assert_eq!(diff.items.len(), MAX_UNKO_DIFF, "頭 500 件だけ");
+        assert_eq!(diff.total, MAX_UNKO_DIFF + 5, "総数は切らない");
+    }
+
+    /// etags の一覧は sink の中でだけ拾える。外なら `None` (「無い」と区別する)。
+    #[tokio::test]
+    async fn the_etag_unko_nos_come_back_only_inside_the_sink() {
+        assert_eq!(collected_etag_unko_nos(), None, "sink の外は None");
+        let (_, diff) = with_unko_diff_sink(async {
+            assert_eq!(collected_etag_unko_nos(), None, "未記録も None");
+            record_etag_unko_nos(gcp_set(&["U1"]));
+            assert_eq!(collected_etag_unko_nos(), Some(gcp_set(&["U1"])));
+        })
+        .await;
+        assert_eq!(diff, UnkoDiff::default(), "突合していなければ空");
+    }
+
+    /// **記録した突合が `with_unko_diff_sink` の戻り値に乗り、warnings に 1 行出る。**
+    #[tokio::test]
+    async fn record_unko_diff_reports_through_the_sink_and_the_warnings() {
+        let ((out, warnings), diff) = with_unko_diff_sink(with_warning_sink(async {
+            let onprem = vec![op(1078, "26062410055500000023021"), op(1517, "U2")];
+            record_unko_diff(&onprem, &gcp_set(&["U9"]));
+            7
+        }))
+        .await;
+        assert_eq!(out, 7);
+        assert_eq!(diff.total, 2);
+        assert_eq!(diff.gcp_only, 1, "U9 はオンプレに無い");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = &warnings[0];
+        assert!(w.contains("オンプレに在って GCP に無い運行 2 件"), "{w}");
+    }
+
+    /// 差が無ければ warning は立たない (月ゲートを無駄に開けない)。
+    #[tokio::test]
+    async fn record_unko_diff_is_silent_when_nothing_is_missing() {
+        let ((_, warnings), diff) = with_unko_diff_sink(with_warning_sink(async {
+            record_unko_diff(&[op(1078, "U1")], &gcp_set(&["U1"]));
+        }))
+        .await;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(diff, UnkoDiff::default());
+    }
+
+    /// **集めていないときは何も起きない** (`record_unsplit` と同じ扱い)。
+    #[test]
+    fn record_unko_diff_outside_a_sink_is_dropped() {
+        let diff = record_unko_diff(&[op(1078, "U1")], &gcp_set(&[]));
+        assert_eq!(diff.total, 1, "戻り値は返る");
+        assert_eq!(collected_etag_unko_nos(), None, "sink は立っていない");
     }
 
     /// `today_jst` は UTC 深夜の前後で日付がずれない (JST 固定オフセット)。
