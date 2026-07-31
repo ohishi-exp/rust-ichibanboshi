@@ -182,6 +182,14 @@ pub fn record_warning_for_test(w: &str) {
     record_warning(w);
 }
 
+/// いま収集中の warnings があるか (Refs #205-17)。**収集器の外なら `None`**
+/// (「無い」と「分からない」を区別する — [`recalc_month`](crate::kintai_fold::recalc_month)
+/// が `write_fold_gate` を書いてよいかの判断に使う)。sink を消費しない —
+/// [`with_warning_sink`] の戻り値の warnings がここで空にならないよう `borrow` だけ。
+pub fn warnings_seen() -> Option<bool> {
+    WARNING_SINK.try_with(|s| !s.borrow().is_empty()).ok()
+}
+
 // ── 認証 token の取り方 (設定で与える。コードに焼かない) ────────────────────
 
 /// 上流に付ける Bearer token の供給元。
@@ -1562,6 +1570,26 @@ mod tests {
         })
         .await;
         assert_eq!(warnings, vec!["from another module".to_string()]);
+    }
+
+    /// **`warnings_seen()` の 3 分岐** (Refs #205-17)。`recalc_month` が
+    /// `write_fold_gate` を書いてよいかの判断に使う — `Some(false)` だけが書いてよい。
+    #[tokio::test]
+    async fn warnings_seen_reports_all_three_states() {
+        // 収集器の外 — 「分からない」
+        assert_eq!(warnings_seen(), None);
+
+        // 収集器の中・warnings ゼロ — 書いてよい
+        let (seen_empty, _) = with_warning_sink(async { warnings_seen() }).await;
+        assert_eq!(seen_empty, Some(false));
+
+        // 収集器の中・warnings あり — 書かない
+        let (seen_some, _) = with_warning_sink(async {
+            record_warning_for_test("R2 分割遅れ");
+            warnings_seen()
+        })
+        .await;
+        assert_eq!(seen_some, Some(true));
     }
 
     #[test]

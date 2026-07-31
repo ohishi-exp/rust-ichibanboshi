@@ -14,6 +14,7 @@ use rust_ichibanboshi::kintai_fold::{
     recalc_month, stale_state, sync_month, write_unit, DayPartRow, DaySummaryRow, FoldUnit,
     MonthGate, ShiftRow,
 };
+use rust_ichibanboshi::kintai_http_repo::with_warning_sink;
 use rust_ichibanboshi::kintai_push::{KintaiPgStore, PushOptions, TimecardWindow};
 use rust_ichibanboshi::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
 use rust_ichibanboshi::kosoku::{KosokuParams, RestraintRounding};
@@ -1345,9 +1346,19 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
         &digest("v1"),
     );
 
-    let first = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
-        .await
-        .expect("1st");
+    // gate を書くのは `warnings_seen() == Some(false)` のときだけなので、
+    // `main.rs` と同じく `with_warning_sink` の内側で呼ぶ (Refs #205-17)
+    let first = with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await
+    .0
+    .expect("1st");
     assert_eq!(
         first.drivers_written, 1,
         "初回は gate が無いので普通に読んで書く"
@@ -1373,9 +1384,17 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
 
     // dtako 側が変わった (alc の etag が変化) — gate が外れて読み直す
     repo.set_digest(&digest("v2"));
-    let third = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
-        .await
-        .expect("3rd");
+    let third = with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await
+    .0
+    .expect("3rd");
     assert_eq!(repo.read_calls(), 2, "digest が変われば読み直す");
     assert_eq!(
         third.drivers_written, 0,
@@ -1437,9 +1456,18 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     );
 
     // recalc_month (driver 省略) だけが gate を書ける。ここで最初の gate を立てる
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
-        .await
-        .expect("establish gate");
+    // (gate を書くのは Some(false) のときだけなので with_warning_sink で包む)
+    with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await
+    .0
+    .expect("establish gate");
     assert_eq!(repo.read_calls(), 1);
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
@@ -1474,9 +1502,17 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     );
 
     // recalc_month が改めて全量を通れば、そのときだけ gate が新しい digest に動く
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
-        .await
-        .expect("recalc_month catches up");
+    with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await
+    .0
+    .expect("recalc_month catches up");
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
         Some(digest("b"))
@@ -1542,9 +1578,17 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
     );
 
     // recalc_month (driver 省略) だけが gate を書ける
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
-        .await
-        .expect("establish gate");
+    with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await
+    .0
+    .expect("establish gate");
     assert_eq!(repo.read_calls(), 1);
 
     // 同じ digest — 刺さる。fold_month はやはり呼ばれない
@@ -1567,6 +1611,109 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
         "digest が変われば Miss (呼び出し側が通常どおり読みに進む)"
     );
     assert_eq!(repo.read_calls(), 1, "判定だけなら外れても読みには進まない");
+}
+
+// ── 13c: recalc_month が gate を書く条件 (warnings の有無) (Refs #205-17) ────
+//
+// `routes::kintai_recalc::run` は #242 で「上流 warnings が空」を書く条件の
+// 1 つに入れたが、`recalc_month` (CLI の Recalc / Sync 経由) は取り残されていた
+// — R2 の分割遅れ中に欠けた入力を「最新」と刻む同じリスクがある。
+// `recalc_month` は `main.rs` で `with_warning_sink` に包まれて呼ばれる前提
+// なので、`kintai_http_repo::warnings_seen()` を覗いて判断する。
+
+/// **書く: 収集器の中で warnings ゼロなら gate が立ち、2 回目は gate hit になる。**
+#[tokio::test]
+async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
+    let (store, pool) = require_db!();
+    let (repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-19 08:00:00", "始業"),
+            punch("2026-07-19 18:00:00", "終業"),
+        ],
+        &digest("no-warnings"),
+    );
+
+    let (first, warnings) = with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await;
+    assert!(warnings.is_empty(), "GatedRepo は warnings を出さない");
+    assert_eq!(first.expect("1st").drivers_written, 1);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("no-warnings")),
+        "warnings が確認できたので gate を書く"
+    );
+
+    // gate が立っているので 2 回目は fold_month を呼ばずに hit する
+    with_warning_sink(recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+    ))
+    .await
+    .0
+    .expect("2nd");
+    assert_eq!(repo.read_calls(), 1, "gate hit で読みが増えない");
+}
+
+/// **書かない: 収集器の中でも warnings があれば gate は空のまま。**
+#[tokio::test]
+async fn recalc_month_does_not_write_the_gate_when_warnings_are_present() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-20 08:00:00", "始業"),
+            punch("2026-07-20 18:00:00", "終業"),
+        ],
+        &digest("with-warnings"),
+    );
+
+    let (r, warnings) = with_warning_sink(async {
+        rust_ichibanboshi::kintai_http_repo::record_warning_for_test("NoSuchKey: U1/KUDGIVT.csv");
+        recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true).await
+    })
+    .await;
+    assert!(!warnings.is_empty());
+    assert_eq!(r.expect("recalc").drivers_written, 1, "書くこと自体は行う");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "warnings ありでは gate を書かない (欠けた入力を最新と刻まない)"
+    );
+}
+
+/// **書かない: 収集器の外 (`with_warning_sink` に包まれていない) では判断できない
+/// ので gate を書かない。**「無い」と「分からない」を混同しないための分岐。
+#[tokio::test]
+async fn recalc_month_does_not_write_the_gate_outside_the_warning_sink() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-21 08:00:00", "始業"),
+            punch("2026-07-21 18:00:00", "終業"),
+        ],
+        &digest("no-sink"),
+    );
+
+    // with_warning_sink に包まずそのまま呼ぶ — main.rs の呼び方から外れた形
+    let r = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+        .await
+        .expect("recalc");
+    assert_eq!(r.drivers_written, 1, "書くこと自体は行う");
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "収集器の外では判断がつかないので gate を書かない"
+    );
 }
 
 // ── 13b: HTTP 経路 (routes::kintai_recalc) が gate を書く条件 ────────────────

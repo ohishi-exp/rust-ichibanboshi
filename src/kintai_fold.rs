@@ -926,11 +926,11 @@ async fn read_fold_gate(
 
 /// `pub(crate)` — [`crate::routes::kintai_recalc::run`] からも直接呼ぶ (実装計画 13)。
 ///
-/// TODO(#205 別タスク、対象外と決定 2026-07-31): [`recalc_month`] 経由 (CLI の
-/// `Recalc` / `Sync`) は `apply` なら warnings の有無を見ずに書いている。R2 の
-/// 分割遅れ中に「最新」と刻む同種のリスクがあるが、この経路はオンプレ CLI 専用
-/// (`main.rs` の `--allow-onprem-fold` 無しでは既定拒否、GCP 本番の定常経路には
-/// 乗らない) なので本 PR のスコープ外とした。
+/// [`recalc_month`] 経由 (CLI の `Recalc` / `Sync`) は
+/// [`crate::kintai_http_repo::warnings_seen`] で「収集器の中で warnings ゼロ」が
+/// 確認できた回だけ書く (Refs #205-17)。`routes::kintai_recalc::run` の 5 条件の
+/// 1 つ (`folded.warnings.is_empty()`) と同じ理由 — R2 の分割遅れ中に欠けた入力を
+/// 「最新」と刻まないため。
 pub(crate) async fn write_fold_gate(
     store: &KintaiPgStore,
     month: &str,
@@ -1063,6 +1063,12 @@ pub async fn month_gate_report(
 /// 再計算の 1 ページだけが書いてしまうと、1 ページ目の乗務員だけ処理した時点で
 /// gate が「この月は最新」になり、未処理のページの乗務員が古い fingerprint の
 /// まま取り残される — #225 / #234 と同型の「静かに一部が消える」事故になる。
+///
+/// **gate を書くのは [`crate::kintai_http_repo::warnings_seen`] が `Some(false)`
+/// (収集器の中・warnings ゼロ) のときだけ** (Refs #205-17)。呼び出し元 (`main.rs`)
+/// が `with_warning_sink` で包んでいる前提だが、包まれていない (`None`) 場合は
+/// 「無い」と「分からない」を混同しないよう書かない — 次回また全量読みに落ちる
+/// だけで安全側。
 pub async fn recalc_month(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,
@@ -1081,7 +1087,9 @@ pub async fn recalc_month(
             } => {
                 let units = fold_month(repo, params, month, driver).await?;
                 let report = store_units(store, params, month, units, apply).await?;
-                if apply {
+                // warnings が確認できた回 (Some(false)) だけ刻む。None (収集器の外) や
+                // Some(true) では書かない — 迷ったら書かない側 (Refs #205-17)
+                if apply && crate::kintai_http_repo::warnings_seen() == Some(false) {
                     write_fold_gate(store, month, &dtako_digest, &punch_digest, &logic_version)
                         .await?;
                 }
