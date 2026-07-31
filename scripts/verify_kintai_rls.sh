@@ -206,6 +206,42 @@ ALTER ROLE kintai_reader PASSWORD :'pw';
 ALTER ROLE kintai_writer PASSWORD :'pw';
 SQL
 
+# ── 3b. GRANT の網羅 (Refs #205 の 20) ────────────────────────────────
+#
+# `GRANT ... ON ALL TABLES IN SCHEMA` は**その時点の表にしか効かない**。001 以降に
+# 作られた表は `ALTER DEFAULT PRIVILEGES` (005) が入るまで権限ゼロで生まれていた。
+# 004 の `kintai.fold_gate` がそれを踏み、本番の `POST /api/kintai/recalc` が
+# `permission denied for table fold_gate` → 502 で落ちた (2026-07-31)。
+#
+# **表を名指しせず「1 表でも権限の欠けたものがあれば落ちる」形にする** — 次に表が
+# 増えたときも同じ漏れを CI が捕まえる。
+echo "== 全表に writer / reader の GRANT が行き渡っている"
+expect_eq "writer の 4 権限が欠けた表の数" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='kintai' AND c.relkind='r'
+         AND NOT (has_table_privilege('kintai_writer', c.oid, 'SELECT')
+              AND has_table_privilege('kintai_writer', c.oid, 'INSERT')
+              AND has_table_privilege('kintai_writer', c.oid, 'UPDATE')
+              AND has_table_privilege('kintai_writer', c.oid, 'DELETE'))")" "0"
+expect_eq "reader の SELECT が欠けた表の数" \
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='kintai' AND c.relkind='r'
+         AND NOT has_table_privilege('kintai_reader', c.oid, 'SELECT')")" "0"
+
+echo "== 月ゲート (fold_gate) を writer が実際に読み書きできる"
+expect_ok_sql "writer が fold_gate を UPSERT" "$WRITER_URL" "
+INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version)
+VALUES ('$TENANT_A', '2026-06', repeat('a',64), repeat('b',64), '0123456789abcdef')
+ON CONFLICT (tenant_id, month) DO UPDATE SET folded_at = now();"
+expect_eq "writer が fold_gate を SELECT" \
+  "$(as "$WRITER_URL" "SELECT logic_version FROM kintai.fold_gate WHERE tenant_id='$TENANT_A'")" \
+  "0123456789abcdef"
+expect_err "reader は fold_gate に書けない" "$READER_URL" "
+INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version)
+VALUES ('$TENANT_A', '2026-05', repeat('c',64), repeat('d',64), '0123456789abcdef');" \
+  "permission denied"
+as "$SUPER_URL" "DELETE FROM kintai.fold_gate" >/dev/null
+
 echo "== writer が 2 テナント分を書く (BYPASSRLS なので app.current_tenant_id 不要)"
 expect_ok_sql "writer INSERT (2 tenants)" "$WRITER_URL" "
 INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no)
