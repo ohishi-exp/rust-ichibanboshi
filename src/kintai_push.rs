@@ -356,6 +356,22 @@ SELECT driver_cd,
  ORDER BY 1, 2
 "#;
 
+/// **押し込み済みに `unko_no` 付きの行を「一度でも」持ったことがある乗務員CD**
+/// (Refs #205 の 39)。
+///
+/// [`MONTH_OPERATIONS_SQL`] の `WHERE` から**窓だけ外した**もの。逆方向
+/// (GCP にしか無い運行) が「そもそも `time_card_dtako` に出ない乗務員」なのか
+/// 「出るはずなのに対象月だけ落ちた」のかを分けるために要る
+/// ([`crate::kintai_http_repo::UnkoDiffDriverSplit`])。
+///
+/// **「一度でも」の範囲は押し込み済みのぶんだけ**で、オンプレ MariaDB の全履歴
+/// ではない。push していない月のことはこの問いでは分からない。
+pub const OPERATION_DRIVER_CDS_SQL: &str = r#"
+SELECT DISTINCT driver_cd
+  FROM kintai.kintai_events
+ WHERE tenant_id = $1 AND source = ANY($2) AND unko_no IS NOT NULL AND unko_no <> ''
+"#;
+
 /// [`STORED_SIGNATURES_SQL`] の**複数乗務員版**。式は 1 文字も変えない。
 ///
 /// 署名の突き合わせを**受け側の中**でやるための口 (Refs #205 の 04b)。送り側が
@@ -677,6 +693,24 @@ impl KintaiPgStore {
                     r.get::<NaiveDate, _>("last_date"),
                 )
             })
+            .collect())
+    }
+
+    /// **`unko_no` 付きの行を一度でも持った乗務員CD**
+    /// (Refs #205 の 39、[`OPERATION_DRIVER_CDS_SQL`])。突合の内訳を割るだけで
+    /// **判定には使わない**。
+    pub async fn stored_operation_driver_cds(
+        &self,
+    ) -> Result<std::collections::HashSet<i64>, KintaiPushError> {
+        use sqlx::Row;
+        let rows = sqlx::query(OPERATION_DRIVER_CDS_SQL)
+            .bind(self.tenant_id)
+            .bind(&PUSHED_SOURCES[..])
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<i64, _>("driver_cd"))
             .collect())
     }
 

@@ -1209,9 +1209,38 @@ async fn measure_unko_diff(
     // etags は読取日で引くので窓の中に前月以前に始まった運行が混ざり、それは
     // オンプレの当月分と一致しなくて当然 — 異常かどうかは月で絞ってから見る
     let ym = month_ym(month);
-    let diff = crate::kintai_http_repo::record_unko_diff(&onprem, &gcp, ym);
+    // 逆方向を乗務員別に割るための材料 (Refs #205 の 39)。**どちらも欠けてよい** —
+    // 引けなければ内訳が空になるだけで、突合そのものは今までどおり出る
+    let aux = crate::kintai_http_repo::UnkoDiffAux {
+        gcp_drivers: crate::kintai_http_repo::collected_etag_driver_cds(),
+        onprem_ever: onprem_ever_driver_cds(store, month).await,
+    };
+    let diff = crate::kintai_http_repo::record_unko_diff(&onprem, &gcp, &aux, ym);
     let (n, r) = (diff.total, diff.gcp_only_in_month);
     tracing::info!(n, r, "kintai unko diff");
+    let s = &diff.gcp_only_driver_split;
+    let (a, b) = (
+        s.never_onprem_ops,
+        s.other_month_only_ops + s.also_in_month_ops,
+    );
+    tracing::info!(a, b, "kintai unko diff gcp-only split");
+}
+
+/// **`unko_no` 付きの行を一度でも持った乗務員CD** (Refs #205 の 39)。
+///
+/// 引けなければ**空を返して先へ進む** — 内訳の 1 列が埋まらないだけで、突合も
+/// 月ゲートも落とす理由が無い ([`measure_unko_diff`] と同じ倒し方)。
+async fn onprem_ever_driver_cds(
+    store: &KintaiPgStore,
+    month: &str,
+) -> std::collections::HashSet<i64> {
+    match store.stored_operation_driver_cds().await {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::warn!(month = %month, error = %e, "kintai unko diff ever-drivers failed");
+            std::collections::HashSet::new()
+        }
+    }
 }
 
 /// `YYYY-MM` を `(年, 月)` へ。壊れていれば `None` (月で絞る観測を諦めるだけ)。
