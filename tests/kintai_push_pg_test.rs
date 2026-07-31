@@ -756,6 +756,7 @@ fn window_of(months: &[&str], drivers: &[i64], events: Vec<serde_json::Value>) -
         months: months.iter().map(|m| m.to_string()).collect(),
         drivers: drivers.to_vec(),
         events,
+        dry_run: false,
     }
 }
 
@@ -902,4 +903,34 @@ async fn drivers_the_sender_did_not_declare_are_left_alone() {
         1,
         "1200 まで消えた"
     );
+}
+
+/// **`dry_run` は 1 行も書かないが、件数は返す。** MCP tool が名乗る
+/// 「apply を付けない限り書かない」を口の側で担保する。
+#[tokio::test]
+async fn a_dry_run_window_reports_without_writing() {
+    let (store, pool) = require_db!();
+    let events = vec![
+        win_punch(1130, "2026-06-20 08:00:00", "始業"),
+        win_punch(1130, "2026-06-20 18:00:00", "終業"),
+    ];
+    let mut w = window_of(&["2026-06"], &[1130], events);
+    w.dry_run = true;
+
+    let planned = apply_timecard_window(&store, &w).await.expect("dry run");
+    assert!(planned.dry_run);
+    assert_eq!(planned.days_written, 1, "計画は返る");
+    assert_eq!(planned.events_written, 2);
+    assert_eq!(
+        count_events(&pool, store.tenant_id()).await,
+        0,
+        "書いてしまった"
+    );
+
+    // 同じ窓を apply すると、dry-run が言ったとおりに書ける
+    w.dry_run = false;
+    let applied = apply_timecard_window(&store, &w).await.expect("apply");
+    assert!(!applied.dry_run);
+    assert_eq!(applied.days_written, planned.days_written);
+    assert_eq!(count_events(&pool, store.tenant_id()).await, 2);
 }
