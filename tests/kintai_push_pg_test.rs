@@ -739,6 +739,14 @@ async fn the_header_decides_which_tenant_the_rows_land_in() {
 
 // ── 窓ぶんをまるごと運ぶ経路 (Refs #205 の 04b) ────────────────────────────
 
+/// **JST の壁時計でその日の中の 1 点**を作る。
+///
+/// `jst_day_bounds(d).1` は**翌日 00:00** なので、「その日に置く」つもりで掴むと
+/// 隣の日に乗る (2026-07-31 に実際に間違えた)。時刻を明示する形にして塞ぐ。
+fn jst_at(date: NaiveDate, hour: i64) -> chrono::DateTime<chrono::FixedOffset> {
+    jst_day_bounds(date).0 + chrono::Duration::hours(hour)
+}
+
 /// 窓ぶんの生行 (乗務員を混ぜられる形)。
 fn win_punch(driver: i64, at: &str, state: &str) -> serde_json::Value {
     json!({
@@ -1026,7 +1034,7 @@ async fn the_window_leaves_rows_from_other_sources_alone() {
          VALUES ($1, 4001, $2, '始業', 'alc_app', NULL, '{}'::jsonb)",
     )
     .bind(tenant)
-    .bind(jst_day_bounds(NaiveDate::from_ymd_opt(2026, 6, 9).unwrap()).0)
+    .bind(jst_at(NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(), 22))
     .execute(&pool)
     .await
     .expect("seed alc_app row");
@@ -1071,14 +1079,14 @@ async fn other_sources_do_not_leak_into_the_signature() {
     );
     apply_timecard_window(&store, &w).await.expect("seed");
 
-    // 同じ日に別の書き手が 1 件足す
+    // **同じ日の中**に別の書き手が 1 件足す (翌日に乗せると別経路の検査になる)
     sqlx::query(
         "INSERT INTO kintai.kintai_events
                 (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw)
          VALUES ($1, 4002, $2, '終業', 'alc_app', NULL, '{}'::jsonb)",
     )
     .bind(tenant)
-    .bind(jst_day_bounds(NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()).1)
+    .bind(jst_at(NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(), 18))
     .execute(&pool)
     .await
     .expect("seed alc_app row");
@@ -1087,4 +1095,97 @@ async fn other_sources_do_not_leak_into_the_signature() {
     let again = apply_timecard_window(&store, &w).await.expect("re-send");
     assert_eq!(again.days_written, 0, "他の書き手の行で差分が出た");
     assert_eq!(again.drivers_written, 0);
+}
+
+/// **payload が覆っていない日に他の書き手の行があっても、幻の削除を起こさない。**
+///
+/// 上の 2 本とは別経路 — あちらは「同じ日のハッシュが汚れるか」、こちらは
+/// 「手元に無い日が `Deleted` と判定されるか」。絞りが無いと格納側にだけ
+/// その日が現れ、消しにいってしまう。
+#[tokio::test]
+async fn other_sources_on_other_days_do_not_look_deleted() {
+    let (store, pool) = require_db!();
+    let tenant = store.tenant_id();
+    let w = window_of(
+        &["2026-06"],
+        &[4003],
+        vec![win_punch(4003, "2026-06-15 08:00:00", "始業")],
+    );
+    apply_timecard_window(&store, &w).await.expect("seed");
+
+    // payload に無い日 (06-16) に別の書き手が置く
+    sqlx::query(
+        "INSERT INTO kintai.kintai_events
+                (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw)
+         VALUES ($1, 4003, $2, '始業', 'alc_app', NULL, '{}'::jsonb)",
+    )
+    .bind(tenant)
+    .bind(jst_at(NaiveDate::from_ymd_opt(2026, 6, 16).unwrap(), 9))
+    .execute(&pool)
+    .await
+    .expect("seed alc_app row");
+
+    let again = apply_timecard_window(&store, &w).await.expect("re-send");
+    assert_eq!(again.days_deleted, 0, "手元に無い日を消しにいった");
+    assert_eq!(again.drivers_written, 0);
+
+    let survivors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kintai.kintai_events
+          WHERE tenant_id = $1 AND source = 'alc_app'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("count alc_app");
+    assert_eq!(survivors, 1);
+}
+
+/// **PK が衝突したら黙って上書きせず、丸ごと落ちる。**
+///
+/// PK は `(tenant_id, driver_cd, occurred_at, state)` で **`source` を含まない**。
+/// DELETE を自分の source に絞った結果、他の書き手の行と同じ鍵になると INSERT が
+/// 衝突する。絞る前は「他人の行を消してから入れる」ので通っていた = 静かに
+/// 消していた。
+///
+/// どちらが正かの規則が無いので **loud fail** にしてある。窓ぜんたいで
+/// 1 トランザクションなので、**1 行も書かれない**ことまで確かめる。
+#[tokio::test]
+async fn a_key_collision_with_another_source_fails_loudly() {
+    let (store, pool) = require_db!();
+    let tenant = store.tenant_id();
+    let at = jst_at(NaiveDate::from_ymd_opt(2026, 6, 18).unwrap(), 8);
+    sqlx::query(
+        "INSERT INTO kintai.kintai_events
+                (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw)
+         VALUES ($1, 4004, $2, '始業', 'alc_app', NULL, '{}'::jsonb)",
+    )
+    .bind(tenant)
+    .bind(at)
+    .execute(&pool)
+    .await
+    .expect("seed alc_app row");
+
+    // 同じ (乗務員, 時刻, state) を打刻として送る
+    let w = window_of(
+        &["2026-06"],
+        &[4004],
+        vec![
+            win_punch(4004, "2026-06-18 08:00:00", "始業"),
+            win_punch(4004, "2026-06-18 18:00:00", "終業"),
+        ],
+    );
+    let err = apply_timecard_window(&store, &w).await.unwrap_err();
+    assert!(err.to_string().contains("duplicate key"), "{err}");
+
+    // 他の書き手の行は残り、こちらは 1 行も入っていない (1 トランザクション)
+    let ours: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kintai.kintai_events
+          WHERE tenant_id = $1 AND source <> 'alc_app'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("count ours");
+    assert_eq!(ours, 0, "衝突したのに一部だけ書けている");
+    assert_eq!(count_events(&pool, tenant).await, 1);
 }
