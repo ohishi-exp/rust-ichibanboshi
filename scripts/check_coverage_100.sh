@@ -88,11 +88,7 @@ if not registered:
     print("ERROR: coverage_100.toml に登録ファイルがありません")
     sys.exit(1)
 
-# 絶対パス + "/src/" を含む + ".rs:" で終わる、の 3 条件。worktree の置き場所
-# (/home/... でも /tmp/... でも) に依存しない。特定の接頭辞を決め打つと
-# scratchpad 配下に worktree を作る運用 (このリポジトリの標準) と噛み合わず、
-# 登録簿の全ファイルが "missing" に見える壊れ方をする (Refs #205 の 33)。
-HEADER = re.compile(r"^(/.*/src/.*\.rs):$")
+HEADER = re.compile(r"^(/.*\.rs):$")
 # "  123|   4.51k| source"  — ヒット数は 12 / 1.19k / 2.50M いずれもあり得る
 COUNTED = re.compile(r"^\s*(\d+)\|\s*([0-9][0-9.]*)([kKmMgG]?)\s*\|")
 # "  123|       | source"   — 非実行行 (コメント・宣言等)
