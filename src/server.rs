@@ -360,6 +360,12 @@ pub async fn run(
         .route("/kintai/rest-diff", get(routes::kintai::rest_diff))
         // 運行 → 読取日の引き当て (Refs #205 の 42)。同じく読むだけ
         .route("/kintai/reading-dates", get(routes::kintai::reading_dates))
+        // 末尾検知 (tail gap) が鳴らしている乗務員の名指し (Refs #205)。読むだけ・
+        // 月ゲートの閾値も封の条件も変えない
+        .route(
+            "/kintai/tail-gap-probe",
+            get(routes::kintai::tail_gap_probe),
+        )
         // 畳んだ結果の読み出し (Refs #205 の 18)。読むだけ。POST は無い
         .route(
             "/kintai/day-summaries",

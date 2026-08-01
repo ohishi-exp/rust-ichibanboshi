@@ -10,6 +10,7 @@ pub mod kintai_reading_dates;
 pub mod kintai_repo;
 pub mod kintai_rest_diff;
 pub mod kintai_store;
+pub mod kintai_tail_gap_probe;
 pub mod kintai_version;
 pub mod kosoku;
 pub mod kosoku_paper;
