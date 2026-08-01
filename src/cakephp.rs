@@ -125,6 +125,18 @@ pub struct TimecardDailyResponse {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `POST /dtako-events/autoload` の応答 (Refs #274 / #205 の 58)。
+///
+/// HTTP status と PHP が返した本文 (先頭 2000 文字) を**そのまま**保持する。
+/// CakePHP 側は MIME 判定に失敗しても展開もエラー応答も出さず 200 を返す
+/// (親が実物で確認済み) ため、ここで「成功/失敗」に丸めない — 呼び出し側
+/// (route) が status と本文の両方を見て判断できるようにする。
+#[derive(Debug, Clone, Serialize)]
+pub struct DtakoAutoloadResponse {
+    pub status: u16,
+    pub body_excerpt: String,
+}
+
 /// CakePHP fetch client。
 ///
 /// `base_url` 空文字なら NotConfigured を返す。
@@ -278,6 +290,65 @@ impl CakephpClient {
         self.get_json(&url).await
     }
 
+    /// PHP (`DtakoEventsController::autoload`) が zip として受け付ける唯一の
+    /// Content-Type。**`$file->getClientMediaType() === "application/x-zip-compressed"`
+    /// でしか判定しない** — OS/ブラウザの一般的な既定 MIME である
+    /// `application/zip` で送ると、展開もエラー応答も無く黙って無視される
+    /// (親が実物で確認済み、Refs #274)。reqwest は拡張子や中身から MIME を
+    /// 推測しないので、ここで固定しないと必ず踏む。
+    const DTAKO_AUTOLOAD_MIME: &'static str = "application/x-zip-compressed";
+
+    /// `post_dtako_autoload` 専用の timeout (秒)。PHP 側は取り込みを
+    /// `for ($i=1;$i<10;$i++)` で最大 18 回叩き直し、`usleep` のビジーウェイトも
+    /// 挟む (親が実物で確認済み、Refs #274) ため応答が遅いことがある。1 回あたりの
+    /// 所要時間は明記されていないので、受け入れ条件の下限 (60 秒) の倍を確保し、
+    /// 「取り込みは進んでいるのにこちらが先に諦めて失敗と誤判定する」方を避ける —
+    /// 待ちすぎるコストより、進行中の書き込みを失敗と誤報するコストの方が高い。
+    /// この client 全体の既定 (`timeout_secs`、他の高速な GET 用) とは別に、この
+    /// 呼び出しだけ `RequestBuilder::timeout()` で上書きする。
+    const DTAKO_AUTOLOAD_TIMEOUT_SECS: u64 = 120;
+
+    /// `POST /dtako-events/autoload` — csvdata.zip を社内 nginx の取り込み口へ渡す
+    /// (Refs #274 / #205 の 58)。**1 回の呼び出しは 1 つの zip だけを送る** —
+    /// 一括取り込みは作らない (`dtako_events` を書き換える破壊的操作のため)。
+    ///
+    /// 認証・CSRF は不要 (`AppController::beforeFilter` の
+    /// `addUnauthenticatedActions` / `Application.php` のホワイトリストに
+    /// `DtakoEvents::autoload` が乗っている、親が実物で確認済み)。
+    pub async fn post_dtako_autoload(
+        &self,
+        file_name: &str,
+        zip_bytes: Vec<u8>,
+    ) -> Result<DtakoAutoloadResponse, CakephpError> {
+        if !self.is_enabled() {
+            return Err(CakephpError::NotConfigured);
+        }
+        // format! を複数行にしない (フォーマット文字列が独立行だと llvm-cov の行
+        // カバレッジに乗らないことがある、CLAUDE.md / kintai-ops skill §5)
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/dtako-events/autoload");
+        let part = reqwest::multipart::Part::bytes(zip_bytes)
+            .file_name(file_name.to_string())
+            .mime_str(Self::DTAKO_AUTOLOAD_MIME)
+            .expect("DTAKO_AUTOLOAD_MIME is a constant valid MIME string");
+        let form = reqwest::multipart::Form::new().part("file[]", part);
+        let res = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(Self::DTAKO_AUTOLOAD_TIMEOUT_SECS))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| CakephpError::RequestFailed(e.to_string()))?;
+        let status = res.status().as_u16();
+        let body = res.text().await.unwrap_or_default();
+        let body_excerpt: String = body.chars().take(2000).collect();
+        Ok(DtakoAutoloadResponse {
+            status,
+            body_excerpt,
+        })
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, CakephpError> {
         let res = self
             .client
@@ -416,6 +487,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err3, CakephpError::NotConfigured));
+        let err4 = c
+            .post_dtako_autoload("csvdata.zip", vec![1, 2, 3])
+            .await
+            .unwrap_err();
+        assert!(matches!(err4, CakephpError::NotConfigured));
     }
 
     #[test]
@@ -435,5 +511,87 @@ mod tests {
         assert!(CakephpError::JsonError("bad".into())
             .to_string()
             .contains("bad"));
+    }
+
+    #[tokio::test]
+    async fn post_dtako_autoload_sends_the_fixed_mime_and_the_zip_as_file_bracket() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dtako-events/autoload"))
+            // ★ 罠1 (MIME 決め打ち): application/zip だと黙って無視されるので、
+            // ここを固定して送っていることを直接検証する
+            .and(body_string_contains(
+                "Content-Type: application/x-zip-compressed",
+            ))
+            .and(body_string_contains("name=\"file[]\""))
+            .and(body_string_contains("filename=\"csvdata.zip\""))
+            .respond_with(ResponseTemplate::new(200).set_body_string("import queued"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_dtako_autoload("csvdata.zip", b"PK\x03\x04fake-zip".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(res.status, 200);
+        assert_eq!(res.body_excerpt, "import queued");
+    }
+
+    #[tokio::test]
+    async fn post_dtako_autoload_returns_non_2xx_as_ok_instead_of_collapsing_to_an_error() {
+        // 条件5: 成功シグナルだけを返さない — HTTP レベルで失敗しても呼び出し側が
+        // 実際の status / 本文を読めるよう、ここで Err に丸めない
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&server)
+            .await;
+
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_dtako_autoload("csvdata.zip", vec![0u8; 8])
+            .await
+            .unwrap();
+        assert_eq!(res.status, 500);
+        assert_eq!(res.body_excerpt, "Internal Server Error");
+    }
+
+    #[tokio::test]
+    async fn post_dtako_autoload_truncates_the_body_to_2000_chars() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let long_body = "x".repeat(5000);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(long_body))
+            .mount(&server)
+            .await;
+
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_dtako_autoload("csvdata.zip", vec![0u8; 4])
+            .await
+            .unwrap();
+        assert_eq!(res.body_excerpt.chars().count(), 2000);
+    }
+
+    #[tokio::test]
+    async fn post_dtako_autoload_maps_connection_failure_to_request_failed() {
+        // port 0 は listen できないアドレスなので必ず接続失敗する
+        let c = CakephpClient::new("http://127.0.0.1:0".to_string(), 1).unwrap();
+        let err = c
+            .post_dtako_autoload("csvdata.zip", vec![0u8; 4])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CakephpError::RequestFailed(_)));
     }
 }

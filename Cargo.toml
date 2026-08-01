@@ -36,7 +36,9 @@ regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Phase 2 CakePHP masters / editable-months HTTP pull (社内 LAN、token 不要)
 # rustls-tls で openssl 依存を回避 (musl static build を維持)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+# multipart: csvdata.zip を POST /dtako-events/autoload へ multipart/form-data で
+# 中継するため (Refs #205 の 58 / #274)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "multipart"] }
 # Phase 2 raw NDJSON.gz 出力
 flate2 = "1"
 # Phase 2 fingerprint (raw rows sha256 — recalc skip 判定 + R2 sync 必要性判定)
