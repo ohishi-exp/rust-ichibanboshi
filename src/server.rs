@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Extension, Router,
 };
@@ -380,6 +381,15 @@ pub async fn run(
         // 読むだけ・既存の events 取得を再利用する (ファイル名は kintai/kosoku で
         // 始めない — dtako_day.rs のモジュール doc 参照、logic_version は動かさない)
         .route("/kintai/day-events", get(routes::dtako_day::day_events))
+        // csvdata.zip → 社内 nginx の取り込み口へ 1 件ずつ中継 (Refs #205 の 58 /
+        // #274)。ファイル名は kintai/kosoku で始めない — logic_version は動かさない
+        // (dtako_autoload.rs のモジュール doc 参照)。zip 本体を受けるので既定の
+        // body 上限 (2 MiB) をこの route だけ緩める (他の route には影響しない)
+        .route(
+            "/dtako/autoload",
+            post(routes::dtako_autoload::autoload)
+                .layer(DefaultBodyLimit::max(routes::dtako_autoload::MAX_ZIP_BYTES)),
+        )
         // 打刻の受け口 (Refs #205 の 04b)。GCP 側だけが使う — オンプレは
         // [kintai_push] が無効なので両方 503 で fail-closed
         .route("/kintai/timecard", post(routes::kintai_timecard::receive))
