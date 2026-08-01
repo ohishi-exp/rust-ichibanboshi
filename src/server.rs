@@ -141,6 +141,10 @@ pub async fn run(
         dir: config.raw.dir.clone(),
     });
 
+    // 修正リンク (/api/kintai/day-events) 組み立て用 base URL (Refs #205 の 57)。
+    // fetch はしない — 文字列を組むだけなので到達性チェックは無い
+    let dtako_day_links = Arc::new(config.dtako_day_links.clone());
+
     // 給与大臣 (OHKEN) 読み取り (#82)。未設定なら stub を挿して該当ルートだけ 503。
     // pool は起動時テストなし — 給与大臣 PC 停止でも本サービス全体は起動する
     let kyuyo_repo: kyuyo::repo::DynKyuyoRepo = if config.kyuyo.db_enabled() {
@@ -372,6 +376,10 @@ pub async fn run(
             get(routes::kintai_day_summaries::day_summaries),
         )
         .route("/kintai/version", get(routes::kintai_version::version))
+        // 乗務員CD + 日付 → 運行NO・全イベント・修正用リンク (Refs #205 の 57)。
+        // 読むだけ・既存の events 取得を再利用する (ファイル名は kintai/kosoku で
+        // 始めない — dtako_day.rs のモジュール doc 参照、logic_version は動かさない)
+        .route("/kintai/day-events", get(routes::dtako_day::day_events))
         // 打刻の受け口 (Refs #205 の 04b)。GCP 側だけが使う — オンプレは
         // [kintai_push] が無効なので両方 503 で fail-closed
         .route("/kintai/timecard", post(routes::kintai_timecard::receive))
@@ -448,7 +456,8 @@ pub async fn run(
         .layer(Extension(kintai_pg_store))
         .layer(Extension(read_tenant))
         .layer(Extension(kosoku_params))
-        .layer(Extension(restraint_store));
+        .layer(Extension(restraint_store))
+        .layer(Extension(dtako_day_links));
 
     let addr = config.addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -66,6 +66,15 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # password = "<kintai_reader パスワード>"
 # database = "<CakePHP の DB 名>"
 
+# 修正リンク (/api/kintai/day-events) 組み立て用の base URL 2 つ (Refs #205 の 57)。
+# fetch はしない — 文字列を組むだけ。空/未設定ならその項目のリンクを応答から省く。
+# [dtako_day_links]
+# 社内 nginx (CakePHP)。`<base>/ryohi-rows/view/<unko_no>` が未ログインで開ける。
+# ryohi_base_url = "<社内 nginx の LAN ホスト>"
+# dtako-admin (nuxt SPA)。`daily-report-api/zip` リンクは参考値 (直接は開けない) で、
+# `<base>/daily-report-edit` (検索画面) だけが実際に使える。
+# dtako_base_url = "https://dtako.ippoan.org"
+
 # 勤怠の生イベントをどこから読むか (Refs #205 実装計画 02)。
 # 既定は "mariadb" = 上の [mariadb] を直読みするオンプレの形 (挙動は従来どおり)。
 #
