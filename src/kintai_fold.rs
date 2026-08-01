@@ -418,6 +418,11 @@ pub struct FoldReport {
     /// 「最新」として保存してしまう。指紋は入力から作るので、次に運行が揃えば
     /// 指紋が変わって畳み直されるが、**その間は静かに少ない拘束を返す**。
     /// tracing に落とすだけでは呼び出し側から見えないのでここまで運ぶ。
+    ///
+    /// **診断専用 (tail gap) の警告も含む** — 月ゲートの封を止めるかどうかは
+    /// この `Vec` の空/非空では判定しない (Refs #205-51、
+    /// [`crate::kintai_http_repo::warnings_seen`] 参照)。降格であって削除ではない
+    /// ので、鳴っていることはここから今までどおり読める。
     pub warnings: Vec<String>,
     /// 畳むのにかかった時間 (ms)。
     ///
@@ -1072,10 +1077,12 @@ async fn read_fold_gate(
 /// (Refs #205 の 20)。
 ///
 /// [`recalc_month`] 経由 (CLI の `Recalc` / `Sync`) は
-/// [`crate::kintai_http_repo::warnings_seen`] で「収集器の中で warnings ゼロ」が
-/// 確認できた回だけ書く (Refs #205-17)。`routes::kintai_recalc::run` の 5 条件の
-/// 1 つ (`folded.warnings.is_empty()`) と同じ理由 — R2 の分割遅れ中に欠けた入力を
-/// 「最新」と刻まないため。
+/// [`crate::kintai_http_repo::warnings_seen`] で「収集器の中で封を止める warning が
+/// 無い」が確認できた回だけ書く (Refs #205-17 / #205-51)。`routes::kintai_recalc::run`
+/// の 5 条件の 1 つ (封を止める warning が無いこと) と同じ理由 — R2 の分割遅れ中に
+/// 欠けた入力を「最新」と刻まないため。**tail gap のような診断専用の warning は
+/// どちらも数えない** (Refs #205-51) — HTTP 経路と CLI 経路で封の基準がずれると
+/// 事故になるため、`warnings_seen()` 1 か所の定義変更で両方揃えてある。
 async fn write_fold_gate(
     store: &KintaiPgStore,
     month: &str,
@@ -1344,10 +1351,13 @@ pub async fn month_gate_report(
 /// まま取り残される — #225 / #234 と同型の「静かに一部が消える」事故になる。
 ///
 /// **gate を書くのは [`crate::kintai_http_repo::warnings_seen`] が `Some(false)`
-/// (収集器の中・warnings ゼロ) のときだけ** (Refs #205-17)。呼び出し元 (`main.rs`)
-/// が `with_warning_sink` で包んでいる前提だが、包まれていない (`None`) 場合は
-/// 「無い」と「分からない」を混同しないよう書かない — 次回また全量読みに落ちる
-/// だけで安全側。
+/// (収集器の中・封を止める warning が無い) のときだけ** (Refs #205-17 / #205-51)。
+/// **tail gap のような診断専用の warning があっても `Some(false)` のまま** —
+/// `warnings_seen()` の定義そのものが「封を止める warning を見たか」なので、ここは
+/// 何も変えなくても HTTP 経路 (`routes::kintai_recalc::run`) と同じ基準になる。
+/// 呼び出し元 (`main.rs`) が `with_warning_sink` で包んでいる前提だが、包まれて
+/// いない (`None`) 場合は「無い」と「分からない」を混同しないよう書かない —
+/// 次回また全量読みに落ちるだけで安全側。
 pub async fn recalc_month(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,

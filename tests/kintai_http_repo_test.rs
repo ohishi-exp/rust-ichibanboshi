@@ -1268,9 +1268,8 @@ async fn test_month_digest_is_silent_when_the_dtako_input_covers_the_window() {
     assert!(warnings.is_empty(), "揃っていれば静か: {warnings:?}");
 }
 
-/// **末尾が欠けたら立つ。** 月ゲートはこの warning を見て封をしない
-/// (`routes::kintai_recalc` の 5 条件 / `kintai_fold::recalc_month` の
-/// `warnings_seen()`)。少ないままの 3 表が「最新」として固定されるのを防ぐ。
+/// **末尾が欠けたら (tail gap) 立つが、これは診断専用で月ゲートの封は止めない**
+/// (Refs #205-51)。応答の `warnings` からは消えない — 降格であって削除ではない。
 #[tokio::test]
 async fn test_month_digest_warns_when_the_tail_of_the_month_is_missing() {
     let server = MockServer::start().await;
@@ -1289,10 +1288,13 @@ async fn test_month_digest_warns_when_the_tail_of_the_month_is_missing() {
         let d = repo(&server.uri())
             .fetch_dtako_month_digest("2026-01")
             .await;
-        // gate が見るのはこの関数 — 読みを 1 バイトも払う前に立っていること
+        // tail gap は診断専用 — 表示 (warnings) には乗るが封は止めない
+        // (`routes::kintai_recalc` の 5 条件 / `kintai_fold::recalc_month` の
+        // `warnings_seen()` はどちらもこの警告だけでは `Some(true)` にならない)
         assert_eq!(
             rust_ichibanboshi::kintai_http_repo::warnings_seen(),
-            Some(true)
+            Some(false),
+            "tail gap 単独では封を止めない (Refs #205-51)"
         );
         d
     })
@@ -1303,6 +1305,7 @@ async fn test_month_digest_warns_when_the_tail_of_the_month_is_missing() {
 }
 
 /// `etag: null` (alc の DB に運行はあるが R2 に CSV が無い) は閾値の要らない欠け。
+/// **こちらは tail gap と違い封を止め続ける** (Refs #205-51、受け入れ条件 #4)。
 #[tokio::test]
 async fn test_month_digest_warns_for_operations_without_an_r2_etag() {
     let server = MockServer::start().await;
@@ -1317,16 +1320,21 @@ async fn test_month_digest_warns_for_operations_without_an_r2_etag() {
         })))
         .mount(&server)
         .await;
-    let (_, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await
-    })
-    .await;
+    let (_, warnings, blocking) =
+        rust_ichibanboshi::kintai_http_repo::with_warning_sink_blocking(async {
+            repo(&server.uri())
+                .fetch_dtako_month_digest("2026-01")
+                .await
+        })
+        .await;
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
         warnings[0].contains("R2 に CSV の無い運行 1 件"),
         "{warnings:?}"
+    );
+    assert!(
+        blocking,
+        "no_etag は封を止める (tail gap との対比、Refs #205-51)"
     );
 }
 
