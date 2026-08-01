@@ -74,6 +74,31 @@
 //! `api` を常に真値で送るので、その分岐そのものに入らない — `?redirect=` を
 //! ここに足しても中継先の挙動には影響しない。むしろ「効かないパラメータが
 //! ある」方が呼び出し側を混乱させるので、対応するパラメータは作らない。
+//!
+//! ## `reset_timecard` (③、Refs #205 の 63、issue #277)
+//!
+//! 値ずれを直すには 3 段そろう必要があり、②(このファイル) だけでは
+//! `time_card_dtako` の古い行が残る (実証: 乗務員 1021 / 運行 2026-06-05 —
+//! ②のあと③ (`resetby-unko-no`) を押して初めて勤務が 2 本 (277+273 分) →
+//! 1 本 (802 分) になり GCP と完全一致した)。`?reset_timecard=true` を付けると
+//! ②に続けて③ (`CakephpClient::post_reset_timecard`) まで実行する。
+//!
+//! - **既定は `false`。** 破壊的操作 (`time_card_dtako` への書き戻し) を既定で
+//!   増やさない (受け入れ条件1)
+//! - **②が失敗 (非 2xx) したら③はやらない。** `reset_skip_reason` に理由を返す
+//!   (受け入れ条件3)。②の接続自体が失敗した場合はこの関数が早期リターンする
+//!   ので、そもそも③まで到達しない
+//! - **`preview=true` のときは③も実行しない。** `reset_target_path` (相対パスの
+//!   み) で「何を叩く予定か」だけを返す (受け入れ条件6)
+//! - **③の結果は `reset_*` prefix で分けて返す。** ②の `http_status` /
+//!   `location` とは別の JSON key (`reset_http_status` / `reset_location`) を
+//!   使い、混ぜない (受け入れ条件4)
+//! - **★★ `reset_http_status` は成功の証明にならない。** ③の応答は空 200 で、
+//!   成否は PHP 側の Flash (session) にしか出ない
+//!   (`yhonda-ohishi/nginx#796` に起票済み、`CakephpClient::post_reset_timecard`
+//!   の doc 参照)。応答には注意書き (`reset_note`) を添えるが、`http_status`
+//!   だけを見て「成功した」と判断してはいけない (受け入れ条件5、親も子も一度
+//!   `http_status` で誤診している)
 
 use std::sync::Arc;
 
@@ -85,6 +110,11 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::cakephp::{CakephpClient, CakephpError};
+
+/// ③ (`CakephpClient::post_reset_timecard`) の応答に添える注意書き。
+/// **空 200 は成功の証明ではない** (`yhonda-ohishi/nginx#796` に起票済み)。
+/// 受け入れ条件5: `reset_http_status` を成功の証明に使わせない。
+const RESET_TIMECARD_STATUS_NOTE: &str = "reset_http_status は空 200 でも失敗でも同じ値になり得ます。成否は Flash (session) にしか出ないため呼び出し側からは判別できません (yhonda-ohishi/nginx#796)";
 
 /// nginx 側の相対パス。**host は含めない** — 受け入れ条件6 (内部アドレスを
 /// commit / PR / docs に書かない)。実際の到達先は `CakephpClient` の
@@ -98,13 +128,24 @@ const AUTOLOAD_PATH: &str = "/dtako-events/autoload";
 /// 影響しない、server.rs でこの route にだけ layer する)。
 pub const MAX_ZIP_BYTES: usize = 20 * 1024 * 1024;
 
-/// `?unko_no=&file_name=&preview=`
+/// `?unko_no=&file_name=&preview=&reset_timecard=`
 #[derive(Debug, Deserialize)]
 pub struct AutoloadQuery {
     pub unko_no: Option<String>,
     pub file_name: Option<String>,
     #[serde(default)]
     pub preview: bool,
+    /// ③ (勤務時間再登録) まで続けるか。**既定 `false`** (受け入れ条件1、
+    /// モジュール doc 「`reset_timecard`」節参照)。
+    #[serde(default)]
+    pub reset_timecard: bool,
+}
+
+/// ③ の相対パス。**host は含めない** — 受け入れ条件6 と同じ理由
+/// (`AUTOLOAD_PATH` 参照)。`unko_no` は呼び出し前に `parse_unko_no` で
+/// 数字のみと確定済みなので percent-encode は不要。
+fn reset_timecard_path(unko_no: &str) -> String {
+    format!("/time-card-dtako/resetby-unko-no/{unko_no}")
 }
 
 /// `unko_no` の受け入れ判定。**空・非数字は拒否** — 「対象を名指しで受け取る」
@@ -185,6 +226,9 @@ pub async fn autoload(
             "size_bytes": size_bytes,
             "target_path": AUTOLOAD_PATH,
             "configured": cakephp.is_enabled(),
+            // ③ は preview でも実行しない (受け入れ条件6) — 予定だけを返す
+            "reset_timecard": params.reset_timecard,
+            "reset_target_path": params.reset_timecard.then(|| reset_timecard_path(&unko_no)),
             "note": "preview=true のため実際には送信していません",
         })));
     }
@@ -196,6 +240,35 @@ pub async fn autoload(
     let http_ok = (200..300).contains(&res.status);
     let status = res.status;
     tracing::info!(unko_no, size_bytes, status, "dtako autoload sent");
+
+    // ③ (reset_timecard)。②が非2xxなら実行しない (受け入れ条件3)。②の接続自体が
+    // 失敗した場合は上の `?` で既に早期リターンしているのでここには来ない。
+    let mut reset_attempted = false;
+    let mut reset_http_status: Option<u16> = None;
+    let mut reset_location: Option<String> = None;
+    let mut reset_error: Option<String> = None;
+    let mut reset_skip_reason: Option<&str> = None;
+    if params.reset_timecard {
+        if http_ok {
+            reset_attempted = true;
+            match cakephp.post_reset_timecard(&unko_no).await {
+                Ok(r) => {
+                    let s = r.status;
+                    tracing::info!(unko_no, status = s, "dtako reset_timecard sent");
+                    reset_http_status = Some(r.status);
+                    reset_location = r.location;
+                }
+                Err(e) => {
+                    tracing::warn!(unko_no, error = %e, "dtako reset_timecard failed");
+                    reset_error = Some(e.to_string());
+                }
+            }
+        } else {
+            tracing::info!(unko_no, "dtako reset_timecard skipped: step2 not http_ok");
+            reset_skip_reason = Some("step2_failed");
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "preview": false,
         "unko_no": unko_no,
@@ -208,6 +281,14 @@ pub async fn autoload(
         // 成否を判断できないので、redirect 先だけでも渡しておく (受け入れ条件2)。
         "location": res.location,
         "response_excerpt": res.body_excerpt,
+        // ③ の結果は reset_ prefix で分ける (②の http_status/location とは混ぜない、受け入れ条件4)
+        "reset_timecard": params.reset_timecard,
+        "reset_attempted": reset_attempted,
+        "reset_skip_reason": reset_skip_reason,
+        "reset_http_status": reset_http_status,
+        "reset_location": reset_location,
+        "reset_error": reset_error,
+        "reset_note": reset_attempted.then_some(RESET_TIMECARD_STATUS_NOTE),
     })))
 }
 
@@ -498,5 +579,152 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn autoload_default_never_calls_step3_reset_timecard() {
+        // 受け入れ条件1: reset_timecard の既定は false。②のみ呼ばれ③は 1 回も叩かれないことを保証する
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dtako-events/autoload"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/time-card-dtako/resetby-unko-no/26060507533000000042861",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
+        let router = app(cakephp);
+        let (status, body) = call(
+            router,
+            "/dtako/autoload?unko_no=26060507533000000042861",
+            b"PK\x03\x04fake-zip".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["reset_timecard"], serde_json::json!(false));
+        assert_eq!(body["reset_attempted"], serde_json::json!(false));
+        assert_eq!(body["reset_http_status"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn autoload_preview_with_reset_timecard_reports_the_plan_without_calling_anything() {
+        // 受け入れ条件6: preview=true のときは③も実行しない。何をするかだけ返す
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
+        let router = app(cakephp);
+        let (status, body) = call(
+            router,
+            "/dtako/autoload?unko_no=26060507533000000042861&preview=true&reset_timecard=true",
+            b"PK\x03\x04fake-zip".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["preview"], serde_json::json!(true));
+        assert_eq!(body["reset_timecard"], serde_json::json!(true));
+        assert_eq!(
+            body["reset_target_path"],
+            serde_json::json!("/time-card-dtako/resetby-unko-no/26060507533000000042861")
+        );
+    }
+
+    #[tokio::test]
+    async fn autoload_reset_timecard_runs_step3_after_step2_succeeds() {
+        // 受け入れ条件2/4: api=1 を送り、③の結果を reset_ prefix で②と分けて返す
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dtako-events/autoload"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("import queued"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/time-card-dtako/resetby-unko-no/26060507533000000042861",
+            ))
+            .and(body_string_contains("name=\"api\""))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
+        let router = app(cakephp);
+        let (status, body) = call(
+            router,
+            "/dtako/autoload?unko_no=26060507533000000042861&reset_timecard=true",
+            b"PK\x03\x04fake-zip".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["http_status"], serde_json::json!(200));
+        assert_eq!(body["reset_timecard"], serde_json::json!(true));
+        assert_eq!(body["reset_attempted"], serde_json::json!(true));
+        assert_eq!(body["reset_skip_reason"], serde_json::Value::Null);
+        assert_eq!(body["reset_http_status"], serde_json::json!(200));
+        assert_eq!(body["reset_location"], serde_json::Value::Null);
+        assert_eq!(body["reset_error"], serde_json::Value::Null);
+        assert!(
+            body["reset_note"].as_str().unwrap().contains("Flash"),
+            "reset_note は http_status が成功の証明にならないことを書く (受け入れ条件5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn autoload_reset_timecard_is_skipped_when_step2_is_not_http_ok() {
+        // 受け入れ条件3: ②が失敗 (非2xx) したら③をやらない
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dtako-events/autoload"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/time-card-dtako/resetby-unko-no/26060507533000000042861",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
+        let router = app(cakephp);
+        let (status, body) = call(
+            router,
+            "/dtako/autoload?unko_no=26060507533000000042861&reset_timecard=true",
+            b"PK\x03\x04fake-zip".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["http_ok"], serde_json::json!(false));
+        assert_eq!(body["reset_timecard"], serde_json::json!(true));
+        assert_eq!(body["reset_attempted"], serde_json::json!(false));
+        assert_eq!(body["reset_skip_reason"], serde_json::json!("step2_failed"));
+        assert_eq!(body["reset_http_status"], serde_json::Value::Null);
     }
 }

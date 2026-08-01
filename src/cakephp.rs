@@ -143,6 +143,19 @@ pub struct DtakoAutoloadResponse {
     pub location: Option<String>,
 }
 
+/// `POST /time-card-dtako/resetby-unko-no/<unko_no>` の応答 (③、Refs #205 の 63 /
+/// yhonda-ohishi/nginx#795, #796)。
+///
+/// **応答は空 200 で、成否は PHP 側の Flash (session) にしか出ない**
+/// (yhonda-ohishi/nginx#796 に起票済み)。ここに持つ `status` は「HTTP レベルで
+/// 届いたか」の記録でしかなく、**「勤務時間が実際に再登録されたか」の証明では
+/// ない** — 呼び出し側 (route / 人) は `status` を成功の証拠に使ってはいけない。
+#[derive(Debug, Clone, Serialize)]
+pub struct ResetTimecardResponse {
+    pub status: u16,
+    pub location: Option<String>,
+}
+
 /// CakePHP fetch client。
 ///
 /// `base_url` 空文字なら NotConfigured を返す。
@@ -378,6 +391,54 @@ impl CakephpClient {
             body_excerpt,
             location,
         })
+    }
+
+    /// `POST /time-card-dtako/resetby-unko-no/<unko_no>` — 勤務時間の再登録
+    /// (③、Refs #205 の 63 / yhonda-ohishi/nginx#795)。**1 回の呼び出しは
+    /// 1 つの `unko_no` だけを対象にする** — `dtako_events` と同じく破壊的操作
+    /// (`time_card_dtako` への書き戻し) のため一括処理は作らない。
+    ///
+    /// ## `api=1` が必須な理由 (実物で確定済み、yhonda-ohishi/nginx#795)
+    ///
+    /// 無いと既定の redirect 先 (`TimeCardDtako::index()` → `_recheck()`) で
+    /// **最大 100 運行ぶんの書き込みが走る**。redirect を追う HTTP client なら
+    /// そこへ丸ごと巻き込まれる — `post_dtako_autoload` の `api` 分岐と同じ罠だが、
+    /// こちらは巻き込まれた場合の被害がより大きい (単一運行のはずが 100 運行)。
+    /// `reqwest` はこの POST の 3xx を自動追跡しないので、万一 `api=1` を送り
+    /// 忘れても実際に巻き込まれることはないが、意図を明示するため常に送る。
+    ///
+    /// ## 応答は空 200 (yhonda-ohishi/nginx#796)
+    ///
+    /// 成否は Flash (session) にしか出ないため、`ResetTimecardResponse::status`
+    /// を成功の証拠として使ってはいけない (型の doc 参照)。
+    ///
+    /// URL は CakePHP の `postLink` が生成するものと同じ形。**DashedRoute なので
+    /// action は `resetby-unko-no`** (controller は `time-card-dtako`)。
+    pub async fn post_reset_timecard(
+        &self,
+        unko_no: &str,
+    ) -> Result<ResetTimecardResponse, CakephpError> {
+        if !self.is_enabled() {
+            return Err(CakephpError::NotConfigured);
+        }
+        // format! を複数行にしない (CLAUDE.md / kintai-ops skill §5)
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/time-card-dtako/resetby-unko-no/{unko_no}");
+        let form = reqwest::multipart::Form::new().text("api", "1");
+        let res = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| CakephpError::RequestFailed(e.to_string()))?;
+        let status = res.status().as_u16();
+        let location = res
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        Ok(ResetTimecardResponse { status, location })
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, CakephpError> {
@@ -647,6 +708,75 @@ mod tests {
         let c = CakephpClient::new("http://127.0.0.1:0".to_string(), 1).unwrap();
         let err = c
             .post_dtako_autoload("csvdata.zip", vec![0u8; 4])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CakephpError::RequestFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn post_reset_timecard_sends_api_flag_to_the_dashed_route() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            // ★ DashedRoute なので action は resetby-unko-no (resetbyUnkoNo ではない)
+            .and(path(
+                "/time-card-dtako/resetby-unko-no/26060507533000000042861",
+            ))
+            // ★ #795: api が無いと最大 100 運行ぶんの書き込みに巻き込まれる
+            .and(body_string_contains("name=\"api\""))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_reset_timecard("26060507533000000042861")
+            .await
+            .unwrap();
+        assert_eq!(res.status, 200);
+        assert_eq!(res.location, None);
+    }
+
+    #[tokio::test]
+    async fn post_reset_timecard_returns_not_configured_when_base_url_is_empty() {
+        let c = CakephpClient::new(String::new(), 30).unwrap();
+        let err = c.post_reset_timecard("26060507533000000042861").await;
+        assert!(matches!(err.unwrap_err(), CakephpError::NotConfigured));
+    }
+
+    #[tokio::test]
+    async fn post_reset_timecard_surfaces_the_location_header() {
+        // 応答は空 200 のはずだが、万一 3xx が返っても location だけは拾えることを保証する。
+        // 307 で確認する — 301/302/303 は reqwest が自動で GET へ追従し得るため、
+        // 追従しない (body を再送しない) 307/308 の方が実際に観測される形に近い
+        // (`post_dtako_autoload_surfaces_the_location_header_on_a_3xx_response` と同じ理由)。
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/time-card-dtako"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_reset_timecard("26060507533000000042861")
+            .await
+            .unwrap();
+        assert_eq!(res.status, 307);
+        assert_eq!(res.location, Some("/time-card-dtako".to_string()));
+    }
+
+    #[tokio::test]
+    async fn post_reset_timecard_maps_connection_failure_to_request_failed() {
+        let c = CakephpClient::new("http://127.0.0.1:0".to_string(), 1).unwrap();
+        let err = c
+            .post_reset_timecard("26060507533000000042861")
             .await
             .unwrap_err();
         assert!(matches!(err, CakephpError::RequestFailed(_)));
