@@ -125,16 +125,22 @@ pub struct TimecardDailyResponse {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// `POST /dtako-events/autoload` の応答 (Refs #274 / #205 の 58)。
+/// `POST /dtako-events/autoload` の応答 (Refs #274 / #205 の 58 / #205 の 61)。
 ///
 /// HTTP status と PHP が返した本文 (先頭 2000 文字) を**そのまま**保持する。
 /// CakePHP 側は MIME 判定に失敗しても展開もエラー応答も出さず 200 を返す
 /// (親が実物で確認済み) ため、ここで「成功/失敗」に丸めない — 呼び出し側
 /// (route) が status と本文の両方を見て判断できるようにする。
+///
+/// `location` は 3xx 応答の `Location` ヘッダをそのまま持つ (無ければ
+/// `None`)。**通常は空になるはず** — 送信時に `api` フィールドを常に真値で
+/// 付けているため (Refs #205 の 61)。それでも 3xx が返ってきた場合に body が
+/// 空だと何も分からないので、保険として残す。
 #[derive(Debug, Clone, Serialize)]
 pub struct DtakoAutoloadResponse {
     pub status: u16,
     pub body_excerpt: String,
+    pub location: Option<String>,
 }
 
 /// CakePHP fetch client。
@@ -309,12 +315,24 @@ impl CakephpClient {
     const DTAKO_AUTOLOAD_TIMEOUT_SECS: u64 = 120;
 
     /// `POST /dtako-events/autoload` — csvdata.zip を社内 nginx の取り込み口へ渡す
-    /// (Refs #274 / #205 の 58)。**1 回の呼び出しは 1 つの zip だけを送る** —
-    /// 一括取り込みは作らない (`dtako_events` を書き換える破壊的操作のため)。
+    /// (Refs #274 / #205 の 58 / #205 の 61)。**1 回の呼び出しは 1 つの zip だけを
+    /// 送る** — 一括取り込みは作らない (`dtako_events` を書き換える破壊的操作のため)。
     ///
     /// 認証・CSRF は不要 (`AppController::beforeFilter` の
     /// `addUnauthenticatedActions` / `Application.php` のホワイトリストに
     /// `DtakoEvents::autoload` が乗っている、親が実物で確認済み)。
+    ///
+    /// ## `api` フィールドが必須な理由 (実物で確定済み、Refs #205 の 61)
+    ///
+    /// `DtakoEventsController::autoload()` は末尾で
+    /// `if ($this->request->getData('api')) { $this->autoRender = false; }
+    /// else { $this->redirect(...getQuery('redirect', '/'), 307); }` という分岐を
+    /// 持つ。**POST データに `api` (真値) が無いと必ず 307 で `/` へ redirect
+    /// される** — nginx でも https でもなく PHP アプリが明示的に返す。
+    /// `DtakoIchizipKintai` にも同じ分岐があり、「API 利用者は `api` を付ける」が
+    /// 暗黙の規約になっている。zip の受信・展開・取り込みはこの分岐より**前**
+    /// (1399〜1468 行) で実行されるため、`api` を付け忘れても取り込み自体は走る
+    /// が、応答が 307 になり `location` 以外の情報が失われる。
     pub async fn post_dtako_autoload(
         &self,
         file_name: &str,
@@ -331,7 +349,11 @@ impl CakephpClient {
             .file_name(file_name.to_string())
             .mime_str(Self::DTAKO_AUTOLOAD_MIME)
             .expect("DTAKO_AUTOLOAD_MIME is a constant valid MIME string");
-        let form = reqwest::multipart::Form::new().part("file[]", part);
+        let form = reqwest::multipart::Form::new()
+            // ★ 無いと PHP 側が 307 で `/` へ redirect する (上の doc 参照)。
+            // 中身は真値であれば何でもよい (`getData('api')` は真偽判定のみ)。
+            .text("api", "1")
+            .part("file[]", part);
         let res = self
             .client
             .post(&url)
@@ -341,11 +363,20 @@ impl CakephpClient {
             .await
             .map_err(|e| CakephpError::RequestFailed(e.to_string()))?;
         let status = res.status().as_u16();
+        // reqwest はこの POST (multipart body) の 3xx を自動追跡しない
+        // (body を再送できないため素通しする、親セッションで実測確認済み) —
+        // 3xx が返ってきたときは Location だけが手がかりなので保険として拾う。
+        let location = res
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let body = res.text().await.unwrap_or_default();
         let body_excerpt: String = body.chars().take(2000).collect();
         Ok(DtakoAutoloadResponse {
             status,
             body_excerpt,
+            location,
         })
     }
 
@@ -528,6 +559,8 @@ mod tests {
             ))
             .and(body_string_contains("name=\"file[]\""))
             .and(body_string_contains("filename=\"csvdata.zip\""))
+            // ★ 罠2 (#205 の 61): api が無いと PHP 側が 307 で "/" へ redirect する
+            .and(body_string_contains("name=\"api\""))
             .respond_with(ResponseTemplate::new(200).set_body_string("import queued"))
             .expect(1)
             .mount(&server)
@@ -540,6 +573,30 @@ mod tests {
             .unwrap();
         assert_eq!(res.status, 200);
         assert_eq!(res.body_excerpt, "import queued");
+        assert_eq!(res.location, None);
+    }
+
+    #[tokio::test]
+    async fn post_dtako_autoload_surfaces_the_location_header_on_a_3xx_response() {
+        // api を送り忘れた (退行) / PHP 側の挙動が変わった等で 3xx が返ってきても、
+        // body が空だと何も分からない (#205 の 61) — Location だけは拾えることを保証する
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_dtako_autoload("csvdata.zip", b"PK\x03\x04fake-zip".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(res.status, 307);
+        assert_eq!(res.location, Some("/".to_string()));
     }
 
     #[tokio::test]

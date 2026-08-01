@@ -47,6 +47,33 @@
 //! エラーも出さず 200 を返す (親が実物で確認済み) ため、HTTP status と PHP の
 //! 応答本文の抜粋をそのまま返し、「実際に何が起きたか」の判断材料を呼び出し側
 //! (kyuyo-mcp / 人) に渡す。
+//!
+//! ## ★★ `http_status` で成否を判断してはいけない (実物で確定済み、#205 の 61)
+//!
+//! `POST /dtako-events/autoload` は multipart body に `api` (真値) が無いと
+//! 307 で `/` へ redirect する (`DtakoEventsController::autoload()` 末尾の分岐)。
+//! **その 307 は「取り込みが失敗した」を意味しない** — zip の受信・展開・取り込み
+//! は redirect 判定より**前**のコードで実行済みだからだ。親が実測で確認している:
+//!
+//! ```text
+//! 取り込み前: 1021 / 2026-06-05 11:58:59  state=休息
+//! 取り込み後: 1021 / 2026-06-05 11:58:59  state=積み   ← 307 が返っても変わっていた
+//! ```
+//!
+//! 親も子も一度「307 だから失敗した」と誤診した。この endpoint は `api` を常に
+//! 真値で送るので通常は 3xx を見ないはずだが、それでも 3xx が返ってきた場合は
+//! `location` (CakePHP の `Location` ヘッダ) を応答に含める — `response_excerpt`
+//! だけでは redirect 先が body に出ないため空同然になる (受け入れ条件2)。
+//! **判断材料は `response_excerpt` と実データの突合であって `http_status` の
+//! 2xx/3xx 分類ではない。**
+//!
+//! ## `?redirect=` は作らない (受け入れ条件7、判断)
+//!
+//! PHP 側の redirect 先は `getQuery('redirect', '/')` で `?redirect=` クエリから
+//! 決まるが、それは **`api` が無いときの分岐**でしか通らない。この route は
+//! `api` を常に真値で送るので、その分岐そのものに入らない — `?redirect=` を
+//! ここに足しても中継先の挙動には影響しない。むしろ「効かないパラメータが
+//! ある」方が呼び出し側を混乱させるので、対応するパラメータは作らない。
 
 use std::sync::Arc;
 
@@ -177,6 +204,9 @@ pub async fn autoload(
         "target_path": AUTOLOAD_PATH,
         "http_status": res.status,
         "http_ok": http_ok,
+        // 3xx でも取り込みは走っている (モジュール doc 参照) — http_status では
+        // 成否を判断できないので、redirect 先だけでも渡しておく (受け入れ条件2)。
+        "location": res.location,
         "response_excerpt": res.body_excerpt,
     })))
 }
@@ -358,12 +388,15 @@ mod tests {
 
     #[tokio::test]
     async fn autoload_executes_and_returns_the_raw_status_and_body() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/dtako-events/autoload"))
+            // ★ #205 の 61: api を送っていなければ PHP 側が 307 を返す想定なので、
+            // ここで送信していることを直接検証する
+            .and(body_string_contains("name=\"api\""))
             .respond_with(ResponseTemplate::new(200).set_body_string("import queued"))
             .expect(1)
             .mount(&server)
@@ -382,6 +415,37 @@ mod tests {
         assert_eq!(body["http_status"], serde_json::json!(200));
         assert_eq!(body["http_ok"], serde_json::json!(true));
         assert_eq!(body["response_excerpt"], serde_json::json!("import queued"));
+        assert_eq!(body["location"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn autoload_surfaces_the_location_header_when_php_returns_a_3xx() {
+        // #205 の 61: api を送っていても PHP 側の挙動が変わる等で 3xx が返って
+        // きた場合、body だけでは redirect 先が分からない (受け入れ条件2)。
+        // ★ 307 でも取り込み自体は先に実行済みなので http_ok=false は
+        // 「失敗した」ではなく「redirect された」としてのみ読む (受け入れ条件3)。
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
+        let router = app(cakephp);
+        let (status, body) = call(
+            router,
+            "/dtako/autoload?unko_no=26060507533000000042861",
+            b"PK\x03\x04fake-zip".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["http_status"], serde_json::json!(307));
+        assert_eq!(body["http_ok"], serde_json::json!(false));
+        assert_eq!(body["location"], serde_json::json!("/"));
     }
 
     #[tokio::test]
