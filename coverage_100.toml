@@ -66,6 +66,10 @@ path = "src/kintai_rest_diff.rs"
 [[files]]
 path = "src/kintai_reading_dates.rs"
 
+# 末尾検知 (tail gap) が鳴らしている乗務員の名指し (Refs #205)。同じく純粋関数
+[[files]]
+path = "src/kintai_tail_gap_probe.rs"
+
 # --- 給与 (給与大臣) ---
 
 [[files]]

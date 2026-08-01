@@ -648,6 +648,78 @@ pub async fn reading_dates(
     })))
 }
 
+/// GET /api/kintai/tail-gap-probe?month=YYYY-MM[&driver=1078] — **末尾検知 (tail gap)
+/// が鳴らしている乗務員を名指しする** (Refs #205)。
+///
+/// 月ゲートの封の条件 ([`crate::kintai_http_repo::missing_input_warnings`] の
+/// tail gap 側) が本物か・「その期間は働いていない」だけかを切り分けるための診断。
+/// 何を測っているか・**alc の警告と同じ量ではないこと**は
+/// [`crate::kintai_tail_gap_probe`] のモジュール docs。
+///
+/// `/events` と同じ経路 (社内 MariaDB の直読み) で全乗務員の生イベントを読み、
+/// [`crate::kintai_tail_gap_probe::tail_gap_probe`] へそのまま渡す。
+///
+/// **`driver` は省略可** ([`rest_diff`] / [`reading_dates`] と同じ)。`driver=` (空) は
+/// 省略ではなく**不正**として 400 にする。
+///
+/// **判定には一切入らない。** 月ゲートの閾値・封の条件・warning 文言は変えない。
+pub async fn tail_gap_probe(
+    Query(params): Query<EventsQuery>,
+    Extension(repo): Extension<DynKintaiEventsRepo>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let month = params.month.unwrap_or_default();
+    let Some((from, to)) = crate::kintai_repo::exact_month_range(&month) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "month は YYYY-MM で指定してください".to_string(),
+        ));
+    };
+    let driver = match params.driver {
+        None => None,
+        Some(raw) => match parse_driver(&raw) {
+            Some(d) => Some(d),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "driver は乗務員CD (数字) で指定してください".to_string(),
+                ))
+            }
+        },
+    };
+    let _permit = KOSOKU_DB_PERMITS.acquire().await.expect("semaphore open");
+    let rows = repo
+        .fetch_all_events_between(&from, &to)
+        .await
+        .map_err(map_repo_err)?;
+    // 窓の末尾 (= 月末) と「進行中の月は today - 1 日」の小さい方 (alc と同じ切り下げ)。
+    // `to` は exact_month_range の翌月 1 日 00:00:00 なので、月末はその前日
+    let month_end = chrono::NaiveDate::parse_from_str(&to[..10], "%Y-%m-%d").expect("to is a date")
+        - chrono::Duration::days(1);
+    let today = crate::kintai_http_repo::today_jst();
+    let expected = month_end.min(today - chrono::Duration::days(1));
+    let probe = crate::kintai_tail_gap_probe::tail_gap_probe(&rows, &month, expected, driver);
+    // マクロは 1 行に収める (CLAUDE.md)
+    let (pop, over) = (probe.population, probe.over_threshold_total);
+    tracing::info!(month = %month, population = pop, over_threshold = over, "kintai tail-gap probe built");
+    // 「働いていない」で説明が付かない候補の数は 0 でも必ず出す
+    tracing::info!(
+        unpunched = probe.over_threshold_unpunched_total,
+        "kintai tail-gap probe real candidates"
+    );
+    Ok(Json(serde_json::json!({
+        "month": probe.month,
+        "driver": driver,
+        "from": from,
+        "to": to,
+        "expected": probe.expected,
+        "threshold_days": probe.threshold_days,
+        "population": probe.population,
+        "over_threshold_total": probe.over_threshold_total,
+        "over_threshold_unpunched_total": probe.over_threshold_unpunched_total,
+        "drivers": probe.drivers,
+    })))
+}
+
 /// GET /api/kintai/kosoku-daily?month=YYYY-MM[&driver=1051] — **打刻基準の日別サマリ**
 /// (Refs #118、拘束時間の打刻基準化 Phase 2)。
 ///

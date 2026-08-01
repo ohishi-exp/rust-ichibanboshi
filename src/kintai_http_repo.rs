@@ -1404,7 +1404,11 @@ const UNKO_NO_DATE_DIGITS: usize = 6;
 /// **年末年始でも運行開始は途切れない** (12/27〜12/31 も毎日 4〜10 件、01/01 も
 /// 2 件)。1/3 の抽出でこれなので、全乗務員なら空き日はさらに減る方向にしか動かない
 /// (部分集合のゼロ日 ⊇ 全体のゼロ日)。
-const MAX_TAIL_GAP_DAYS: i64 = 7;
+///
+/// `pub(crate)` なのは [`crate::kintai_tail_gap_probe`] が同じ値を読むだけの診断
+/// (Refs #205、鳴っている 12 名を名指しする口) に使うため。**値はここが唯一の
+/// 真実**で、診断側は複製しない — 複製すると drift したときに気付けない。
+pub(crate) const MAX_TAIL_GAP_DAYS: i64 = 7;
 
 /// `unko_no` の先頭 6 桁 (`YYMMDD`) = **運行開始日**。
 ///
@@ -1608,7 +1612,10 @@ fn missing_input_warnings(cov: &InputCoverage) -> Vec<String> {
 }
 
 /// いまの日付 (JST)。窓の末尾の期待値を「進行中の月」で切り下げるためだけに使う。
-fn today_jst() -> NaiveDate {
+///
+/// `pub(crate)` なのは [`crate::kintai_tail_gap_probe`] が同じ切り下げを
+/// 使うため (実装を複製しない)。
+pub(crate) fn today_jst() -> NaiveDate {
     let jst = chrono::FixedOffset::east_opt(crate::kintai_push::JST_OFFSET_SECONDS);
     chrono::Utc::now()
         .with_timezone(&jst.expect("JST offset is in range"))
