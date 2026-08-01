@@ -11,6 +11,15 @@
 //! **オンプレだけが社内 nginx (内部アドレス) に届く。** Cloudflare の worker からは
 //! 届かない (Refs #205、kintai-ops skill §4.5)。
 //!
+//! ## ★ edge 経由で叩くには別 repo (`ippoan/auth-worker`) 側の allowlist 登録が要る
+//!
+//! `kyuyo-mcp` からオンプレを呼ぶ経路 (`NUXT_ICHIBAN_API_URL` 経由) は
+//! `auth-worker` の `/ichibanboshi-proxy` を通り、そこは **path + method の完全一致
+//! allowlist**。この endpoint (`POST /api/dtako/autoload`) は**登録するまで外から
+//! 届かない** (このタスクの範囲外・親が別途手配、Refs #274)。オンプレ内 / 作業 PC
+//! からの直接 POST はこの登録が無くても届く。
+//!
+
 //! ## ファイル名がなぜ `dtako_autoload.rs` か (`kintai`/`kosoku` で始めない)
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` は `src/routes/` 配下を**ファイル名の接頭辞**
