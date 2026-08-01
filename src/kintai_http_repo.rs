@@ -128,12 +128,23 @@ const SOURCE_DTAKO_EVENTS: &str = "dtako_events";
 /// 運行数 (実測 1,100 件超) が並ぶ。応答を膨らませても読めないので頭だけ。
 const MAX_COLLECTED_WARNINGS: usize = 20;
 
+/// 集めた warning 1 本 (Refs #205-51)。
+///
+/// **`blocks_seal` は生成箇所で決める** — 呼び出し側が文面を見て後から分類しない
+/// ([`missing_input_warnings`] が唯一 `false` (tail gap 診断) を付ける場所)。
+/// 文字列の前方一致にすると、メッセージ文言を変えた瞬間に静かに壊れるため。
+#[derive(Debug, Clone)]
+struct CollectedWarning {
+    text: String,
+    blocks_seal: bool,
+}
+
 tokio::task_local! {
     /// いま集めている最中の warnings。[`with_warning_sink`] の中だけで立つ。
     ///
     /// `Mutex` ではなく `RefCell` — task local なので触るのは 1 つの task だけで、
     /// `.await` を挟んで借りたままにする箇所も無い。
-    static WARNING_SINK: std::cell::RefCell<Vec<String>>;
+    static WARNING_SINK: std::cell::RefCell<Vec<CollectedWarning>>;
 }
 
 /// **上流の warnings を集めながら `fut` を走らせる** (Refs #205 の 06 の HTTP 版)。
@@ -147,6 +158,10 @@ tokio::task_local! {
 /// 共有されているので、struct にバッファを持たせると隣のリクエストの warnings が
 /// 混ざる (逆に、隣に持って行かれて自分の分が消える)。axum のハンドラは 1
 /// リクエスト = 1 task なので、その task に閉じた置き場なら取り違えが起きない。
+///
+/// **戻り値は表示用の `Vec<String>` のまま** (診断専用の tail gap も含む —
+/// [`record_diagnostic_warning`])。封を止めてよいかは
+/// [`with_warning_sink_blocking`] / [`warnings_seen`] を使う。
 pub async fn with_warning_sink<F: std::future::Future>(fut: F) -> (F::Output, Vec<String>) {
     WARNING_SINK
         .scope(std::cell::RefCell::new(Vec::new()), async move {
@@ -157,41 +172,80 @@ pub async fn with_warning_sink<F: std::future::Future>(fut: F) -> (F::Output, Ve
         .await
 }
 
+/// [`with_warning_sink`] と同じだが、集めた warnings に**封を止めるべきもの**が
+/// 混ざっていたかも一緒に返す (Refs #205-51)。**tail gap は診断用なので数えない**
+/// ([`CollectedWarning::blocks_seal`])。月ゲートの 5 条件だけがこれを使う —
+/// 他の呼び出し元は表示用の `Vec<String>` で足りるので `with_warning_sink` のまま
+/// (このリポ全体で呼び出し側を増やさない — 触るファイルを最小にする Refs #205-51)。
+pub async fn with_warning_sink_blocking<F: std::future::Future>(
+    fut: F,
+) -> (F::Output, Vec<String>, bool) {
+    WARNING_SINK
+        .scope(std::cell::RefCell::new(Vec::new()), async move {
+            let out = fut.await;
+            let collected = collected_warnings();
+            let blocking = warnings_seen().unwrap_or(false);
+            (out, collected, blocking)
+        })
+        .await
+}
+
 /// いま集まっている warnings。sink が無ければ空。
 fn collected_warnings() -> Vec<String> {
     WARNING_SINK
-        .try_with(|sink| sink.borrow().clone())
+        .try_with(|sink| sink.borrow().iter().map(|c| c.text.clone()).collect())
         .unwrap_or_default()
 }
 
-/// 集めている最中なら記録する。**同じ文面は 1 回だけ**、上限まで。
-///
-/// `pub(crate)` なのは [`crate::kintai_fold`] が push 窓の欠けをここへ載せるため
-/// (Refs #205 の 30)。上流 warnings と同じ器に入れることで、月ゲートの
-/// `warnings.is_empty()` がそのまま効く。
-pub(crate) fn record_warning(w: &str) {
+fn record_warning_impl(w: &str, blocks_seal: bool) {
     let _ = WARNING_SINK.try_with(|sink| {
         let mut v = sink.borrow_mut();
-        if v.len() < MAX_COLLECTED_WARNINGS && !v.iter().any(|s| s == w) {
-            v.push(w.to_string());
+        if v.len() < MAX_COLLECTED_WARNINGS && !v.iter().any(|c| c.text == w) {
+            v.push(CollectedWarning {
+                text: w.to_string(),
+                blocks_seal,
+            });
         }
     });
+}
+
+/// 集めている最中なら記録する。**同じ文面は 1 回だけ**、上限まで。**封を止める**
+/// (Refs #205-51 — 診断専用は [`record_diagnostic_warning`])。
+///
+/// `pub(crate)` なのは [`crate::kintai_fold`] が push 窓の欠けをここへ載せるため
+/// (Refs #205 の 30)。上流 warnings と同じ器に入れることで、月ゲートの判定が
+/// そのまま効く。
+pub(crate) fn record_warning(w: &str) {
+    record_warning_impl(w, true);
+}
+
+/// 集めている最中なら記録する。表示 (`warnings`) には乗るが**封は止めない**
+/// (Refs #205-51)。いまは [`missing_input_warnings`] の tail gap 枝だけがこちらを使う
+/// — 「入力カバレッジの診断」と「この畳み直しを封じてよいか」を分ける口。
+pub(crate) fn record_diagnostic_warning(w: &str) {
+    record_warning_impl(w, false);
 }
 
 /// テスト専用の [`record_warning`] 穴あけ (実装計画 13)。`record_warning` 自体は
 /// private なので、他モジュールの `KintaiEventsApi` スタブ実装 (pg 統合テストの
 /// 上流 warnings 疑似発火など) から呼べない。それだけの理由で公開する薄い口。
+/// **常に封を止める側** (`blocks_seal = true`) — 診断専用を疑似発火したいテストは
+/// [`with_warning_sink_blocking`] と組み合わせて別に書く。
 #[doc(hidden)]
 pub fn record_warning_for_test(w: &str) {
     record_warning(w);
 }
 
-/// いま収集中の warnings があるか (Refs #205-17)。**収集器の外なら `None`**
-/// (「無い」と「分からない」を区別する — [`recalc_month`](crate::kintai_fold::recalc_month)
-/// が `write_fold_gate` を書いてよいかの判断に使う)。sink を消費しない —
-/// [`with_warning_sink`] の戻り値の warnings がここで空にならないよう `borrow` だけ。
+/// いま**封を止める** warning を見たか (Refs #205-51 — 「1 件でもあれば」から
+/// 「封を止める warning があれば」に定義変更。tail gap のような診断専用は数えない)。
+/// **収集器の外なら `None`** (「無い」と「分からない」を区別する —
+/// [`recalc_month`](crate::kintai_fold::recalc_month) が `write_fold_gate` を
+/// 書いてよいかの判断に使う)。sink を消費しない — [`with_warning_sink`] の
+/// 戻り値の warnings がここで空にならないよう `borrow` だけ。
 pub fn warnings_seen() -> Option<bool> {
-    WARNING_SINK.try_with(|s| !s.borrow().is_empty()).ok()
+    WARNING_SINK
+        .try_with(|s| s.borrow().iter().any(|c| c.blocks_seal))
+        .ok()
 }
 
 // ── `unsplit` (has_kudgivt = FALSE) の素通し (Refs #205 の 32) ──────────────
@@ -1596,19 +1650,56 @@ impl InputCoverage {
 ///
 /// 誤検知は**安全側**に倒れる — warning が立つと月ゲートが封をしないので、最悪でも
 /// 「毎回全量読みに戻る (遅いが正しい)」で済む。逆 (見逃し) は静かに間違う。
-fn missing_input_warnings(cov: &InputCoverage) -> Vec<String> {
+///
+/// **例外が 1 つだけある: tail gap ([`InputCoverage::tail_gap`]) は封を止めない**
+/// (Refs #205-51)。運行開始日を稼働の代理指標にしている限り、月の途中で稼働が
+/// 止まった乗務員 (打刻も無い) と本物の入力欠けを区別できず、恒常的に鳴って
+/// #199 の月ゲートが一生封じられない。`blocks_seal` をここで `false` にすることで
+/// 「診断としては引き続き鳴らす (応答からは消えない) が、封の判定には使わない」に
+/// 倒す — 判定定義 (運行開始日) 自体はここでは直さない (`MAX_TAIL_GAP_DAYS` の
+/// 閾値調整でもない。上流に帰庫日時を足す別タスクの仕事)。
+fn missing_input_warnings(cov: &InputCoverage) -> Vec<MissingInputWarning> {
     let mut out = Vec::new();
     let s = cov.summary();
     if cov.no_etag > 0 {
         let n = cov.no_etag;
-        out.push(format!("dtako 入力欠け: R2 に CSV の無い運行 {n} 件 ({s})"));
+        let w = format!("dtako 入力欠け: R2 に CSV の無い運行 {n} 件 ({s})");
+        out.push(MissingInputWarning::blocking(w));
     }
     if cov.last.is_none() {
-        out.push(format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})"));
+        let w = format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})");
+        out.push(MissingInputWarning::blocking(w));
     } else if let Some((n, g)) = cov.tail_gap() {
-        out.push(format!("dtako 入力欠け: 乗務員{n}名の末尾が{g}日超 ({s})"));
+        let w = format!("dtako 入力欠け: 乗務員{n}名の末尾が{g}日超 ({s})");
+        out.push(MissingInputWarning::diagnostic(w));
     }
     out
+}
+
+/// [`missing_input_warnings`] が返す 1 件 (Refs #205-51)。**`blocks_seal` は
+/// ここで — 生成した瞬間に — 決まる。** 呼び出し側 ([`fetch_dtako_month_digest`])
+/// はこの値をそのまま [`record_warning`] / [`record_diagnostic_warning`] へ
+/// 振り分けるだけで、文面を見て分類し直さない。
+#[derive(Debug)]
+struct MissingInputWarning {
+    text: String,
+    blocks_seal: bool,
+}
+
+impl MissingInputWarning {
+    fn blocking(text: String) -> Self {
+        Self {
+            text,
+            blocks_seal: true,
+        }
+    }
+
+    fn diagnostic(text: String) -> Self {
+        Self {
+            text,
+            blocks_seal: false,
+        }
+    }
 }
 
 /// いまの日付 (JST)。窓の末尾の期待値を「進行中の月」で切り下げるためだけに使う。
@@ -2014,8 +2105,12 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
                 tracing::info!("kintai dtako driver_cds 未対応: 月ぜんたい判定にフォールバック");
             }
             for w in missing_input_warnings(&cov) {
-                tracing::warn!(warning = %w, "kintai dtako input gap");
-                record_warning(&w);
+                let blocks = w.blocks_seal;
+                tracing::warn!(warning = %w.text, blocks, "kintai dtako input gap");
+                match blocks {
+                    true => record_warning(&w.text),
+                    false => record_diagnostic_warning(&w.text),
+                }
             }
         }
         Ok(pairs.map(|p| digest_from_pairs(&p)))
@@ -2650,6 +2745,58 @@ mod tests {
         assert_eq!(seen_some, Some(true));
     }
 
+    /// **診断専用は表示に残るが `warnings_seen()` は `Some(false)` のまま**
+    /// (Refs #205-51)。tail gap が恒常的に鳴っても CLI 経路 (`recalc_month`) の
+    /// gate が一生開かないことがないようにする本題。
+    #[tokio::test]
+    async fn warnings_seen_ignores_diagnostic_only_warnings() {
+        let (seen, warnings) = with_warning_sink(async {
+            record_diagnostic_warning("dtako 入力欠け: 乗務員1名の末尾が8日超 (診断)");
+            warnings_seen()
+        })
+        .await;
+        assert_eq!(seen, Some(false), "診断のみでは封を止めない");
+        assert_eq!(
+            warnings,
+            vec!["dtako 入力欠け: 乗務員1名の末尾が8日超 (診断)".to_string()],
+            "表示 (warnings) からは消えない"
+        );
+    }
+
+    /// **封を止める warning が 1 本でも混ざれば `Some(true)`。** 診断専用と
+    /// 同居していても、封を止める側が勝つ (Refs #205-51)。
+    #[tokio::test]
+    async fn warnings_seen_is_true_when_a_blocking_warning_joins_a_diagnostic_one() {
+        let (seen, warnings) = with_warning_sink(async {
+            record_diagnostic_warning("diag only");
+            record_warning_for_test("blocking one");
+            warnings_seen()
+        })
+        .await;
+        assert_eq!(seen, Some(true));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    /// **`with_warning_sink_blocking` はスコープを抜けた後も blocking の有無を運ぶ**
+    /// (Refs #205-51)。`kintai_recalc::run` が 2 つの scope の結果を `||` で
+    /// 合成するために必要な形。
+    #[tokio::test]
+    async fn with_warning_sink_blocking_carries_the_flag_out_of_the_scope() {
+        let (_, warnings, blocking) = with_warning_sink_blocking(async {
+            record_diagnostic_warning("diag only");
+        })
+        .await;
+        assert_eq!(warnings, vec!["diag only".to_string()]);
+        assert!(!blocking, "診断のみでは blocking=false");
+
+        let (_, warnings, blocking) = with_warning_sink_blocking(async {
+            record_warning_for_test("real gap");
+        })
+        .await;
+        assert_eq!(warnings, vec!["real gap".to_string()]);
+        assert!(blocking, "封を止める warning があれば true");
+    }
+
     // ── `unsplit` の素通し (Refs #205 の 32) ────────────────────────────────
 
     fn unsplit_op(unko_no: &str, driver_cd: &str, reading_date: &str) -> UnsplitOperation {
@@ -2729,9 +2876,13 @@ mod tests {
         warns_in(pairs, d(2000, 1, 1), end, today)
     }
 
-    /// 窓 `[start, end]` を明示する版 (母集団の確認用)。
+    /// 窓 `[start, end]` を明示する版 (母集団の確認用)。**文面だけ** — 分類
+    /// (`blocks_seal`) を見るテストは [`missing_input_warnings`] を直接呼ぶ。
     fn warns_in(pairs: &[Pair], start: NaiveDate, end: NaiveDate, today: NaiveDate) -> Vec<String> {
         missing_input_warnings(&InputCoverage::measure(pairs, start, end, today))
+            .into_iter()
+            .map(|w| w.text)
+            .collect()
     }
 
     /// **揃っている月は静か。** 窓の端まで運行開始が届いていれば warning ゼロ。
@@ -2797,6 +2948,39 @@ mod tests {
         let w = warns_in(&real, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
         assert_eq!(w.len(), 1, "本物の欠けは拾う: {w:?}");
         assert!(w[0].contains("乗務員1名の末尾が8日超"), "{w:?}");
+    }
+
+    /// **tail gap だけは封を止めない。他 (no_etag / 読めない) は止める**
+    /// (Refs #205-51、台帳の受け入れ条件 #4)。分類は文字列一致ではなく
+    /// [`MissingInputWarning::blocks_seal`] (生成箇所) で見る。
+    #[test]
+    fn tail_gap_does_not_block_the_seal_but_no_etag_and_unreadable_dates_do() {
+        // tail gap 単独: 本物の末尾欠け (gap 8 日) — 診断のみ
+        let real = vec![driver_pair("26062210000000000023021", Some("e1"), "D1")];
+        let cov = InputCoverage::measure(&real, d(2026, 6, 1), d(2026, 6, 30), d(2026, 7, 5));
+        let ws = missing_input_warnings(&cov);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        assert!(!ws[0].blocks_seal, "tail gap は診断のみ: {ws:?}");
+        assert!(ws[0].text.contains("乗務員1名の末尾が8日超"), "{ws:?}");
+
+        // no_etag: 封を止める
+        let no_etag = vec![
+            pair("26060110000000000023021", Some("e1")),
+            pair("26070110000000000023021", None),
+        ];
+        let cov = InputCoverage::measure(&no_etag, d(2000, 1, 1), d(2026, 7, 1), d(2026, 7, 20));
+        let ws = missing_input_warnings(&cov);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        assert!(ws[0].blocks_seal, "no_etag は封を止める: {ws:?}");
+        assert!(ws[0].text.contains("R2 に CSV の無い運行"), "{ws:?}");
+
+        // 運行開始日が 1 件も読めない: 封を止める
+        let unreadable = vec![pair("U1", Some("e1"))];
+        let cov = InputCoverage::measure(&unreadable, d(2000, 1, 1), d(2026, 7, 1), d(2026, 7, 20));
+        let ws = missing_input_warnings(&cov);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        assert!(ws[0].blocks_seal, "読めない = 封を止める: {ws:?}");
+        assert!(ws[0].text.contains("1 件も読めない"), "{ws:?}");
     }
 
     /// **進行中の月は末尾に運行が無くて当然。** 期待値を `today - 1` に切り下げる。

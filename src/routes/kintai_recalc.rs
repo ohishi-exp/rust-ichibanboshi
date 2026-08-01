@@ -49,8 +49,12 @@
 //! **この口は「そのページで月まるごとを完結させたときだけ」gate を書く** —
 //! `apply` かつ `after_driver_cd` 無し (1 ページ目から) かつ `next_after_driver_cd`
 //! が無い (回りきった) かつ `stale_only` でない (母集団を狭めていない) かつ
-//! warnings が空 (欠けた入力を「最新」と刻まない。上流の応答の横流しだけでなく、
-//! 指紋を取るときに自分で見つけた入力の欠けも含む — Refs #205 の 21) の
+//! **封を止める warning が無い** (欠けた入力を「最新」と刻まない。上流の応答の
+//! 横流しだけでなく、指紋を取るときに自分で見つけた入力の欠けも含む —
+//! Refs #205 の 21。**ただし tail gap は診断専用で対象外** — 運行開始日という
+//! 稼働の代理指標では「月の途中で稼働が止まった」と「入力が欠けた」を区別できず、
+//! 対象から外さないと恒常的に鳴って封が一生開かない。応答の `warnings` からは
+//! 消えない (降格であって削除ではない) — Refs #205-51) の
 //! 5 条件が揃ったときだけ。母集団 (実測 132 名) は `DEFAULT_MAX_FOLD_DRIVERS`
 //! (100) より上の `max_drivers` を渡せば 1 ページで収まる。書く digest は
 //! ページ処理の**冒頭**で判定した値のまま (fold の後に作り直さない —
@@ -76,7 +80,7 @@
 //! 2. **封をする**: 続けて `max_drivers=150` (母集団を 1 ページに収める) +
 //!    `apply=true` を**もう 1 回**。1 で全員書き終えた直後なので全員 unchanged —
 //!    fold だけで済み (実測 fold 23.5 秒、応答 50 秒程度)、上の 5 条件
-//!    (1 ページ目・回りきる・stale_only でない・warnings 空) を満たして
+//!    (1 ページ目・回りきる・stale_only でない・封を止める warning 無し) を満たして
 //!    **その回が gate の初回書き込みを兼ねる**
 //!
 //! #### ①のページサイズは 50。既定の 100 は Cloudflare の上限を超える
@@ -127,9 +131,11 @@
 //! `unko_diff` の突合は「押し込み済みの `kintai.kintai_events` の
 //! `(乗務員CD, unko_no)`」対「etags の `unko_no`」。**左辺は「オンプレ全部」では
 //! ない** — `dtako_events` にしか出てこない運行は push されないので射程外
-//! ([`crate::kintai_http_repo::OnpremOperation`] の docs)。**空でなければ `warnings` に 1 行立つ**ので、上の 5 条件の
-//! `warnings.is_empty()` が外れて月ゲートは封をしない — 運行が欠けたままの月を
-//! 「最新」と刻まないための意図した挙動 (欠けが埋まれば静かになる)。
+//! ([`crate::kintai_http_repo::OnpremOperation`] の docs)。**空でなければ `warnings` に**
+//! **封を止める行が 1 本立つ**ので、上の 5 条件の「封を止める warning が無い」が
+//! 外れて月ゲートは封をしない — 運行が欠けたままの月を「最新」と刻まないための
+//! 意図した挙動 (欠けが埋まれば静かになる)。tail gap と違い診断への降格対象では
+//! ない (Refs #205-51 の在庫表)。
 //!
 //! **標本を両側で返すのは、本番の初回実測 (2026-06) で `unko_diff_gcp_only` が
 //! etags の item 総数 (1,130) と一致した = 2 集合の重なりがゼロだったため。**
@@ -259,10 +265,12 @@ async fn run(
     // なら通常どおり進む — miss の digest は末尾の書き込み判定まで運ぶ
     // (fold 後に作り直さない。理由は MonthGate::Miss の docs)
     //
-    // **`with_warning_sink` で包むのは `fold_month` だけでは足りない** (Refs #205 の
-    // 21)。指紋を取る `fetch_etags` は入力の欠けを最初に見る場所で、そこが立てる
-    // warning は sink の外だと黙って捨てられる — 5 条件の `warnings.is_empty()` が
-    // 素通りし、欠けたままの月に「最新」の封をしてしまう
+    // **`with_warning_sink_blocking` で包むのは `fold_month` だけでは足りない**
+    // (Refs #205 の 21)。指紋を取る `fetch_etags` は入力の欠けを最初に見る場所で、
+    // そこが立てる warning は sink の外だと黙って捨てられる — 「封を止める warning
+    // が無い」の判定が素通りし、欠けたままの月に「最新」の封をしてしまう。
+    // **`_blocking` 版を使うのは、tail gap (診断専用、Refs #205-51) が混ざっても
+    // 封の判定を誤らせないため** — 表示用の `Vec<String>` は今までどおり
     //
     // `with_unsplit_sink` を重ねて包むのは `unsplit` (Refs #205 の 32、alc の
     // `has_kudgivt = FALSE` 一覧) も同じ `fetch_etags` の応答から拾うため。判定には
@@ -272,11 +280,11 @@ async fn run(
     // (押し込み済みの `kintai_events`) に在って GCP (alc の etags) に無い運行の一覧。
     // これも同じ `fetch_etags` の応答が材料で、判定には使わず応答へ素通しするだけ
     #[allow(clippy::type_complexity)]
-    let (((gate, gate_warnings), unsplit, unsplit_total), unko_diff) =
+    let (((gate, gate_warnings, gate_blocking), unsplit, unsplit_total), unko_diff) =
         crate::kintai_http_repo::with_unko_diff_sink(crate::kintai_http_repo::with_unsplit_sink(
-            crate::kintai_http_repo::with_warning_sink(crate::kintai_fold::month_gate_report(
-                &repo, &st, &params, &req.month, req.apply,
-            )),
+            crate::kintai_http_repo::with_warning_sink_blocking(
+                crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply),
+            ),
         ))
         .await;
     let gate = match gate.map_err(map_push_err)? {
@@ -327,15 +335,18 @@ async fn run(
     // 生イベントは月 1 回だけ読み、母集団の決定 (#205-12) と畳みの両方に使い回す。
     // ここで 2 回読むと 1 ページの費用 (全量読み 25〜55 秒、モジュール docs) が
     // 単純に倍になる。上流 warnings を握り潰さない
-    // ([`crate::kintai_http_repo::with_warning_sink`])
-    let (all_units, warnings) = crate::kintai_http_repo::with_warning_sink(
+    // ([`crate::kintai_http_repo::with_warning_sink_blocking`])
+    let (all_units, warnings, fold_blocking) = crate::kintai_http_repo::with_warning_sink_blocking(
         crate::kintai_fold::fold_month(&repo, &params, &req.month, None),
     )
     .await;
     let all_units = all_units.map_err(map_push_err)?;
-    // 指紋を取ったときの warning も同じ列に混ぜる (Refs #205 の 21)
+    // 指紋を取ったときの warning も同じ列に混ぜる (Refs #205 の 21)。封を止める
+    // かどうかも 2 つの scope の `||` で合成する (Refs #205-51 — tail gap のような
+    // 診断専用が混ざっていても、封を止める warning が片方にでもあれば止める)
     let mut warnings = warnings;
     warnings.extend(gate_warnings);
+    let has_blocking_warning = fold_blocking || gate_blocking;
     // rest-only 乗務員 (Postgres に 1 行も無い) を母集団に足すための集合
     // ([`recalc_driver_page`] docs)
     let extra: std::collections::BTreeSet<i64> = all_units
@@ -375,7 +386,7 @@ async fn run(
             && req.after_driver_cd.is_none()
             && next.is_none()
             && !req.stale_only
-            && folded.warnings.is_empty();
+            && !has_blocking_warning;
         if completed_the_whole_month {
             // 書けなくてもこの応答は落とさない (Refs #205 の 20 — 畳みは全部
             // 成功しているので、最適化の書き込み 1 本で 502 にしない)
