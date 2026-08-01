@@ -106,6 +106,30 @@ pub struct CakephpConfig {
     pub sqlite_path: String,
 }
 
+/// 修正リンク組み立て用の base URL 2 つ (Refs #205 の 57)。
+///
+/// `/api/kintai/day-events` が値ずれの修正導線 (theearth から csvdata.zip を
+/// 落とす → 社内 nginx のフォームへ) の**リンクを文字列として組む**ためだけに使う。
+/// **fetch はしない** — オンプレから nginx / dtako へ実際に到達可能かは見ない。
+/// 実値は repo に置かず、デプロイ先で env か TOML に注入する
+/// (`CakephpConfig.base_url` と同じ作法)。空文字ならその項目のリンクを省く。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DtakoDayLinksConfig {
+    /// 社内 nginx (CakePHP、`yhonda-ohishi/nginx`) の base URL。
+    /// `<base>/ryohi-rows/view/<23 桁 unko_no>` が未ログインで開けるビューア
+    /// (`AppController::beforeFilter` の `addUnauthenticatedActions` に `view`、
+    /// Refs #205 の 57 実機確認)。空 = リンク省略。
+    #[serde(default)]
+    pub ryohi_base_url: String,
+    /// dtako-admin (nuxt SPA) の base URL。**`daily-report-api/zip` は直接開けない**
+    /// — SPA の `authHeaders()` (Bearer token + `X-Theearth-*` ヘッダ) が無いと
+    /// 失敗する (Refs #205 の 57 実機確認、`useTheearthSession.ts`)。ここから組む
+    /// `zip` リンクは参考値、`<base>/daily-report-edit` (検索画面) だけが実際に
+    /// 開いて使える。空 = リンク省略。
+    #[serde(default)]
+    pub dtako_base_url: String,
+}
+
 /// 拘束サマリ store configuration (Refs #106 Phase 3)
 #[derive(Debug, Clone, Deserialize)]
 pub struct RestraintConfig {
@@ -510,6 +534,10 @@ pub struct Config {
 
     #[serde(default)]
     pub kosoku: KosokuConfigToml,
+
+    /// 修正リンク (`/api/kintai/day-events`) 組み立て用 base URL (Refs #205 の 57)。
+    #[serde(default)]
+    pub dtako_day_links: DtakoDayLinksConfig,
 }
 
 /// 拘束時間サマリ (`/api/kintai/kosoku-daily`) の計算パラメータ (Refs #118)。
@@ -995,6 +1023,13 @@ impl Config {
         if let Some(v) = env_str(get, "CAKEPHP_BASE_URL") {
             self.cakephp.base_url = v;
         }
+        // 修正リンク組み立て用 (Refs #205 の 57)。fetch はしないので到達性は問わない
+        if let Some(v) = env_str(get, "DTAKO_DAY_RYOHI_BASE_URL") {
+            self.dtako_day_links.ryohi_base_url = v;
+        }
+        if let Some(v) = env_str(get, "DTAKO_DAY_DTAKO_BASE_URL") {
+            self.dtako_day_links.dtako_base_url = v;
+        }
         if let Some(v) = env_list(get, "CORS_ALLOWED_ORIGINS") {
             self.cors.allowed_origins = v;
         }
@@ -1056,6 +1091,7 @@ impl Config {
             kintai_events: KintaiEventsConfig::default(),
             kintai_push: KintaiPushConfig::default(),
             kosoku: KosokuConfigToml::default(),
+            dtako_day_links: DtakoDayLinksConfig::default(),
         })
     }
 }

@@ -1,3 +1,4 @@
+pub mod dtako_day;
 pub mod employees;
 pub mod health;
 pub mod kintai;
