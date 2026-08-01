@@ -1663,18 +1663,15 @@ fn missing_input_warnings(cov: &InputCoverage) -> Vec<MissingInputWarning> {
     let s = cov.summary();
     if cov.no_etag > 0 {
         let n = cov.no_etag;
-        out.push(MissingInputWarning::blocking(format!(
-            "dtako 入力欠け: R2 に CSV の無い運行 {n} 件 ({s})"
-        )));
+        let w = format!("dtako 入力欠け: R2 に CSV の無い運行 {n} 件 ({s})");
+        out.push(MissingInputWarning::blocking(w));
     }
     if cov.last.is_none() {
-        out.push(MissingInputWarning::blocking(format!(
-            "dtako 入力欠け: 運行開始日が 1 件も読めない ({s})"
-        )));
+        let w = format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})");
+        out.push(MissingInputWarning::blocking(w));
     } else if let Some((n, g)) = cov.tail_gap() {
-        out.push(MissingInputWarning::diagnostic(format!(
-            "dtako 入力欠け: 乗務員{n}名の末尾が{g}日超 ({s})"
-        )));
+        let w = format!("dtako 入力欠け: 乗務員{n}名の末尾が{g}日超 ({s})");
+        out.push(MissingInputWarning::diagnostic(w));
     }
     out
 }
