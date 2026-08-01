@@ -115,6 +115,8 @@ fn test_env_overrides_every_supported_key() {
             ("KINTAI_PUSH_CONNECT_TIMEOUT_SECS", "15"),
             ("KINTAI_PUSH_STATEMENT_TIMEOUT_SECS", "600"),
             ("CAKEPHP_BASE_URL", "http://127.0.0.1:120"),
+            ("DTAKO_DAY_RYOHI_BASE_URL", "https://ryohi.example"),
+            ("DTAKO_DAY_DTAKO_BASE_URL", "https://dtako.example"),
             (
                 "CORS_ALLOWED_ORIGINS",
                 "https://x.example, https://y.example",
@@ -153,6 +155,14 @@ fn test_env_overrides_every_supported_key() {
     assert!(config.kyuyo.db_enabled());
     assert!(config.kyuyo.auth_configured());
     assert_eq!(config.cakephp.base_url, "http://127.0.0.1:120");
+    assert_eq!(
+        config.dtako_day_links.ryohi_base_url,
+        "https://ryohi.example"
+    );
+    assert_eq!(
+        config.dtako_day_links.dtako_base_url,
+        "https://dtako.example"
+    );
     assert_eq!(
         config.cors.allowed_origins,
         vec!["https://x.example", "https://y.example"]
