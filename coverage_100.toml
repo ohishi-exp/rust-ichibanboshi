@@ -122,6 +122,13 @@ path = "src/routes/surcharge.rs"
 [[files]]
 path = "src/routes/unchin.rs"
 
+# 取り込み漏れ候補 (also_in_month) の GCP にしか無い運行の運行NO を返す口
+# (Refs ohishi-exp/nuxt-dtako-admin#623 の 1)。実測 422/422 で 100%。
+# stale_months.rs と同じく pg テストが要る形のまま登録 (CI の Coverage
+# regression check は postgres service 込みで cov-check を回す)
+[[files]]
+path = "src/routes/unko_gaps.rs"
+
 [[files]]
 path = "src/routes/vehicle_daily.rs"
 

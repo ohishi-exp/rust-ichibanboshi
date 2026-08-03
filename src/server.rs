@@ -385,6 +385,11 @@ pub async fn run(
             "/kintai/stale-months",
             get(routes::stale_months::stale_months),
         )
+        // 取り込み漏れ候補 (also_in_month) の GCP にしか無い運行の運行NO
+        // (Refs ohishi-exp/nuxt-dtako-admin#623 の 1)。読むだけ・既存の etags 部品
+        // (pub) を呼ぶだけ (ファイル名は kintai/kosoku で始めない — unko_gaps.rs
+        // のモジュール doc 参照、logic_version は動かさない)
+        .route("/kintai/unko-gaps", get(routes::unko_gaps::unko_gaps))
         // 乗務員CD + 日付 → 運行NO・全イベント・修正用リンク (Refs #205 の 57)。
         // 読むだけ・既存の events 取得を再利用する (ファイル名は kintai/kosoku で
         // 始めない — dtako_day.rs のモジュール doc 参照、logic_version は動かさない)
