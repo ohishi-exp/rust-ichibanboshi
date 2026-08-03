@@ -170,6 +170,14 @@ fn params() -> KosokuParams {
     KosokuParams::default()
 }
 
+/// テストで固定する「今日」。**壁時計に一切依存しない**ための注入値
+/// (Refs #286-1)。2026-07 の fold が読む窓のはみ出し日 (`spill` = 2026-08-01)
+/// より前なので、`push_window_gap_warning` は実行日に関係なく毎回黙る
+/// (`push_window_gap_warning` 自体の単体テストと同じ `2026-07-15` を使う)。
+fn fixed_today() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")
+}
+
 async fn shift_count(pool: &sqlx::PgPool, t: uuid::Uuid) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM kintai.shifts WHERE tenant_id = $1")
         .bind(t)
@@ -196,7 +204,7 @@ async fn rest_events_still_produce_shifts_after_the_fold() {
         run("2026-07-02 14:10:00", "運行終了", "A"),
         rest("2026-07-02 16:18:00", "2026-07-03 06:01:00"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
     assert_eq!(r.shifts, 1, "休息で切った勤務が立つ");
@@ -222,7 +230,7 @@ async fn a_shift_crossing_midnight_splits_into_day_parts() {
         punch("2026-07-01 22:00:00", "始業"),
         punch("2026-07-02 09:00:00", "終業"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
     assert_eq!(r.shifts, 1);
@@ -253,7 +261,7 @@ async fn a_39_hour_shift_spans_three_days_and_the_parts_add_up() {
         punch("2026-07-05 22:00:00", "始業"),
         punch("2026-07-07 13:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
 
@@ -288,12 +296,12 @@ async fn a_shift_crossing_the_month_belongs_to_the_starting_month() {
     ]);
 
     // 7 月として畳んでも勤務は立たない (始業日が 6 月)
-    let july = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let july = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("july");
     assert_eq!(july.shifts, 0, "始業月ではないので勤務は出ない");
 
-    let june = recalc_month(&repo, &store, &params(), "2026-06", None, true)
+    let june = recalc_month(&repo, &store, &params(), "2026-06", None, true, None)
         .await
         .expect("june");
     assert_eq!(june.shifts, 1);
@@ -332,12 +340,12 @@ async fn a_second_recalc_is_a_no_op() {
         punch("2026-07-10 08:00:00", "始業"),
         punch("2026-07-10 18:00:00", "終業"),
     ]);
-    let first = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let first = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("1st");
     assert_eq!(first.drivers_written, 1);
 
-    let second = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let second = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("2nd");
     assert_eq!(second.drivers_written, 0, "指紋が一致するので書かない");
@@ -356,7 +364,7 @@ async fn changing_the_rounding_makes_every_unit_stale() {
         punch("2026-07-12 08:00:30", "始業"),
         punch("2026-07-12 18:00:20", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("1st");
     let before: Vec<String> =
@@ -370,7 +378,7 @@ async fn changing_the_rounding_makes_every_unit_stale() {
         restraint_rounding: RestraintRounding::TruncateElapsed,
         ..params()
     };
-    let again = recalc_month(&repo, &store, &other, "2026-07", None, true)
+    let again = recalc_month(&repo, &store, &other, "2026-07", None, true, None)
         .await
         .expect("2nd");
     assert_eq!(again.drivers_written, 1, "丸め方を変えたら書き直す");
@@ -394,7 +402,7 @@ async fn logic_version_is_the_code_and_settings_hash() {
         punch("2026-07-14 08:00:00", "始業"),
         punch("2026-07-14 18:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
     let v: String =
@@ -419,7 +427,7 @@ async fn changing_the_rounding_shows_up_in_the_stored_logic_version() {
         punch("2026-07-21 08:00:00", "始業"),
         punch("2026-07-21 18:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
 
@@ -457,7 +465,7 @@ async fn the_recalc_page_walks_drivers_from_postgres() {
         punch("2026-07-23 08:00:00", "始業"),
         punch("2026-07-23 18:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
 
@@ -513,7 +521,7 @@ async fn the_recalc_page_pulls_in_rest_only_drivers_via_extra() {
         rest_of(REST_ONLY, "2026-07-01 16:19:00", "2026-07-02 04:42:00"),
         rest_of(REST_ONLY, "2026-07-02 16:18:00", "2026-07-03 06:01:00"),
     ]);
-    let units = fold_month(&repo, &params(), "2026-07", None)
+    let units = fold_month(&repo, &params(), "2026-07", None, None)
         .await
         .expect("fold_month");
     assert!(
@@ -814,7 +822,7 @@ async fn recalc_dry_run_writes_nothing() {
         punch("2026-07-16 08:00:00", "始業"),
         punch("2026-07-16 18:00:00", "終業"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, false)
+    let r = recalc_month(&repo, &store, &params(), "2026-07", None, false, None)
         .await
         .expect("dry run");
     assert_eq!(r.drivers_written, 1, "書く対象としては数える");
@@ -834,7 +842,7 @@ async fn changing_the_input_rewrites_the_folded_rows() {
         punch("2026-07-18 18:00:00", "終業"),
     ]));
     let repo: DynKintaiEventsRepo = stub.clone();
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("1st");
     let before: i32 = sqlx::query_scalar(
@@ -850,7 +858,7 @@ async fn changing_the_input_rewrites_the_folded_rows() {
         punch("2026-07-18 08:00:00", "始業"),
         punch("2026-07-18 19:00:00", "終業"),
     ];
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("2nd");
     let after: i32 = sqlx::query_scalar(
@@ -878,7 +886,7 @@ async fn deleting_a_shift_cascades_to_the_derived_rows() {
         punch("2026-07-20 22:00:00", "始業"),
         punch("2026-07-21 09:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM kintai.day_parts WHERE tenant_id = $1")
@@ -927,7 +935,7 @@ async fn the_unnest_write_matches_the_folded_unit_column_by_column() {
         rows.push(punch(&format!("2026-07-{d:02} 18:{:02}:00", d), "終業"));
     }
     let repo = repo(rows.clone());
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
     assert_eq!(r.shifts, 28);
@@ -991,7 +999,7 @@ async fn the_unnest_write_matches_the_folded_unit_column_by_column() {
     assert!(distinct > 1, "全日同じ値では取り違えを検知できない");
 
     // 2 回目は指紋が一致して 1 行も書かない
-    let again = recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    let again = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("2nd");
     assert_eq!(again.drivers_written, 0, "unnest 化しても据え置きになる");
@@ -1092,9 +1100,17 @@ async fn a_driver_with_nothing_to_fold_is_not_counted_as_written() {
     let (store, pool) = require_db!();
     let repo = repo(Vec::new());
     for pass in ["1st", "2nd"] {
-        let r = recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
-            .await
-            .expect(pass);
+        let r = recalc_month(
+            &repo,
+            &store,
+            &params(),
+            "2026-07",
+            Some(DRIVER),
+            true,
+            None,
+        )
+        .await
+        .expect(pass);
         assert_eq!(r.drivers, 1, "{pass}: 対象には数える");
         assert_eq!(r.drivers_written, 0, "{pass}: 書くものが無い");
         assert_eq!(r.drivers_unchanged, 1, "{pass}");
@@ -1114,16 +1130,32 @@ async fn an_emptied_month_still_clears_the_stored_rows() {
         punch("2026-07-28 18:00:00", "終業"),
     ]));
     let repo: DynKintaiEventsRepo = stub.clone();
-    recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
-        .await
-        .expect("1st");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        Some(DRIVER),
+        true,
+        None,
+    )
+    .await
+    .expect("1st");
     assert_eq!(shift_count(&pool, store.tenant_id()).await, 1);
 
     // 上流からイベントが消えた (取り込みの取り消し等)
     stub.rows.lock().unwrap().clear();
-    let r = recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
-        .await
-        .expect("2nd");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        Some(DRIVER),
+        true,
+        None,
+    )
+    .await
+    .expect("2nd");
     assert_eq!(r.drivers_written, 1, "空にするのも書き込み");
     assert_eq!(shift_count(&pool, store.tenant_id()).await, 0);
 }
@@ -1207,9 +1239,17 @@ async fn driver_filter_touches_only_that_driver() {
         other("2026-07-26 08:00:00", "始業"),
         other("2026-07-26 18:00:00", "終業"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", Some(DRIVER), true)
-        .await
-        .expect("recalc");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        Some(DRIVER),
+        true,
+        None,
+    )
+    .await
+    .expect("recalc");
     assert_eq!(r.drivers, 1);
 
     let drivers: Vec<i64> =
@@ -1355,6 +1395,7 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await
     .0
@@ -1371,7 +1412,7 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
     );
 
     // 同じ digest で 2 回目 — gate が刺さり、fold_month の読みが増えない
-    let second = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+    let second = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("2nd");
     assert_eq!(
@@ -1391,6 +1432,7 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await
     .0
@@ -1423,7 +1465,7 @@ async fn month_gate_is_not_written_on_a_dry_run() {
         ],
         &digest("dry"),
     );
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, false)
+    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, false, None)
         .await
         .expect("dry-run");
     assert_eq!(
@@ -1464,6 +1506,7 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await
     .0
@@ -1509,6 +1552,7 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await
     .0
@@ -1533,9 +1577,17 @@ async fn month_gate_is_skipped_when_a_single_driver_is_named() {
         ],
         &digest("single"),
     );
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", Some(DRIVER), true)
-        .await
-        .expect("single-driver recalc");
+    recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        Some(DRIVER),
+        true,
+        None,
+    )
+    .await
+    .expect("single-driver recalc");
     assert_eq!(repo.read_calls(), 1);
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
@@ -1544,9 +1596,17 @@ async fn month_gate_is_skipped_when_a_single_driver_is_named() {
     );
 
     // gate に何も書かれていないので、2 回目も普通に読む (省かれない)
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", Some(DRIVER), true)
-        .await
-        .expect("single-driver recalc again");
+    recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        Some(DRIVER),
+        true,
+        None,
+    )
+    .await
+    .expect("single-driver recalc again");
     assert_eq!(repo.read_calls(), 2);
 }
 
@@ -1585,6 +1645,7 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await
     .0
@@ -1640,6 +1701,7 @@ async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await;
     assert!(warnings.is_empty(), "GatedRepo は warnings を出さない");
@@ -1658,6 +1720,7 @@ async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
         "2026-07",
         None,
         true,
+        Some(fixed_today()),
     ))
     .await
     .0
@@ -1679,7 +1742,7 @@ async fn recalc_month_does_not_write_the_gate_when_warnings_are_present() {
 
     let (r, warnings) = with_warning_sink(async {
         rust_ichibanboshi::kintai_http_repo::record_warning_for_test("NoSuchKey: U1/KUDGIVT.csv");
-        recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true).await
+        recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true, None).await
     })
     .await;
     assert!(!warnings.is_empty());
@@ -1705,7 +1768,7 @@ async fn recalc_month_does_not_write_the_gate_outside_the_warning_sink() {
     );
 
     // with_warning_sink に包まずそのまま呼ぶ — main.rs の呼び方から外れた形
-    let r = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true)
+    let r = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("recalc");
     assert_eq!(r.drivers_written, 1, "書くこと自体は行う");
@@ -1759,6 +1822,9 @@ fn recalc_req(month: &str, apply: bool) -> RecalcRequest {
         max_drivers: None,
         stale_only: false,
         apply,
+        // 壁時計に頼らない (Refs #286-1) — HTTP 経路からは絶対に外から
+        // 上書きできない (JSON からは skip、`RecalcRequest` docs 参照)
+        today: Some(fixed_today()),
     }
 }
 
@@ -2069,7 +2135,7 @@ async fn stored_states_matches_stored_state_driver_by_driver() {
     let (store, _pool) = require_db!();
     let saved = [1101_u64, 1102, 1103];
     let repo = repo(punches_for(&saved));
-    recalc_month(&repo, &store, &params(), "2026-07", None, true)
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
         .await
         .expect("fold");
 

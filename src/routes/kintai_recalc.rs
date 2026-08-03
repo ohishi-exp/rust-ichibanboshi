@@ -153,6 +153,7 @@ use axum::extract::Query;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
+use chrono::NaiveDate;
 use serde::Deserialize;
 
 use crate::kintai_fold::{recalc_driver_page, recalc_drivers_from_units, stale_state, FoldReport};
@@ -206,6 +207,11 @@ pub struct RecalcRequest {
     /// **`true` で初めて書く。** 既定は 1 行も書かない。
     #[serde(default)]
     pub apply: bool,
+    /// [`crate::kintai_fold::fold_month`] に渡す「今日」。**`#[serde(skip)]` — HTTP の
+    /// JSON body からは絶対に上書きできない** (常に `None` = 実時計)。テストだけが
+    /// Rust の構造体リテラルで直接 `Some` を渡せる (Refs #286-1)。
+    #[serde(skip)]
+    pub today: Option<NaiveDate>,
 }
 
 fn bad_request(msg: &str) -> (StatusCode, String) {
@@ -227,6 +233,7 @@ pub async fn preview(
         max_drivers: q.max_drivers,
         stale_only: q.stale_only,
         apply: false,
+        today: None,
     };
     run(headers, pg, repo, params, read_tenant, req).await
 }
@@ -337,7 +344,7 @@ async fn run(
     // 単純に倍になる。上流 warnings を握り潰さない
     // ([`crate::kintai_http_repo::with_warning_sink_blocking`])
     let (all_units, warnings, fold_blocking) = crate::kintai_http_repo::with_warning_sink_blocking(
-        crate::kintai_fold::fold_month(&repo, &params, &req.month, None),
+        crate::kintai_fold::fold_month(&repo, &params, &req.month, None, req.today),
     )
     .await;
     let all_units = all_units.map_err(map_push_err)?;
