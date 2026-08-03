@@ -22,8 +22,14 @@
 //!
 //! 月の数だけ往復すると 12 か月で 12 往復になり、この口を作る意味が消える。
 //! `generate_series` で対象範囲の月を並べ、`kintai.day_summaries` を月単位で
-//! `GROUP BY` した集計を `LEFT JOIN` する — データが 1 行も無い月も
-//! `stale_drivers: 0` で必ず出る (月タブが穴無く埋まる)。
+//! `GROUP BY` した集計を `LEFT JOIN` する — データが 1 行も無い月も 1 往復のまま
+//! `{ "stale_drivers": 0, "total_drivers": 0 }` で必ず出る (月タブが穴無く埋まる)。
+//!
+//! **`stale_drivers: 0` だけでは「収束済み」と「まだ 1 度も畳んでいない」を
+//! 区別できない** (「応答に無い = 0」と同じ落とし穴)。そこで `total_drivers`
+//! (版を問わない distinct driver_cd 数) を添える —
+//! `total_drivers == 0` はデータが無い月、`total_drivers > 0 && stale_drivers == 0`
+//! が本当の収束済み。
 //!
 //! ## 対象範囲の既定
 //!
@@ -165,18 +171,25 @@ fn jst_today() -> NaiveDate {
 /// [`crate::kintai_fold::stale_state`] の月単位版。式は 1 文字も変えず、
 /// `GROUP BY date_trunc('month', date)` に割っただけ (モジュール docs 参照)。
 /// `months` の CTE が対象範囲の月を並べるので、データの無い月も 1 往復のまま返る。
+///
+/// **`total_drivers` を添えるのは「stale_drivers: 0 (収束済み)」と「その月は
+/// まだ 1 度も畳まれていない (データが無い)」を区別するため** — `total_drivers`
+/// (版を問わない distinct driver_cd 数) が 0 の月は後者。「応答に無い = 0」と
+/// 混同しないための追加列で、月の数だけ往復する形には戻さない。
 const STALE_MONTHS_SQL: &str = r#"
 WITH months AS (
     SELECT generate_series($2::date, $3::date - interval '1 month', interval '1 month')::date AS month
 ), agg AS (
     SELECT date_trunc('month', date)::date AS month,
-           count(DISTINCT driver_cd) FILTER (WHERE logic_version <> $4) AS stale_drivers
+           count(DISTINCT driver_cd) FILTER (WHERE logic_version <> $4) AS stale_drivers,
+           count(DISTINCT driver_cd) AS total_drivers
       FROM kintai.day_summaries
      WHERE tenant_id = $1 AND date >= $2 AND date < $3
      GROUP BY date_trunc('month', date)
 )
 SELECT to_char(m.month, 'YYYY-MM') AS month,
-       coalesce(a.stale_drivers, 0)::bigint AS stale_drivers
+       coalesce(a.stale_drivers, 0)::bigint AS stale_drivers,
+       coalesce(a.total_drivers, 0)::bigint AS total_drivers
   FROM months m
   LEFT JOIN agg a ON a.month = m.month
  ORDER BY m.month
@@ -219,6 +232,9 @@ pub async fn stale_months(
             serde_json::json!({
                 "month": r.get::<String, _>("month"),
                 "stale_drivers": r.get::<i64, _>("stale_drivers"),
+                // total_drivers == 0 は「まだ畳まれていない (データが無い)」の意味
+                // (stale_drivers: 0 単体だと収束済みと区別できない — モジュール docs)
+                "total_drivers": r.get::<i64, _>("total_drivers"),
             })
         })
         .collect();

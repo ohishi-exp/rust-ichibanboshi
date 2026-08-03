@@ -222,11 +222,46 @@ async fn test_stale_drivers_are_grouped_per_month_and_empty_months_are_zero() {
     let months = got["months"].as_array().expect("months array");
     assert_eq!(months.len(), 3, "got: {got}");
     assert_eq!(months[0]["month"], "2026-04");
-    assert_eq!(months[0]["stale_drivers"], 0);
+    // データが 1 行も無い月は stale_drivers も total_drivers も 0 —
+    // 「収束済み (0)」と「まだ畳んでいない (データ無し)」を区別する鍵は total_drivers
+    assert_eq!(months[0]["stale_drivers"], 0, "got: {got}");
+    assert_eq!(months[0]["total_drivers"], 0, "got: {got}");
     assert_eq!(months[1]["month"], "2026-05");
     assert_eq!(months[1]["stale_drivers"], 1, "got: {got}");
+    assert_eq!(months[1]["total_drivers"], 2, "got: {got}");
     assert_eq!(months[2]["month"], "2026-06");
     assert_eq!(months[2]["stale_drivers"], 1, "got: {got}");
+    assert_eq!(months[2]["total_drivers"], 1, "got: {got}");
+}
+
+// ── 1b. 収束済み (stale 0, データ有り) と未畳み (データ無し) を区別できる ────────
+
+#[tokio::test]
+async fn test_converged_and_no_data_are_distinguishable_via_total_drivers() {
+    let store = require_db!();
+    let tenant = store.tenant_id();
+    let current = current_version();
+    // 2026-09: 現行版だけの乗務員 1 名 → 収束済み (stale_drivers: 0, total_drivers: 1)
+    seed(store.pool(), tenant, 6001, "2026-09-05", "09", &current).await;
+    // 2026-10: 何も入れない → まだ畳んでいない (stale_drivers: 0, total_drivers: 0)
+
+    let got = stale_months(
+        q(Some("2026-09"), Some("2026-10")),
+        Extension(Some(store.clone())),
+        read(tenant),
+        params(),
+    )
+    .await
+    .expect("handler")
+    .0;
+
+    let months = got["months"].as_array().unwrap();
+    let converged = months.iter().find(|m| m["month"] == "2026-09").unwrap();
+    assert_eq!(converged["stale_drivers"], 0, "got: {got}");
+    assert_eq!(converged["total_drivers"], 1, "got: {got}");
+    let no_data = months.iter().find(|m| m["month"] == "2026-10").unwrap();
+    assert_eq!(no_data["stale_drivers"], 0, "got: {got}");
+    assert_eq!(no_data["total_drivers"], 0, "got: {got}");
 }
 
 // ── 2. 現行版だけの乗務員は stale に数えない ──────────────────────────────────
