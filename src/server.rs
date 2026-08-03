@@ -219,6 +219,20 @@ pub async fn run(
             Arc::new(crate::kintai_version::DisabledKintaiVersionRepo)
         };
 
+    // ③ (勤務時間再登録) の材料件数 (Refs #633 の 5)。events と同じ MariaDB を
+    // 読むが trait / pool は分離 (`dtako_reset_material.rs` のモジュール doc 参照) —
+    // 未設定なら Disabled で fail-closed (`dtako/autoload` の reset_timecard は
+    // count_failed として③をやらない)
+    let reset_material_repo: crate::dtako_reset_material::DynResetMaterialRepo =
+        if config.mariadb.enabled() {
+            Arc::new(crate::dtako_reset_material::MariadbResetMaterialRepo::new(
+                &config.mariadb,
+            ))
+        } else {
+            tracing::info!("mariadb not configured — reset_timecard material count fails closed");
+            Arc::new(crate::dtako_reset_material::DisabledResetMaterialRepo)
+        };
+
     // 生イベントの読み先が名乗るテナント (Refs #205 の 06)。畳むときに書き先と
     // 突き合わせる — 割れたまま畳むと別テナントのデジタコで組んだ勤務を書き込む。
     // MariaDB 直読みの形では空 = 突き合わせる相手が無いので None
@@ -476,6 +490,7 @@ pub async fn run(
         .layer(Extension(kintai_store))
         .layer(Extension(kintai_events_repo))
         .layer(Extension(kintai_version_repo))
+        .layer(Extension(reset_material_repo))
         .layer(Extension(kintai_pg_store))
         .layer(Extension(read_tenant))
         .layer(Extension(kosoku_params))
