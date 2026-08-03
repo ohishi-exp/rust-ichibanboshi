@@ -1,6 +1,7 @@
 pub mod cakephp;
 pub mod config;
 pub mod db;
+pub mod dtako_reset_material;
 pub mod kintai_diff;
 pub mod kintai_fold;
 pub mod kintai_http_repo;
