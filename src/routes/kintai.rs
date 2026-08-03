@@ -908,6 +908,12 @@ async fn kosoku_daily_all(
     };
     let drivers: Vec<serde_json::Value> = split_by_driver(rows)
         .into_iter()
+        // 乗務員CD=0 は打刻の紐付かないデジタコ運行 (構内移動・回送・乗務員未確定等) で
+        // 実在の従業員ではない (Refs #284)。基準は kintai_repo.rs の
+        // timecard_driver_cds / kintai_fold.rs の RECALC_DRIVER_PAGE_SQL と同じ `> 0`。
+        // driver 指定の単一乗務員経路 (このファイルの kosoku_daily) は診断用途を
+        // 残すため対象外 — ここは全乗務員版だけの絞り込み
+        .filter(|(driver, _)| *driver > 0)
         .map(|(driver, rows)| {
             // 紙の再現は**重複除去の前**の行で計算する (単一乗務員経路と同じ理由 —
             // 紙は重複行を二重計上する)。突合経路だけで計算する
