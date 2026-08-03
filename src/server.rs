@@ -377,6 +377,14 @@ pub async fn run(
             get(routes::kintai_day_summaries::day_summaries),
         )
         .route("/kintai/version", get(routes::kintai_version::version))
+        // 月別 stale (畳み直しが要るか) を 1 往復で返す軽い口 (Refs #620 の 1)。
+        // 読むだけ・既存の kintai.day_summaries 突合を月単位に割っただけ (ファイル名
+        // は kintai/kosoku で始めない — stale_months.rs のモジュール doc 参照、
+        // logic_version は動かさない)
+        .route(
+            "/kintai/stale-months",
+            get(routes::stale_months::stale_months),
+        )
         // 乗務員CD + 日付 → 運行NO・全イベント・修正用リンク (Refs #205 の 57)。
         // 読むだけ・既存の events 取得を再利用する (ファイル名は kintai/kosoku で
         // 始めない — dtako_day.rs のモジュール doc 参照、logic_version は動かさない)
