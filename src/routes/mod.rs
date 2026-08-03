@@ -14,5 +14,6 @@ pub mod schema;
 pub mod stale_months;
 pub mod surcharge;
 pub mod unchin;
+pub mod unko_gaps;
 pub mod uriage;
 pub mod vehicle_daily;
