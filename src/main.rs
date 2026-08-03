@@ -182,6 +182,7 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
                     &opts.month,
                     opts.driver,
                     opts.apply,
+                    None,
                 ))
                 .await;
                 let mut r = r?;
