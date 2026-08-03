@@ -11,6 +11,7 @@ pub mod kyuyo;
 pub mod restraint;
 pub mod sales;
 pub mod schema;
+pub mod stale_months;
 pub mod surcharge;
 pub mod unchin;
 pub mod uriage;
