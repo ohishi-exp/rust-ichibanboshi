@@ -116,17 +116,17 @@
 //! `イベント名 IN ('休息','運行開始','運行終了')` で読む。**「dtako_events が
 //! 何行あるか」ではなく「この絞り込みで何行拾えるか」が本当の材料件数。**
 //!
-//! **この実装は材料のうち `休息` だけを数える** ([`count_reset_material`])。
-//! `driver` (乗務員CD) を渡さずに `運行NO` 付きで `dtako_events` を読める既存の
-//! 口が [`crate::kintai_repo::KintaiEventsApi::fetch_rest_events_between`]
-//! (`休息` 固定) しか無いため — `運行開始`/`運行終了` まで含めるには
+//! **この実装は 3 種 (`休息`/`運行開始`/`運行終了`) を全部数える**
+//! ([`crate::dtako_reset_material::count_reset_material`]、Refs #633 の 5)。
+//! 実装は独立ファイル [`crate::dtako_reset_material`] に持つ — 理由は
 //! `kintai_repo.rs` (build.rs の `KINTAI_OUTPUT_GLOBS` 対象) に新しい SQL を
-//! 足す必要があり、それは `logic_version` を動かす (受け入れ条件7 と衝突)。
-//! **⇒ 休息が 0 件でも運行開始/運行終了だけが材料として残るケースはこの歯止めを
-//! すり抜け得る** (安全側の誤り — 材料が無いのに実行、ではなく材料があるのに
-//! スキップと誤判定する側)。実害の事例 (issue #281) は `dtako_events` が丸ごと
-//! 0 件だったので休息も 0 件になり、この絞りでも検知できる。完全一致させる
-//! フォローアップは親と協議 (2026-08-01、[質問] で報告済み)。
+//! 足すと `logic_version` が動いてしまうため、そちらのモジュール doc 参照。
+//!
+//! **旧実装は `休息` だけを数えていて、実害を出した** (issue #281 の再発、
+//! 2026-08-04): 運行 `26060608220000000041571` (乗務員 1740) は `dtako_events`
+//! 23 行のうち `休息` が 0 件・`運行開始`/`運行終了` が各 1 件で、旧実装は
+//! `reset_skip_reason: "no_dtako_events"` として③を誤ってスキップしていた。
+//! 3 種を数える現在の実装はこのケースで `dtako_events_count: 2` を返す。
 //!
 //! - **③の直前 (②のあと) に数える。** ②の取り込みで `dtako_events` が増え得る
 //!   ので、②の前に数えると取りこぼす (受け入れ条件・数え方)
@@ -147,11 +147,10 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
-use chrono::NaiveDateTime;
 use serde::Deserialize;
 
 use crate::cakephp::{CakephpClient, CakephpError};
-use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
+use crate::dtako_reset_material::{count_reset_material, DynResetMaterialRepo};
 
 /// ③ (`CakephpClient::post_reset_timecard`) の応答に添える注意書き。
 /// **空 200 は成功の証明ではない** (`yhonda-ohishi/nginx#796` に起票済み)。
@@ -202,57 +201,6 @@ fn parse_unko_no(raw: &str) -> Option<&str> {
     Some(raw)
 }
 
-/// `unko_no` 先頭 12 桁 (`YYMMDDHHMMSS`) を運行開始日時として読む。
-/// `dtako_day.rs` と同じロジックを独立して持つ (モジュール doc の「ファイル名が
-/// なぜ」参照 — `kintai_repo.rs`/`dtako_day.rs` 経由にすると余計な依存が増える)。
-fn unko_no_start_datetime(unko_no: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(unko_no.get(..12)?, "%y%m%d%H%M%S").ok()
-}
-
-/// ③ (PHP `_setbyUnkoNo`) が材料として見る**運行NO の 2 パターン** (対象CD 1/2
-/// 両方) を組む。`substr($id, 0, 22)` に "1"/"2" を付けるだけの PHP 実装をそのまま
-/// 写す (モジュール doc 「③は削除してから作り直す」参照)。呼び出し側が渡した
-/// 末尾 1 桁は使わない — PHP 自身が無視して両方を見るため。
-fn reset_material_unko_no_variants(unko_no: &str) -> (String, String) {
-    let prefix: String = unko_no.chars().take(22).collect();
-    (format!("{prefix}1"), format!("{prefix}2"))
-}
-
-/// 材料を数える窓。運行は日をまたぐ (実測: 開始 16:50 → 終了翌日 01:23) ので、
-/// 開始日の前日 0 時から 3 日ぶんという広めの余白を取る。`fetch_rest_events_between`
-/// は `開始日時`/`終了日時` それぞれに索引が効く範囲検索なので、広めでも安い。
-fn material_window(start_dt: NaiveDateTime) -> (String, String) {
-    let from = start_dt.date() - chrono::Duration::days(1);
-    let to = from + chrono::Duration::days(4);
-    (format!("{from} 00:00:00"), format!("{to} 00:00:00"))
-}
-
-/// ③ の材料のうち `休息` ぶんを数える (モジュール doc 「③は削除してから作り直す」
-/// 参照)。`運行開始`/`運行終了` は数えない — 理由と限界はモジュール doc に明記。
-///
-/// `unko_no` の先頭 12 桁が読めない (壊れた入力) 場合は材料無しとして `Ok(0)`
-/// (fail-safe — 数えられないなら実行しない側に倒す)。
-async fn count_reset_material(
-    repo: &DynKintaiEventsRepo,
-    unko_no: &str,
-) -> Result<i64, KintaiRepoError> {
-    let Some(start_dt) = unko_no_start_datetime(unko_no) else {
-        return Ok(0);
-    };
-    let (from, to) = material_window(start_dt);
-    let (variant1, variant2) = reset_material_unko_no_variants(unko_no);
-    let rows = repo.fetch_rest_events_between(&from, &to, None).await?;
-    let count = rows
-        .iter()
-        .filter(|r| r.get("source").and_then(|v| v.as_str()) == Some("dtako_events"))
-        .filter(|r| {
-            let u = r.get("unko_no").and_then(|v| v.as_str());
-            u == Some(variant1.as_str()) || u == Some(variant2.as_str())
-        })
-        .count();
-    Ok(count as i64)
-}
-
 /// CakePHP client のエラーを HTTP ステータスへ写す。`routes/kintai.rs` に同じ形の
 /// `map_cakephp_err` があるが、あちらは `build.rs` の glob 対象 (`logic_version` が
 /// 動く) なので import せず独立して持つ (`dtako_day.rs` と同じ方針)。
@@ -287,7 +235,7 @@ fn map_cakephp_err(e: CakephpError) -> (StatusCode, String) {
 pub async fn autoload(
     Query(params): Query<AutoloadQuery>,
     Extension(cakephp): Extension<Arc<CakephpClient>>,
-    Extension(kintai_events): Extension<DynKintaiEventsRepo>,
+    Extension(reset_material): Extension<DynResetMaterialRepo>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let unko_no = match params.unko_no.as_deref().and_then(parse_unko_no) {
@@ -316,7 +264,7 @@ pub async fn autoload(
         // preview でも③の材料件数は計算する (受け入れ条件4) — 打つ前に危険が見える。
         // reset_timecard=false なら計算しない (preview は今までどおり DB を叩かない)。
         let (dtako_events_count, count_error) = if params.reset_timecard {
-            match count_reset_material(&kintai_events, &unko_no).await {
+            match count_reset_material(&reset_material, &unko_no).await {
                 Ok(n) => (Some(n), None),
                 Err(e) => {
                     tracing::warn!(unko_no, error = %e, "dtako reset material count failed (preview)");
@@ -363,7 +311,7 @@ pub async fn autoload(
         if http_ok {
             // ★③の直前 (②のあと) に数える — ②の取り込みで増えた分を取りこぼさない
             // (モジュール doc 「③は削除してから作り直す」参照)。
-            match count_reset_material(&kintai_events, &unko_no).await {
+            match count_reset_material(&reset_material, &unko_no).await {
                 Ok(0) => {
                     tracing::info!(unko_no, "dtako reset_timecard skipped: no dtako_events");
                     reset_skip_reason = Some("no_dtako_events");
@@ -432,154 +380,66 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    /// `KintaiEventsApi` の mock。`fetch_rest_events_between` (③の材料数え、
-    /// [`count_reset_material`] 参照) に仕込んだ行を返すだけ — 他のメソッドは
-    /// この route の経路では使わないので panic する
-    /// (`dtako_day.rs` の `MockRepo` と同じ形)。
-    struct MockRepo {
-        rows: Vec<Value>,
+    /// `ResetMaterialApi` の mock。仕込んだ件数をそのまま返す — 窓・variant の
+    /// 組み立てと絞り込み SQL 自体は `crate::dtako_reset_material` 側でテスト
+    /// 済みなので、ここでは「route が結果をどう使うか」だけを見る。
+    struct MockResetMaterialRepo {
+        count: i64,
     }
 
     #[async_trait]
-    impl crate::kintai_repo::KintaiEventsApi for MockRepo {
-        async fn fetch_events_between(
+    impl crate::dtako_reset_material::ResetMaterialApi for MockResetMaterialRepo {
+        async fn count_material(
             &self,
             _from: &str,
             _to: &str,
-            _driver: u64,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("dtako_autoload はドライバ指定の events を読まない")
-        }
-
-        async fn fetch_all_events_between(
-            &self,
-            _from: &str,
-            _to: &str,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("dtako_autoload は全乗務員 events を読まない")
-        }
-
-        async fn fetch_ferry_between(
-            &self,
-            _from: &str,
-            _to: &str,
-            _driver: Option<u64>,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("dtako_autoload はフェリーを読まない")
-        }
-
-        async fn fetch_rest_events_between(
-            &self,
-            _from: &str,
-            _to: &str,
-            driver: Option<u64>,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            assert_eq!(
-                driver, None,
-                "材料数えは driver を指定しない (unko_no だけで絞る)"
-            );
-            Ok(self.rows.clone())
+            _variant1: &str,
+            _variant2: &str,
+        ) -> Result<i64, crate::kintai_repo::KintaiRepoError> {
+            Ok(self.count)
         }
     }
 
     /// 呼ばれたら panic する repo。「②失敗 / reset_timecard=false のときは
     /// 材料を数えにいかない」ことをテストで強制するのに使う。
-    struct PanicRepo;
+    struct PanicResetMaterialRepo;
 
     #[async_trait]
-    impl crate::kintai_repo::KintaiEventsApi for PanicRepo {
-        async fn fetch_events_between(
+    impl crate::dtako_reset_material::ResetMaterialApi for PanicResetMaterialRepo {
+        async fn count_material(
             &self,
             _from: &str,
             _to: &str,
-            _driver: u64,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("unused")
-        }
-
-        async fn fetch_all_events_between(
-            &self,
-            _from: &str,
-            _to: &str,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("unused")
-        }
-
-        async fn fetch_ferry_between(
-            &self,
-            _from: &str,
-            _to: &str,
-            _driver: Option<u64>,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("unused")
-        }
-
-        async fn fetch_rest_events_between(
-            &self,
-            _from: &str,
-            _to: &str,
-            _driver: Option<u64>,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
+            _variant1: &str,
+            _variant2: &str,
+        ) -> Result<i64, crate::kintai_repo::KintaiRepoError> {
             panic!("材料を数えてはいけない場面で呼ばれた")
         }
     }
 
     /// 材料の件数クエリ自体が失敗する repo (`count_failed` の歯止め用)。
-    struct FailingRestRepo;
+    struct FailingResetMaterialRepo;
 
     #[async_trait]
-    impl crate::kintai_repo::KintaiEventsApi for FailingRestRepo {
-        async fn fetch_events_between(
+    impl crate::dtako_reset_material::ResetMaterialApi for FailingResetMaterialRepo {
+        async fn count_material(
             &self,
             _from: &str,
             _to: &str,
-            _driver: u64,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("unused")
-        }
-
-        async fn fetch_all_events_between(
-            &self,
-            _from: &str,
-            _to: &str,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("unused")
-        }
-
-        async fn fetch_ferry_between(
-            &self,
-            _from: &str,
-            _to: &str,
-            _driver: Option<u64>,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
-            panic!("unused")
-        }
-
-        async fn fetch_rest_events_between(
-            &self,
-            _from: &str,
-            _to: &str,
-            _driver: Option<u64>,
-        ) -> Result<Vec<Value>, crate::kintai_repo::KintaiRepoError> {
+            _variant1: &str,
+            _variant2: &str,
+        ) -> Result<i64, crate::kintai_repo::KintaiRepoError> {
             Err(crate::kintai_repo::KintaiRepoError::QueryFailed(
                 "boom".to_string(),
             ))
         }
     }
 
-    fn empty_repo() -> DynKintaiEventsRepo {
-        Arc::new(MockRepo { rows: Vec::new() })
+    fn empty_repo() -> DynResetMaterialRepo {
+        Arc::new(MockResetMaterialRepo { count: 0 })
     }
 
-    fn material_row(unko_no: &str) -> Value {
-        serde_json::json!({
-            "source": "dtako_events",
-            "state": "休息",
-            "unko_no": unko_no,
-        })
-    }
-
-    fn app(cakephp: Arc<CakephpClient>, repo: DynKintaiEventsRepo) -> Router {
+    fn app(cakephp: Arc<CakephpClient>, repo: DynResetMaterialRepo) -> Router {
         Router::new()
             .route("/dtako/autoload", post(autoload))
             .layer(Extension(cakephp))
@@ -884,7 +744,7 @@ mod tests {
 
         let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
         // reset_timecard=false のときは材料を数えにもいかない — 呼ばれたら panic
-        let router = app(cakephp, Arc::new(PanicRepo));
+        let router = app(cakephp, Arc::new(PanicResetMaterialRepo));
         let (status, body) = call(
             router,
             "/dtako/autoload?unko_no=26060507533000000042861",
@@ -913,9 +773,7 @@ mod tests {
 
         let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
         // preview でも材料件数は計算する (受け入れ条件4) — 1件仕込んで確認する
-        let repo: DynKintaiEventsRepo = Arc::new(MockRepo {
-            rows: vec![material_row("26060507533000000042861")],
-        });
+        let repo: DynResetMaterialRepo = Arc::new(MockResetMaterialRepo { count: 1 });
         let router = app(cakephp, repo);
         let (status, body) = call(
             router,
@@ -961,13 +819,8 @@ mod tests {
             .await;
 
         let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
-        // 材料 (dtako_events の休息、対象CD 1/2 両方) を2件仕込む
-        let repo: DynKintaiEventsRepo = Arc::new(MockRepo {
-            rows: vec![
-                material_row("26060507533000000042861"),
-                material_row("26060507533000000042862"),
-            ],
-        });
+        // 材料 (dtako_events の休息/運行開始/運行終了、対象CD 1/2 両方) を2件仕込む
+        let repo: DynResetMaterialRepo = Arc::new(MockResetMaterialRepo { count: 2 });
         let router = app(cakephp, repo);
         let (status, body) = call(
             router,
@@ -1060,7 +913,7 @@ mod tests {
             .await;
 
         let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
-        let router = app(cakephp, Arc::new(FailingRestRepo));
+        let router = app(cakephp, Arc::new(FailingResetMaterialRepo));
         let (status, body) = call(
             router,
             "/dtako/autoload?unko_no=26060507533000000042861&reset_timecard=true",
@@ -1097,7 +950,7 @@ mod tests {
 
         let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
         // ②が失敗したら材料も数えにいかない — 呼ばれたら panic
-        let router = app(cakephp, Arc::new(PanicRepo));
+        let router = app(cakephp, Arc::new(PanicResetMaterialRepo));
         let (status, body) = call(
             router,
             "/dtako/autoload?unko_no=26060507533000000042861&reset_timecard=true",
@@ -1111,79 +964,5 @@ mod tests {
         assert_eq!(body["reset_skip_reason"], serde_json::json!("step2_failed"));
         assert_eq!(body["reset_http_status"], serde_json::Value::Null);
         assert_eq!(body["dtako_events_count"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn reset_material_unko_no_variants_builds_both_crew_suffixes_from_the_leading_22_digits() {
-        assert_eq!(
-            reset_material_unko_no_variants("26060507533000000042861"),
-            (
-                "26060507533000000042861".to_string(),
-                "26060507533000000042862".to_string()
-            ),
-            "呼び出し側の末尾1桁は無視し、両クルーを組む (PHP _setbyUnkoNo と同じ)"
-        );
-        assert_eq!(
-            reset_material_unko_no_variants("2606050753300000004286"),
-            (
-                "26060507533000000042861".to_string(),
-                "26060507533000000042862".to_string()
-            ),
-            "22桁ちょうどの入力でも動く"
-        );
-    }
-
-    #[test]
-    fn unko_no_start_datetime_reads_the_leading_12_digits() {
-        let dt = unko_no_start_datetime("26060507533000000042861").unwrap();
-        assert_eq!(dt.to_string(), "2026-06-05 07:53:30");
-        assert_eq!(unko_no_start_datetime("U1"), None, "12桁に満たない");
-    }
-
-    #[test]
-    fn material_window_spans_a_day_before_to_three_days_after_the_start_date() {
-        let start = unko_no_start_datetime("26060507533000000042861").unwrap();
-        let (from, to) = material_window(start);
-        assert_eq!(
-            from, "2026-06-04 00:00:00",
-            "日をまたぐ運行を取りこぼさない余白"
-        );
-        assert_eq!(to, "2026-06-08 00:00:00");
-    }
-
-    #[tokio::test]
-    async fn count_reset_material_counts_only_dtako_events_rows_matching_either_crew_suffix() {
-        let rows = vec![
-            material_row("26060507533000000042861"), // 対象、対象CD=1
-            material_row("26060507533000000042862"), // 対象、対象CD=2 (別クルー)
-            material_row("26060507533000000042869"), // 別運行なので対象外
-            serde_json::json!({"source": "dtako", "unko_no": "26060507533000000042861"}), // dtako_events以外は対象外
-        ];
-        let repo: DynKintaiEventsRepo = Arc::new(MockRepo { rows });
-        let n = count_reset_material(&repo, "26060507533000000042861")
-            .await
-            .unwrap();
-        assert_eq!(n, 2);
-    }
-
-    #[tokio::test]
-    async fn count_reset_material_is_zero_and_never_queries_when_unko_no_is_too_short_to_parse() {
-        // fail-safe: 開始日時が読めないなら「材料無し」に倒す。クエリも投げない
-        // (PanicRepo が呼ばれたら panic するので、投げていないことも同時に確認する)
-        let repo: DynKintaiEventsRepo = Arc::new(PanicRepo);
-        let n = count_reset_material(&repo, "1234").await.unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[tokio::test]
-    async fn count_reset_material_surfaces_repo_errors() {
-        let repo: DynKintaiEventsRepo = Arc::new(FailingRestRepo);
-        let err = count_reset_material(&repo, "26060507533000000042861")
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::kintai_repo::KintaiRepoError::QueryFailed(_)
-        ));
     }
 }
