@@ -276,7 +276,7 @@ async fn folding_from_one_read_matches_the_per_driver_read() {
     let (repo, _) = repo();
 
     let old = fold_month_per_driver(&repo, &params, MONTH).await;
-    let new = fold_month(&repo, &params, MONTH, None).await.unwrap();
+    let new = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
 
     assert!(!old.is_empty(), "fixture が空では何も確かめていない");
     assert_eq!(
@@ -317,7 +317,7 @@ async fn the_duplicate_unko_no_row_changes_the_fingerprint_but_not_the_values() 
     let (repo, _) = repo();
 
     let old = fold_month_per_driver(&repo, &params, MONTH).await;
-    let new = fold_month(&repo, &params, MONTH, None).await.unwrap();
+    let new = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
     let pick = |v: &[(u64, FoldUnit, String)]| {
         v.iter()
             .find(|(cd, ..)| *cd == 1526)
@@ -341,7 +341,7 @@ async fn folding_a_month_reads_the_events_once() {
     let params = KosokuParams::default();
     let (repo, counts) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, None).await.unwrap();
+    let units = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
 
     assert_eq!(counts.all.load(Ordering::SeqCst), 1, "全量読みは月 1 回");
     assert_eq!(
@@ -373,7 +373,9 @@ async fn naming_one_driver_still_reads_once() {
     let params = KosokuParams::default();
     let (repo, counts) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, Some(1130)).await.unwrap();
+    let units = fold_month(&repo, &params, MONTH, Some(1130), None)
+        .await
+        .unwrap();
 
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].0, 1130);
@@ -391,7 +393,9 @@ async fn naming_a_driver_with_no_rows_still_yields_an_empty_unit() {
     let params = KosokuParams::default();
     let (repo, _) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, Some(4242)).await.unwrap();
+    let units = fold_month(&repo, &params, MONTH, Some(4242), None)
+        .await
+        .unwrap();
 
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].0, 4242);
@@ -405,7 +409,7 @@ async fn a_driver_outside_the_month_is_not_folded() {
     let params = KosokuParams::default();
     let (repo, _) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, None).await.unwrap();
+    let units = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
 
     assert!(
         !units.iter().any(|(cd, ..)| *cd == 1999),
@@ -418,6 +422,8 @@ async fn a_bad_month_is_rejected_before_reading() {
     let params = KosokuParams::default();
     let (repo, counts) = repo();
 
-    assert!(fold_month(&repo, &params, "nope", None).await.is_err());
+    assert!(fold_month(&repo, &params, "nope", None, None)
+        .await
+        .is_err());
     assert_eq!(counts.all.load(Ordering::SeqCst), 0, "読む前に落とす");
 }

@@ -317,6 +317,7 @@ async fn call_recalc(
             max_drivers: None,
             stale_only: false,
             apply,
+            today: None,
         }),
     )
     .await?;

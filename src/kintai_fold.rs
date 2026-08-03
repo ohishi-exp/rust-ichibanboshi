@@ -993,19 +993,26 @@ fn push_window_gap_warning(
 /// (`driver` 未指定のとき同じことが起きないのは、そもそも行が無い乗務員を
 /// 列挙できないため — こちらは別途 #205 の宿題)
 ///
+/// `today` は [`push_window_gap_warning`] が「はみ出した先はもう過ぎた日か」を
+/// 見るための基準日。**`None` なら実時計 ([`today_jst`]) を使う** — 本番の
+/// 呼び出しは全て `None` を渡し、挙動は今までどおり。固定日を渡せるのは
+/// テストだけ (Refs #286-1 — 月を固定値で書いた PG テストが壁時計の経過で
+/// 落ちるのを直す。詳細は `push_window_gap_warning` の docs)。
+///
 /// [`KintaiEventsApi::fetch_all_events_between`]: crate::kintai_repo::KintaiEventsApi::fetch_all_events_between
 pub async fn fold_month(
     repo: &DynKintaiEventsRepo,
     params: &KosokuParams,
     month: &str,
     driver: Option<u64>,
+    today: Option<NaiveDate>,
 ) -> Result<Vec<(u64, FoldUnit, String)>, KintaiPushError> {
     let (from, to) = month_range(month)
         .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
     let rows = repo.fetch_all_events_between(&from, &to).await?;
     tracing::debug!("fold {month}: read {} rows in 1 fetch_all", rows.len());
     // はみ出した先の 1 日が push されているかを確かめる (Refs #205 の 30)
-    if let Some(w) = push_window_gap_warning(month, &rows, today_jst()) {
+    if let Some(w) = push_window_gap_warning(month, &rows, today.unwrap_or_else(today_jst)) {
         tracing::warn!("{w}");
         crate::kintai_http_repo::record_warning(&w);
     }
@@ -1358,6 +1365,9 @@ pub async fn month_gate_report(
 /// 呼び出し元 (`main.rs`) が `with_warning_sink` で包んでいる前提だが、包まれて
 /// いない (`None`) 場合は「無い」と「分からない」を混同しないよう書かない —
 /// 次回また全量読みに落ちるだけで安全側。
+///
+/// `today` は [`fold_month`] にそのまま渡す。**呼び出し元は `None` を渡すこと**
+/// (実時計を使う、今までどおりの挙動)。固定できるのはテストだけ (Refs #286-1)。
 pub async fn recalc_month(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,
@@ -1365,6 +1375,7 @@ pub async fn recalc_month(
     month: &str,
     driver: Option<u64>,
     apply: bool,
+    today: Option<NaiveDate>,
 ) -> Result<FoldReport, KintaiPushError> {
     if driver.is_none() {
         match month_gate_report(repo, store, params, month, apply).await? {
@@ -1374,7 +1385,7 @@ pub async fn recalc_month(
                 punch_digest,
                 logic_version,
             } => {
-                let units = fold_month(repo, params, month, driver).await?;
+                let units = fold_month(repo, params, month, driver, today).await?;
                 let report = store_units(store, params, month, units, apply).await?;
                 // warnings が確認できた回 (Some(false)) だけ刻む。None (収集器の外) や
                 // Some(true) では書かない — 迷ったら書かない側 (Refs #205-17)
@@ -1393,7 +1404,7 @@ pub async fn recalc_month(
             MonthGate::Unavailable => {}
         }
     }
-    let units = fold_month(repo, params, month, driver).await?;
+    let units = fold_month(repo, params, month, driver, today).await?;
     store_units(store, params, month, units, apply).await
 }
 
@@ -1438,7 +1449,10 @@ pub async fn recalc_drivers(
         report.drivers_unchanged = drivers.len();
         return Ok(report);
     }
-    let all = fold_month(repo, params, month, None).await?;
+    // 実時計 — `recalc_drivers` は今回の注入経路の対象外 (Refs #286-1、呼び出し元
+    // docs 参照)。名指しした乗務員だけを畳む窓の受け口が使う経路で、月ゲートを
+    // 「読むだけで書かない」ぶん push 窓ずれ警告の有無が判定を左右しない
+    let all = fold_month(repo, params, month, None, None).await?;
     recalc_drivers_from_units(store, params, month, drivers, all, apply).await
 }
 
@@ -1575,7 +1589,17 @@ pub async fn sync_month(
     opts: &crate::kintai_push::PushOptions,
 ) -> Result<SyncReport, KintaiPushError> {
     let push = crate::kintai_push::push_month(repo, store, opts).await?;
-    let fold = recalc_month(repo, store, params, &opts.month, opts.driver, opts.apply).await?;
+    // 実時計 (Refs #286-1) — CLI の Sync は常に本番の「今日」で判定する
+    let fold = recalc_month(
+        repo,
+        store,
+        params,
+        &opts.month,
+        opts.driver,
+        opts.apply,
+        None,
+    )
+    .await?;
     Ok(SyncReport { push, fold })
 }
 
