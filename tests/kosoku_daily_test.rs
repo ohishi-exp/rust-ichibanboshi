@@ -467,6 +467,43 @@ async fn bulk_drops_drivers_without_any_shift_or_punch() {
 }
 
 #[tokio::test]
+async fn bulk_drops_driver_zero() {
+    // 乗務員CD=0 は打刻の紐付かないデジタコ運行 (Refs #284)。全乗務員版は
+    // kintai_repo.rs / kintai_fold.rs と同じ `> 0` 基準で除く
+    let (status, body) = serve(
+        vec![
+            tc_of(1119, "2026-06-02 06:00:00", "始業"),
+            tc_of(1119, "2026-06-02 18:00:00", "終業"),
+            tc_of(0, "2026-06-02 06:00:00", "始業"),
+            tc_of(0, "2026-06-02 18:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let drivers = body["drivers"].as_array().unwrap();
+    assert_eq!(drivers.len(), 1);
+    assert_eq!(drivers[0]["driver"], 1119);
+}
+
+#[tokio::test]
+async fn explicit_driver_zero_still_returns() {
+    // driver=0 を名指しした診断経路は変えない (Refs #284) — 実際にこの経路で
+    // 混入を調べたので、潰すと調査手段が失われる
+    let (status, body) = serve(
+        vec![
+            tc("2026-06-02 06:00:00", "始業"),
+            tc("2026-06-02 18:00:00", "終業"),
+        ],
+        "/api/kintai/kosoku-daily?month=2026-06&driver=0",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["driver"], 0);
+    assert_eq!(body["days"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn bulk_with_no_events_is_empty_drivers_not_error() {
     let (status, body) = serve(vec![], "/api/kintai/kosoku-daily?month=2026-06").await;
     assert_eq!(status, StatusCode::OK);
