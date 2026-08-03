@@ -252,7 +252,7 @@ async fn http_repo_and_onprem_repo_fold_to_the_same_rows() {
     let onprem: DynKintaiEventsRepo = Arc::new(OnpremStub {
         rows: onprem_rows(),
     });
-    let onprem_units = fold_month(&onprem, &params, MONTH, Some(DRIVER))
+    let onprem_units = fold_month(&onprem, &params, MONTH, Some(DRIVER), None)
         .await
         .expect("onprem fold");
 
@@ -277,7 +277,7 @@ async fn http_repo_and_onprem_repo_fold_to_the_same_rows() {
     ));
     let gcp = HttpKintaiEventsRepo::new(&http_cfg(&server.uri()), Some(fallback)).unwrap();
     let gcp: DynKintaiEventsRepo = Arc::new(gcp);
-    let gcp_units = fold_month(&gcp, &params, MONTH, Some(DRIVER))
+    let gcp_units = fold_month(&gcp, &params, MONTH, Some(DRIVER), None)
         .await
         .expect("gcp fold");
 

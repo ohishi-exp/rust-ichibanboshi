@@ -642,7 +642,7 @@ async fn test_folding_a_month_costs_one_all_drivers_read() {
         .await;
 
     let repo: DynKintaiEventsRepo = Arc::new(repo(&server.uri()));
-    let units = fold_month(&repo, &KosokuParams::default(), "2026-07", None)
+    let units = fold_month(&repo, &KosokuParams::default(), "2026-07", None, None)
         .await
         .unwrap();
 
