@@ -23,3 +23,4 @@ pub mod server;
 #[cfg(windows)]
 pub mod service;
 pub mod sqlite;
+pub mod wage_snapshot;

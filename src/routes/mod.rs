@@ -17,3 +17,4 @@ pub mod unchin;
 pub mod unko_gaps;
 pub mod uriage;
 pub mod vehicle_daily;
+pub mod wage_snapshot;
