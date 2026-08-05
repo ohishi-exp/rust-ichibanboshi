@@ -72,7 +72,10 @@ CREATE TABLE kintai.wage_snapshot (
     computed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     PRIMARY KEY (tenant_id, comp_id, ym, restraint_source, driver_cd),
-    CHECK (restraint_source IN ('gcp', 'current'))
+    -- 制約名は明示する。`scripts/verify_kintai_rls.sh` がエラーメッセージで
+    -- 「弾かれたこと」を確かめるので、自動生成名に依存させない
+    CONSTRAINT wage_snapshot_restraint_source_check
+        CHECK (restraint_source IN ('gcp', 'current'))
 );
 
 -- 期間集計の主経路 (会社 × ソース × 月範囲を舐めて GROUP BY driver_cd)。
