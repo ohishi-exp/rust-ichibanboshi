@@ -340,6 +340,10 @@ pub struct MonthAmounts {
     /// 「要再計算」を出すために返す。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hourly_rate: Option<i32>,
+    /// その月の実労働時間 (分)。行合計とは別に月ごとで返す — 画面が
+    /// 月セルの内訳 (単価 × 実働 でその金額になったのか) を出せるようにするため。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_minutes: Option<i32>,
 }
 
 /// 期間集計の 1 行 (1 乗務員)。
@@ -481,6 +485,7 @@ pub fn aggregate_range(
                     paid_base: row.paid_base,
                     paid_overtime: row.paid_overtime,
                     hourly_rate: row.hourly_rate,
+                    working_minutes: row.working_minutes,
                 },
             );
             entry.months_counted += 1;
@@ -835,6 +840,8 @@ mod tests {
         assert_eq!(d.paid_base, 396_000);
         assert_eq!(d.by_month.len(), 2);
         assert_eq!(d.by_month["2026-01"].hourly_rate, Some(1420));
+        // 実働は行合計とは別に月ごとでも返す (画面が月セルの内訳を出せるように)
+        assert_eq!(d.by_month["2026-01"].working_minutes, Some(11_820));
         assert!(d.months_missing.is_empty());
         assert!(agg.months.iter().all(|m| m.saved && m.excluded.is_none()));
         // 版を渡していないので鮮度は判定しない
