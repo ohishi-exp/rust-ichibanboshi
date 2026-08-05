@@ -187,16 +187,21 @@ expect_eq "kintai_reader は NOINHERIT" \
 expect_eq "kintai_reader は superuser ではない" \
   "$(as "$SUPER_URL" "SELECT rolsuper FROM pg_roles WHERE rolname='kintai_reader'")" "f"
 
-echo "== RLS が 7 表とも有効で、テナント分離ポリシーが 1 本ずつある"
+echo "== RLS が 8 表とも有効で、テナント分離ポリシーが 1 本ずつある"
 # 6 -> 7 は 004 (kintai.fold_gate、Refs #205 実装計画 13) を足した分。
+# 7 -> 8 は 006 (kintai.wage_snapshot、Refs #291) を足した分。
+#
+# **表を足したらこの 3 つの数を上げる。** 数え上げを動的 (「RLS 無効の表が 0 件」)
+# にすると、RLS を付け忘れた表が 0 件のまま通ってしまう — この検査は「表の数だけ
+# ポリシーがある」ことを人が意識して更新することで成り立っている。
 expect_eq "relrowsecurity = true の表の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "7"
+       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "8"
 expect_eq "policy の数" \
-  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "7"
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "8"
 expect_eq "WITH CHECK を明示していない (= USING が WITH CHECK として効く) policy の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies
-       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "7"
+       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "8"
 
 # ── 3. reader / writer で実際に繋ぐ ────────────────────────────────────
 # migration はパスワードを持たないので、検証用にここで付ける (テスト scaffolding)。
@@ -242,6 +247,25 @@ expect_eq "新しい表に writer の 4 権限が自動で付く" \
 expect_eq "新しい表に reader の SELECT が自動で付く" \
   "$(as "$SUPER_URL" "SELECT has_table_privilege('kintai_reader','kintai.probe_default_acl','SELECT')")" "t"
 as "$SUPER_URL" "DROP TABLE kintai.probe_default_acl" >/dev/null
+
+# 賃金確定値のスナップショット (006、Refs #291)。他の表と同じく「触っていない表は
+# 権限が壊れていても気付けない」を残さないため、writer で往復させる。
+# `restraint_source` の CHECK も併せて確かめる (画面が誤った値を送っても DB で止まる)。
+echo "== wage_snapshot も writer で往復でき、restraint_source の CHECK が効く"
+expect_ok_sql "writer が wage_snapshot を INSERT" "$WRITER_URL" "
+INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driver_cd,
+                                  driver_name, calc_base, calc_overtime, calc_total,
+                                  paid_base, paid_overtime, wage_logic_version)
+VALUES ('$TENANT_A', 'comp-a', '2026-01-01', 'gcp', 1001, '山田',
+        200000, 80000, 280000, 198000, 78000, 'wage-1');"
+expect_eq "writer が wage_snapshot を SELECT" \
+  "$(as "$WRITER_URL" "SELECT calc_total FROM kintai.wage_snapshot WHERE tenant_id='$TENANT_A'")" "280000"
+expect_err "restraint_source は gcp / current だけ" "$WRITER_URL" "
+INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driver_cd,
+                                  wage_logic_version)
+VALUES ('$TENANT_A', 'comp-a', '2026-02-01', 'supabase', 1001, 'wage-1');" \
+  "wage_snapshot_restraint_source_check"
+as "$SUPER_URL" "DELETE FROM kintai.wage_snapshot" >/dev/null
 
 # paper_drift だけ writer で 1 度も触られていなかった (他 6 表は下で触る)。
 # 「触っていない表は権限が壊れていても気付けない」を残さない。
