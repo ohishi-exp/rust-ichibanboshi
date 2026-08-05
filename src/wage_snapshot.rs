@@ -87,12 +87,20 @@ pub struct WageSnapshotRow {
 pub struct MonthMasters {
     #[serde(default)]
     pub salary_item_sha: Option<String>,
-    #[serde(default)]
-    pub min_wage_sha: Option<String>,
     /// 突合した給与明細の同期時刻 (RFC3339 文字列のまま扱う — 比較は等値のみ)。
     #[serde(default)]
     pub payroll_synced_at: Option<String>,
 }
+
+// **最低賃金マスタの版 (`min_wage_sha`) は持たない** (2026-08-05 に廃止)。
+//
+// 保存している 9 数値 (計算 3 / 給与 2 + 実働) は単価マスタ・拘束時間・支給項目区分で
+// 決まり、**最低賃金は 1 円も動かさない** (割れているかの判定に使うだけ)。影響しない
+// ものを鮮度メタに入れたせいで、画面側では「最低賃金カードを開かないと版が付かない」
+// という UI の折りたたみ状態への依存が生まれていた。
+//
+// 表の `min_wage_sha` 列は 006 で作ってしまった (適用済み migration は改変しない) ので
+// 残るが、**常に NULL を書く**。将来ここが計算に効く設計になったら再利用する。
 
 /// 保存要求 (`POST /api/kintai/wage-snapshot` の body)。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -243,7 +251,6 @@ pub struct MonthBucket {
 #[derive(Debug, Clone, Default)]
 pub struct CurrentVersions {
     pub salary_item_sha: Option<String>,
-    pub min_wage_sha: Option<String>,
     pub wage_logic_version: Option<String>,
     pub payroll_synced_at: Option<String>,
 }
@@ -252,7 +259,6 @@ impl CurrentVersions {
     /// 1 つも渡されていない = 鮮度を判定しない。
     pub fn is_empty(&self) -> bool {
         self.salary_item_sha.is_none()
-            && self.min_wage_sha.is_none()
             && self.wage_logic_version.is_none()
             && self.payroll_synced_at.is_none()
     }
@@ -274,9 +280,6 @@ pub fn stale_reasons(
     };
     if differs(&current.salary_item_sha, &saved.salary_item_sha) {
         out.push("salary_item".to_string());
-    }
-    if differs(&current.min_wage_sha, &saved.min_wage_sha) {
-        out.push("min_wage".to_string());
     }
     if differs(&current.payroll_synced_at, &saved.payroll_synced_at) {
         out.push("payroll".to_string());
@@ -532,7 +535,6 @@ mod tests {
             rows,
             masters: MonthMasters {
                 salary_item_sha: Some("item-1".to_string()),
-                min_wage_sha: Some("mw-1".to_string()),
                 payroll_synced_at: Some("2026-02-03T09:12:00Z".to_string()),
             },
             wage_logic_version: Some("wage-1".to_string()),
@@ -722,7 +724,6 @@ mod tests {
         let saved = bucket(vec![]).masters;
         let current = CurrentVersions {
             salary_item_sha: Some("item-2".to_string()),
-            min_wage_sha: Some("mw-1".to_string()),
             wage_logic_version: Some("wage-1".to_string()),
             payroll_synced_at: Some("2026-02-03T09:12:00Z".to_string()),
         };
@@ -758,14 +759,14 @@ mod tests {
     #[test]
     fn stale_reasons_treats_missing_saved_version_as_moved() {
         let current = CurrentVersions {
-            min_wage_sha: Some("mw-1".to_string()),
+            salary_item_sha: Some("item-1".to_string()),
             wage_logic_version: Some("wage-1".to_string()),
             ..Default::default()
         };
         let reasons = stale_reasons(&MonthMasters::default(), None, &current);
         assert_eq!(
             reasons,
-            vec!["min_wage".to_string(), "wage_logic_version".to_string()]
+            vec!["salary_item".to_string(), "wage_logic_version".to_string()]
         );
     }
 
@@ -994,7 +995,6 @@ mod tests {
         let buckets = vec![Some(bucket(vec![row(1035)]))];
         let current = CurrentVersions {
             salary_item_sha: Some("item-1".to_string()),
-            min_wage_sha: Some("mw-1".to_string()),
             wage_logic_version: Some("wage-1".to_string()),
             payroll_synced_at: Some("2026-02-03T09:12:00Z".to_string()),
         };

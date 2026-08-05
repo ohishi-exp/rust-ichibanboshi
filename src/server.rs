@@ -454,14 +454,15 @@ pub async fn run(
         .route("/kyuyo/employees", get(routes::kyuyo::employees))
         .route("/kyuyo/sync", post(routes::kyuyo::sync))
         .route("/kyuyo/synced-months", get(routes::kyuyo::synced_months))
-        // 賃金確定値の月次スナップショット (Refs #291)。**金額を返すので
-        // `/kyuyo/*` の in-service gate の内側**に置く (kintai_day_summaries の
-        // モジュール docs の指示)。表は勤怠の派生なので kintai スキーマのまま
+        // 賃金確定値の月次スナップショット (Refs #291)。**`/kintai/*` 側に置く** —
+        // 読み書きする `kintai.wage_snapshot` は Supabase にあり、そこへ繋がるのは
+        // GCP のインスタンスだけ。`/kyuyo/*` の宛先 (ohishi-data) には
+        // `[kintai_push]` が無く 503 になる (2026-08-05 本番で判明)
         .route(
-            "/kyuyo/wage-snapshot",
+            "/kintai/wage-snapshot",
             post(routes::wage_snapshot::put_wage_snapshot),
         )
-        .route("/kyuyo/wage-range", get(routes::wage_snapshot::wage_range))
+        .route("/kintai/wage-range", get(routes::wage_snapshot::wage_range))
         .route(
             "/restraint/summaries",
             axum::routing::put(routes::restraint::put_summaries),

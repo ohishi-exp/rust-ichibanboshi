@@ -2,20 +2,33 @@
 //! ohishi-exp/nuxt-dtako-admin#677)。判断は [`crate::wage_snapshot`] に置き、
 //! ここは「受ける・引く・書く」だけを持つ。
 //!
-//! - `POST /api/kyuyo/wage-snapshot` — 画面が確定させた 1 か月ぶんを置き換え保存
-//! - `GET  /api/kyuyo/wage-range` — 期間の月別 + 合計 + カバレッジを 1 往復で返す
+//! - `POST /api/kintai/wage-snapshot` — 画面が確定させた 1 か月ぶんを置き換え保存
+//! - `GET  /api/kintai/wage-range` — 期間の月別 + 合計 + カバレッジを 1 往復で返す
 //!
-//! ## なぜ `/api/kyuyo/*` に置くか (金額を含むため)
+//! ## なぜ `/api/kintai/*` なのか (金額を返すのに)
 //!
-//! [`crate::routes::kintai_day_summaries`] のモジュール docs が明示している:
+//! [`crate::routes::kintai_day_summaries`] のモジュール docs は「将来ここに金額を足す
+//! ことになったら `/kyuyo/*` と同じ in-service gate へ移すこと」と指示している。
+//! 一度そのとおり `/kyuyo/*` に置いたが、**本番で 503 になった** (2026-08-05):
 //!
-//! > 応答に含まれるのは拘束・実働・深夜などの分数だけで、**金額を含まない**ため、
-//! > `/kyuyo/*` の in-service gate は要らない。**将来ここに金額を足すことになったら、
-//! > その時点で `/kyuyo/*` と同じ in-service gate へ移すこと。**
+//! | | Supabase 接続 (`[kintai_push]`) | `/kyuyo/*` の認可 |
+//! |---|---|---|
+//! | ohishi-data (`/api/kyuyo/*` の宛先) | 無い | ある |
+//! | GCP Cloud Run (`/api/kintai/*` の宛先) | ある | 無い |
 //!
-//! この口はまさに金額 (基本給・残業代・支払い実績) を返すので、CF Access (edge) だけに
-//! 寄りかからず [`authorize`] (auth-worker introspect + email allowlist) を通す。
-//! 表は勤怠の派生なので `kintai` スキーマのままだが、**口は kyuyo 側の関門の内側**に置く。
+//! この表が読み書きする `kintai.wage_snapshot` は Supabase にあり、そこへ繋がるのは
+//! GCP のインスタンスだけ。**Supabase の接続情報を ohishi-data (local) には置かない**
+//! 方針なので (auth-worker 1 箇所に資格情報を集約する設計)、口は GCP 側に置くしかない。
+//!
+//! ## 代わりに何が守っているか
+//!
+//! GCP の Cloud Run は `--no-allow-unauthenticated` で、到達できるのは auth-worker の
+//! `/ichibanboshi-proxy` が OIDC を mint した呼び出しだけ。その手前で
+//! `dtako-scraper-relay` の `restraint-api` が auth-worker JWT + 閲覧者 email で
+//! 認可している。**edge の CF Access だけに寄りかかってはいない。**
+//!
+//! `/kyuyo/*` と同じ in-service gate をここに掛けるには GCP 側に introspect と
+//! allowlist の設定を配る必要があり、それは「資格情報を増やさない」方針と衝突する。
 //!
 //! ## テナントは設定 pin (`X-Tenant-ID` を読まない)
 //!
@@ -36,10 +49,8 @@
 //! `skipped_unchanged: true` を返して DB に触らない (`computed_at` も動かさない —
 //! 動かすと「いつ計算した値か」が読めなくなる)。
 
-use std::sync::Arc;
-
 use axum::extract::Query;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -47,7 +58,6 @@ use serde::Deserialize;
 use sqlx::Row;
 
 use crate::kintai_push::KintaiPgStore;
-use crate::kyuyo::introspect::{authorize, KyuyoAuthState};
 use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
 use crate::wage_snapshot::{
     add_months, aggregate_range, normalize_ts, resolve_months, rows_equal, validate_snapshot,
@@ -107,10 +117,11 @@ SELECT $1, $2, $3, $4, d.driver_cd, d.driver_name, d.company, d.branch_name,
        d.branch_code, d.job_name, d.pay_kubun, d.hourly_rate,
        d.calc_base, d.calc_overtime, d.calc_total, d.paid_base, d.paid_overtime,
        d.working_minutes, d.restraint_missing,
-       $5, $6, $7, $8, now()
-  FROM unnest($9::int8[], $10::text[], $11::text[], $12::text[], $13::int4[],
-              $14::text[], $15::int2[], $16::int4[], $17::int4[], $18::int4[],
-              $19::int4[], $20::int4[], $21::int4[], $22::int4[], $23::bool[])
+       -- min_wage_sha は常に NULL (2026-08-05 に廃止、`crate::wage_snapshot` の docs 参照)
+       $5, NULL, $6, $7, now()
+  FROM unnest($8::int8[], $9::text[], $10::text[], $11::text[], $12::int4[],
+              $13::text[], $14::int2[], $15::int4[], $16::int4[], $17::int4[],
+              $18::int4[], $19::int4[], $20::int4[], $21::int4[], $22::bool[])
        AS d(driver_cd, driver_name, company, branch_name, branch_code, job_name,
             pay_kubun, hourly_rate, calc_base, calc_overtime, calc_total,
             paid_base, paid_overtime, working_minutes, restraint_missing)
@@ -122,7 +133,7 @@ SELECT to_char(ym, 'YYYY-MM') AS ym,
        driver_cd, driver_name, company, branch_name, branch_code, job_name,
        pay_kubun, hourly_rate, calc_base, calc_overtime, calc_total,
        paid_base, paid_overtime, working_minutes, restraint_missing,
-       salary_item_sha, min_wage_sha, payroll_synced_at, wage_logic_version, computed_at
+       salary_item_sha, payroll_synced_at, wage_logic_version, computed_at
   FROM kintai.wage_snapshot
  WHERE tenant_id = $1 AND comp_id = $2 AND restraint_source = $3
    AND ym >= $4 AND ym < $5
@@ -162,7 +173,6 @@ fn to_fetched(r: &sqlx::postgres::PgRow) -> FetchedRow {
         },
         masters: MonthMasters {
             salary_item_sha: r.get("salary_item_sha"),
-            min_wage_sha: r.get("min_wage_sha"),
             payroll_synced_at: synced.map(|t| t.to_rfc3339()),
         },
         wage_logic_version: r.get("wage_logic_version"),
@@ -181,15 +191,12 @@ fn parse_synced_at(s: Option<&String>) -> Result<Option<DateTime<Utc>>, (StatusC
     }
 }
 
-/// POST /api/kyuyo/wage-snapshot — 1 か月ぶんを置き換え保存する。
+/// POST /api/kintai/wage-snapshot — 1 か月ぶんを置き換え保存する。
 pub async fn put_wage_snapshot(
     Extension(pg): Extension<DynKintaiPgStore>,
     Extension(read_tenant): Extension<ReadTenant>,
-    Extension(auth): Extension<Arc<KyuyoAuthState>>,
-    headers: HeaderMap,
     Json(req): Json<SnapshotRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    authorize(&headers, &auth).await?;
     let valid = validate_snapshot(req).map_err(bad_request)?;
     let synced_at = parse_synced_at(valid.masters.payroll_synced_at.as_ref())?;
     let store = store(&pg)?;
@@ -277,7 +284,6 @@ async fn write_month(
             .bind(valid.ym)
             .bind(&valid.restraint_source)
             .bind(valid.masters.salary_item_sha.as_deref())
-            .bind(valid.masters.min_wage_sha.as_deref())
             .bind(synced_at)
             .bind(&valid.wage_logic_version)
             .bind(&driver_cd)
@@ -311,20 +317,16 @@ pub struct RangeQuery {
     pub to: Option<String>,
     pub source: Option<String>,
     pub salary_item_sha: Option<String>,
-    pub min_wage_sha: Option<String>,
     pub wage_logic_version: Option<String>,
     pub payroll_synced_at: Option<String>,
 }
 
-/// GET /api/kyuyo/wage-range — 期間の月別 + 合計 + カバレッジ。
+/// GET /api/kintai/wage-range — 期間の月別 + 合計 + カバレッジ。
 pub async fn wage_range(
     Query(q): Query<RangeQuery>,
     Extension(pg): Extension<DynKintaiPgStore>,
     Extension(read_tenant): Extension<ReadTenant>,
-    Extension(auth): Extension<Arc<KyuyoAuthState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    authorize(&headers, &auth).await?;
     let comp = q.comp.as_deref().unwrap_or("").trim().to_string();
     if comp.is_empty() {
         return Err(bad_request("comp は必須です"));
@@ -356,7 +358,6 @@ pub async fn wage_range(
     let buckets = to_buckets(&months, fetched.iter().map(to_fetched));
     let current = CurrentVersions {
         salary_item_sha: q.salary_item_sha.clone(),
-        min_wage_sha: q.min_wage_sha.clone(),
         wage_logic_version: q.wage_logic_version.clone(),
         // 画面が送ってくる時刻も保存側と同じ正規化を通す (表記揺れで常に stale に
         // なるのを防ぐ)。形が違う時は判定材料にしない
