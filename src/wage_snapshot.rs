@@ -294,10 +294,21 @@ pub fn stale_reasons(
 
 /// その月が「給与を取り込んでいない」か。
 ///
-/// 同期時刻が無い、または保存された全行の `paid_base` が NULL なら未取込とみなす。
-/// **0 円と NULL は別物** — 全員が本当に 0 円の月は無いので、全行 NULL は取り込み漏れ。
+/// **判定は保存された金額だけで行う** — 全行の `paid_base` が NULL なら未取込。
+/// **0 円と NULL は別物**で、全員が本当に 0 円の月は無いので、全行 NULL は取り込み漏れ。
+///
+/// ## `payroll_synced_at` を判定に混ぜない (2026-08-05 の修正)
+///
+/// 当初は「同期時刻が無ければ未取込」も条件に入れていたが、**本番で全月が集計から
+/// 消えた**。同期時刻は画面が突合に使った給与明細から拾う鮮度メタで、
+/// 給与額そのものが入っていても取れないことがある (画面のキャッシュに古い形の
+/// 明細が残っている等)。
+///
+/// **鮮度メタの欠落は「古いかもしれない」であって「データが無い」ではない。**
+/// 混ぜると、金額が入っているのに月ごと集計から外れる — 実際の支払い不足を
+/// 見落とす方向の誤りなので、判定は金額の有無だけに寄せる。
 pub fn month_payroll_missing(bucket: &MonthBucket) -> bool {
-    bucket.masters.payroll_synced_at.is_none() || bucket.rows.iter().all(|r| r.paid_base.is_none())
+    bucket.rows.iter().all(|r| r.paid_base.is_none())
 }
 
 /// 月ごとの状態 (画面のカバレッジバー)。
@@ -771,19 +782,26 @@ mod tests {
     }
 
     #[test]
-    fn payroll_missing_when_no_sync_time_or_all_rows_null() {
-        let mut b = bucket(vec![row(1)]);
+    fn payroll_missing_only_when_every_row_lacks_pay() {
+        let b = bucket(vec![row(1)]);
         assert!(!month_payroll_missing(&b));
-
-        b.masters.payroll_synced_at = None;
-        assert!(month_payroll_missing(&b));
 
         let mut b = bucket(vec![WageSnapshotRow {
             paid_base: None,
             ..row(1)
         }]);
         assert!(month_payroll_missing(&b));
+        // 1 人でも金額が入っていれば取り込み済み
         b.rows.push(row(2));
+        assert!(!month_payroll_missing(&b));
+    }
+
+    /// **鮮度メタの欠落を「データが無い」と読まない** (2026-08-05 に本番で全月が
+    /// 集計から消えた)。同期時刻が取れなくても金額が入っていれば集計する。
+    #[test]
+    fn payroll_present_even_without_sync_time() {
+        let mut b = bucket(vec![row(1)]);
+        b.masters.payroll_synced_at = None;
         assert!(!month_payroll_missing(&b));
     }
 
@@ -839,11 +857,17 @@ mod tests {
     }
 
     /// 給与未取込の月は**そもそも集計に出さない** (ユーザー決定 2026-08-05)。
+    ///
+    /// 「未取込」の判定は**金額の有無だけ** — 全行の `paid_base` が NULL の月。
+    /// 同期時刻の欠落では外さない ([`month_payroll_missing`] の docs 参照)。
     #[test]
     fn aggregate_excludes_months_without_payroll() {
         let months = vec![ym(2026, 1), ym(2026, 2)];
-        let mut no_payroll = bucket(vec![row(1035)]);
-        no_payroll.masters.payroll_synced_at = None;
+        let no_payroll = bucket(vec![WageSnapshotRow {
+            paid_base: None,
+            paid_overtime: None,
+            ..row(1035)
+        }]);
         let buckets = vec![Some(bucket(vec![row(1035)])), Some(no_payroll)];
         let agg = aggregate_range(&months, &buckets, &CurrentVersions::default());
 
@@ -851,6 +875,20 @@ mod tests {
         assert_eq!(agg.months[1].drivers, 0);
         assert_eq!(agg.rows[0].months_counted, 1);
         assert_eq!(agg.rows[0].calc_total, 280_000);
+    }
+
+    /// **同期時刻が取れなくても、金額が入っていれば集計する** (2026-08-05 の本番事故)。
+    /// 混同していたせいで、給与が入っている月まで全部「給与未取込」で消えていた。
+    #[test]
+    fn aggregate_keeps_months_whose_sync_time_is_unknown() {
+        let months = vec![ym(2026, 1)];
+        let mut no_sync = bucket(vec![row(1035)]);
+        no_sync.masters.payroll_synced_at = None;
+        let agg = aggregate_range(&months, &[Some(no_sync)], &CurrentVersions::default());
+
+        assert!(agg.months[0].excluded.is_none());
+        assert_eq!(agg.months[0].drivers, 1);
+        assert_eq!(agg.rows[0].months_counted, 1);
     }
 
     /// 欠測・単価未設定・その人だけ給与に無い月は、その人の集計だけから外れる。
