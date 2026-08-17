@@ -675,4 +675,12 @@ mod tests {
             .await
             .is_ok());
     }
+
+    #[test]
+    fn the_remaining_errors_are_displayed() {
+        // 上の検証テストは変種を matches! で見ているだけなので、文面はここで押さえる
+        // (Display の腕は呼ばないと行カバレッジに乗らない)。
+        assert!(CfAccessError::BadKey.to_string().contains("鍵成分"));
+        assert!(CfAccessError::Rejected.to_string().contains("検証"));
+    }
 }
