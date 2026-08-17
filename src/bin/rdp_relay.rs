@@ -13,11 +13,21 @@
 //!
 //! ## 誰を通すか
 //!
-//! `serve` は loopback に張り、公開は前段の Cloudflare Tunnel + Access に任せる。
-//! ただし Access を通ったことを**中継自身が確かめる**: `/rdp` は
-//! `Cf-Access-Jwt-Assertion` を team の JWKS で検証し、通らなければ 401 で閉じる
-//! (`rust_ichibanboshi::cf_access`)。Access の設定漏れやヘッダ偽装で素通りさせないため。
-//! `/health` だけは deploy の疎通確認 (localhost 直叩き) が要るので素通し。
+//! ブラウザがどう届くかで 2 通りあり、`--auth` で選ぶ。**どちらも「中継が公開の口を
+//! 素通しで持つ」ことはない。**
+//!
+//! - `cf-access` … 中継自身を公開ホスト名で出し、前段の Cloudflare Access が利用者を
+//!   認証する。中継は Access を通ったことを**自分で確かめる**: `/rdp` は
+//!   `Cf-Access-Jwt-Assertion` を team の JWKS で検証し、通らなければ 401 で閉じる
+//!   (`rust_ichibanboshi::cf_access`)。設定漏れやヘッダ偽装で素通りさせないため
+//! - `vpc` … 中継に公開ホスト名を与えず、Workers VPC の binding 経由でだけ届かせる。
+//!   利用者の認証は**アプリ側の Worker が自分のセッションで**行い、中継はそこから
+//!   来た要求だけを受ける。Access は経路に居ないのでヘッダを要求しない
+//!
+//! ブラウザの WebSocket はヘッダを足せず、Access の cookie も別オリジンには飛ばない。
+//! アプリに埋め込む (別オリジンになる) 構成では `vpc` を使う。
+//!
+//! `/health` はどちらでも素通し。deploy の疎通確認が localhost から叩くため。
 //!
 //! プロトコルの解釈は `rust_ichibanboshi::rdp_nego` に閉じている。ここは I/O だけを持つ。
 
@@ -30,7 +40,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse as _;
 use axum::routing::get;
 use axum::Router;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt as _, StreamExt as _};
 use ironrdp_pdu::nego::SecurityProtocol;
 use rust_ichibanboshi::cf_access::CfAccessVerifier;
@@ -83,16 +93,20 @@ enum Command {
         #[arg(long)]
         allow: Vec<String>,
 
+        /// 誰を通すか。経路の作りに合わせて選ぶ (モジュール冒頭の説明を参照)。
+        #[arg(long, value_enum, default_value_t = AuthMode::CfAccess, env = "RDP_RELAY_AUTH")]
+        auth: AuthMode,
+
         /// Cloudflare Access の team ドメイン。例: example.cloudflareaccess.com
         /// (team 名だけでもよい)。JWKS と期待する iss の出所になる。
-        /// systemd では EnvironmentFile から渡す。
+        /// `--auth cf-access` のときだけ要る。systemd では EnvironmentFile から渡す。
         #[arg(long, env = "CF_ACCESS_TEAM_DOMAIN")]
-        cf_access_team_domain: String,
+        cf_access_team_domain: Option<String>,
 
         /// Access アプリの AUD タグ。これを固定しないと同じ team の別アプリの
-        /// トークンで入られる。systemd では EnvironmentFile から渡す。
+        /// トークンで入られる。`--auth cf-access` のときだけ要る。
         #[arg(long, env = "CF_ACCESS_AUD")]
-        cf_access_aud: String,
+        cf_access_aud: Option<String>,
 
         /// RDS への接続と読み取りの制限時間 (秒)。
         #[arg(long, default_value_t = 10)]
@@ -162,6 +176,7 @@ async fn main() -> Result<(), BoxError> {
         Command::Serve {
             bind,
             allow,
+            auth,
             cf_access_team_domain,
             cf_access_aud,
             timeout,
@@ -169,6 +184,7 @@ async fn main() -> Result<(), BoxError> {
             serve(ServeOptions {
                 bind,
                 allow,
+                auth,
                 team_domain: cf_access_team_domain,
                 aud: cf_access_aud,
                 timeout: Duration::from_secs(timeout),
@@ -181,12 +197,22 @@ async fn main() -> Result<(), BoxError> {
 /// Cloudflare Access が origin へ挿してくるヘッダ。
 const ACCESS_JWT_HEADER: &str = "cf-access-jwt-assertion";
 
+/// 中継の入口を誰に開けるか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AuthMode {
+    /// 前段の Cloudflare Access を中継自身で検証する (公開ホスト名で出す構成)。
+    CfAccess,
+    /// Workers VPC の binding 経由でだけ届く前提。認証はアプリ側の Worker が持つ。
+    Vpc,
+}
+
 /// `serve` の起動引数。
 struct ServeOptions {
     bind: String,
     allow: Vec<String>,
-    team_domain: String,
-    aud: String,
+    auth: AuthMode,
+    team_domain: Option<String>,
+    aud: Option<String>,
     timeout: Duration,
 }
 
@@ -195,8 +221,9 @@ struct ServeOptions {
 struct RelayState {
     /// 繋いでよい RDS の集合。空なら誰にも繋がない (安全側に倒す)。
     allow: Arc<Vec<String>>,
-    /// 入口で Access トークンを検証する。
-    verifier: CfAccessVerifier,
+    /// 入口で Access トークンを検証する。`--auth vpc` では持たない
+    /// (Access が経路に居ないため。誰を通すかは前段の Worker が決める)。
+    verifier: Option<CfAccessVerifier>,
     timeout: Duration,
 }
 
@@ -216,9 +243,29 @@ async fn serve(options: ServeOptions) -> Result<(), BoxError> {
         );
     }
 
+    // 設定不足は起動時に鳴らす (`--allow` 未指定を拒否するのと同じ姿勢)。
+    // 黙って上がって全部 401 になる方が、切り分けがはるかに難しい。
+    let verifier = match options.auth {
+        AuthMode::CfAccess => {
+            let team = options
+                .team_domain
+                .ok_or("--auth cf-access には CF_ACCESS_TEAM_DOMAIN が要る")?;
+            let aud = options
+                .aud
+                .ok_or("--auth cf-access には CF_ACCESS_AUD が要る")?;
+            let verifier = CfAccessVerifier::new(&team, aud)?;
+            tracing::info!("入口: Access を検証する (team {team})");
+            Some(verifier)
+        }
+        AuthMode::Vpc => {
+            tracing::info!("入口: Workers VPC 経由のみ (Access は経路外)");
+            None
+        }
+    };
+
     let state = RelayState {
         allow: Arc::new(options.allow),
-        verifier: CfAccessVerifier::new(&options.team_domain, options.aud)?,
+        verifier,
         timeout: options.timeout,
     };
 
@@ -231,7 +278,6 @@ async fn serve(options: ServeOptions) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(&options.bind).await?;
     tracing::info!("中継を開始: ws://{}/rdp", options.bind);
     tracing::info!("繋ぎ先: {}", state.allow.join(", "));
-    tracing::info!("Access の team: {}", options.team_domain);
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -244,17 +290,21 @@ async fn ws_upgrade(
 ) -> axum::response::Response {
     tracing::info!("WebSocket の接続要求を受けた");
 
-    // 前段の Access を通ったことを中継自身で確かめる。ヘッダの有無だけでは信用しない。
-    let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else {
-        tracing::warn!("Access トークンの無い要求を拒否");
-        return (StatusCode::UNAUTHORIZED, "Cf-Access-Jwt-Assertion が無い").into_response();
-    };
+    // `--auth vpc` では検証器を持たない。Access が経路に居ないので、ここで
+    // ヘッダを要求すると誰も通れなくなる。誰を通すかは前段の Worker が決める。
+    if let Some(verifier) = &state.verifier {
+        // Access を通ったことを中継自身で確かめる。ヘッダの有無だけでは信用しない。
+        let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else {
+            tracing::warn!("Access トークンの無い要求を拒否");
+            return (StatusCode::UNAUTHORIZED, "Cf-Access-Jwt-Assertion が無い").into_response();
+        };
 
-    match state.verifier.verify(token).await {
-        Ok(identity) => tracing::info!("Access 検証を通った: {}", identity.subject),
-        Err(e) => {
-            tracing::warn!("Access 検証で拒否: {e}");
-            return (StatusCode::UNAUTHORIZED, "Access トークンが通らない").into_response();
+        match verifier.verify(token).await {
+            Ok(identity) => tracing::info!("Access 検証を通った: {}", identity.subject),
+            Err(e) => {
+                tracing::warn!("Access 検証で拒否: {e}");
+                return (StatusCode::UNAUTHORIZED, "Access トークンが通らない").into_response();
+            }
         }
     }
 
