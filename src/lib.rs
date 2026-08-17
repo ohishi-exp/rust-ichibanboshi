@@ -1,4 +1,5 @@
 pub mod cakephp;
+pub mod cf_access;
 pub mod config;
 pub mod db;
 pub mod dtako_reset_material;
@@ -16,6 +17,8 @@ pub mod kintai_version;
 pub mod kosoku;
 pub mod kosoku_paper;
 pub mod kyuyo;
+pub mod rdcleanpath;
+pub mod rdp_nego;
 pub mod repo;
 pub mod restraint_store;
 pub mod routes;

@@ -8,6 +8,12 @@ description = "一番星 SQL Server sales data API — Windows Service with Clou
 name = "ichibanboshi"
 path = "src/main.rs"
 
+# RDP 中継 (ブラウザ ↔ RDS)。ohishi-data 上で ichibanboshi と並べて動かす。
+# 詳細は docs/plan-ironrdp-rail.md。
+[[bin]]
+name = "rdp-relay"
+path = "src/bin/rdp_relay.rs"
+
 [lib]
 name = "rust_ichibanboshi"
 path = "src/lib.rs"
@@ -16,7 +22,8 @@ path = "src/lib.rs"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-axum = "0.8"
+futures-util = "0.3"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
 bb8 = "0.8"
@@ -24,7 +31,9 @@ bb8-tiberius = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
+# env: rdp-relay の Access 設定 (team ドメイン / AUD) を systemd の EnvironmentFile から
+# 受けるため。site 固有の値を unit ファイルにも repo にも置かずに済む
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -46,6 +55,19 @@ sha2 = "0.10"
 mysql_async = { version = "0.37.0", default-features = false, features = ["minimal-rust"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
 
+# RDP 中継用。ironrdp は RDP の PDU 定義をそのまま借りる (自前で組み立て直さない)。
+# rustls は既定の aws-lc-rs ではなく ring を明示する — musl static build を維持するため
+# (既存の reqwest / sqlx / tiberius も rustls-tls で openssl を避けている)。
+ironrdp-core = "0.2"
+ironrdp-pdu = "0.9"
+ironrdp-rdcleanpath = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# 中継の入口で Cloudflare Access の JWT (Cf-Access-Jwt-Assertion) を検証する (cf_access.rs)。
+# ring 実装なので openssl を引き込まない。先例は rust-alc-api の
+# crates/alc-core/src/auth_google.rs (Google OIDC を同じ形で検証、100% 登録済み)
+jsonwebtoken = "9"
+
 [build-dependencies]
 # build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ、Refs #191)
 sha2 = "0.10"
@@ -55,8 +77,12 @@ windows-service = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-# CakePHP fetch を stub する HTTP mock (Phase 2 /recalc 統合テスト)
+# CakePHP fetch を stub する HTTP mock (Phase 2 /recalc 統合テスト、cf_access の JWKS stub)
 wiremock = "0.6"
+# cf_access のテストで RSA 鍵を起こし、JWKS (n, e) と署名済みトークンを自作するため。
+# 本体は検証しかしないので dev 限定 (先例: rust-alc-api crates/alc-core)
+rsa = "0.9"
+base64 = "0.22"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }

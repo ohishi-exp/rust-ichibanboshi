@@ -15,4 +15,9 @@ cargo build --release --target x86_64-unknown-linux-musl
 export DEPLOY_SSH_HOST="${DEPLOY_SSH_HOST:-ohishi-data.tailea945d.ts.net}"
 export DEPLOY_SSH_USER="${DEPLOY_SSH_USER:-ubuntu}"
 
+# RDP 中継も一緒に運ぶ (上の cargo build が [[bin]] を全部作っている)。
+# health は unit をホストに入れてから: DEPLOY_EXTRA_HEALTH_PORT=3390 を足す。
+export DEPLOY_EXTRA_BINARY="${DEPLOY_EXTRA_BINARY:-target/x86_64-unknown-linux-musl/release/rdp-relay}"
+export DEPLOY_EXTRA_NAME="${DEPLOY_EXTRA_NAME:-rdp-relay}"
+
 exec bash scripts/deploy-remote.sh
