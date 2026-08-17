@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart rdp-relay after binary update
+
+[Service]
+Type=oneshot
+# scp → mv の直後に走らないよう少し待つ (ichibanboshi-watcher.service と同じ型)。
+ExecStartPre=/bin/sleep 2
+ExecStart=/bin/systemctl restart rdp-relay

@@ -1,0 +1,37 @@
+[Unit]
+Description=Ichibanboshi RDP Relay - ブラウザ ↔ RDS の RDCleanPath 中継
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# team ドメインと Access アプリの AUD タグは site 固有なので repo に置かない。
+# CF_ACCESS_TEAM_DOMAIN / CF_ACCESS_AUD を置くこと (雛形: rdp-relay.env.example)。
+# `-` を付けていないので **ファイルが無ければ起動しない** (無認証で上がるより落ちる方を選ぶ)。
+EnvironmentFile=/etc/ichibanboshi/rdp-relay.env
+# --bind: loopback のみ。公開は前段の cloudflared (同じホスト上) に任せる。
+#   0.0.0.0 にすると社内 LAN 全体へ晒されるので広げない。
+# --allow: ブラウザに任意の宛先を指定させないための allowlist。未指定だと起動を拒否する。
+ExecStart=/opt/ichibanboshi/rdp-relay serve \
+    --bind 127.0.0.1:3390 \
+    --allow 172.18.21.102:3389
+WorkingDirectory=/opt/ichibanboshi
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+Group=ubuntu
+
+# 中継は外から繋がれる口なので、既存の ichibanboshi (User=root) より絞る。
+# ログは stdout → journal なので書き込み先は要らない。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# AF_UNIX / AF_NETLINK も残す。JWKS 取得の名前解決で使われうるものを塞ぐと
+# 「Access 検証だけが無音で全部 401」という切り分けの難しい壊れ方をする
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
