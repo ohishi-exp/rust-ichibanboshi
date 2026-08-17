@@ -1,4 +1,5 @@
 pub mod cakephp;
+pub mod cf_access;
 pub mod config;
 pub mod db;
 pub mod dtako_reset_material;

@@ -73,6 +73,12 @@ path = "src/kintai_tail_gap_probe.rs"
 [[files]]
 path = "src/rdp_nego.rs"
 
+# RDP 中継の入口で Cloudflare Access の JWT を検証する。JWKS の取得だけが I/O で、
+# wiremock で差し替えられる形にしてある (テスト内で RSA 鍵を起こして署名する)。
+# 先例は rust-alc-api の crates/alc-core/src/auth_google.rs (同じ形で 100% 登録済み)
+[[files]]
+path = "src/cf_access.rs"
+
 # --- 給与 (給与大臣) ---
 
 [[files]]

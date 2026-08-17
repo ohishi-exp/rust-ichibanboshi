@@ -5,10 +5,19 @@
 //! 代わりに張る」中継が必ず要る。この bin がそれになる。
 //!
 //! 置き場所は `ohishi-data` — 社内 LAN 側にあり RDS (172.18.21.102:3389) へ直接届くため、
-//! 経路が 1 段減る。既存の `ichibanboshi` サービスと同じ systemd の型で動かす。
+//! 経路が 1 段減る。既存の `ichibanboshi` サービスと同じ systemd の型で動かす
+//! (`deploy/rdp-relay.service`)。
 //!
-//! いまは `probe` だけ。「Rust から X.224 → TLS を張れるか」を実機に対して確かめる段階で、
-//! RDCleanPath と WebSocket はこの上に積む。
+//! 口は 2 つ。`probe` が「Rust から X.224 → TLS を張れるか」を実機に対して確かめる用、
+//! `serve` が本番の中継。
+//!
+//! ## 誰を通すか
+//!
+//! `serve` は loopback に張り、公開は前段の Cloudflare Tunnel + Access に任せる。
+//! ただし Access を通ったことを**中継自身が確かめる**: `/rdp` は
+//! `Cf-Access-Jwt-Assertion` を team の JWKS で検証し、通らなければ 401 で閉じる
+//! (`rust_ichibanboshi::cf_access`)。Access の設定漏れやヘッダ偽装で素通りさせないため。
+//! `/health` だけは deploy の疎通確認 (localhost 直叩き) が要るので素通し。
 //!
 //! プロトコルの解釈は `rust_ichibanboshi::rdp_nego` に閉じている。ここは I/O だけを持つ。
 
@@ -17,11 +26,14 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse as _;
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt as _, StreamExt as _};
 use ironrdp_pdu::nego::SecurityProtocol;
+use rust_ichibanboshi::cf_access::CfAccessVerifier;
 use rust_ichibanboshi::rdcleanpath::{
     build_general_error, build_negotiation_error, build_response, detect_pdu, parse_request,
     RelayRequest,
@@ -62,13 +74,24 @@ enum Command {
     /// 中継を起動する。ブラウザ (IronRDP/WASM) が WebSocket で繋いでくる。
     Serve {
         /// 待ち受けアドレス。既定は loopback のみ
-        /// (公開は tailscale serve か Cloudflare Tunnel 側で行う)。
+        /// (公開は前段の Cloudflare Tunnel が行う)。
         #[arg(long, default_value = "127.0.0.1:3390")]
         bind: String,
 
         /// 繋いでよい RDS。ブラウザから任意の宛先を指定させないための allowlist。
         #[arg(long)]
         allow: Vec<String>,
+
+        /// Cloudflare Access の team ドメイン。例: example.cloudflareaccess.com
+        /// (team 名だけでもよい)。JWKS と期待する iss の出所になる。
+        /// systemd では EnvironmentFile から渡す。
+        #[arg(long, env = "CF_ACCESS_TEAM_DOMAIN")]
+        cf_access_team_domain: String,
+
+        /// Access アプリの AUD タグ。これを固定しないと同じ team の別アプリの
+        /// トークンで入られる。systemd では EnvironmentFile から渡す。
+        #[arg(long, env = "CF_ACCESS_AUD")]
+        cf_access_aud: String,
 
         /// RDS への接続と読み取りの制限時間 (秒)。
         #[arg(long, default_value_t = 10)]
@@ -138,9 +161,32 @@ async fn main() -> Result<(), BoxError> {
         Command::Serve {
             bind,
             allow,
+            cf_access_team_domain,
+            cf_access_aud,
             timeout,
-        } => serve(&bind, allow, Duration::from_secs(timeout)).await,
+        } => {
+            serve(ServeOptions {
+                bind,
+                allow,
+                team_domain: cf_access_team_domain,
+                aud: cf_access_aud,
+                timeout: Duration::from_secs(timeout),
+            })
+            .await
+        }
     }
+}
+
+/// Cloudflare Access が origin へ挿してくるヘッダ。
+const ACCESS_JWT_HEADER: &str = "cf-access-jwt-assertion";
+
+/// `serve` の起動引数。
+struct ServeOptions {
+    bind: String,
+    allow: Vec<String>,
+    team_domain: String,
+    aud: String,
+    timeout: Duration,
 }
 
 /// 中継の設定。WebSocket ハンドラへ共有する。
@@ -148,26 +194,12 @@ async fn main() -> Result<(), BoxError> {
 struct RelayState {
     /// 繋いでよい RDS の集合。空なら誰にも繋がない (安全側に倒す)。
     allow: Arc<Vec<String>>,
+    /// 入口で Access トークンを検証する。
+    verifier: CfAccessVerifier,
     timeout: Duration,
 }
 
-async fn serve(bind: &str, allow: Vec<String>, timeout: Duration) -> Result<(), BoxError> {
-    if allow.is_empty() {
-        return Err(
-            "--allow で繋ぎ先を 1 つ以上指定すること (例: --allow 172.18.21.102:3389)".into(),
-        );
-    }
-
-    let state = RelayState {
-        allow: Arc::new(allow),
-        timeout,
-    };
-
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/rdp", get(ws_upgrade))
-        .with_state(state.clone());
-
+async fn serve(options: ServeOptions) -> Result<(), BoxError> {
     // 何も繋がらないときに「届いていないのか、落ちているのか」を切り分けられないと詰むので、
     // 中継は経過をログに出す。既定は info。
     tracing_subscriber::fmt()
@@ -177,9 +209,28 @@ async fn serve(bind: &str, allow: Vec<String>, timeout: Duration) -> Result<(), 
         )
         .init();
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!("中継を開始: ws://{bind}/rdp");
+    if options.allow.is_empty() {
+        return Err(
+            "--allow で繋ぎ先を 1 つ以上指定すること (例: --allow 172.18.21.102:3389)".into(),
+        );
+    }
+
+    let state = RelayState {
+        allow: Arc::new(options.allow),
+        verifier: CfAccessVerifier::new(&options.team_domain, options.aud)?,
+        timeout: options.timeout,
+    };
+
+    let app = Router::new()
+        // deploy の疎通確認が localhost から叩く。Access の検証は掛けない。
+        .route("/health", get(|| async { "ok" }))
+        .route("/rdp", get(ws_upgrade))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind(&options.bind).await?;
+    tracing::info!("中継を開始: ws://{}/rdp", options.bind);
     tracing::info!("繋ぎ先: {}", state.allow.join(", "));
+    tracing::info!("Access の team: {}", options.team_domain);
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -188,8 +239,24 @@ async fn serve(bind: &str, allow: Vec<String>, timeout: Duration) -> Result<(), 
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<RelayState>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
     tracing::info!("WebSocket の接続要求を受けた");
+
+    // 前段の Access を通ったことを中継自身で確かめる。ヘッダの有無だけでは信用しない。
+    let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else {
+        tracing::warn!("Access トークンの無い要求を拒否");
+        return (StatusCode::UNAUTHORIZED, "Cf-Access-Jwt-Assertion が無い").into_response();
+    };
+
+    match state.verifier.verify(token).await {
+        Ok(identity) => tracing::info!("Access 検証を通った: {}", identity.subject),
+        Err(e) => {
+            tracing::warn!("Access 検証で拒否: {e}");
+            return (StatusCode::UNAUTHORIZED, "Access トークンが通らない").into_response();
+        }
+    }
+
     ws.on_upgrade(move |socket| async move {
         match relay_session(socket, state).await {
             Ok(()) => tracing::info!("中継セッション終了"),
