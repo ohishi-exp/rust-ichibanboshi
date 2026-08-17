@@ -22,7 +22,8 @@ path = "src/lib.rs"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-axum = "0.8"
+futures-util = "0.3"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
 bb8 = "0.8"
@@ -57,6 +58,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # (既存の reqwest / sqlx / tiberius も rustls-tls で openssl を避けている)。
 ironrdp-core = "0.2"
 ironrdp-pdu = "0.9"
+ironrdp-rdcleanpath = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 

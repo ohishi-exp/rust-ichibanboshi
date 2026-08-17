@@ -16,6 +16,7 @@ pub mod kintai_version;
 pub mod kosoku;
 pub mod kosoku_paper;
 pub mod kyuyo;
+pub mod rdcleanpath;
 pub mod rdp_nego;
 pub mod repo;
 pub mod restraint_store;

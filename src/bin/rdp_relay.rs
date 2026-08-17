@@ -15,8 +15,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::routing::get;
+use axum::Router;
 use clap::{Parser, Subcommand};
+use futures_util::{SinkExt as _, StreamExt as _};
 use ironrdp_pdu::nego::SecurityProtocol;
+use rust_ichibanboshi::rdcleanpath::{
+    build_general_error, build_negotiation_error, build_response, detect_pdu, parse_request,
+    RelayRequest,
+};
 use rust_ichibanboshi::rdp_nego::{
     build_connection_request, needs_tls, parse_connection_confirm, tpkt_frame_len, TPKT_HEADER_LEN,
 };
@@ -25,6 +34,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -45,6 +55,22 @@ enum Command {
         target: String,
 
         /// 接続と読み取りの制限時間 (秒)。
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
+
+    /// 中継を起動する。ブラウザ (IronRDP/WASM) が WebSocket で繋いでくる。
+    Serve {
+        /// 待ち受けアドレス。既定は loopback のみ
+        /// (公開は tailscale serve か Cloudflare Tunnel 側で行う)。
+        #[arg(long, default_value = "127.0.0.1:3390")]
+        bind: String,
+
+        /// 繋いでよい RDS。ブラウザから任意の宛先を指定させないための allowlist。
+        #[arg(long)]
+        allow: Vec<String>,
+
+        /// RDS への接続と読み取りの制限時間 (秒)。
         #[arg(long, default_value_t = 10)]
         timeout: u64,
     },
@@ -109,7 +135,207 @@ async fn main() -> Result<(), BoxError> {
 
     match cli.command {
         Command::Probe { target, timeout } => probe(&target, Duration::from_secs(timeout)).await,
+        Command::Serve {
+            bind,
+            allow,
+            timeout,
+        } => serve(&bind, allow, Duration::from_secs(timeout)).await,
     }
+}
+
+/// 中継の設定。WebSocket ハンドラへ共有する。
+#[derive(Clone)]
+struct RelayState {
+    /// 繋いでよい RDS の集合。空なら誰にも繋がない (安全側に倒す)。
+    allow: Arc<Vec<String>>,
+    timeout: Duration,
+}
+
+async fn serve(bind: &str, allow: Vec<String>, timeout: Duration) -> Result<(), BoxError> {
+    if allow.is_empty() {
+        return Err(
+            "--allow で繋ぎ先を 1 つ以上指定すること (例: --allow 172.18.21.102:3389)".into(),
+        );
+    }
+
+    let state = RelayState {
+        allow: Arc::new(allow),
+        timeout,
+    };
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/rdp", get(ws_upgrade))
+        .with_state(state.clone());
+
+    // 何も繋がらないときに「届いていないのか、落ちているのか」を切り分けられないと詰むので、
+    // 中継は経過をログに出す。既定は info。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("中継を開始: ws://{bind}/rdp");
+    tracing::info!("繋ぎ先: {}", state.allow.join(", "));
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<RelayState>,
+) -> axum::response::Response {
+    tracing::info!("WebSocket の接続要求を受けた");
+    ws.on_upgrade(move |socket| async move {
+        match relay_session(socket, state).await {
+            Ok(()) => tracing::info!("中継セッション終了"),
+            Err(e) => tracing::warn!("中継セッション異常終了: {e}"),
+        }
+    })
+}
+
+/// 1 本の WebSocket を最後まで面倒みる。
+///
+/// 前半が RDCleanPath のハンドシェイク (1 往復)、後半は素の RDP を右から左へ流すだけ。
+async fn relay_session(mut socket: WebSocket, state: RelayState) -> Result<(), BoxError> {
+    // --- 前半: RDCleanPath ---
+    let request = read_rdcleanpath_request(&mut socket).await?;
+    tracing::info!("RDCleanPath 要求を受理: 宛先 {}", request.destination);
+
+    if !state.allow.iter().any(|a| a == &request.destination) {
+        tracing::warn!("許可されていない宛先を拒否: {}", request.destination);
+        let _ = socket
+            .send(Message::Binary(build_general_error()?.into()))
+            .await;
+        return Err(format!("許可されていない宛先: {}", request.destination).into());
+    }
+
+    let mut stream =
+        tokio::time::timeout(state.timeout, TcpStream::connect(&request.destination)).await??;
+
+    // ブラウザが組み立てた X.224 要求をそのまま流す。中継は中身を作り変えない。
+    stream.write_all(&request.x224_connection_request).await?;
+    let confirm = read_x224_frame(&mut stream, state.timeout).await?;
+
+    // 蹴られたなら、その接続確認をそのまま返す。理由はブラウザ側で解釈させる。
+    if parse_connection_confirm(&confirm).is_err() {
+        socket
+            .send(Message::Binary(build_negotiation_error(confirm)?.into()))
+            .await?;
+        return Err("RDS が接続を蹴った".into());
+    }
+
+    tracing::info!("X.224 交渉が成立、TLS を張る: {}", request.destination);
+    let tls = tls_connect(stream).await?;
+    let chain = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .map(|certs| certs.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    // 証明書を返さないとブラウザは NLA (CredSSP) に進めない。
+    let response = build_response(&request.destination, confirm, chain)?;
+    socket.send(Message::Binary(response.into())).await?;
+    tracing::info!("RDCleanPath ハンドシェイク完了、素の RDP を流し始める");
+
+    // --- 後半: 素の RDP を双方向に流す ---
+    pump(socket, tls).await
+}
+
+/// WebSocket から RDCleanPath の要求を 1 つ読む。
+///
+/// WebSocket のフレーム境界と PDU の境界は一致しないので、揃うまで溜める。
+async fn read_rdcleanpath_request(socket: &mut WebSocket) -> Result<RelayRequest, BoxError> {
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(message) = socket.recv().await {
+        match message? {
+            Message::Binary(bytes) => buf.extend_from_slice(&bytes),
+            Message::Close(_) => return Err("ハンドシェイク前に切断された".into()),
+            // テキストや ping は RDCleanPath には現れない。無視して読み続ける。
+            _ => continue,
+        }
+
+        if let Some(total) = detect_pdu(&buf)? {
+            if buf.len() >= total {
+                return Ok(parse_request(&buf[..total])?);
+            }
+        }
+    }
+
+    Err("RDCleanPath 要求が来ないまま WebSocket が閉じた".into())
+}
+
+/// TPKT の長さに従って X.224 のフレームを 1 つ読む。
+async fn read_x224_frame(stream: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>, BoxError> {
+    let mut header = [0u8; TPKT_HEADER_LEN];
+    tokio::time::timeout(timeout, stream.read_exact(&mut header)).await??;
+
+    let frame_len = tpkt_frame_len(&header)?;
+    let mut frame = vec![0u8; frame_len];
+    frame[..TPKT_HEADER_LEN].copy_from_slice(&header);
+    tokio::time::timeout(timeout, stream.read_exact(&mut frame[TPKT_HEADER_LEN..])).await??;
+
+    Ok(frame)
+}
+
+/// ブラウザ ↔ RDS を双方向に流す。片方が閉じたら終わり。
+async fn pump(socket: WebSocket, tls: TlsStream<TcpStream>) -> Result<(), BoxError> {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut server_rx, mut server_tx) = tokio::io::split(tls);
+
+    // ブラウザ → RDS
+    let to_server = async {
+        while let Some(message) = ws_rx.next().await {
+            match message? {
+                Message::Binary(bytes) => server_tx.write_all(&bytes).await?,
+                Message::Close(_) => break,
+                _ => continue,
+            }
+        }
+        Ok::<_, BoxError>(())
+    };
+
+    // RDS → ブラウザ
+    let to_browser = async {
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            let read = server_rx.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            ws_tx
+                .send(Message::Binary(chunk[..read].to_vec().into()))
+                .await?;
+        }
+        Ok::<_, BoxError>(())
+    };
+
+    tokio::select! {
+        result = to_server => result,
+        result = to_browser => result,
+    }
+}
+
+/// RDS と TLS を張る。証明書は検証しない ([`NoCertVerification`] の判断理由を参照)。
+async fn tls_connect(stream: TcpStream) -> Result<TlsStream<TcpStream>, BoxError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerification(provider)))
+        .with_no_client_auth();
+
+    // 証明書を検証しないので、ここに渡す名前は何でも通る。
+    let server_name = ServerName::try_from("rdp-target")?.to_owned();
+    Ok(TlsConnector::from(Arc::new(config))
+        .connect(server_name, stream)
+        .await?)
 }
 
 async fn probe(target: &str, timeout: Duration) -> Result<(), BoxError> {
