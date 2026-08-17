@@ -34,6 +34,9 @@ const ACCESS_DOMAIN: &str = "cloudflareaccess.com";
 pub enum CfAccessError {
     /// `--cf-access-team-domain` から JWKS の URL を組み立てられない。
     BadTeamDomain(String),
+    /// AUD タグが空。空のまま起動すると全部 401 になって原因が分かりにくいので、
+    /// 起動時に鳴らす (`--allow` 未指定を拒否するのと同じ姿勢)。
+    MissingAud,
     /// JWT として壊れている、または `kid` が無い。
     Malformed,
     /// JWKS を取れない (通信不能 / JSON でない)。
@@ -50,6 +53,7 @@ impl fmt::Display for CfAccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadTeamDomain(d) => write!(f, "team ドメインを解釈できない: {d}"),
+            Self::MissingAud => write!(f, "Access アプリの AUD タグが空"),
             Self::Malformed => write!(f, "Access トークンが JWT として壊れている"),
             Self::JwksUnavailable => write!(f, "Access の JWKS を取得できない"),
             Self::UnknownKey => write!(f, "トークンの kid が JWKS に無い"),
@@ -155,6 +159,9 @@ pub struct CfAccessVerifier {
 impl CfAccessVerifier {
     /// team ドメインと AUD タグから作る。
     pub fn new(team_domain: &str, aud: String) -> Result<Self, CfAccessError> {
+        if aud.trim().is_empty() {
+            return Err(CfAccessError::MissingAud);
+        }
         let (issuer, certs_url) = team_endpoints(team_domain)?;
         Ok(Self::with_endpoints(
             issuer,
@@ -405,6 +412,13 @@ mod tests {
         // CfAccessVerifier に Debug を要求しないため (derive しても呼ばれず、
         // llvm-cov では未カバー行に見えて 100% gate を落とす)。
         assert!(CfAccessVerifier::new("", TEST_AUD.to_owned()).is_err());
+    }
+
+    #[test]
+    fn new_rejects_an_empty_aud() {
+        // 空のまま上がると「全部 401」になって切り分けが効かないので起動時に鳴らす。
+        assert!(CfAccessVerifier::new("example", "   ".to_owned()).is_err());
+        assert!(CfAccessError::MissingAud.to_string().contains("AUD"));
     }
 
     // --- verify: 通る道 ---

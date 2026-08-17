@@ -9,11 +9,13 @@ Type=simple
 # CF_ACCESS_TEAM_DOMAIN / CF_ACCESS_AUD を置くこと (雛形: rdp-relay.env.example)。
 # `-` を付けていないので **ファイルが無ければ起動しない** (無認証で上がるより落ちる方を選ぶ)。
 EnvironmentFile=/etc/ichibanboshi/rdp-relay.env
-# --bind: loopback のみ。公開は前段の cloudflared (同じホスト上) に任せる。
-#   0.0.0.0 にすると社内 LAN 全体へ晒されるので広げない。
+# 待ち受けアドレスは RDP_RELAY_BIND (env ファイル側) で決める。既定は 127.0.0.1:3390。
+#   既存の tunnel (localTunnel) の connector が ohishi-data 上に居ない構成なら
+#   loopback では届かないので、env 側で LAN アドレスに上書きする。
+#   広げても素通しにはならない: /rdp は Cf-Access-Jwt-Assertion の検証を通らないと
+#   401 で閉じる (cf_access.rs)。ネットワーク位置だけに依存していない。
 # --allow: ブラウザに任意の宛先を指定させないための allowlist。未指定だと起動を拒否する。
 ExecStart=/opt/ichibanboshi/rdp-relay serve \
-    --bind 127.0.0.1:3390 \
     --allow 172.18.21.102:3389
 WorkingDirectory=/opt/ichibanboshi
 Restart=on-failure

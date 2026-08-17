@@ -73,9 +73,10 @@ enum Command {
 
     /// 中継を起動する。ブラウザ (IronRDP/WASM) が WebSocket で繋いでくる。
     Serve {
-        /// 待ち受けアドレス。既定は loopback のみ
-        /// (公開は前段の Cloudflare Tunnel が行う)。
-        #[arg(long, default_value = "127.0.0.1:3390")]
+        /// 待ち受けアドレス。既定は loopback のみで、公開は前段の Cloudflare Tunnel が行う。
+        /// tunnel の connector が別ホストに居る構成では loopback だと届かないので、
+        /// そこだけ site 側 (systemd の EnvironmentFile) で上書きする。
+        #[arg(long, env = "RDP_RELAY_BIND", default_value = "127.0.0.1:3390")]
         bind: String,
 
         /// 繋いでよい RDS。ブラウザから任意の宛先を指定させないための allowlist。
