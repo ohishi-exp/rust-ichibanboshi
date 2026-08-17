@@ -183,6 +183,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_connection_confirm_reports_server_refusal() {
+        // サーバーが要求を蹴ったときの形 (RDP_NEG_FAILURE)。
+        // 末尾 4 バイトが失敗コードで、0x05 は HYBRID_REQUIRED_BY_SERVER。
+        let frame = [
+            0x03, 0x00, 0x00, 0x13, 0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x03, 0x00, 0x08,
+            0x00, 0x05, 0x00, 0x00, 0x00,
+        ];
+        let err = parse_connection_confirm(&frame).unwrap_err();
+        assert!(matches!(err, RdpNegoError::Rejected(_)));
+        assert!(err.to_string().contains("拒否"));
+    }
+
+    #[test]
+    fn encode_failure_keeps_the_original_message() {
+        // 組み立て失敗は実機では起こしにくいので、表示だけを直接確かめる。
+        let err = RdpNegoError::Encode("buffer too small".to_owned());
+        assert!(err.to_string().contains("buffer too small"));
+    }
+
+    #[test]
     fn standard_rdp_security_does_not_need_tls() {
         assert!(!needs_tls(SecurityProtocol::empty()));
         assert!(needs_tls(SecurityProtocol::SSL));

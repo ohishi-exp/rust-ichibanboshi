@@ -70,6 +70,9 @@ path = "src/kintai_reading_dates.rs"
 [[files]]
 path = "src/kintai_tail_gap_probe.rs"
 
+[[files]]
+path = "src/rdp_nego.rs"
+
 # --- 給与 (給与大臣) ---
 
 [[files]]
