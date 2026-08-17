@@ -24,6 +24,14 @@
 #   CF_ACCESS_CLIENT_ID       … CF Access service token id  (cloudflared が読む)
 #   CF_ACCESS_CLIENT_SECRET   … CF Access service token secret
 #
+# 任意 env (2 本目の binary — 指定が無いときは一切触らない):
+#   DEPLOY_EXTRA_BINARY       … 追加で運ぶ binary path (例 rdp-relay の musl build)
+#   DEPLOY_EXTRA_NAME         … 転送先のファイル名 (default: DEPLOY_EXTRA_BINARY の basename)。
+#                               systemd の unit 名も これ と一致させる前提
+#                               (journalctl -u <name> で失敗時のログを出すため)
+#   DEPLOY_EXTRA_HEALTH_PORT  … 2 本目の疎通確認する localhost ポート (例 rdp-relay なら 3390)。
+#                               未指定なら 2 本目の health は確認しない
+#
 # deploy 失敗 (build 不在 / scp / ssh / health) は即 exit != 0 で loud fail する
 # (set -e + health 200 厳格チェック)。
 set -euo pipefail
@@ -35,8 +43,22 @@ TARGET_DIR="${DEPLOY_TARGET_DIR:-/opt/ichibanboshi}"
 BINARY="${DEPLOY_BINARY:-target/x86_64-unknown-linux-musl/release/ichibanboshi}"
 HEALTH_PORT="${DEPLOY_HEALTH_PORT:-3100}"
 
+# 2 本目 (任意)。未指定なら以降の extra 系は全部素通りする。
+EXTRA_BINARY="${DEPLOY_EXTRA_BINARY:-}"
+EXTRA_HEALTH_PORT="${DEPLOY_EXTRA_HEALTH_PORT:-}"
+EXTRA_NAME=""
+if [[ -n "$EXTRA_BINARY" ]]; then
+  EXTRA_NAME="${DEPLOY_EXTRA_NAME:-$(basename "$EXTRA_BINARY")}"
+fi
+
 if [[ ! -f "$BINARY" ]]; then
   echo "::error::deploy binary not found: $BINARY" >&2
+  exit 1
+fi
+
+# 指定されたのに無い = build を取り違えている。黙って 1 本だけ運ばず loud fail する。
+if [[ -n "$EXTRA_BINARY" && ! -f "$EXTRA_BINARY" ]]; then
+  echo "::error::extra deploy binary not found: $EXTRA_BINARY" >&2
   exit 1
 fi
 
@@ -58,6 +80,15 @@ if [[ -n "${DEPLOY_SSH_PROXY_COMMAND:-}" ]]; then
   SSH_OPTS+=(-o "ProxyCommand=$DEPLOY_SSH_PROXY_COMMAND")
 fi
 
+# 2 本目を先に置く。あとで置く 1 本目の PathModified 待ち (下の sleep) が
+# 両方の restart を兼ねるので、待ち時間を増やさずに済む。
+if [[ -n "$EXTRA_BINARY" ]]; then
+  echo "=== Deploying $EXTRA_BINARY to $TARGET ($TARGET_DIR/$EXTRA_NAME) ==="
+  scp "${SSH_OPTS[@]}" "$EXTRA_BINARY" "$TARGET:/tmp/$EXTRA_NAME.new"
+  ssh "${SSH_OPTS[@]}" "$TARGET" \
+    "mv /tmp/$EXTRA_NAME.new $TARGET_DIR/$EXTRA_NAME && chmod +x $TARGET_DIR/$EXTRA_NAME"
+fi
+
 echo "=== Deploying $BINARY to $TARGET ($TARGET_DIR) ==="
 # 実行中バイナリは直接上書きできないので /tmp 経由で mv (mv はアトミック)。
 scp "${SSH_OPTS[@]}" "$BINARY" "$TARGET:/tmp/ichibanboshi.new"
@@ -68,22 +99,29 @@ ssh "${SSH_OPTS[@]}" "$TARGET" \
 echo "=== Waiting for auto-restart (PathModified) ==="
 sleep 6
 
-echo "=== Health check (localhost:$HEALTH_PORT/health) ==="
-# remote の localhost に対して health を叩く。body + HTTP code を一括取得し、
-# HTTP 200 以外は loud fail。body は build 情報 ({"status","commit","built_at"})。
+# remote 側から <addr>/health を叩き、HTTP_CODE / HEALTH_BODY に置く。
+# body は build 情報 ({"status","commit","built_at"})。
 # 起動は 20 秒超かかることがある (kyuyo SQL Server pool 初期化だけで 13 秒の実測、
 # 2026-07-29 に一発チェックで race って赤になった) ので、最長 60 秒までポーリング。
-HTTP_CODE=""
-HEALTH_BODY=""
-for _i in $(seq 1 12); do
-  HEALTH_RESP="$(ssh "${SSH_OPTS[@]}" "$TARGET" \
-    "curl -s -w '\n%{http_code}' --max-time 10 http://localhost:$HEALTH_PORT/health || true")"
-  HTTP_CODE="$(printf '%s' "$HEALTH_RESP" | tail -n1)"
-  HEALTH_BODY="$(printf '%s' "$HEALTH_RESP" | sed '$d')"
-  if [[ "$HTTP_CODE" == "200" ]]; then break; fi
-  echo "health not ready yet (got ${HTTP_CODE:-<none>}) — retrying in 5s"
-  sleep 5
-done
+poll_health() {
+  local addr="$1"
+  local resp
+  HTTP_CODE=""
+  HEALTH_BODY=""
+  for _i in $(seq 1 12); do
+    resp="$(ssh "${SSH_OPTS[@]}" "$TARGET" \
+      "curl -s -w '\n%{http_code}' --max-time 10 http://$addr/health || true")"
+    HTTP_CODE="$(printf '%s' "$resp" | tail -n1)"
+    HEALTH_BODY="$(printf '%s' "$resp" | sed '$d')"
+    if [[ "$HTTP_CODE" == "200" ]]; then return 0; fi
+    echo "health not ready yet (got ${HTTP_CODE:-<none>}) — retrying in 5s"
+    sleep 5
+  done
+  return 1
+}
+
+echo "=== Health check (localhost:$HEALTH_PORT/health) ==="
+poll_health "localhost:$HEALTH_PORT" || true
 
 echo "health HTTP code: ${HTTP_CODE:-<none>}"
 echo "health body: ${HEALTH_BODY:-<none>}"
@@ -115,6 +153,41 @@ if [[ "$HTTP_CODE" != "200" ]]; then
     } >> "$GITHUB_STEP_SUMMARY"
   fi
   exit 1
+fi
+
+# 主 binary の health body は下の Step Summary で使う。2 本目の確認で HTTP_CODE /
+# HEALTH_BODY が上書きされる前に退避する。
+MAIN_HEALTH_BODY="$HEALTH_BODY"
+
+# 2 本目 (rdp-relay 等)。systemd の unit 名が EXTRA_NAME と一致している前提。
+# **ホストに unit を入れてから** DEPLOY_EXTRA_HEALTH_PORT を設定すること。
+# binary だけ運んで unit が無い状態でここを有効にすると、置いただけで deploy が赤くなる。
+if [[ -n "$EXTRA_BINARY" && -n "$EXTRA_HEALTH_PORT" ]]; then
+  echo "=== Health check ($EXTRA_NAME, localhost:$EXTRA_HEALTH_PORT/health) ==="
+  poll_health "localhost:$EXTRA_HEALTH_PORT" || true
+  echo "$EXTRA_NAME health HTTP code: ${HTTP_CODE:-<none>}"
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    echo "::error::$EXTRA_NAME health check failed (expected 200, got ${HTTP_CODE:-<none>})" >&2
+    echo "--- systemctl status $EXTRA_NAME (last 15 lines) ---" >&2
+    ssh "${SSH_OPTS[@]}" "$TARGET" \
+      "systemctl status $EXTRA_NAME --no-pager 2>&1 | head -15" >&2 || true
+    # 起動を拒否する作りなので、設定不足はここに出る (--allow 無し / env file 無し)。
+    echo "--- journalctl -u $EXTRA_NAME (last 80 lines) ---" >&2
+    ssh "${SSH_OPTS[@]}" "$TARGET" \
+      "journalctl -u $EXTRA_NAME --no-pager --since='5 minutes ago' 2>&1 | tail -80" >&2 || true
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      {
+        echo "### ❌ Deploy 失敗 — $EXTRA_NAME の health check ${HTTP_CODE:-<none>}"
+        echo ""
+        echo "#### journalctl -u $EXTRA_NAME (last 100 lines)"
+        echo '```'
+        ssh "${SSH_OPTS[@]}" "$TARGET" \
+          "journalctl -u $EXTRA_NAME --no-pager --since='5 minutes ago' 2>&1 | tail -100" 2>&1 || true
+        echo '```'
+      } >> "$GITHUB_STEP_SUMMARY"
+    fi
+    exit 1
+  fi
 fi
 
 # GitHub Actions の Step Summary に build 情報を出す (CI のみ。手動 deploy では未設定)。

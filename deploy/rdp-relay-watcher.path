@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch rdp-relay binary for changes
+
+[Path]
+PathModified=/opt/ichibanboshi/rdp-relay
+Unit=rdp-relay-watcher.service
+
+[Install]
+WantedBy=multi-user.target
