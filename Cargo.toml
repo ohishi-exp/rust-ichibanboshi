@@ -8,6 +8,12 @@ description = "一番星 SQL Server sales data API — Windows Service with Clou
 name = "ichibanboshi"
 path = "src/main.rs"
 
+# RDP 中継 (ブラウザ ↔ RDS)。ohishi-data 上で ichibanboshi と並べて動かす。
+# 詳細は docs/plan-ironrdp-rail.md。
+[[bin]]
+name = "rdp-relay"
+path = "src/bin/rdp_relay.rs"
+
 [lib]
 name = "rust_ichibanboshi"
 path = "src/lib.rs"
@@ -45,6 +51,14 @@ flate2 = "1"
 sha2 = "0.10"
 mysql_async = { version = "0.37.0", default-features = false, features = ["minimal-rust"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
+
+# RDP 中継用。ironrdp は RDP の PDU 定義をそのまま借りる (自前で組み立て直さない)。
+# rustls は既定の aws-lc-rs ではなく ring を明示する — musl static build を維持するため
+# (既存の reqwest / sqlx / tiberius も rustls-tls で openssl を避けている)。
+ironrdp-core = "0.2"
+ironrdp-pdu = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [build-dependencies]
 # build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ、Refs #191)
