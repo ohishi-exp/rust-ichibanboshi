@@ -2,7 +2,7 @@
 name: rust-ichibanboshi-map
 generated-from: rust-ichibanboshi:a866c377c770e9f305c21db5b818c9839887d86d
 paths: [src/]
-description: rust-ichibanboshi (一番星 SQL Server CAPE#01 の売上データを tiberius で読み REST API 提供する Rust/Axum サービス) の構造ナビゲーション。sales 集計エンドポイント / tiberius+bb8 接続 / 売上集計ロジック (税抜カラム・請求K) / musl deploy + Cloudflare Tunnel の gotcha を 1 枚にまとめる。トリガー:「rust-ichibanboshi」「一番星」「CAPE#01」「tiberius」「SQL Server 売上」「月計テーブル」「請求K」「税抜金額」「傭車」「Cloudflare Tunnel」「CF Access Service Token」等。
+description: rust-ichibanboshi (一番星 SQL Server CAPE#01 の売上データを tiberius で読み REST API 提供する Rust/Axum サービス) の構造ナビゲーション。sales 集計エンドポイント / tiberius+bb8 接続 / 売上集計ロジック (税抜カラム・請求K) / musl deploy + Cloudflare Tunnel の gotcha を 1 枚にまとめる。トリガー:「rust-ichibanboshi」「一番星」「CAPE#01」「tiberius」「SQL Server 売上」「月計テーブル」「請求K」「税抜金額」「傭車」「Cloudflare Tunnel」「CF Access Service Token」「rdp-relay」「RDP 中継」「RemoteApp」「RDCleanPath」「Cf-Access-Jwt-Assertion」等。
 ---
 
 # rust-ichibanboshi-map — rust-ichibanboshi 構造ナビゲーション
@@ -682,6 +682,75 @@ CLAUDE.md の「テストは DB も環境変数も不要」と両立しないた
 
 無人化 (07) は `deploy/ichibanboshi-sync.{service,timer,sh}`。設置手順は
 `docs/setup-kintai-sync-timer.md`。
+
+## RDP 中継 (`rdp-relay`) — ブラウザ ↔ RDS (Refs #296)
+
+**同じ repo の 2 本目の binary。** `cargo build` が `[[bin]]` を全部作るので、
+売上 API (`ichibanboshi`) と同じ musl release から拾って同じ SSH deploy で運ぶ
+(`ci.yml` の `DEPLOY_EXTRA_BINARY` / `DEPLOY_EXTRA_NAME`)。`ohishi-data` の上で
+**2 つの systemd サービスが並走**する。
+
+| | `ichibanboshi.service` | `rdp-relay.service` |
+|---|---|---|
+| ポート | 3100 (LAN) | `RDP_RELAY_BIND` (既定 loopback、site では LAN IP) |
+| 実行ユーザー | `root` | `ubuntu` + `ProtectSystem=strict` 等 |
+| 再起動 | `ichibanboshi-watcher` | `rdp-relay-watcher` (binary の mtime を見て restart) |
+
+**deploy 後の health チェックは 3100 しか見ていない** (`DEPLOY_EXTRA_HEALTH_PORT` 未設定)。
+中継が起動に失敗しても main の deploy は緑のままなので、`rdp-relay` を触った PR の後は
+自分で確かめる (`systemctl is-active rdp-relay` / `curl <bind>/health`)。
+
+### 経路と認証
+
+```
+ブラウザ (IronRDP/WASM) ──wss──> rdp.ippoan.org (Cloudflare Access)
+                                → localTunnel → 中継 → RDS:3389
+```
+
+`--auth` (env `RDP_RELAY_AUTH`) が入口を決める:
+
+- **`cf-access`** (現行) … 中継自身が `Cf-Access-Jwt-Assertion` を team の JWKS で検証する
+  (`src/cf_access.rs`)。Access の設定漏れやヘッダ偽装で素通りさせないための二段目の壁。
+  **Access の IdP は auth-worker の OIDC surface** (`auth.ippoan.org/oidc/*`) なので、
+  管理画面に既にログインしている利用者は追加ログイン無しで通る
+- **`vpc`** … 公開ホスト名を持たず Workers VPC binding からだけ届かせる。認証はアプリ側の
+  Worker が持つ。`nuxt-dtako-admin` の `/ws/rdp` がこれだったが #705 で撤去済み
+
+`/health` はどちらでも素通し (deploy の疎通確認が localhost から叩くため)。
+
+### 口
+
+| path | 中身 |
+|---|---|
+| `GET /health` | `ok`。認証なし |
+| `GET /rdp` | WebSocket。RDCleanPath を 1 往復して RDS と TLS を張り、以降は素の RDP を流す |
+| `GET /defaults` | 画面が入力欄の初期値に使う値。`{destination, domain, remote_app}` |
+
+`/defaults` の宛先は **`--allow` の先頭をそのまま返す** — 画面が同じ値を別に持つと
+二重管理になり、ズレた瞬間に「許可されていない宛先」で閉じられるため、権威をここに集める。
+ドメインと RemoteApp は RDP セッションの中身で中継からは見えないので `RDP_RELAY_DEFAULT_*` で受ける。
+別オリジンから cookie 付きで読まれるので `RDP_RELAY_CORS_ORIGIN` に挙げた origin だけを echo する
+(**credentials 付きに `*` は使えない**。前段の Access は origin 応答に CORS ヘッダを足さず、
+preflight は 403 で落とす — 実測)。
+
+### ファイル
+
+| ファイル | 役割 |
+|---|---|
+| `src/bin/rdp_relay.rs` | I/O とルーティング。`probe` サブコマンドは X.224→TLS の実機確認用 |
+| `src/rdcleanpath.rs` | RDCleanPath (DER) の解釈 |
+| `src/rdp_nego.rs` | X.224 接続要求/確認・TPKT |
+| `src/cf_access.rs` | Access JWT の検証 (JWKS 取得だけが I/O、wiremock でテスト) |
+| `src/rdp_defaults.rs` | `/defaults` の組み立てと CORS 判断 (純粋関数) |
+| `deploy/rdp-relay.service` / `-watcher.{path,service}` | systemd |
+| `deploy/rdp-relay.env.example` | `/etc/ichibanboshi/rdp-relay.env` の雛形。**この env が無いと起動しない** (`EnvironmentFile` に `-` を付けていない — 無認証で上がるより落ちる方を選ぶ) |
+
+**site 固有の値は repo に置かない**: `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD` /
+`RDP_RELAY_BIND` / `RDP_RELAY_DEFAULT_*` / `RDP_RELAY_CORS_ORIGIN` は env ファイル側。
+**CI は env を触らない**ので、新しい変数を足したら人が入れて `systemctl restart rdp-relay`。
+
+ブラウザ側 (画面・cookie の確保・`/defaults` の使い方) は `nuxt-dtako-admin-map` skill。
+
 
 ## Cloudflare Access
 
