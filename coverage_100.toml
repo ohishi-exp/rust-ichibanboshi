@@ -73,6 +73,11 @@ path = "src/kintai_tail_gap_probe.rs"
 [[files]]
 path = "src/rdp_nego.rs"
 
+# 中継が画面へ配る既定値 (`/defaults`) と CORS の判断 (Refs #296)。純粋関数だけで、
+# JWT 検証も I/O も bin 側に置いてある。実測 100% (Regions/Functions/Lines) を見てから登録
+[[files]]
+path = "src/rdp_defaults.rs"
+
 # RDP 中継の入口で Cloudflare Access の JWT を検証する。JWKS の取得だけが I/O で、
 # wiremock で差し替えられる形にしてある (テスト内で RSA 鍵を起こして署名する)。
 # 先例は rust-alc-api の crates/alc-core/src/auth_google.rs (同じ形で 100% 登録済み)

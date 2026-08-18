@@ -36,10 +36,13 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY,
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse as _;
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt as _, StreamExt as _};
 use ironrdp_pdu::nego::SecurityProtocol;
@@ -48,6 +51,7 @@ use rust_ichibanboshi::rdcleanpath::{
     build_general_error, build_negotiation_error, build_response, detect_pdu, parse_request,
     RelayRequest,
 };
+use rust_ichibanboshi::rdp_defaults::{build_defaults, cors_allow_origin};
 use rust_ichibanboshi::rdp_nego::{
     build_connection_request, needs_tls, parse_connection_confirm, tpkt_frame_len, TPKT_HEADER_LEN,
 };
@@ -107,6 +111,19 @@ enum Command {
         /// トークンで入られる。`--auth cf-access` のときだけ要る。
         #[arg(long, env = "CF_ACCESS_AUD")]
         cf_access_aud: Option<String>,
+
+        /// `/defaults` が配る Windows のドメイン。配置先ごとの値なので repo に置かない。
+        #[arg(long, env = "RDP_RELAY_DEFAULT_DOMAIN")]
+        default_domain: Option<String>,
+
+        /// `/defaults` が配る RemoteApp のエイリアス (`||ALIAS`)。空ならフルデスクトップ。
+        #[arg(long, env = "RDP_RELAY_DEFAULT_REMOTE_APP")]
+        default_remote_app: Option<String>,
+
+        /// `/defaults` を読んでよいブラウザのオリジン (カンマ区切り)。
+        /// cookie 付きで読むので `*` は使えない — ここに挙げた値をそのまま返す。
+        #[arg(long, env = "RDP_RELAY_CORS_ORIGIN", value_delimiter = ',')]
+        cors_origin: Vec<String>,
 
         /// RDS への接続と読み取りの制限時間 (秒)。
         #[arg(long, default_value_t = 10)]
@@ -179,6 +196,9 @@ async fn main() -> Result<(), BoxError> {
             auth,
             cf_access_team_domain,
             cf_access_aud,
+            default_domain,
+            default_remote_app,
+            cors_origin,
             timeout,
         } => {
             serve(ServeOptions {
@@ -187,6 +207,9 @@ async fn main() -> Result<(), BoxError> {
                 auth,
                 team_domain: cf_access_team_domain,
                 aud: cf_access_aud,
+                default_domain,
+                default_remote_app,
+                cors_origin,
                 timeout: Duration::from_secs(timeout),
             })
             .await
@@ -213,6 +236,9 @@ struct ServeOptions {
     auth: AuthMode,
     team_domain: Option<String>,
     aud: Option<String>,
+    default_domain: Option<String>,
+    default_remote_app: Option<String>,
+    cors_origin: Vec<String>,
     timeout: Duration,
 }
 
@@ -224,6 +250,11 @@ struct RelayState {
     /// 入口で Access トークンを検証する。`--auth vpc` では持たない
     /// (Access が経路に居ないため。誰を通すかは前段の Worker が決める)。
     verifier: Option<CfAccessVerifier>,
+    /// `/defaults` が配る値。配置先ごとに違うので env から受ける。
+    default_domain: Option<String>,
+    default_remote_app: Option<String>,
+    /// `/defaults` を読んでよいブラウザのオリジン。
+    cors_origin: Arc<Vec<String>>,
     timeout: Duration,
 }
 
@@ -266,6 +297,9 @@ async fn serve(options: ServeOptions) -> Result<(), BoxError> {
     let state = RelayState {
         allow: Arc::new(options.allow),
         verifier,
+        default_domain: options.default_domain,
+        default_remote_app: options.default_remote_app,
+        cors_origin: Arc::new(options.cors_origin),
         timeout: options.timeout,
     };
 
@@ -273,6 +307,8 @@ async fn serve(options: ServeOptions) -> Result<(), BoxError> {
         // deploy の疎通確認が localhost から叩く。Access の検証は掛けない。
         .route("/health", get(|| async { "ok" }))
         .route("/rdp", get(ws_upgrade))
+        // 画面が初期値に使う値を配る。`/rdp` と同じく Access を通った人にだけ返す。
+        .route("/defaults", get(defaults))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&options.bind).await?;
@@ -283,6 +319,72 @@ async fn serve(options: ServeOptions) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Access を通っていなければ、返すべき拒否応答を返す (通っていれば `None`)。
+///
+/// `--auth vpc` では検証器を持たない。Access が経路に居ないので、ここで
+/// ヘッダを要求すると誰も通れなくなる。誰を通すかは前段の Worker が決める。
+async fn reject_unless_access(
+    state: &RelayState,
+    headers: &HeaderMap,
+) -> Option<axum::response::Response> {
+    let verifier = state.verifier.as_ref()?;
+
+    // Access を通ったことを中継自身で確かめる。ヘッダの有無だけでは信用しない。
+    let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else {
+        tracing::warn!("Access トークンの無い要求を拒否");
+        return Some((StatusCode::UNAUTHORIZED, "Cf-Access-Jwt-Assertion が無い").into_response());
+    };
+
+    match verifier.verify(token).await {
+        Ok(identity) => {
+            tracing::info!("Access 検証を通った: {}", identity.subject);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Access 検証で拒否: {e}");
+            Some((StatusCode::UNAUTHORIZED, "Access トークンが通らない").into_response())
+        }
+    }
+}
+
+/// `/defaults` — 画面 (`/remote-app`) が初期値に使う、配置先ごとの値を配る。
+///
+/// 宛先は `--allow` の先頭をそのまま返す。**画面が同じ値を別に持つと二重管理**に
+/// なり、ズレた瞬間に「許可されていない宛先」で閉じられるため、権威は中継に置く。
+///
+/// 別オリジンから cookie 付きで読まれるので、許可した origin だけを echo する。
+/// preflight は前段の Access が 403 で落とすため用意しない (画面側は追加ヘッダを
+/// 付けない単純な GET で読む — それなら preflight は起きない)。
+async fn defaults(State(state): State<RelayState>, headers: HeaderMap) -> axum::response::Response {
+    if let Some(rejection) = reject_unless_access(&state, &headers).await {
+        return rejection;
+    }
+
+    let body = build_defaults(
+        &state.allow,
+        state.default_domain.as_deref(),
+        state.default_remote_app.as_deref(),
+    );
+    let origin = headers.get(ORIGIN).and_then(|v| v.to_str().ok());
+    let allowed = cors_allow_origin(origin, &state.cors_origin);
+    let mut response = Json(body).into_response();
+
+    if let Some(value) = allowed
+        .as_deref()
+        .and_then(|a| HeaderValue::from_str(a).ok())
+    {
+        let out = response.headers_mut();
+        out.insert(ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        out.insert(
+            ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+        // 同じ URL でも origin ごとに応答が違う。キャッシュに混ぜさせない。
+        out.insert(VARY, HeaderValue::from_static("origin"));
+    }
+    response
+}
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<RelayState>,
@@ -290,22 +392,8 @@ async fn ws_upgrade(
 ) -> axum::response::Response {
     tracing::info!("WebSocket の接続要求を受けた");
 
-    // `--auth vpc` では検証器を持たない。Access が経路に居ないので、ここで
-    // ヘッダを要求すると誰も通れなくなる。誰を通すかは前段の Worker が決める。
-    if let Some(verifier) = &state.verifier {
-        // Access を通ったことを中継自身で確かめる。ヘッダの有無だけでは信用しない。
-        let Some(token) = headers.get(ACCESS_JWT_HEADER).and_then(|v| v.to_str().ok()) else {
-            tracing::warn!("Access トークンの無い要求を拒否");
-            return (StatusCode::UNAUTHORIZED, "Cf-Access-Jwt-Assertion が無い").into_response();
-        };
-
-        match verifier.verify(token).await {
-            Ok(identity) => tracing::info!("Access 検証を通った: {}", identity.subject),
-            Err(e) => {
-                tracing::warn!("Access 検証で拒否: {e}");
-                return (StatusCode::UNAUTHORIZED, "Access トークンが通らない").into_response();
-            }
-        }
+    if let Some(rejection) = reject_unless_access(&state, &headers).await {
+        return rejection;
     }
 
     ws.on_upgrade(move |socket| async move {
