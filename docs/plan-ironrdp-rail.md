@@ -224,9 +224,21 @@ UTF-8 を書いている (仕様は PDFDocEncoding か UTF-16BE + BOM)。同じ�
 対処を入れたが効かず、`/Title` が圧縮オブジェクトストリームの中にある可能性が高い。
 次に印刷したとき形式がコンソールに出るようにしてある。**帳票の中身は正しい。**
 
-### fork の扱い
+### fork の扱い (2026-08-19 更新)
+
+fork の正本は `ippoan/IronRDP`。2026-08-19 に**縮小 (slim) 構成へ組み替えた**
+(ippoan/IronRDP#3): fork の実体 — `crates/ironrdp-web` (RAIL 合成 / 仮想プリンタ)、
+`crates/ironrdp-session` (`fill_rect` を足した vendor、root の `[patch]` で差し込み)、
+`web-client/` — だけを残し、他の ironrdp-* crate は上流 Devolutions/IronRDP の
+git 依存 (rev 固定) で取る。上流追随の手順は同 repo の README にある。
+
+ブラウザに配る成果物は `nuxt-dtako-admin` の `vendor/iron-remote-desktop{,-rdp}`
+(wasm 埋め込み済み JS)。作り直しは fork の `web-client/iron-remote-desktop{,-rdp}` で
+`npm run build` し、dist を vendor へコピーする (焼き込み検査つき。dtako-admin#699 /
+#711 の PR 本文が手順の実例)。
 
 **上流への PR は出していない** (オーナー判断)。あなた自身の fork
 `yhonda-ohishi/IronRDP` に、上流 master 直上の 3 ファイル差分だけを切り出したブランチ
 `upstream/web-tests-and-window-support` を push してある (Window Order の初期接続での
 取りこぼし修正 + 単体テストが CI で走らない件)。出したくなったらそのまま使える。
+`fill_rect` (ironrdp-session) も汎用 API なので、上流に入れば vendor ごと消せる。
