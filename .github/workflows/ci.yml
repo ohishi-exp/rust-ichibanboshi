@@ -237,13 +237,12 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           # RDP 中継も一緒に運ぶ。`cargo build` は [[bin]] を全部作るので build 手順は
           # 増えない (ichibanboshi と同じ musl release から拾うだけ)。
-          #
-          # **DEPLOY_EXTRA_HEALTH_PORT はまだ設定しない。** ホストに
-          # deploy/rdp-relay.service と /etc/ichibanboshi/rdp-relay.env を入れる前に
-          # 有効にすると、binary を置いただけの状態で health が 200 を返せず
-          # main の deploy が赤くなる。unit を入れてから 3390 を足すこと。
           DEPLOY_EXTRA_BINARY: target/x86_64-unknown-linux-musl/release/rdp-relay
           DEPLOY_EXTRA_NAME: rdp-relay
+          # ホスト側の unit と /etc/ichibanboshi/rdp-relay.env は設置済みなので、
+          # 中継の health も deploy のたびに確かめる。中継が上がらないまま
+          # 気づかない状態を作らないため (RemoteApp が丸ごと死ぬ)。
+          DEPLOY_EXTRA_HEALTH_PORT: 3390
         run: |
           if [ -z "$DEPLOY_SSH_HOST" ]; then
             echo "::error::vars.DEPLOY_SSH_HOST is not set — configure repo/org variable" >&2
