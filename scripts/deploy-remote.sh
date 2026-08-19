@@ -163,8 +163,22 @@ MAIN_HEALTH_BODY="$HEALTH_BODY"
 # **ホストに unit を入れてから** DEPLOY_EXTRA_HEALTH_PORT を設定すること。
 # binary だけ運んで unit が無い状態でここを有効にすると、置いただけで deploy が赤くなる。
 if [[ -n "$EXTRA_BINARY" && -n "$EXTRA_HEALTH_PORT" ]]; then
-  echo "=== Health check ($EXTRA_NAME, localhost:$EXTRA_HEALTH_PORT/health) ==="
-  poll_health "localhost:$EXTRA_HEALTH_PORT" || true
+  # 中継は loopback ではなく LAN アドレスに bind していることがある (RDP_RELAY_BIND)。
+  # その値は root しか読めない env にあるので、実際に listen しているソケットから引く。
+  # まだ listen していない (再起動直後) / wildcard bind のときは localhost に落とす。
+  EXTRA_ADDR=""
+  for _j in $(seq 1 6); do
+    EXTRA_ADDR="$(ssh "${SSH_OPTS[@]}" "$TARGET" "ss -tln 2>/dev/null" \
+      | awk -v port=":$EXTRA_HEALTH_PORT" 'index($4, port) == length($4) - length(port) + 1 {print $4; exit}')"
+    [[ -n "$EXTRA_ADDR" ]] && break
+    echo "$EXTRA_NAME is not listening on :$EXTRA_HEALTH_PORT yet — retrying in 5s"
+    sleep 5
+  done
+  case "$EXTRA_ADDR" in
+    ''|0.0.0.0:*|\[::\]:*|\*:*) EXTRA_ADDR="localhost:$EXTRA_HEALTH_PORT" ;;
+  esac
+  echo "=== Health check ($EXTRA_NAME, $EXTRA_ADDR/health) ==="
+  poll_health "$EXTRA_ADDR" || true
   echo "$EXTRA_NAME health HTTP code: ${HTTP_CODE:-<none>}"
   if [[ "$HTTP_CODE" != "200" ]]; then
     echo "::error::$EXTRA_NAME health check failed (expected 200, got ${HTTP_CODE:-<none>})" >&2
