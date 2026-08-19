@@ -1,0 +1,38 @@
+[Unit]
+Description=Ichibanboshi RDP Relay (LAN) - 社内ページ ↔ RDS の RDCleanPath 中継
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 社内 nginx (ohishi-dev) から使う LAN 側の口。公開ホスト名で出ている
+# rdp-relay.service (cf-access) とは**別インスタンス**で、binary は共用する。
+#
+# --auth vpc: Access ヘッダを要求しない。「LAN に届くこと」が入場条件だが、
+# LAN は元々 mstsc で RDS:3389 に直結できるので露出は増えない。RDS 側の
+# Windows 認証 (NLA) はそのまま残る。--allow で宛先は固定する。
+#
+# bind (LAN IP:port) は site 固有なので env で決める (雛形: rdp-relay-lan.env.example)。
+# `-` を付けていないので **ファイルが無ければ起動しない** (既定 127.0.0.1:3390 の
+# まま上がって cf-access 側の口と紛れるより落ちる方を選ぶ)。
+EnvironmentFile=/etc/ichibanboshi/rdp-relay-lan.env
+ExecStart=/opt/ichibanboshi/rdp-relay serve \
+    --auth vpc \
+    --allow 172.18.21.102:3389
+WorkingDirectory=/opt/ichibanboshi
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+Group=ubuntu
+
+# rdp-relay.service と同じ絞り。外から繋がれる口なので既存 ichibanboshi より狭く。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
