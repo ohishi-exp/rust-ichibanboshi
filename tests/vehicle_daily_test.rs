@@ -87,6 +87,7 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     // 車番の枝番と乗務員CD (#741: 車番だけでは車輌も乗務員も一意に指せない)
     assert_eq!(first.vehicle_branch, "01");
     assert_eq!(first.driver_code, "1656");
+    // `社員ﾏｽﾀ.社員N` 由来の表示名 (`運転日報明細.乗務員N` は自由入力でほぼ空)。
     assert_eq!(first.driver_name, "西島 健太");
 
     let second = &rows[1];

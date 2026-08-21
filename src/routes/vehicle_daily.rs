@@ -99,11 +99,15 @@ pub struct RawVehicleDailyRow {
     pub vehicle_branch: String,
     /// `運転手C` (乗務員CD)。**車番ではなく乗務員で明細を引くための鍵。**
     pub driver_code: String,
-    /// `乗務員N` (自由入力の氏名)。
+    /// `運転手C` → `社員ﾏｽﾀ.社員N` (表示名)。
     ///
-    /// **突合には使わない — `driver_code` を使う。** 氏名は表記ゆれがあり、
-    /// この列の埋まり具合も確認できていない (`/api/schema/sample` は日付で
-    /// 絞れないため、対象月の行だけを見る手段が無い)。表示の補助にとどめる。
+    /// **`運転日報明細` の `乗務員N` 列は使わない。** 自由入力で、実データではほぼ空
+    /// (2026-07 の帯広5台を実機で引くと全行が空文字だった)。`得意先C`→`得意先N`、
+    /// `地域C`→`地域N` と同じく**マスタを引く**のが正しい。
+    /// `社員ﾏｽﾀ` は同一 `社員C` の複数行があり得るので `TOP 1`
+    /// (`uriage`/`surcharge` のスカラサブクエリと同じ扱い)。
+    ///
+    /// **突合には使わない — `driver_code` を使う。** 表示専用。
     pub driver_name: String,
 }
 
@@ -136,7 +140,7 @@ pub struct VehicleDailyRow {
     pub vehicle_branch: String,
     /// `運転手C` (乗務員CD)。
     pub driver_code: String,
-    /// `乗務員N` (自由入力の氏名。突合には使わない — `driver_code` を使う)。
+    /// `運転手C` → `社員ﾏｽﾀ.社員N` (表示名。突合には使わない — `driver_code` を使う)。
     pub driver_name: String,
 }
 
@@ -250,7 +254,7 @@ pub async fn vehicle_daily(
         .map_err(map_repo_err)?;
 
     Ok(Json(ApiResponse {
-        source_table: "運転日報明細 + 得意先ﾏｽﾀ + 地域ﾏｽﾀ".to_string(),
+        source_table: "運転日報明細 + 得意先ﾏｽﾀ + 地域ﾏｽﾀ + 社員ﾏｽﾀ".to_string(),
         data: build_vehicle_daily_rows(&raw),
     }))
 }
