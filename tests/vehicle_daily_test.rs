@@ -34,6 +34,9 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             unit_price: 6190.47, // 単価は decimal で端数を持ちうる (実データ検証で確認済み)
             unit: "個".into(),
             row_id: "20260621-1001".into(),
+            vehicle_branch: "01".into(),
+            driver_code: "1656".into(),
+            driver_name: "西島 健太".into(),
         },
         // 傭車 (傭車先C!='000000') → subcontract_amount を使う。品名/数量/単価/単位も未入力のエッジ。
         RawVehicleDailyRow {
@@ -54,6 +57,10 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             unit_price: 0.0,
             unit: "".into(),
             row_id: "20260620-1002".into(),
+            // 枝番・乗務員CD が空のエッジ (実データにも空行がある)。
+            vehicle_branch: "".into(),
+            driver_code: "".into(),
+            driver_name: "".into(),
         },
     ];
 
@@ -77,10 +84,17 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(first.unit_price, 6190.47);
     assert_eq!(first.unit, "個");
     assert_eq!(first.row_id, "20260621-1001");
+    // 車番の枝番と乗務員CD (#741: 車番だけでは車輌も乗務員も一意に指せない)
+    assert_eq!(first.vehicle_branch, "01");
+    assert_eq!(first.driver_code, "1656");
+    assert_eq!(first.driver_name, "西島 健太");
 
     let second = &rows[1];
     assert_eq!(second.sale_date, "2026-06-20");
     assert!(second.is_subcontracted);
+    assert_eq!(second.vehicle_branch, "");
+    assert_eq!(second.driver_code, "");
+    assert_eq!(second.driver_name, "");
     assert_eq!(second.amount, 40_000);
     // 積地・卸地・得意先名は空文字のまま passthrough (surcharge_base 同様に県正規化しない)
     assert_eq!(second.origin_area_name, "");
@@ -161,7 +175,7 @@ async fn test_vehicle_daily_blank_filters_is_bad_request() {
             Request::builder()
                 .uri(
                     "/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01\
-                     &vehicle=%20&customer=&origin=&dest=",
+                     &vehicle=%20&driver=%20&customer=&origin=&dest=",
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -198,6 +212,37 @@ async fn test_vehicle_daily_customer_only_searches_across_vehicles() {
         .collect();
     assert!(vehicles.contains("8504"));
     assert!(vehicles.contains("9012"));
+}
+
+#[tokio::test]
+async fn test_vehicle_daily_driver_only_searches_across_vehicles() {
+    // #741 の主目的: 同じ乗務員の売上が日によって別の車番に載る (デジタコを積んで
+    // いない車輌等) ため、**車番ではなく乗務員CD で横断して引けること**。
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01&driver=1656")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let data = json["data"].as_array().unwrap();
+    // 乗務員 1656 は車輌 8504 と 9012 の両方で走っている (mock フィクスチャ)
+    assert_eq!(data.len(), 2);
+    let vehicles: std::collections::HashSet<_> = data
+        .iter()
+        .map(|r| r["vehicle_number"].as_str().unwrap())
+        .collect();
+    assert!(vehicles.contains("8504"));
+    assert!(vehicles.contains("9012"));
+    assert_eq!(data[0]["driver_code"], "1656");
 }
 
 #[tokio::test]

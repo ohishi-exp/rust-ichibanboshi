@@ -302,6 +302,7 @@ impl AppRepo for MockRepo {
         _from: &str,
         _to: &str,
         vehicle: Option<&str>,
+        driver: Option<&str>,
         customer: Option<&str>,
         origin: Option<&str>,
         dest: Option<&str>,
@@ -329,6 +330,9 @@ impl AppRepo for MockRepo {
                 unit_price: 6190.47,
                 unit: "個".into(),
                 row_id: "20260621-1001".into(),
+                vehicle_branch: "01".into(),
+                driver_code: "1656".into(),
+                driver_name: "西島 健太".into(),
             },
             // 傭車 (傭車先C!='000000')。得意先名・積地・卸地・品名/数量/単価が未マップ/空文字のエッジ。
             RawVehicleDailyRow {
@@ -349,6 +353,10 @@ impl AppRepo for MockRepo {
                 unit_price: 0.0,
                 unit: "".into(),
                 row_id: "20260620-1002".into(),
+                // 枝番・乗務員CD が空のエッジ (実データにも空行がある)。
+                vehicle_branch: "".into(),
+                driver_code: "".into(),
+                driver_name: "".into(),
             },
             // 別車輌・同得意先。customer/origin/dest だけの車輌横断検索 (#79 の主目的) の
             // テスト用に、vehicle_number/積地・卸地とも row 1 と異なる値にしてある。
@@ -370,12 +378,17 @@ impl AppRepo for MockRepo {
                 unit_price: 16000.0,
                 unit: "個".into(),
                 row_id: "20260622-1003".into(),
+                // 同じ乗務員が別の車番で走った日 (#741 で見つかった形)。
+                vehicle_branch: "00".into(),
+                driver_code: "1656".into(),
+                driver_name: "西島 健太".into(),
             },
         ];
 
         Ok(rows
             .into_iter()
             .filter(|r| vehicle.is_none_or(|v| r.vehicle_number == v))
+            .filter(|r| driver.is_none_or(|d| r.driver_code == d))
             .filter(|r| customer.is_none_or(|c| r.customer_code == c))
             .filter(|r| {
                 origin.is_none_or(|o| r.origin_area_name.contains(o) || r.origin.contains(o))
@@ -717,6 +730,7 @@ impl AppRepo for ErrorRepo {
         _: Option<&str>,
         _: Option<&str>,
         _: Option<&str>,
+        _: Option<&str>,
         _: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         Err(RepoError::PoolError)
@@ -899,6 +913,7 @@ impl AppRepo for QueryErrorRepo {
         &self,
         _: &str,
         _: &str,
+        _: Option<&str>,
         _: Option<&str>,
         _: Option<&str>,
         _: Option<&str>,
