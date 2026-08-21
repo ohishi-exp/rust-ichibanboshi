@@ -93,6 +93,18 @@ pub struct RawVehicleDailyRow {
     /// 行 ID = `管理年月日`(yyyymmdd) + '-' + `管理C`。`surcharge.rs`/`uriage.rs` と
     /// 同じ安定キー (値カラムに依存しないため編集されても不変)。
     pub row_id: String,
+    /// `車輌H` (車番の枝番)。**`車輌C` だけでは車輌を一意に指せない** — 帳票は
+    /// `0040 01` のように 2 つ並べて印字しており、同じ `車輌C` に別の枝番が存在する
+    /// (ohishi-exp/nuxt-dtako-admin#741 の突合で判明)。
+    pub vehicle_branch: String,
+    /// `運転手C` (乗務員CD)。**車番ではなく乗務員で明細を引くための鍵。**
+    pub driver_code: String,
+    /// `乗務員N` (自由入力の氏名)。
+    ///
+    /// **突合には使わない — `driver_code` を使う。** 氏名は表記ゆれがあり、
+    /// この列の埋まり具合も確認できていない (`/api/schema/sample` は日付で
+    /// 絞れないため、対象月の行だけを見る手段が無い)。表示の補助にとどめる。
+    pub driver_name: String,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -120,6 +132,12 @@ pub struct VehicleDailyRow {
     pub unit_price: f64,
     pub unit: String,
     pub row_id: String,
+    /// `車輌H` (車番の枝番)。`vehicle_number` と対で使う。
+    pub vehicle_branch: String,
+    /// `運転手C` (乗務員CD)。
+    pub driver_code: String,
+    /// `乗務員N` (自由入力の氏名。突合には使わない — `driver_code` を使う)。
+    pub driver_name: String,
 }
 
 /// Raw 行リストをレスポンス行に変換 (自車/傭車どちらの金額を使うか判定・日付整形)。
@@ -148,6 +166,9 @@ pub fn build_vehicle_daily_rows(raw: &[RawVehicleDailyRow]) -> Vec<VehicleDailyR
                 unit_price: r.unit_price,
                 unit: r.unit.clone(),
                 row_id: r.row_id.clone(),
+                vehicle_branch: r.vehicle_branch.clone(),
+                driver_code: r.driver_code.clone(),
+                driver_name: r.driver_name.clone(),
             }
         })
         .collect()
@@ -165,6 +186,12 @@ pub struct VehicleDailyQuery {
     pub to: String,
     /// `車輌C` (車番、完全一致)。
     pub vehicle: Option<String>,
+    /// `運転手C` (乗務員CD、完全一致)。
+    ///
+    /// **車番では引けない日があるため足した** (ohishi-exp/nuxt-dtako-admin#741)。
+    /// 同じ乗務員の売上が日によって別の車番 (デジタコを積んでいない車輌等) に
+    /// 載ることがあり、車番で引くとその日の明細がまるごと見えない。
+    pub driver: Option<String>,
     /// `得意先C` (完全一致)。
     pub customer: Option<String>,
     /// 積地 (`origin_area_name`/`origin` のいずれかに部分一致)。
@@ -184,20 +211,26 @@ fn normalize_filter(s: &Option<String>) -> Option<&str> {
 // ハンドラ
 // ══════════════════════════════════════════════════════════════
 
-/// GET /api/sales/vehicle-daily?from=&to=&vehicle=&customer=&origin=&dest=&limit=
+/// GET /api/sales/vehicle-daily?from=&to=&vehicle=&driver=&customer=&origin=&dest=&limit=
 ///
-/// `vehicle`/`customer`/`origin`/`dest` は最低 1 つ必須 (#79)。日付レンジのみでの
+/// `vehicle`/`driver`/`customer`/`origin`/`dest` は最低 1 つ必須 (#79)。日付レンジのみでの
 /// 全件スキャンは SQL Server/Tunnel への負荷が大きいため 400 で拒否する。
 pub async fn vehicle_daily(
     Extension(repo): Extension<DynRepo>,
     Query(params): Query<VehicleDailyQuery>,
 ) -> Result<Json<ApiResponse<Vec<VehicleDailyRow>>>, StatusCode> {
     let vehicle = normalize_filter(&params.vehicle);
+    let driver = normalize_filter(&params.driver);
     let customer = normalize_filter(&params.customer);
     let origin = normalize_filter(&params.origin);
     let dest = normalize_filter(&params.dest);
 
-    if vehicle.is_none() && customer.is_none() && origin.is_none() && dest.is_none() {
+    if vehicle.is_none()
+        && driver.is_none()
+        && customer.is_none()
+        && origin.is_none()
+        && dest.is_none()
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     let limit = params.limit.unwrap_or(500).clamp(1, 5000);
@@ -207,6 +240,7 @@ pub async fn vehicle_daily(
             &params.from,
             &params.to,
             vehicle,
+            driver,
             customer,
             origin,
             dest,
