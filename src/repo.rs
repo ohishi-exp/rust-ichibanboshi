@@ -116,6 +116,7 @@ pub trait AppRepo: Send + Sync {
         from: &str,
         to: &str,
         vehicle: Option<&str>,
+        driver: Option<&str>,
         customer: Option<&str>,
         origin: Option<&str>,
         dest: Option<&str>,
@@ -1089,6 +1090,7 @@ impl AppRepo for TiberiusRepo {
         from: &str,
         to: &str,
         vehicle: Option<&str>,
+        driver: Option<&str>,
         customer: Option<&str>,
         origin: Option<&str>,
         dest: Option<&str>,
@@ -1128,10 +1130,12 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[税抜傭車金額],0)+ISNULL(t.[税抜傭車割増],0)+ISNULL(t.[税抜傭車実費],0)-ISNULL(t.[傭車値引],0), \
              ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
              ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), ISNULL(t.[単位], ''), \
-             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
+             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
+             ISNULL(t.[車輌H], ''), ISNULL(t.[運転手C], ''), ISNULL(t.[乗務員N], '') \
              FROM [運転日報明細] t \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                AND (@P3 IS NULL OR t.[車輌C] = @P3) \
+               AND (@P7 IS NULL OR t.[運転手C] = @P7) \
                AND (@P4 IS NULL OR t.[得意先C] = @P4) \
                AND (@P5 IS NULL \
                  OR ISNULL((SELECT TOP 1 om.[地域N] FROM [地域ﾏｽﾀ] om WHERE om.[地域C] = t.[発地域C]), '') LIKE @P5 \
@@ -1156,6 +1160,7 @@ impl AppRepo for TiberiusRepo {
                     &customer,
                     &origin_pattern,
                     &dest_pattern,
+                    &driver,
                 ],
             )
             .await
@@ -1909,6 +1914,11 @@ impl TiberiusRepo {
                 unit_price: get_f64(r, 14),
                 unit: decode_cp932(r, 15),
                 row_id: decode_cp932(r, 16),
+                // **新しい列は末尾に足す。** 途中に挿すと下の index が全部ずれ、
+                // 静かに別の列を読む (金額を取り違える) 事故になりうる。
+                vehicle_branch: decode_cp932(r, 17),
+                driver_code: decode_cp932(r, 18),
+                driver_name: decode_cp932(r, 19),
             })
             .collect()
     }
