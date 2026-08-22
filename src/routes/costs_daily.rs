@@ -21,6 +21,13 @@
 //! 紐づかない経費は走行距離の比で按分**することになっており、消費側はその**固定費と
 //! 変動費を分ける材料**としてこの区分を使う。よって**絞らずそのまま返す**
 //! (`vehicle_daily` の `request_kind` と同じ方針)。
+//!
+//! ## `remarks` / `vendor_*` / `entered_date` を返す理由 (#760-11)
+//!
+//! 粗利タブで直課経費が突出する乗務員が居ても、経費C/種別/金額だけでは
+//! **何の修理か・どこに払ったか**が読めない。`経費明細` の `備考` (varchar 64) と
+//! `未払先C`/`未払先H` (名前は `未払先ﾏｽﾀ.未払先N`)、`入力年月日` をそのまま足す。
+//! 既存フィールドの意味・順序は変えない (JSON は末尾への追加のみ)。
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -88,6 +95,19 @@ pub struct RawCostsDailyRow {
     /// 行 ID = `管理年月日`(yyyymmdd) + '-' + `管理C`。`vehicle_daily` と同じ安定キー
     /// (値カラムに依存しないため編集されても不変)。
     pub row_id: String,
+    /// `備考` (varchar 64)。何の修理か等の自由記述。NULL は DB 層の `ISNULL` で空文字。
+    pub remarks: String,
+    /// `未払先C` (支払先コード)。
+    pub vendor_code: String,
+    /// `未払先H` (支払先コードの枝番)。`車輌C`/`車輌H` と同じく **単独では一意に指せない**
+    /// 前提で、`未払先ﾏｽﾀ` は `未払先C` + `未払先H` の複合で引く。
+    pub vendor_branch: String,
+    /// `未払先C` + `未払先H` → `未払先ﾏｽﾀ.未払先N` (表示名)。`経費N` と同じく
+    /// `TOP 1` のスカラサブクエリで引く (LEFT JOIN だと明細が N 重に返る)。
+    /// 引けなければ空文字。
+    pub vendor_name: String,
+    /// `入力年月日`。NULL は `None` (ロジック層で空文字にする)。
+    pub entered_date: Option<NaiveDateTime>,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -117,6 +137,16 @@ pub struct CostsDailyRow {
     /// `固定経費K == "1"`。月極めの固定費を走行距離の比で按分するための材料。
     pub is_fixed: bool,
     pub row_id: String,
+    /// `備考`。NULL は空文字。
+    pub remarks: String,
+    /// `未払先C`。
+    pub vendor_code: String,
+    /// `未払先H`。`vendor_code` と対で使う。
+    pub vendor_branch: String,
+    /// `未払先ﾏｽﾀ.未払先N`。引けなければ空文字。
+    pub vendor_name: String,
+    /// `入力年月日` を `YYYY-MM-DD` に整形。NULL は空文字。
+    pub entered_date: String,
 }
 
 /// Raw 行リストをレスポンス行に変換 (日付整形・`固定経費K` の bool 化)。
@@ -139,6 +169,15 @@ pub fn build_costs_daily_rows(raw: &[RawCostsDailyRow]) -> Vec<CostsDailyRow> {
             // 空文字 (ISNULL の既定値) も `"0"` も変動費として扱う。
             is_fixed: r.fixed_cost_flag == "1",
             row_id: r.row_id.clone(),
+            remarks: r.remarks.clone(),
+            vendor_code: r.vendor_code.clone(),
+            vendor_branch: r.vendor_branch.clone(),
+            vendor_name: r.vendor_name.clone(),
+            // NULL (None) は空文字。消費側が「未入力」と「日付」を同じ型で受けられる。
+            entered_date: r
+                .entered_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
         })
         .collect()
 }
