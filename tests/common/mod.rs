@@ -333,6 +333,7 @@ impl AppRepo for MockRepo {
                 vehicle_branch: "01".into(),
                 driver_code: "1656".into(),
                 driver_name: "西島 健太".into(),
+                request_kind: "0".into(),
             },
             // 傭車 (傭車先C!='000000')。得意先名・積地・卸地・品名/数量/単価が未マップ/空文字のエッジ。
             RawVehicleDailyRow {
@@ -357,6 +358,7 @@ impl AppRepo for MockRepo {
                 vehicle_branch: "".into(),
                 driver_code: "".into(),
                 driver_name: "".into(),
+                request_kind: "".into(),
             },
             // 別車輌・同得意先。customer/origin/dest だけの車輌横断検索 (#79 の主目的) の
             // テスト用に、vehicle_number/積地・卸地とも row 1 と異なる値にしてある。
@@ -382,6 +384,8 @@ impl AppRepo for MockRepo {
                 vehicle_branch: "00".into(),
                 driver_code: "1656".into(),
                 driver_name: "西島 健太".into(),
+                // 請求のみ (運送を伴わない請求行)。収支に足すと二重計上になる区分。
+                request_kind: "1".into(),
             },
         ];
 
