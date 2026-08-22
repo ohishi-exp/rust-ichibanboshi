@@ -1210,6 +1210,10 @@ impl AppRepo for TiberiusRepo {
         // 得るものだけがある。経費種別ﾏｽﾀ は 経費種別C 単独キーなのでそのまま。
         // 金額は 税抜金額 (金額 は実費の税処理で消費税の含み方が違う。CLAUDE.md)。
         // 軽油引取税は 税抜金額 に含まれない別立てなので独立に返す。
+        // 未払先名 (未払先ﾏｽﾀ.未払先N) も同じく TOP 1 のスカラサブクエリ (#760-11)。
+        // 引き当ては 未払先C + 未払先H の複合 (車輌C/車輌H と同じ形。これが
+        // マスタの主キーかどうかは INFORMATION_SCHEMA で要確認だが、TOP 1 なので
+        // 複合キーでなくても明細が N 重に返ることは構造的に無い)。
         // vehicle/driver/kind は全て任意だが、`(@Pn IS NULL OR ...)` 形で毎回 5
         // パラメータ固定のバインドにし、動的なクエリ文字列組み立て (injection リスク)
         // を避ける。呼び出し側 (handler) が「最低 1 つ必須」を検証する (全件スキャン防止)。
@@ -1225,7 +1229,11 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), \
              ISNULL(t.[税抜金額], 0), ISNULL(t.[軽油引取税], 0), ISNULL(t.[KM], 0), \
              ISNULL(t.[固定経費K], ''), \
-             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
+             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
+             ISNULL(t.[備考], ''), ISNULL(t.[未払先C], ''), ISNULL(t.[未払先H], ''), \
+             ISNULL((SELECT TOP 1 v.[未払先N] FROM [未払先ﾏｽﾀ] v \
+               WHERE v.[未払先C] = t.[未払先C] AND v.[未払先H] = t.[未払先H]), ''), \
+             t.[入力年月日] \
              FROM [経費明細] t \
              WHERE t.[運行年月日] >= @P1 AND t.[運行年月日] < @P2 \
                AND (@P3 IS NULL OR t.[車輌C] = @P3) \
@@ -2018,6 +2026,12 @@ impl TiberiusRepo {
                 // **新しい列は末尾に足す。** 途中に挿すと下の index が全部ずれ、
                 // 静かに別の列を読む (金額を取り違える) 事故になりうる。
                 row_id: decode_cp932(r, 14),
+                remarks: decode_cp932(r, 15),
+                vendor_code: decode_cp932(r, 16),
+                vendor_branch: decode_cp932(r, 17),
+                vendor_name: decode_cp932(r, 18),
+                // NULL も型不一致も None (空文字で返る)。`get` だと型不一致で panic する。
+                entered_date: r.try_get::<chrono::NaiveDateTime, _>(19).ok().flatten(),
             })
             .collect()
     }

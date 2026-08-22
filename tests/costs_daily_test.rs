@@ -31,6 +31,11 @@ fn test_build_costs_daily_rows_variable_and_fixed() {
             km: 12_345.6,
             fixed_cost_flag: "0".into(),
             row_id: "20260621-2001".into(),
+            remarks: "".into(),
+            vendor_code: "".into(),
+            vendor_branch: "".into(),
+            vendor_name: "".into(),
+            entered_date: None,
         },
         // 固定経費 (固定経費K="1")。月極めなので乗務員が紐付かず、数量/単価/KM も 0。
         RawCostsDailyRow {
@@ -49,6 +54,11 @@ fn test_build_costs_daily_rows_variable_and_fixed() {
             km: 0.0,
             fixed_cost_flag: "1".into(),
             row_id: "20260601-2003".into(),
+            remarks: "".into(),
+            vendor_code: "".into(),
+            vendor_branch: "".into(),
+            vendor_name: "".into(),
+            entered_date: None,
         },
         // 区分も名前も空 (ISNULL の既定値) のエッジ。空文字は固定経費ではない。
         RawCostsDailyRow {
@@ -67,6 +77,11 @@ fn test_build_costs_daily_rows_variable_and_fixed() {
             km: 0.0,
             fixed_cost_flag: "".into(),
             row_id: "20260622-2004".into(),
+            remarks: "".into(),
+            vendor_code: "".into(),
+            vendor_branch: "".into(),
+            vendor_name: "".into(),
+            entered_date: None,
         },
     ];
 
@@ -115,6 +130,86 @@ fn test_build_costs_daily_rows_variable_and_fixed() {
     assert_eq!(blank.cost_kind_name, "");
     assert_eq!(blank.amount, 0);
     assert_eq!(blank.row_id, "20260622-2004");
+}
+
+/// #760-11: 備考 / 未払先 / 入力日 の詰め替え。粗利タブで突出した直課経費が
+/// 「何の修理か・どこに払ったか」を読めるようにする追加フィールド。
+#[test]
+fn test_build_costs_daily_rows_remarks_vendor_entered_date() {
+    let raw = vec![
+        // 一般修理費。備考・未払先名・入力日が全部入っている行。
+        RawCostsDailyRow {
+            operation_date: dt(2026, 7, 13),
+            vehicle_number: "1420".into(),
+            vehicle_branch: "00".into(),
+            driver_code: "1234".into(),
+            cost_code: "0631".into(),
+            cost_name: "一般修理費".into(),
+            cost_kind: "02".into(),
+            cost_kind_name: "修繕費".into(),
+            quantity: 1.0,
+            unit_price: 206_060.0,
+            amount: 206_060,
+            diesel_tax: 0,
+            km: 0.0,
+            fixed_cost_flag: "0".into(),
+            row_id: "20260713-3001".into(),
+            remarks: "ミッション載せ替え".into(),
+            vendor_code: "001122".into(),
+            vendor_branch: "01".into(),
+            vendor_name: "○○自動車整備".into(),
+            entered_date: Some(dt(2026, 7, 15)),
+        },
+        // 備考 NULL (DB 層の ISNULL で空文字)、未払先ﾏｽﾀ に無い (名前 空)、入力日 NULL。
+        RawCostsDailyRow {
+            operation_date: dt(2026, 7, 13),
+            vehicle_number: "1420".into(),
+            vehicle_branch: "00".into(),
+            driver_code: "1234".into(),
+            cost_code: "0631".into(),
+            cost_name: "一般修理費".into(),
+            cost_kind: "02".into(),
+            cost_kind_name: "修繕費".into(),
+            quantity: 1.0,
+            unit_price: 12_000.0,
+            amount: 12_000,
+            diesel_tax: 0,
+            km: 0.0,
+            fixed_cost_flag: "0".into(),
+            row_id: "20260713-3002".into(),
+            remarks: "".into(),
+            vendor_code: "999999".into(),
+            vendor_branch: "00".into(),
+            vendor_name: "".into(),
+            entered_date: None,
+        },
+    ];
+
+    let rows = build_costs_daily_rows(&raw);
+    assert_eq!(rows.len(), 2);
+
+    let full = &rows[0];
+    assert_eq!(full.remarks, "ミッション載せ替え");
+    assert_eq!(full.vendor_code, "001122");
+    assert_eq!(full.vendor_branch, "01");
+    assert_eq!(full.vendor_name, "○○自動車整備");
+    // 入力年月日 は YYYY-MM-DD (運行年月日 と同じ整形)
+    assert_eq!(full.entered_date, "2026-07-15");
+    // 既存フィールドは不変
+    assert_eq!(full.operation_date, "2026-07-13");
+    assert_eq!(full.amount, 206_060);
+    assert_eq!(full.row_id, "20260713-3001");
+
+    let blank = &rows[1];
+    // 備考 NULL → 空文字
+    assert_eq!(blank.remarks, "");
+    // 未払先C/H はコードのまま返り、マスタで引けない名前だけ空
+    assert_eq!(blank.vendor_code, "999999");
+    assert_eq!(blank.vendor_branch, "00");
+    assert_eq!(blank.vendor_name, "");
+    // 入力日 NULL → 空文字 (None のまま返さない)
+    assert_eq!(blank.entered_date, "");
+    assert_eq!(blank.amount, 12_000);
 }
 
 #[test]
@@ -178,6 +273,71 @@ async fn test_costs_daily_returns_fuel_and_toll_kinds() {
         .collect();
     assert_eq!(fixed.len(), 1);
     assert_eq!(fixed[0]["cost_kind"], "09");
+}
+
+/// #760-11: JSON に 備考 / 未払先 / 入力日 が載り、既存キーも揃ったまま (追加のみ)。
+#[tokio::test]
+async fn test_costs_daily_json_has_remarks_vendor_entered_date() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/costs/vehicle-daily?from=2026-06-01&to=2026-07-01&vehicle=8504")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let json = body_json(res).await;
+    let data = json["data"].as_array().unwrap();
+    let fuel = data
+        .iter()
+        .find(|r| r["row_id"] == "20260621-2001")
+        .unwrap();
+    // 既存キーは全て残る (消費側の互換)
+    for key in [
+        "operation_date",
+        "vehicle_number",
+        "vehicle_branch",
+        "driver_code",
+        "cost_code",
+        "cost_name",
+        "cost_kind",
+        "cost_kind_name",
+        "quantity",
+        "unit_price",
+        "amount",
+        "diesel_tax",
+        "km",
+        "is_fixed",
+        "row_id",
+    ] {
+        assert!(fuel.get(key).is_some(), "missing existing key {key}");
+    }
+    assert_eq!(fuel["amount"], 19_339);
+    // 追加キー
+    assert_eq!(fuel["remarks"], "");
+    assert_eq!(fuel["vendor_code"], "001234");
+    assert_eq!(fuel["vendor_branch"], "00");
+    assert_eq!(fuel["vendor_name"], "○○石油");
+    assert_eq!(fuel["entered_date"], "2026-06-23");
+
+    // 備考あり・未払先名 無し (マスタ未登録) の行
+    let toll = data
+        .iter()
+        .find(|r| r["row_id"] == "20260620-2002")
+        .unwrap();
+    assert_eq!(toll["remarks"], "ETC");
+    assert_eq!(toll["vendor_name"], "");
+    // 固定経費は 未払先も入力日も無い → 全部空文字 (null ではない)
+    let fixed = data
+        .iter()
+        .find(|r| r["row_id"] == "20260601-2003")
+        .unwrap();
+    assert_eq!(fixed["vendor_code"], "");
+    assert_eq!(fixed["entered_date"], "");
+    assert!(fixed["entered_date"].is_string());
 }
 
 #[tokio::test]

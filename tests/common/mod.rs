@@ -432,6 +432,11 @@ impl AppRepo for MockRepo {
                 km: 12_345.6,
                 fixed_cost_flag: "0".into(),
                 row_id: "20260621-2001".into(),
+                remarks: "".into(),
+                vendor_code: "001234".into(),
+                vendor_branch: "00".into(),
+                vendor_name: "○○石油".into(),
+                entered_date: Some(dt(2026, 6, 23)),
             },
             // 通行料。KM を持たない (0) 種別のエッジ。
             RawCostsDailyRow {
@@ -450,6 +455,11 @@ impl AppRepo for MockRepo {
                 km: 0.0,
                 fixed_cost_flag: "0".into(),
                 row_id: "20260620-2002".into(),
+                remarks: "ETC".into(),
+                vendor_code: "005678".into(),
+                vendor_branch: "00".into(),
+                vendor_name: "".into(),
+                entered_date: Some(dt(2026, 6, 22)),
             },
             // 固定経費 (固定経費K="1")。月極めなので乗務員が紐付かない (空文字) エッジ。
             RawCostsDailyRow {
@@ -468,6 +478,11 @@ impl AppRepo for MockRepo {
                 km: 0.0,
                 fixed_cost_flag: "1".into(),
                 row_id: "20260601-2003".into(),
+                remarks: "".into(),
+                vendor_code: "".into(),
+                vendor_branch: "".into(),
+                vendor_name: "".into(),
+                entered_date: None,
             },
             // 同じ乗務員が別の車番で給油した日 (#741 と同じ形)。経費名/種別名が
             // マスタ未登録で空、固定経費K も空 (ISNULL の既定値) のエッジ。
@@ -487,6 +502,11 @@ impl AppRepo for MockRepo {
                 km: 0.0,
                 fixed_cost_flag: "".into(),
                 row_id: "20260622-2004".into(),
+                remarks: "".into(),
+                vendor_code: "".into(),
+                vendor_branch: "".into(),
+                vendor_name: "".into(),
+                entered_date: None,
             },
         ];
 
