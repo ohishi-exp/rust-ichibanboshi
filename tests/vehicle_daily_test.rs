@@ -37,6 +37,7 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             vehicle_branch: "01".into(),
             driver_code: "1656".into(),
             driver_name: "西島 健太".into(),
+            request_kind: "0".into(),
         },
         // 傭車 (傭車先C!='000000') → subcontract_amount を使う。品名/数量/単価/単位も未入力のエッジ。
         RawVehicleDailyRow {
@@ -61,6 +62,8 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             vehicle_branch: "".into(),
             driver_code: "".into(),
             driver_name: "".into(),
+            // 請求区分が空のエッジ (ISNULL の既定値)。
+            request_kind: "".into(),
         },
     ];
 
@@ -89,6 +92,8 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(first.driver_code, "1656");
     // `社員ﾏｽﾀ.社員N` 由来の表示名 (`運転日報明細.乗務員N` は自由入力でほぼ空)。
     assert_eq!(first.driver_name, "西島 健太");
+    // 請求区分はそのまま返す (どれを収支に入れるかは消費側の判断)
+    assert_eq!(first.request_kind, "0");
 
     let second = &rows[1];
     assert_eq!(second.sale_date, "2026-06-20");
@@ -96,6 +101,7 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(second.vehicle_branch, "");
     assert_eq!(second.driver_code, "");
     assert_eq!(second.driver_name, "");
+    assert_eq!(second.request_kind, "");
     assert_eq!(second.amount, 40_000);
     // 積地・卸地・得意先名は空文字のまま passthrough (surcharge_base 同様に県正規化しない)
     assert_eq!(second.origin_area_name, "");
@@ -133,6 +139,38 @@ async fn test_vehicle_daily_ok() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// **請求区分をそのまま返す** (2026-08-22)。`請求K=1` は「請求のみ」= 運送を伴わない
+/// 請求行で、車輌収支に足すと二重計上になる。実データ (2026-07) では中継の通し請求
+/// `釧路 → ユナイテッド牧場 ¥43,750` (請求K=1) と、実際に走った 2 本
+/// `釧路 → 駒場 ¥21,750` + `駒場 → ユナイテッド牧場 ¥22,000` (どちらも請求K=2) が
+/// 同じ荷の表裏になっていた。**絞り込みはせず、消費側が判断できるように出す。**
+#[tokio::test]
+async fn test_vehicle_daily_returns_request_kind() {
+    let app = common::build_app(common::mock_repo());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sales/vehicle-daily?from=2026-06-01&to=2026-07-01&customer=000001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let kinds: Vec<&str> = json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["request_kind"].as_str().unwrap())
+        .collect();
+    // 得意先 000001 の 2 行 = 通常運送 (請求K=0) と 請求のみ (請求K=1)。どちらも落ちない。
+    assert_eq!(kinds, vec!["0", "1"]);
 }
 
 #[tokio::test]
