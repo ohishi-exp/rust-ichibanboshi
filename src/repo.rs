@@ -1132,7 +1132,8 @@ impl AppRepo for TiberiusRepo {
              ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), ISNULL(t.[単位], ''), \
              CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
              ISNULL(t.[車輌H], ''), ISNULL(t.[運転手C], ''), \
-             ISNULL((SELECT TOP 1 s.[社員N] FROM [社員ﾏｽﾀ] s WHERE s.[社員C] = t.[運転手C]), '') \
+             ISNULL((SELECT TOP 1 s.[社員N] FROM [社員ﾏｽﾀ] s WHERE s.[社員C] = t.[運転手C]), ''), \
+             ISNULL(t.[請求K], '') \
              FROM [運転日報明細] t \
              WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 \
                AND (@P3 IS NULL OR t.[車輌C] = @P3) \
@@ -1920,6 +1921,7 @@ impl TiberiusRepo {
                 vehicle_branch: decode_cp932(r, 17),
                 driver_code: decode_cp932(r, 18),
                 driver_name: decode_cp932(r, 19),
+                request_kind: decode_cp932(r, 20),
             })
             .collect()
     }
