@@ -10,6 +10,7 @@ use rust_ichibanboshi::cakephp::CakephpClient;
 use rust_ichibanboshi::config::RawConfig;
 use rust_ichibanboshi::repo::{AppRepo, DynRepo, RepoError};
 use rust_ichibanboshi::routes;
+use rust_ichibanboshi::routes::costs_daily::RawCostsDailyRow;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
@@ -401,6 +402,102 @@ impl AppRepo for MockRepo {
             .collect())
     }
 
+    async fn costs_daily(
+        &self,
+        _from: &str,
+        _to: &str,
+        vehicle: Option<&str>,
+        driver: Option<&str>,
+        kind: Option<&str>,
+        _limit: i32,
+    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
+        // 実 SQL の `(@Pn IS NULL OR ...)` 絞り込みを模倣する固定フィクスチャ 4 行
+        // (nuxt-dtako-admin#760)。**燃料 (経費種別C="01") と通行料 ("04") を必ず
+        // 1 行ずつ**含める — 消費側が種別で分けて粗利の内訳を出すため。
+        let rows = vec![
+            // 燃料 (軽油)。軽油引取税は 税抜金額 に含まれない別立ての税。
+            RawCostsDailyRow {
+                operation_date: dt(2026, 6, 21),
+                vehicle_number: "8504".into(),
+                vehicle_branch: "01".into(),
+                driver_code: "1656".into(),
+                cost_code: "0101".into(),
+                cost_name: "軽油".into(),
+                cost_kind: "01".into(),
+                cost_kind_name: "燃料費".into(),
+                quantity: 150.5,
+                unit_price: 128.5,
+                amount: 19_339,
+                diesel_tax: 4_830,
+                km: 12_345.6,
+                fixed_cost_flag: "0".into(),
+                row_id: "20260621-2001".into(),
+            },
+            // 通行料。KM を持たない (0) 種別のエッジ。
+            RawCostsDailyRow {
+                operation_date: dt(2026, 6, 20),
+                vehicle_number: "8504".into(),
+                vehicle_branch: "01".into(),
+                driver_code: "1656".into(),
+                cost_code: "0401".into(),
+                cost_name: "高速道路通行料".into(),
+                cost_kind: "04".into(),
+                cost_kind_name: "通行料".into(),
+                quantity: 1.0,
+                unit_price: 8_400.0,
+                amount: 8_400,
+                diesel_tax: 0,
+                km: 0.0,
+                fixed_cost_flag: "0".into(),
+                row_id: "20260620-2002".into(),
+            },
+            // 固定経費 (固定経費K="1")。月極めなので乗務員が紐付かない (空文字) エッジ。
+            RawCostsDailyRow {
+                operation_date: dt(2026, 6, 1),
+                vehicle_number: "8504".into(),
+                vehicle_branch: "01".into(),
+                driver_code: "".into(),
+                cost_code: "0901".into(),
+                cost_name: "自動車保険料".into(),
+                cost_kind: "09".into(),
+                cost_kind_name: "保険料".into(),
+                quantity: 0.0,
+                unit_price: 0.0,
+                amount: 45_000,
+                diesel_tax: 0,
+                km: 0.0,
+                fixed_cost_flag: "1".into(),
+                row_id: "20260601-2003".into(),
+            },
+            // 同じ乗務員が別の車番で給油した日 (#741 と同じ形)。経費名/種別名が
+            // マスタ未登録で空、固定経費K も空 (ISNULL の既定値) のエッジ。
+            RawCostsDailyRow {
+                operation_date: dt(2026, 6, 22),
+                vehicle_number: "9012".into(),
+                vehicle_branch: "00".into(),
+                driver_code: "1656".into(),
+                cost_code: "0102".into(),
+                cost_name: "".into(),
+                cost_kind: "01".into(),
+                cost_kind_name: "".into(),
+                quantity: 80.0,
+                unit_price: 130.0,
+                amount: 10_400,
+                diesel_tax: 2_568,
+                km: 0.0,
+                fixed_cost_flag: "".into(),
+                row_id: "20260622-2004".into(),
+            },
+        ];
+
+        Ok(rows
+            .into_iter()
+            .filter(|r| vehicle.is_none_or(|v| r.vehicle_number == v))
+            .filter(|r| driver.is_none_or(|d| r.driver_code == d))
+            .filter(|r| kind.is_none_or(|k| r.cost_kind == k))
+            .collect())
+    }
+
     async fn uriage_rows(
         &self,
         _from: &str,
@@ -739,6 +836,17 @@ impl AppRepo for ErrorRepo {
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         Err(RepoError::PoolError)
     }
+    async fn costs_daily(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: i32,
+    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
+        Err(RepoError::PoolError)
+    }
     async fn uriage_rows(
         &self,
         _: &str,
@@ -926,6 +1034,17 @@ impl AppRepo for QueryErrorRepo {
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
+    async fn costs_daily(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: i32,
+    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
+        Err(RepoError::QueryError("test".into()))
+    }
     async fn uriage_rows(
         &self,
         _: &str,
@@ -1075,6 +1194,10 @@ pub fn build_app_full(
         .route(
             "/sales/vehicle-daily",
             get(routes::vehicle_daily::vehicle_daily),
+        )
+        .route(
+            "/costs/vehicle-daily",
+            get(routes::costs_daily::costs_daily),
         )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
         .route("/vehicles", get(routes::surcharge::vehicles))
