@@ -146,6 +146,12 @@ path = "src/routes/unko_gaps.rs"
 [[files]]
 path = "src/routes/vehicle_daily.rs"
 
+# 経費明細 (粗利 = 売上 − 手当 − 経費 の「経費」) を返す口
+# (Refs ohishi-exp/nuxt-dtako-admin#760 の 1)。vehicle_daily.rs と同型で、
+# MockRepo / ErrorRepo / QueryErrorRepo だけでカバーできる (DB 不要)
+[[files]]
+path = "src/routes/costs_daily.rs"
+
 # --- 未登録 (2026-07-30 実測、100% 未達) ---
 #
 # 到達したら登録すること。`make cov-not100` で最新の未達一覧が出る。

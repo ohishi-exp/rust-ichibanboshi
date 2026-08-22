@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::routes::costs_daily::RawCostsDailyRow;
 use crate::routes::sales::*;
 use crate::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use crate::routes::surcharge::RawSurchargeRow;
@@ -122,6 +123,18 @@ pub trait AppRepo: Send + Sync {
         dest: Option<&str>,
         limit: i32,
     ) -> Result<Vec<RawVehicleDailyRow>, RepoError>;
+
+    // ── costs_daily (車番×期間の経費明細、nuxt-dtako-admin#760。粗利 = 売上 − 手当 − 経費
+    //    の「経費」を運ぶ) ──
+    async fn costs_daily(
+        &self,
+        from: &str,
+        to: &str,
+        vehicle: Option<&str>,
+        driver: Option<&str>,
+        kind: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<RawCostsDailyRow>, RepoError>;
 
     // ── uriage (担当者別売上、#762) ──
     /// `[運転日報明細]` から `compute_person_sum` の入力 1 行を取得する。
@@ -1175,6 +1188,65 @@ impl AppRepo for TiberiusRepo {
         Ok(Self::rows_to_vehicle_daily(&rows))
     }
 
+    async fn costs_daily(
+        &self,
+        from: &str,
+        to: &str,
+        vehicle: Option<&str>,
+        driver: Option<&str>,
+        kind: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
+        let mut conn = self.conn().await?;
+
+        // 経費名 (経費ﾏｽﾀ.経費N) と経費種別名 (経費種別ﾏｽﾀ.経費種別N) は
+        // vehicle_daily と同じくスカラサブクエリ (TOP 1) で引く。LEFT JOIN にすると
+        // マスタ側が同一コードで複数行を持つとき明細が N 重に返る。
+        // **経費ﾏｽﾀ は 経費種別C + 経費C の複合キーで引く** (これがマスタの主キー。
+        // 例 01+0621=軽油費、02+0631=車検整備費)。実測 (2026-08-22) では 経費C は
+        // マスタ 51 行で一意なので単独でも当たるが、それだと将来 経費C が別種別で
+        // 再利用されたとき **amount は正しいまま cost_name だけ静かにすり替わる**。
+        // 複合にしても引けなくなる行は 0 件 (経費明細 100 行で確認済み) なので、
+        // 得るものだけがある。経費種別ﾏｽﾀ は 経費種別C 単独キーなのでそのまま。
+        // 金額は 税抜金額 (金額 は実費の税処理で消費税の含み方が違う。CLAUDE.md)。
+        // 軽油引取税は 税抜金額 に含まれない別立てなので独立に返す。
+        // vehicle/driver/kind は全て任意だが、`(@Pn IS NULL OR ...)` 形で毎回 5
+        // パラメータ固定のバインドにし、動的なクエリ文字列組み立て (injection リスク)
+        // を避ける。呼び出し側 (handler) が「最低 1 つ必須」を検証する (全件スキャン防止)。
+        let query = format!(
+            "SELECT TOP {} \
+             t.[運行年月日], \
+             ISNULL(t.[車輌C], ''), ISNULL(t.[車輌H], ''), ISNULL(t.[運転手C], ''), \
+             ISNULL(t.[経費C], ''), \
+             ISNULL((SELECT TOP 1 m.[経費N] FROM [経費ﾏｽﾀ] m \
+               WHERE m.[経費種別C] = t.[経費種別C] AND m.[経費C] = t.[経費C]), ''), \
+             ISNULL(t.[経費種別C], ''), \
+             ISNULL((SELECT TOP 1 k.[経費種別N] FROM [経費種別ﾏｽﾀ] k WHERE k.[経費種別C] = t.[経費種別C]), ''), \
+             ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), \
+             ISNULL(t.[税抜金額], 0), ISNULL(t.[軽油引取税], 0), ISNULL(t.[KM], 0), \
+             ISNULL(t.[固定経費K], ''), \
+             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]) \
+             FROM [経費明細] t \
+             WHERE t.[運行年月日] >= @P1 AND t.[運行年月日] < @P2 \
+               AND (@P3 IS NULL OR t.[車輌C] = @P3) \
+               AND (@P4 IS NULL OR t.[運転手C] = @P4) \
+               AND (@P5 IS NULL OR t.[経費種別C] = @P5) \
+             ORDER BY t.[運行年月日], t.[管理C]",
+            limit.clamp(1, 5000)
+        );
+
+        let stream = conn
+            .query(&query, &[&from, &to, &vehicle, &driver, &kind])
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .map_err(|e| RepoError::QueryError(e.to_string()))?;
+
+        Ok(Self::rows_to_costs_daily(&rows))
+    }
+
     async fn uriage_rows(
         &self,
         from: &str,
@@ -1922,6 +1994,30 @@ impl TiberiusRepo {
                 driver_code: decode_cp932(r, 18),
                 driver_name: decode_cp932(r, 19),
                 request_kind: decode_cp932(r, 20),
+            })
+            .collect()
+    }
+
+    fn rows_to_costs_daily(rows: &[tiberius::Row]) -> Vec<RawCostsDailyRow> {
+        rows.iter()
+            .map(|r| RawCostsDailyRow {
+                operation_date: r.get(0).unwrap_or_default(),
+                vehicle_number: decode_cp932(r, 1),
+                vehicle_branch: decode_cp932(r, 2),
+                driver_code: decode_cp932(r, 3),
+                cost_code: decode_cp932(r, 4),
+                cost_name: decode_cp932(r, 5),
+                cost_kind: decode_cp932(r, 6),
+                cost_kind_name: decode_cp932(r, 7),
+                quantity: get_f64(r, 8),
+                unit_price: get_f64(r, 9),
+                amount: get_i64(r, 10),
+                diesel_tax: get_i64(r, 11),
+                km: get_f64(r, 12),
+                fixed_cost_flag: decode_cp932(r, 13),
+                // **新しい列は末尾に足す。** 途中に挿すと下の index が全部ずれ、
+                // 静かに別の列を読む (金額を取り違える) 事故になりうる。
+                row_id: decode_cp932(r, 14),
             })
             .collect()
     }

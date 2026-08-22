@@ -1,3 +1,4 @@
+pub mod costs_daily;
 pub mod dtako_autoload;
 pub mod dtako_day;
 pub mod employees;
