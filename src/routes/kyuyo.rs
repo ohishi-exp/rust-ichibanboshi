@@ -659,3 +659,74 @@ pub async fn sync(
         warnings,
     }))
 }
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/access (allowlist 判定だけ。DB も derived store も触らない)
+// ══════════════════════════════════════════════════════════════
+
+/// 「この人は給与データを見てよいか」の答え。
+///
+/// **`allowed` は常に `true`** — allowlist 外なら [`authorize`] が 403 を返して
+/// ここへ来ない。`{allowed: false}` を返す分岐を作らないのは、**呼び出し側が
+/// status を無視して body だけ読む実装になるのを防ぐため**。この口の答えは
+/// HTTP status が正で、body は「誰として通ったか」を添えるだけ。
+#[derive(Serialize, Debug)]
+pub struct AccessResponse {
+    /// 常に `true` (上の docs 参照)。
+    pub allowed: bool,
+    /// 判定に使った email (introspect 応答由来)。
+    pub email: String,
+}
+
+/// 給与データの閲覧可否だけを答える (Refs ohishi-exp/nuxt-dtako-admin#951)。
+///
+/// ## なぜこの口が要るのか
+///
+/// `POST /api/kintai/wage-snapshot` / `GET /api/kintai/wage-range` が扱う `paid`
+/// (給与支払額) は**給与大臣の実支給額**で、`/api/kyuyo/payroll` と同じ値。
+/// なのにあの 2 本の認可は呼び出し側 (dtako-scraper-relay) の **tenant 単位**で、
+/// **allowlist に載っている 1 名が保存した瞬間、実支給額が tenant 全員の読める
+/// 場所へ移る**という穴があった。
+///
+/// あの 2 本にこのゲートを直接掛けることは**できない** —
+/// [`crate::routes::wage_snapshot`] の module docs のとおり、`kintai.wage_snapshot`
+/// を持つ Supabase に繋がるのは GCP のインスタンスだけで、そちらには introspect
+/// も allowlist も配っていない (「資格情報を増やさない」方針)。⇒ **呼び出し側が
+/// 「見てよいか」をこちら (allowlist を持つインスタンス) に 1 回聞く**形にする。
+///
+/// ## 新しい認可ロジックは書かない
+///
+/// 中身は [`authorize`] 1 本で、`/kyuyo/*` の他の 6 本とまったく同じ関門を通る。
+/// **正は `KYUYO_ALLOWED_EMAILS` の 1 か所のまま**で、呼び出し側に allowlist を
+/// 持たせない (二重管理になり、片方だけ更新されて食い違う)。
+///
+/// ## DB を触らない
+///
+/// `synced-months` を流用すると derived SQLite を無駄に読む。この口は
+/// `Extension` も `KyuyoAuthState` しか取らない — **判定だけで往復を終える**。
+///
+/// ## 応答をキャッシュしない
+///
+/// `Cache-Control` も `ETag` も付けない。allowlist から外した人がいつまでも
+/// 通る状態を作らないため。呼び出し側で memo する場合も短時間に限ること。
+///
+/// ## status (すべて [`authorize`] のもの、ここでは 1 つも足していない)
+///
+/// | status | 条件 |
+/// | --- | --- |
+/// | **200** | allowlist 内 (`{allowed: true, email}`) |
+/// | **401** | `Authorization: Bearer` 無し / introspect `active:false` |
+/// | **403** | allowlist 外の email |
+/// | **503** | introspect 未設定 / allowlist 空 / 認可サーバに不達 |
+pub async fn access(
+    Extension(auth): Extension<Arc<KyuyoAuthState>>,
+    headers: HeaderMap,
+) -> Result<Json<AccessResponse>, ApiError> {
+    let email = authorize(&headers, &auth)
+        .await
+        .map_err(|(status, message)| err(status, message))?;
+    Ok(Json(AccessResponse {
+        allowed: true,
+        email,
+    }))
+}
