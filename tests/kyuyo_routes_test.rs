@@ -39,6 +39,19 @@ impl IntrospectApi for StubIntrospect {
     }
 }
 
+/// introspect に**到達できない**とき用 (認可判断ができない = 503)。
+/// `StubIntrospect` は必ず `Ok` を返すので、この分岐は別の stub でしか作れない。
+struct UnreachableIntrospect;
+
+#[async_trait]
+impl IntrospectApi for UnreachableIntrospect {
+    async fn introspect(&self, _token: &str) -> Result<IntrospectResult, IntrospectError> {
+        Err(IntrospectError::RequestFailed(
+            "connection refused".to_string(),
+        ))
+    }
+}
+
 fn auth_ok() -> KyuyoAuthState {
     KyuyoAuthState::new(
         Some(Arc::new(StubIntrospect(IntrospectResult {
@@ -150,6 +163,7 @@ fn build_app_with_store(repo: DynKyuyoRepo, auth: KyuyoAuthState, store: DynKyuy
             "/api/kyuyo/synced-months",
             get(routes::kyuyo::synced_months),
         )
+        .route("/api/kyuyo/access", get(routes::kyuyo::access))
         .layer(Extension(repo))
         .layer(Extension(Arc::new(auth)))
         .layer(Extension(Arc::new(KyuyoLimiter::default())))
@@ -1016,4 +1030,108 @@ async fn synced_months_empty_and_error_paths() {
     let app = build_app_with_store(Arc::new(MockKyuyoRepo::default()), auth_ok(), store);
     let (status, _) = get_json(app, "/api/kyuyo/synced-months", true).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/kyuyo/access (Refs ohishi-exp/nuxt-dtako-admin#951)
+// ══════════════════════════════════════════════════════════════
+//
+// **`authorize()` の 4 分岐すべて**を、この口の上で 1 対 1 に固定する。
+// 3 つしか列挙しないと「4 分岐と一致する」を検証したことにならない
+// (呼び出し側 dtako-scraper-relay は status で処方を撃ち分けるので、
+// どれか 1 つでもずれると画面の文言が原因と食い違う)。
+
+#[tokio::test]
+async fn access_allows_listed_email_and_echoes_it() {
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth_ok());
+    let (status, body) = get_json(app, "/api/kyuyo/access", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["allowed"], serde_json::json!(true));
+    // **誰として通ったか**を返す — 呼び出し側のログで「1 名だけ」を確かめられるように
+    assert_eq!(body["email"], serde_json::json!("keiri@example.com"));
+}
+
+#[tokio::test]
+async fn access_without_bearer_is_401() {
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth_ok());
+    let (status, body) = get_json(app, "/api/kyuyo/access", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body["error"].as_str().unwrap().contains("Bearer"));
+}
+
+#[tokio::test]
+async fn access_with_inactive_token_is_401() {
+    let auth = KyuyoAuthState::new(
+        Some(Arc::new(StubIntrospect(IntrospectResult {
+            active: false,
+            ..Default::default()
+        }))),
+        &["keiri@example.com".to_string()],
+    );
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth);
+    let (status, _) = get_json(app, "/api/kyuyo/access", true).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn access_with_email_outside_allowlist_is_403() {
+    let auth = KyuyoAuthState::new(
+        Some(Arc::new(StubIntrospect(IntrospectResult {
+            active: true,
+            email: "other@example.com".to_string(),
+            tenant_id: "t".to_string(),
+            // ★ role は見ない — admin でも allowlist 外なら 403 (introspect.rs 実装)
+            role: "admin".to_string(),
+        }))),
+        &["keiri@example.com".to_string()],
+    );
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth);
+    let (status, _) = get_json(app, "/api/kyuyo/access", true).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn access_is_503_when_introspect_not_configured() {
+    let auth = KyuyoAuthState::new(None, &["keiri@example.com".to_string()]);
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth);
+    let (status, _) = get_json(app, "/api/kyuyo/access", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn access_is_503_when_allowlist_empty() {
+    let auth = KyuyoAuthState::new(
+        Some(Arc::new(StubIntrospect(IntrospectResult {
+            active: true,
+            email: "keiri@example.com".to_string(),
+            ..Default::default()
+        }))),
+        &[],
+    );
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth);
+    let (status, _) = get_json(app, "/api/kyuyo/access", true).await;
+    // **allowlist が空 = 全拒否**。403 (権限の話) ではなく 503 (設定の話)
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn access_is_503_when_introspect_unreachable() {
+    let auth = KyuyoAuthState::new(
+        Some(Arc::new(UnreachableIntrospect)),
+        &["keiri@example.com".to_string()],
+    );
+    let app = build_app(Arc::new(MockKyuyoRepo::default()), auth);
+    let (status, _) = get_json(app, "/api/kyuyo/access", true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// この口は **DB にも derived store にも触らない** — `NotConfiguredKyuyoRepo`
+/// (全メソッドが `NotConfigured` を返す) でも 200 が返ることで固定する。
+/// `synced-months` を流用していたら store を読んで別の結果になる。
+#[tokio::test]
+async fn access_does_not_touch_db_or_store() {
+    let app = build_app(Arc::new(NotConfiguredKyuyoRepo), auth_ok());
+    let (status, body) = get_json(app, "/api/kyuyo/access", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["allowed"], serde_json::json!(true));
 }
