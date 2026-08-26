@@ -1,6 +1,7 @@
 pub mod costs_daily;
 pub mod dtako_autoload;
 pub mod dtako_day;
+pub mod dtako_worktime;
 pub mod employees;
 pub mod health;
 pub mod kintai;
