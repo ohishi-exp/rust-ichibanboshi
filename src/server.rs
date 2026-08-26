@@ -458,6 +458,12 @@ pub async fn run(
         .route("/kyuyo/employees", get(routes::kyuyo::employees))
         .route("/kyuyo/sync", post(routes::kyuyo::sync))
         .route("/kyuyo/synced-months", get(routes::kyuyo::synced_months))
+        // 「この人は給与データを見てよいか」だけを答える口 (Refs
+        // ohishi-exp/nuxt-dtako-admin#951)。下の `/kintai/wage-*` は Supabase の
+        // 都合で GCP 側にしか置けず、そちらには allowlist が無い。呼び出し側
+        // (dtako-scraper-relay) が **allowlist を持つこちらのインスタンス**へ
+        // 1 回聞いてから wage-* を通す、という組み合わせで塞ぐ
+        .route("/kyuyo/access", get(routes::kyuyo::access))
         // 賃金確定値の月次スナップショット (Refs #291)。**`/kintai/*` 側に置く** —
         // 読み書きする `kintai.wage_snapshot` は Supabase にあり、そこへ繋がるのは
         // GCP のインスタンスだけ。`/kyuyo/*` の宛先 (ohishi-data) には
