@@ -50,14 +50,23 @@
 //! 一切変えないので、`kintai` で始まる名前を付けると無関係な deploy まで
 //! 全乗務員を stale にしてしまう ([`crate::routes::dtako_day`] と同じ理由)。
 //!
-//! ## 秒で返す — 分に丸めるのは呼ぶ側
+//! ## ★ 秒で返す — 分に丸めるのは呼ぶ側 (「画面が分なんだから分で返せ」で単純化しない)
 //!
 //! **`minutes` ではなく `seconds` (整数、丸めなし) を返す。** 区間の端は秒まで
 //! あり、暦日クリップでも秒が出る。ここで (乗務員 × 暦日 × 区分) ごとに分へ丸めると、
 //! 月合計で最大 数十分ぶんの丸め誤差が積み上がる — #612 が測った 運転 の月差の
 //! 中央値が **4.5 分**なので、その丸めは突合の結論そのものを壊す大きさになる。
+//!
+//! **決定打は判定閾値との関係**: 設計 §4 の受け入れ試験は一致判定を
+//! **`|Δ| <= 勤務日数 × 1 分`** で切る。theearth が日別に H:mm へ丸めることで積み上がる
+//! ぶんを許すための閾値なので、**こちらでも日別に丸めて同じ堆積を自分で作ってから
+//! その閾値で許す**のは本末転倒になる。生の精度で返し、丸めは表示側 (最終的には
+//! theearth が H:mm へ丸めている側) に寄せる。
+//!
 //! 秒は丸めていない実測値で、分への変換 (と丸め方の選択) は合成と同じく
-//! **呼ぶ側 1 か所**に置く。
+//! **呼ぶ側 1 か所**に置く。**この口は 1 度も分に落としていない。**
+//! フィールド名にも単位を入れてある (`seconds_by_state`) — 秒を分の名前で渡すのが
+//! この設計でいちばん危ない取り違えなので。
 //!
 //! ## 読む窓 — 暦日にクリップするので `exact_month_range`
 //!
@@ -232,14 +241,20 @@ impl Aggregate {
         }
     }
 
-    /// 応答 JSON。`days` は `(乗務員CD, 暦日)` 昇順、`seconds` は
+    /// 応答 JSON。`days` は `(乗務員CD, 暦日)` 昇順、`seconds_by_state` は
     /// [`LAYER_A_STATES`] の順で 6 個そろえる (欠けたキーを作らない)。
+    ///
+    /// **フィールド名に単位を入れる** (`seconds_by_state` /
+    /// `clipped_outside_window_seconds`)。この repo と上流は `drivingMinutes` /
+    /// `restraintMinutes` のように単位を名前で持つ流儀で、**秒を分の名前で渡すのが
+    /// この変更でいちばん危ない取り違え**になる。どの参照経路
+    /// (`row.seconds_by_state["運転"]`) を通っても単位が読める形にしておく。
     fn to_json(&self, month: &str, driver: Option<u64>, from: &str, to: &str) -> serde_json::Value {
         let days: Vec<serde_json::Value> = self
             .days
             .iter()
             .map(|((driver_cd, date), secs)| {
-                let seconds: serde_json::Map<String, serde_json::Value> = LAYER_A_STATES
+                let by_state: serde_json::Map<String, serde_json::Value> = LAYER_A_STATES
                     .iter()
                     .zip(secs.iter())
                     .map(|(name, v)| ((*name).to_string(), serde_json::json!(v)))
@@ -247,7 +262,7 @@ impl Aggregate {
                 serde_json::json!({
                     "driver_cd": driver_cd,
                     "date": date.to_string(),
-                    "seconds": seconds,
+                    "seconds_by_state": by_state,
                 })
             })
             .collect();
@@ -751,10 +766,16 @@ mod tests {
         assert_eq!(body["days"].as_array().unwrap().len(), 2);
         assert_eq!(body["days"][0]["driver_cd"], json!(1041));
         assert_eq!(body["days"][0]["date"], json!("2026-06-02"));
-        assert_eq!(body["days"][0]["seconds"]["運転"], json!(3600));
-        assert_eq!(body["days"][0]["seconds"]["積み"], json!(0));
+        assert_eq!(body["days"][0]["seconds_by_state"]["運転"], json!(3600));
+        assert_eq!(body["days"][0]["seconds_by_state"]["積み"], json!(0));
+        // ★ 単位はフィールド名で持つ。裸の `seconds` / `minutes` では返さない —
+        // 秒を分の名前で渡すのがこの設計でいちばん危ない取り違えなので、
+        // 名前が戻ったらここで落ちる
+        assert!(body["days"][0].get("seconds_by_state").is_some());
+        assert!(body["days"][0].get("minutes").is_none());
+        assert!(body["days"][0].get("seconds").is_none());
         assert_eq!(body["days"][1]["driver_cd"], json!(1368));
-        assert_eq!(body["days"][1]["seconds"]["積み"], json!(1800));
+        assert_eq!(body["days"][1]["seconds_by_state"]["積み"], json!(1800));
         assert_eq!(body["counted_rows"], json!(2));
         assert_eq!(body["unclassified_states"], json!({}));
         assert_eq!(body["ignored_rows"]["layer_b"], json!(0));
@@ -769,6 +790,6 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["driver"], json!(1041));
         assert_eq!(body["days"].as_array().unwrap().len(), 1);
-        assert_eq!(body["days"][0]["seconds"]["運転"], json!(3600));
+        assert_eq!(body["days"][0]["seconds_by_state"]["運転"], json!(3600));
     }
 }
