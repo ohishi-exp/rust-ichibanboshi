@@ -152,6 +152,12 @@ path = "src/routes/vehicle_daily.rs"
 [[files]]
 path = "src/routes/costs_daily.rs"
 
+# dtako_events の作業区分 (層 A) を 乗務員 × 暦日 × 区分 の秒数で返す口
+# (Refs ohishi-exp/nuxt-dtako-admin#612 の PR-2)。dtako_day.rs と同型で、
+# MockRepo / FailingRepo だけでカバーできる (DB 不要)
+[[files]]
+path = "src/routes/dtako_worktime.rs"
+
 # --- 未登録 (2026-07-30 実測、100% 未達) ---
 #
 # 到達したら登録すること。`make cov-not100` で最新の未達一覧が出る。
