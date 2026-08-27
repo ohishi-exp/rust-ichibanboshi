@@ -211,14 +211,20 @@ pub fn validate_snapshot(req: SnapshotRequest) -> Result<ValidSnapshot, String> 
     if !RESTRAINT_SOURCES.contains(&req.restraint_source.as_str()) {
         return Err("restraint_source は gcp / current のいずれかです".to_string());
     }
-    // 既知の 3 値でなければ弾く — **`restraint_source` と同じ流儀**を選んだ
-    // (親の判断はどちらでも可、理由を書けとのこと)。理由は 2 つ:
+    // 既知の 3 値でなければ弾く (**黙って `None` に倒さない**)。理由は 4 つ:
     //
-    // 1. 黙って `None` に倒すと「見ていない」という**別の事実**に化ける。
-    //    `parse_synced_at` が形の違う時刻を NULL にせず 400 にするのと同じ理由で、
-    //    取れなかった土台の上で組んだ数字を「見ていない」と記録したら、
-    //    健全に見えるのに数字だけ違う保存物 (この issue そのもの) がもう 1 つ増える。
-    // 2. DDL 側にも同じ CHECK を置いた (007)。ここで弾かないと DB エラーが 502 で出る。
+    // 1. **`None` は既に「見ていない」という意味を持っている。** そこへ「未知の値が
+    //    来た」を混ぜると 1 つの値に意味が 2 つ乗り、後から読む人が区別できない。
+    // 2. 取れなかった土台の上で組んだ数字を「見ていない」と記録するのは、
+    //    **この issue が塞ごうとしている穴そのものと同じ形** — 健全に見えるのに
+    //    数字だけ違う保存物がもう 1 つ増える。この repo の流儀は loud fail で、
+    //    `parse_synced_at` も形の違う時刻を NULL にせず 400 にしている。
+    // 3. 同じ層・同じ性格の `restraint_source` が [`RESTRAINT_SOURCES`] で
+    //    strict に検証しているので、流儀を揃える。
+    // 4. DDL 側にも同じ CHECK を置いた (007)。ここで弾かないと DB エラーが 502 で出る。
+    //
+    // 前方互換の心配は要らない — PR の順が「上流が先」なので、画面が新しい値を
+    // 送り始める時点で上流は必ずその値を知っている。
     if let Some(v) = &req.timecard_kosoku {
         if !TIMECARD_KOSOKU_STATES.contains(&v.as_str()) {
             return Err("timecard_kosoku は yes / no / unreadable のいずれかです".to_string());
