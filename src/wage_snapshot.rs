@@ -44,6 +44,18 @@ pub const MAX_SNAPSHOT_ROWS: usize = 4000;
 /// 拘束時間ソース。DDL の CHECK と同じ 2 値。
 pub const RESTRAINT_SOURCES: [&str; 2] = ["gcp", "current"];
 
+/// 当月の拘束を オンプレ `kosoku-daily` から組めたか。DDL の CHECK と同じ 3 値で、
+/// 画面 (`GET /restraint-api/wage-report` の `timecard_kosoku`) の語彙をそのまま使う
+/// (Refs ohishi-exp/nuxt-dtako-admin#986 / #980)。
+///
+/// **`None` (未指定) はここに入れない** — `None` は「見ていない」で、`"yes"`
+/// (揃っていた) とは別の事実。`restraint_source: "gcp"` は `kosoku-daily` を
+/// 取りに行かないので、その経路では `None` が正しい値になる。
+///
+/// **`"no"` (取れなかった) と `"unreadable"` (読めなかった) を畳まない** — 前者は
+/// 読み直せば入り、後者は上流の応答の形が変わっている。処方が逆になる。
+pub const TIMECARD_KOSOKU_STATES: [&str; 3] = ["yes", "no", "unreadable"];
+
 /// 乗務員 1 人 × 1 か月の確定値。保存 (POST の payload) と読み出し (SELECT の 1 行) で
 /// 同じ形を使う — 片方だけ列が増える事故を防ぐ。
 ///
@@ -108,6 +120,15 @@ pub struct SnapshotRequest {
     pub comp_id: String,
     pub month: String,
     pub restraint_source: String,
+    /// 当月の拘束の土台が取れていたか ([`TIMECARD_KOSOKU_STATES`] のいずれか)。
+    ///
+    /// **`masters` ではなくここに置く** — `masters` は「マスタの内容ハッシュ」の
+    /// 並びで、これは土台の**取得可否**なので層が違う。
+    ///
+    /// 省略 (`None`) は「見ていない」。**既存クライアント (この列を送らない画面) が
+    /// 壊れないよう `#[serde(default)]`** で受け、`"yes"` には化けさせない。
+    #[serde(default)]
+    pub timecard_kosoku: Option<String>,
     pub wage_logic_version: String,
     #[serde(default)]
     pub masters: MonthMasters,
@@ -121,6 +142,9 @@ pub struct ValidSnapshot {
     pub comp_id: String,
     pub ym: NaiveDate,
     pub restraint_source: String,
+    /// [`SnapshotRequest::timecard_kosoku`] と同じ。検証済みなので
+    /// [`TIMECARD_KOSOKU_STATES`] のいずれか、または `None`。
+    pub timecard_kosoku: Option<String>,
     pub wage_logic_version: String,
     pub masters: MonthMasters,
     pub rows: Vec<WageSnapshotRow>,
@@ -187,6 +211,19 @@ pub fn validate_snapshot(req: SnapshotRequest) -> Result<ValidSnapshot, String> 
     if !RESTRAINT_SOURCES.contains(&req.restraint_source.as_str()) {
         return Err("restraint_source は gcp / current のいずれかです".to_string());
     }
+    // 既知の 3 値でなければ弾く — **`restraint_source` と同じ流儀**を選んだ
+    // (親の判断はどちらでも可、理由を書けとのこと)。理由は 2 つ:
+    //
+    // 1. 黙って `None` に倒すと「見ていない」という**別の事実**に化ける。
+    //    `parse_synced_at` が形の違う時刻を NULL にせず 400 にするのと同じ理由で、
+    //    取れなかった土台の上で組んだ数字を「見ていない」と記録したら、
+    //    健全に見えるのに数字だけ違う保存物 (この issue そのもの) がもう 1 つ増える。
+    // 2. DDL 側にも同じ CHECK を置いた (007)。ここで弾かないと DB エラーが 502 で出る。
+    if let Some(v) = &req.timecard_kosoku {
+        if !TIMECARD_KOSOKU_STATES.contains(&v.as_str()) {
+            return Err("timecard_kosoku は yes / no / unreadable のいずれかです".to_string());
+        }
+    }
     if req.wage_logic_version.trim().is_empty() {
         return Err("wage_logic_version は必須です".to_string());
     }
@@ -211,6 +248,7 @@ pub fn validate_snapshot(req: SnapshotRequest) -> Result<ValidSnapshot, String> 
         comp_id: req.comp_id,
         ym,
         restraint_source: req.restraint_source,
+        timecard_kosoku: req.timecard_kosoku,
         wage_logic_version: req.wage_logic_version,
         masters: MonthMasters {
             payroll_synced_at,
@@ -239,6 +277,8 @@ pub fn resolve_months(from: &str, to: &str) -> Result<Vec<NaiveDate>, String> {
 pub struct MonthBucket {
     pub rows: Vec<WageSnapshotRow>,
     pub masters: MonthMasters,
+    /// 保存時に付いていた [`ValidSnapshot::timecard_kosoku`]。読み出しでそのまま返す。
+    pub timecard_kosoku: Option<String>,
     pub wage_logic_version: Option<String>,
     pub computed_at: Option<String>,
 }
@@ -326,6 +366,12 @@ pub struct MonthCoverage {
     /// 集計から外した理由 (`"payroll_missing"`)。入っている月は合計に寄与しない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded: Option<String>,
+    /// 保存時に拘束の土台が取れていたか ([`TIMECARD_KOSOKU_STATES`])。
+    ///
+    /// **無ければ列ごと出さない。** 出すと「見ていない」と「揃っていた」が混ざる —
+    /// 画面はこの値が在るときだけ注記を出す (nuxt-dtako-admin#989 と同じ読み方)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timecard_kosoku: Option<String>,
 }
 
 /// 乗務員 × 月の金額 (`by_month`)。差は入れない (画面が引く)。
@@ -441,6 +487,8 @@ pub fn aggregate_range(
                 stale: None,
                 stale_reason: Vec::new(),
                 excluded: None,
+                // 未保存の月は「見ていない」ですらない (保存物が無い)。None のまま出さない
+                timecard_kosoku: None,
             });
             continue;
         };
@@ -463,6 +511,7 @@ pub fn aggregate_range(
                 stale,
                 stale_reason: reasons,
                 excluded: Some("payroll_missing".to_string()),
+                timecard_kosoku: bucket.timecard_kosoku.clone(),
             });
             continue;
         }
@@ -505,6 +554,7 @@ pub fn aggregate_range(
             stale,
             stale_reason: reasons,
             excluded: None,
+            timecard_kosoku: bucket.timecard_kosoku.clone(),
         });
     }
 
@@ -553,6 +603,7 @@ mod tests {
                 salary_item_sha: Some("item-1".to_string()),
                 payroll_synced_at: Some("2026-02-03T09:12:00Z".to_string()),
             },
+            timecard_kosoku: Some("no".to_string()),
             wage_logic_version: Some("wage-1".to_string()),
             computed_at: Some("2026-08-05T01:20:00Z".to_string()),
         }
@@ -563,6 +614,7 @@ mod tests {
             comp_id: "comp".to_string(),
             month: "2026-01".to_string(),
             restraint_source: "gcp".to_string(),
+            timecard_kosoku: None,
             wage_logic_version: "wage-1".to_string(),
             masters: MonthMasters::default(),
             rows: vec![row(1035)],
@@ -593,6 +645,7 @@ mod tests {
         assert_eq!(v.restraint_source, "gcp");
         assert_eq!(v.wage_logic_version, "wage-1");
         assert_eq!(v.masters, MonthMasters::default());
+        assert_eq!(v.timecard_kosoku, None);
     }
 
     #[test]
@@ -623,6 +676,91 @@ mod tests {
         assert!(validate_snapshot(bad)
             .unwrap_err()
             .contains("restraint_source"));
+    }
+
+    /// **後方互換の要**: `timecard_kosoku` を送ってこない既存クライアントの payload は
+    /// `None` (= 見ていない) になる。`"yes"` (揃っていた) に化けてはいけない —
+    /// 化けると「拘束が取れていないのに健全に見える保存物」がまた増える
+    /// (Refs ohishi-exp/nuxt-dtako-admin#986 / #980)。
+    #[test]
+    fn timecard_kosoku_defaults_to_none_when_omitted() {
+        let body = r#"{"comp_id":"comp","month":"2026-01","restraint_source":"gcp",
+                       "wage_logic_version":"wage-1","rows":[]}"#;
+        let parsed: SnapshotRequest = serde_json::from_str(body).expect("既存の payload は通る");
+        assert_eq!(parsed.timecard_kosoku, None);
+        let v = validate_snapshot(parsed).expect("省略は検証も通る");
+        assert_eq!(v.timecard_kosoku, None);
+    }
+
+    /// 3 値はそのまま通る。**`no` と `unreadable` を畳まない** (処方が逆)。
+    #[test]
+    fn validate_accepts_every_timecard_kosoku_state() {
+        for state in TIMECARD_KOSOKU_STATES {
+            let req = SnapshotRequest {
+                timecard_kosoku: Some(state.to_string()),
+                ..req()
+            };
+            let v = validate_snapshot(req).unwrap_or_else(|e| panic!("{state}: {e}"));
+            assert_eq!(v.timecard_kosoku.as_deref(), Some(state));
+        }
+        assert_eq!(TIMECARD_KOSOKU_STATES.len(), 3);
+        assert!(TIMECARD_KOSOKU_STATES.contains(&"no"));
+        assert!(TIMECARD_KOSOKU_STATES.contains(&"unreadable"));
+    }
+
+    /// 知らない値は**黙って `None` に倒さず**弾く。`None` は「見ていない」という
+    /// 別の事実なので、倒すと保存物が嘘をつく (`payroll_synced_at` と同じ判断)。
+    #[test]
+    fn validate_rejects_unknown_timecard_kosoku() {
+        for bad in ["", "YES", "missing", "null"] {
+            let req = SnapshotRequest {
+                timecard_kosoku: Some(bad.to_string()),
+                ..req()
+            };
+            let err = validate_snapshot(req).unwrap_err();
+            assert!(err.contains("timecard_kosoku"), "{bad:?}: {err}");
+        }
+    }
+
+    /// 明示された `null` も省略と同じく `None` (画面は `null` を送ってくる)。
+    #[test]
+    fn timecard_kosoku_accepts_explicit_null() {
+        let body = r#"{"comp_id":"comp","month":"2026-01","restraint_source":"gcp",
+                       "timecard_kosoku":null,"wage_logic_version":"wage-1","rows":[]}"#;
+        let parsed: SnapshotRequest = serde_json::from_str(body).expect("null は通る");
+        assert_eq!(parsed.timecard_kosoku, None);
+    }
+
+    /// 保存に付いていた値が月別カバレッジに乗る (読み出しで返す)。
+    /// 未保存の月は**列ごと出さない** — 「見ていない」と「揃っていた」を混ぜないため。
+    #[test]
+    fn aggregate_returns_timecard_kosoku_per_month() {
+        let months = vec![ym(2026, 1), ym(2026, 2)];
+        let mut b = bucket(vec![row(1035)]);
+        b.timecard_kosoku = Some("unreadable".to_string());
+        let agg = aggregate_range(&months, &[Some(b), None], &CurrentVersions::default());
+
+        assert_eq!(agg.months[0].timecard_kosoku.as_deref(), Some("unreadable"));
+        assert_eq!(agg.months[1].timecard_kosoku, None);
+        let json = serde_json::to_value(&agg.months[1]).unwrap();
+        assert!(
+            json.get("timecard_kosoku").is_none(),
+            "未保存の月は出さない"
+        );
+    }
+
+    /// 給与未取込で集計から外れた月でも、土台の取得可否は返す
+    /// (「なぜこの月が外れたか」と「拘束が取れていたか」は別の話)。
+    #[test]
+    fn excluded_month_still_reports_timecard_kosoku() {
+        let mut r = row(1035);
+        r.paid_base = None;
+        let mut b = bucket(vec![r]);
+        b.timecard_kosoku = Some("no".to_string());
+        let agg = aggregate_range(&[ym(2026, 1)], &[Some(b)], &CurrentVersions::default());
+
+        assert_eq!(agg.months[0].excluded.as_deref(), Some("payroll_missing"));
+        assert_eq!(agg.months[0].timecard_kosoku.as_deref(), Some("no"));
     }
 
     #[test]
