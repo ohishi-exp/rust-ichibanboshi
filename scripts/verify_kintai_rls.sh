@@ -251,20 +251,36 @@ as "$SUPER_URL" "DROP TABLE kintai.probe_default_acl" >/dev/null
 # 賃金確定値のスナップショット (006、Refs #291)。他の表と同じく「触っていない表は
 # 権限が壊れていても気付けない」を残さないため、writer で往復させる。
 # `restraint_source` の CHECK も併せて確かめる (画面が誤った値を送っても DB で止まる)。
+#
+# `timecard_kosoku` (007、Refs ohishi-exp/nuxt-dtako-admin#986) もここで書く。**表単位の
+# GRANT が後から足した列にも及ぶ**という 007 の前提を、人の記憶ではなく実測で持つため。
 echo "== wage_snapshot も writer で往復でき、restraint_source の CHECK が効く"
 expect_ok_sql "writer が wage_snapshot を INSERT" "$WRITER_URL" "
 INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driver_cd,
                                   driver_name, calc_base, calc_overtime, calc_total,
-                                  paid_base, paid_overtime, wage_logic_version)
+                                  paid_base, paid_overtime, wage_logic_version,
+                                  timecard_kosoku)
 VALUES ('$TENANT_A', 'comp-a', '2026-01-01', 'gcp', 1001, '山田',
-        200000, 80000, 280000, 198000, 78000, 'wage-1');"
+        200000, 80000, 280000, 198000, 78000, 'wage-1', 'unreadable');"
 expect_eq "writer が wage_snapshot を SELECT" \
   "$(as "$WRITER_URL" "SELECT calc_total FROM kintai.wage_snapshot WHERE tenant_id='$TENANT_A'")" "280000"
+expect_eq "writer が足したばかりの列も読める" \
+  "$(as "$WRITER_URL" "SELECT timecard_kosoku FROM kintai.wage_snapshot WHERE tenant_id='$TENANT_A'")" "unreadable"
 expect_err "restraint_source は gcp / current だけ" "$WRITER_URL" "
 INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driver_cd,
                                   wage_logic_version)
 VALUES ('$TENANT_A', 'comp-a', '2026-02-01', 'supabase', 1001, 'wage-1');" \
   "wage_snapshot_restraint_source_check"
+# NULL (= 見ていない) は通し、知らない値だけを止める。畳むと「揃っていた」と混ざる
+expect_ok_sql "timecard_kosoku は NULL を許す" "$WRITER_URL" "
+INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driver_cd,
+                                  wage_logic_version)
+VALUES ('$TENANT_A', 'comp-a', '2026-03-01', 'gcp', 1001, 'wage-1');"
+expect_err "timecard_kosoku は yes / no / unreadable だけ" "$WRITER_URL" "
+INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driver_cd,
+                                  wage_logic_version, timecard_kosoku)
+VALUES ('$TENANT_A', 'comp-a', '2026-04-01', 'gcp', 1001, 'wage-1', 'missing');" \
+  "wage_snapshot_timecard_kosoku_check"
 as "$SUPER_URL" "DELETE FROM kintai.wage_snapshot" >/dev/null
 
 # paper_drift だけ writer で 1 度も触られていなかった (他 6 表は下で触る)。

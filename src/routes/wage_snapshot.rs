@@ -112,16 +112,19 @@ INSERT INTO kintai.wage_snapshot
         branch_name, branch_code, job_name, pay_kubun, hourly_rate,
         calc_base, calc_overtime, calc_total, paid_base, paid_overtime,
         working_minutes, restraint_missing,
-        salary_item_sha, min_wage_sha, payroll_synced_at, wage_logic_version, computed_at)
+        salary_item_sha, min_wage_sha, payroll_synced_at, wage_logic_version,
+        timecard_kosoku, computed_at)
 SELECT $1, $2, $3, $4, d.driver_cd, d.driver_name, d.company, d.branch_name,
        d.branch_code, d.job_name, d.pay_kubun, d.hourly_rate,
        d.calc_base, d.calc_overtime, d.calc_total, d.paid_base, d.paid_overtime,
        d.working_minutes, d.restraint_missing,
        -- min_wage_sha は常に NULL (2026-08-05 に廃止、`crate::wage_snapshot` の docs 参照)
-       $5, NULL, $6, $7, now()
-  FROM unnest($8::int8[], $9::text[], $10::text[], $11::text[], $12::int4[],
-              $13::text[], $14::int2[], $15::int4[], $16::int4[], $17::int4[],
-              $18::int4[], $19::int4[], $20::int4[], $21::int4[], $22::bool[])
+       -- timecard_kosoku ($8) は会社 × 月 × ソースの属性なので全行に同じ値が入る
+       -- (`salary_item_sha` / `wage_logic_version` と同じ持ち方)
+       $5, NULL, $6, $7, $8, now()
+  FROM unnest($9::int8[], $10::text[], $11::text[], $12::text[], $13::int4[],
+              $14::text[], $15::int2[], $16::int4[], $17::int4[], $18::int4[],
+              $19::int4[], $20::int4[], $21::int4[], $22::int4[], $23::bool[])
        AS d(driver_cd, driver_name, company, branch_name, branch_code, job_name,
             pay_kubun, hourly_rate, calc_base, calc_overtime, calc_total,
             paid_base, paid_overtime, working_minutes, restraint_missing)
@@ -133,7 +136,8 @@ SELECT to_char(ym, 'YYYY-MM') AS ym,
        driver_cd, driver_name, company, branch_name, branch_code, job_name,
        pay_kubun, hourly_rate, calc_base, calc_overtime, calc_total,
        paid_base, paid_overtime, working_minutes, restraint_missing,
-       salary_item_sha, payroll_synced_at, wage_logic_version, computed_at
+       salary_item_sha, payroll_synced_at, wage_logic_version, timecard_kosoku,
+       computed_at
   FROM kintai.wage_snapshot
  WHERE tenant_id = $1 AND comp_id = $2 AND restraint_source = $3
    AND ym >= $4 AND ym < $5
@@ -145,6 +149,7 @@ struct FetchedRow {
     ym: String,
     row: WageSnapshotRow,
     masters: MonthMasters,
+    timecard_kosoku: Option<String>,
     wage_logic_version: Option<String>,
     computed_at: Option<String>,
 }
@@ -175,6 +180,7 @@ fn to_fetched(r: &sqlx::postgres::PgRow) -> FetchedRow {
             salary_item_sha: r.get("salary_item_sha"),
             payroll_synced_at: synced.map(|t| t.to_rfc3339()),
         },
+        timecard_kosoku: r.get("timecard_kosoku"),
         wage_logic_version: r.get("wage_logic_version"),
         computed_at: computed.map(|t| t.to_rfc3339()),
     }
@@ -213,8 +219,12 @@ pub async fn put_wage_snapshot(
         .await
         .map_err(db_err)?;
     let fetched: Vec<FetchedRow> = existing.iter().map(to_fetched).collect();
+    // timecard_kosoku も比べる。ここに入れないと、**土台の取得可否だけが変わった
+    // 保存が `skipped_unchanged` で捨てられる** (この issue と同じ「送っているのに
+    // 残らない」型の穴になる)
     let same_versions = fetched.first().is_some_and(|f| {
         f.masters == valid.masters
+            && f.timecard_kosoku == valid.timecard_kosoku
             && f.wage_logic_version.as_deref() == Some(&valid.wage_logic_version)
     });
     let prev_rows: Vec<WageSnapshotRow> = fetched.iter().map(|f| f.row.clone()).collect();
@@ -223,6 +233,7 @@ pub async fn put_wage_snapshot(
             "saved": prev_rows.len(),
             "skipped_unchanged": true,
             "computed_at": fetched.first().and_then(|f| f.computed_at.clone()),
+            "timecard_kosoku": fetched.first().and_then(|f| f.timecard_kosoku.clone()),
         })));
     }
 
@@ -231,6 +242,7 @@ pub async fn put_wage_snapshot(
     Ok(Json(serde_json::json!({
         "saved": saved,
         "skipped_unchanged": false,
+        "timecard_kosoku": valid.timecard_kosoku,
     })))
 }
 
@@ -286,6 +298,7 @@ async fn write_month(
             .bind(valid.masters.salary_item_sha.as_deref())
             .bind(synced_at)
             .bind(&valid.wage_logic_version)
+            .bind(valid.timecard_kosoku.as_deref())
             .bind(&driver_cd)
             .bind(&driver_name)
             .bind(&company)
@@ -391,6 +404,7 @@ fn to_buckets(
         let bucket = by_month.entry(f.ym).or_insert_with(|| MonthBucket {
             rows: Vec::new(),
             masters: f.masters.clone(),
+            timecard_kosoku: f.timecard_kosoku.clone(),
             wage_logic_version: f.wage_logic_version.clone(),
             computed_at: f.computed_at.clone(),
         });
@@ -435,6 +449,7 @@ mod tests {
                 payroll_synced_at: Some("2026-02-03T09:12:00+00:00".to_string()),
                 ..Default::default()
             },
+            timecard_kosoku: Some("no".to_string()),
             wage_logic_version: Some("wage-1".to_string()),
             computed_at: Some("2026-08-05T01:20:00+00:00".to_string()),
         }
@@ -457,6 +472,11 @@ mod tests {
         assert_eq!(
             buckets[0].as_ref().unwrap().wage_logic_version.as_deref(),
             Some("wage-1")
+        );
+        assert_eq!(
+            buckets[0].as_ref().unwrap().timecard_kosoku.as_deref(),
+            Some("no"),
+            "土台の取得可否は月の属性として bucket に運ぶ"
         );
         assert_eq!(ym_label(months[0]), "2026-01");
     }
