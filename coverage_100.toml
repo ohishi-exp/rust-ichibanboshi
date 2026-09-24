@@ -94,6 +94,12 @@ path = "src/kyuyo/logic.rs"
 
 # --- routes (全て MockRepo / wiremock でカバー) ---
 
+# day_parts を 乗務員 × 暦日 で SUM して返す口 (Refs ohishi-exp/nuxt-dtako-admin#1121)。
+# stale_months.rs / unko_gaps.rs と同じく pg テストが要る形のまま登録 (CI の
+# Coverage regression check は postgres service 込みで cov-check を回す)
+[[files]]
+path = "src/routes/day_parts.rs"
+
 [[files]]
 path = "src/routes/employees.rs"
 
