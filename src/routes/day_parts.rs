@@ -1,5 +1,5 @@
 //! 暦日ビュー (`kintai.day_parts`) を 乗務員 × 暦日 で足して返す読み出し口
-//! (Refs ohishi-exp/nuxt-dtako-admin#1121)。
+//! (Refs ohishi-exp/nuxt-dtako-admin#1123)。
 //!
 //! `kintai.day_parts` は勤務を 0 時で切って暦日に配った行 (1 行 ≤ 1440 の CHECK 付き、
 //! `migrations/001_kintai_schema.sql`)。最低賃金の検証タブの条件 3 (同じ乗務員の同じ日に

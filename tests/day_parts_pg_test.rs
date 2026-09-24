@@ -1,5 +1,5 @@
 //! `GET /api/kintai/day-parts` の**実 Postgres** に対する検証
-//! (Refs ohishi-exp/nuxt-dtako-admin#1121)。
+//! (Refs ohishi-exp/nuxt-dtako-admin#1123)。
 //!
 //! ここでしか確かめられないのは、**乗務員 × 暦日の `SUM` が正しく割れているか**
 //! (同じ日の別勤務は足され、0 時をまたぐ勤務は暦日ごとに分かれる) と、
