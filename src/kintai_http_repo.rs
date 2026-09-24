@@ -1658,6 +1658,12 @@ impl InputCoverage {
 /// 「診断としては引き続き鳴らす (応答からは消えない) が、封の判定には使わない」に
 /// 倒す — 判定定義 (運行開始日) 自体はここでは直さない (`MAX_TAIL_GAP_DAYS` の
 /// 閾値調整でもない。上流に帰庫日時を足す別タスクの仕事)。
+///
+/// **文面も他の 3 本と違え、`dtako 入力欠け` を名乗らない。** ここが見ているのは
+/// etag でも読めた運行開始日でもなく、窓の末尾に運行そのものが無いことだけ
+/// (`no_etag` は判定式に一切出てこない) — 入力は欠けていない。他 3 本は
+/// `no_etag > 0` / `last.is_none()` / 運行突合の件数を実際に見ているので、
+/// `入力欠け` のままで正しい。
 fn missing_input_warnings(cov: &InputCoverage) -> Vec<MissingInputWarning> {
     let mut out = Vec::new();
     let s = cov.summary();
@@ -1670,7 +1676,7 @@ fn missing_input_warnings(cov: &InputCoverage) -> Vec<MissingInputWarning> {
         let w = format!("dtako 入力欠け: 運行開始日が 1 件も読めない ({s})");
         out.push(MissingInputWarning::blocking(w));
     } else if let Some((n, g)) = cov.tail_gap() {
-        let w = format!("dtako 入力欠け: 乗務員{n}名の末尾が{g}日超 ({s})");
+        let w = format!("dtako 末尾ギャップ: 乗務員{n}名の末尾が{g}日超 ({s})");
         out.push(MissingInputWarning::diagnostic(w));
     }
     out
@@ -2751,14 +2757,14 @@ mod tests {
     #[tokio::test]
     async fn warnings_seen_ignores_diagnostic_only_warnings() {
         let (seen, warnings) = with_warning_sink(async {
-            record_diagnostic_warning("dtako 入力欠け: 乗務員1名の末尾が8日超 (診断)");
+            record_diagnostic_warning("dtako 末尾ギャップ: 乗務員1名の末尾が8日超 (診断)");
             warnings_seen()
         })
         .await;
         assert_eq!(seen, Some(false), "診断のみでは封を止めない");
         assert_eq!(
             warnings,
-            vec!["dtako 入力欠け: 乗務員1名の末尾が8日超 (診断)".to_string()],
+            vec!["dtako 末尾ギャップ: 乗務員1名の末尾が8日超 (診断)".to_string()],
             "表示 (warnings) からは消えない"
         );
     }
@@ -2924,6 +2930,9 @@ mod tests {
             w[0].contains("期待=2026-07-01"),
             "期待した末尾も書く: {w:?}"
         );
+        // 実体は入力欠けではなく末尾ギャップ (Refs #c1121-3)。名乗りをここで縛る。
+        assert!(w[0].contains("dtako 末尾ギャップ"), "prefix: {w:?}");
+        assert!(!w[0].contains("入力欠け"), "入力欠けを名乗らない: {w:?}");
     }
 
     /// **閾値 7 日の境目を両側から縛る** (Refs #205 の 37)。
@@ -2962,6 +2971,9 @@ mod tests {
         assert_eq!(ws.len(), 1, "{ws:?}");
         assert!(!ws[0].blocks_seal, "tail gap は診断のみ: {ws:?}");
         assert!(ws[0].text.contains("乗務員1名の末尾が8日超"), "{ws:?}");
+        // ★ #c1121-3: この 1 本だけ「dtako 入力欠け」を名乗らない (実体は末尾ギャップ)。
+        assert!(ws[0].text.contains("dtako 末尾ギャップ"), "{ws:?}");
+        assert!(!ws[0].text.contains("入力欠け"), "{ws:?}");
 
         // no_etag: 封を止める
         let no_etag = vec![
