@@ -2,17 +2,18 @@
 //! (Refs ohishi-exp/nuxt-dtako-admin#1123)。
 //!
 //! ここでしか確かめられないのは、**乗務員 × 暦日の `SUM` が正しく割れているか**
-//! (同じ日の別勤務は足され、0 時をまたぐ勤務は暦日ごとに分かれる) と、
-//! **テナント分離・月の境界が効いているか**。どれも実 DB を往復させないと分からない
-//! (`tests/kintai_day_summaries_pg_test.rs` と同じ理由)。
+//! (同じ日の別勤務は足され、0 時をまたぐ勤務は暦日ごとに分かれる)、**日内で終わる勤務
+//! (day_parts を持たず day_summaries の行だけ) も足され、0 時をまたぐ勤務の
+//! day_summaries は二重に足されないか**、**テナント分離・月の境界が効いているか**。
+//! どれも実 DB を往復させないと分からない (`tests/kintai_day_summaries_pg_test.rs` と同じ理由)。
 //!
 //! `KINTAI_TEST_DATABASE_URL` が無ければ**丸ごと skip** する (CI の test job は
 //! postgres service を持つので実際に走る)。手元で回すなら (**このタスク専用の
 //! コンテナ**、ホストポートはエフェメラル):
 //!
 //! ```text
-//! docker run -d --name kintai-pg-1121-12 -e POSTGRES_PASSWORD=pw -p 127.0.0.1::5432 postgres:16
-//! docker port kintai-pg-1121-12 5432
+//! docker run -d --name kintai-pg-1121-15 -e POSTGRES_PASSWORD=pw -p 127.0.0.1::5432 postgres:16
+//! docker port kintai-pg-1121-15 5432
 //! KINTAI_TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:<port>/postgres \
 //!   cargo test --test day_parts_pg_test
 //! ```
@@ -146,6 +147,36 @@ async fn insert_day_part(
     .execute(pool)
     .await
     .expect("insert day_part");
+}
+
+/// `kintai.day_summaries` に 1 行入れる (勤務 1 本 = 1 行)。`date` は始業日
+/// (`migrations/002` の CHECK) なので `shift_start_at` の日付部分を使う。
+/// 対応する `shifts` 行は [`insert_shift`] で先に入れる。
+async fn insert_day_summary(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    driver_cd: i64,
+    shift_start_at: &str,
+    restraint: i32,
+) {
+    sqlx::query(
+        "INSERT INTO kintai.day_summaries \
+           (tenant_id, driver_cd, date, shift_start_at, shift_source, \
+            restraint_minutes, working_minutes, break_minutes, rest_minus_minutes, \
+            statutory_minutes, within_statutory_overtime_minutes, overtime_minutes, \
+            legal_holiday_minutes, night_minutes, overtime_night_minutes, \
+            legal_holiday_night_minutes, fingerprint, logic_version) \
+         VALUES ($1, $2, $3, $4, 'rest', $5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+                 repeat('a', 64), repeat('0', 16))",
+    )
+    .bind(tenant)
+    .bind(driver_cd)
+    .bind(chrono::NaiveDate::parse_from_str(&shift_start_at[..10], "%Y-%m-%d").expect("date"))
+    .bind(jst_at(shift_start_at).expect("shift_start_at"))
+    .bind(restraint)
+    .execute(pool)
+    .await
+    .expect("insert day_summary");
 }
 
 fn query(month: &str) -> Query<DayPartsQuery> {
@@ -400,4 +431,124 @@ async fn test_a_closed_pool_is_bad_gateway() {
     .expect_err("must fail on a closed pool");
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(msg.contains("day_parts"), "{msg}");
+}
+
+// ── 6. 日内で終わる勤務 2 本 (day_parts 0 行) も SUM される ──────────────────────
+
+/// `kosoku.rs` の `daily_summary` は 1 日で終わる勤務の内訳を出さないので、
+/// その勤務は day_parts を 1 行も持たない。day_summaries の行がそのまま暦日の値。
+/// 600 + 900 = 1500。
+#[tokio::test]
+async fn test_two_single_day_shifts_are_summed_from_day_summaries() {
+    let store = require_db!();
+    let t = store.tenant_id();
+    let p = store.pool();
+    insert_shift(p, t, 1018, "2026-06-05 03:10:00", "2026-06-05 13:10:00").await;
+    insert_shift(p, t, 1018, "2026-06-05 08:30:00", "2026-06-05 23:30:00").await;
+    insert_day_summary(p, t, 1018, "2026-06-05 03:10:00", 600).await;
+    insert_day_summary(p, t, 1018, "2026-06-05 08:30:00", 900).await;
+
+    let got = get(&store, t, "2026-06").await;
+
+    assert_eq!(
+        got,
+        serde_json::json!({
+            "month": "2026-06",
+            "items": [
+                { "driver_cd": 1018, "date": "2026-06-05", "restraint_minutes": 1500 },
+            ],
+        }),
+        "got: {got}"
+    );
+}
+
+// ── 7. 日内の勤務 + 同じ暦日に掛かる 0 時またぎ勤務の day_parts は足される ────────
+
+#[tokio::test]
+async fn test_a_single_day_shift_and_a_midnight_part_are_summed() {
+    let store = require_db!();
+    let t = store.tenant_id();
+    let p = store.pool();
+    // 0 時またぎ: 06-11 に 240、06-12 に 240。勤務全体の day_summaries (480) は足さない
+    insert_shift(p, t, 1300, "2026-06-11 20:00:00", "2026-06-12 04:00:00").await;
+    insert_day_part(p, t, 1300, "2026-06-11 20:00:00", "2026-06-11", 240).await;
+    insert_day_part(p, t, 1300, "2026-06-11 20:00:00", "2026-06-12", 240).await;
+    insert_day_summary(p, t, 1300, "2026-06-11 20:00:00", 480).await;
+    // 日内: 06-12 に 540 (day_parts なし)
+    insert_shift(p, t, 1300, "2026-06-12 06:00:00", "2026-06-12 15:00:00").await;
+    insert_day_summary(p, t, 1300, "2026-06-12 06:00:00", 540).await;
+
+    let got = get(&store, t, "2026-06").await;
+
+    assert_eq!(
+        got["items"],
+        serde_json::json!([
+            { "driver_cd": 1300, "date": "2026-06-11", "restraint_minutes": 240 },
+            { "driver_cd": 1300, "date": "2026-06-12", "restraint_minutes": 780 },
+        ]),
+        "got: {got}"
+    );
+}
+
+// ── 8. 0 時またぎ勤務の day_summaries は二重に足さない ─────────────────────────
+
+#[tokio::test]
+async fn test_a_midnight_shift_counts_only_its_day_parts() {
+    let store = require_db!();
+    let t = store.tenant_id();
+    let p = store.pool();
+    insert_shift(p, t, 1740, "2026-06-17 19:00:00", "2026-06-18 07:30:00").await;
+    insert_day_part(p, t, 1740, "2026-06-17 19:00:00", "2026-06-17", 300).await;
+    insert_day_part(p, t, 1740, "2026-06-17 19:00:00", "2026-06-18", 450).await;
+    insert_day_summary(p, t, 1740, "2026-06-17 19:00:00", 750).await;
+
+    let got = get(&store, t, "2026-06").await;
+
+    assert_eq!(
+        got["items"],
+        serde_json::json!([
+            { "driver_cd": 1740, "date": "2026-06-17", "restraint_minutes": 300 },
+            { "driver_cd": 1740, "date": "2026-06-18", "restraint_minutes": 450 },
+        ]),
+        "got: {got}"
+    );
+}
+
+// ── 9. 月末に始まり翌月へまたぐ勤務は、月ごとに day_parts の分だけ ──────────────
+
+/// day_summaries の行 (始業日 = 当月) は、day_parts がどの月にあっても足さない。
+/// 1052 は始業日側の day_parts が 0 分で積まれず (`kintai_fold::fold_days` の
+/// 「全部 0 の暦日は保存しない」)、day_parts が**翌月にしか無い**勤務。NOT EXISTS に
+/// 月の条件を入れると、当月で day_summaries の 480 を数え直してしまう。
+#[tokio::test]
+async fn test_a_shift_across_the_month_end_splits_by_month() {
+    let store = require_db!();
+    let t = store.tenant_id();
+    let p = store.pool();
+    insert_shift(p, t, 1051, "2026-06-30 20:00:00", "2026-07-01 05:00:00").await;
+    insert_day_part(p, t, 1051, "2026-06-30 20:00:00", "2026-06-30", 240).await;
+    insert_day_part(p, t, 1051, "2026-06-30 20:00:00", "2026-07-01", 300).await;
+    insert_day_summary(p, t, 1051, "2026-06-30 20:00:00", 540).await;
+    insert_shift(p, t, 1052, "2026-06-30 23:59:40", "2026-07-01 08:00:00").await;
+    insert_day_part(p, t, 1052, "2026-06-30 23:59:40", "2026-07-01", 480).await;
+    insert_day_summary(p, t, 1052, "2026-06-30 23:59:40", 480).await;
+
+    let june = get(&store, t, "2026-06").await;
+    assert_eq!(
+        june["items"],
+        serde_json::json!([
+            { "driver_cd": 1051, "date": "2026-06-30", "restraint_minutes": 240 },
+        ]),
+        "got: {june}"
+    );
+
+    let july = get(&store, t, "2026-07").await;
+    assert_eq!(
+        july["items"],
+        serde_json::json!([
+            { "driver_cd": 1051, "date": "2026-07-01", "restraint_minutes": 300 },
+            { "driver_cd": 1052, "date": "2026-07-01", "restraint_minutes": 480 },
+        ]),
+        "got: {july}"
+    );
 }
