@@ -1,14 +1,22 @@
-//! 暦日ビュー (`kintai.day_parts`) を 乗務員 × 暦日 で足して返す読み出し口
+//! 暦日の拘束を 乗務員 × 暦日 で足して返す読み出し口
 //! (Refs ohishi-exp/nuxt-dtako-admin#1123)。
 //!
-//! `kintai.day_parts` は勤務を 0 時で切って暦日に配った行 (1 行 ≤ 1440 の CHECK 付き、
-//! `migrations/001_kintai_schema.sql`)。最低賃金の検証タブの条件 3 (同じ乗務員の同じ日に
-//! 勤務が 2 本重なっていないか) は、**乗務員 × 暦日で `SUM` しただけ**の値が 1440 を
-//! 超えるかで見る。これまで day_parts は書く口 (`kintai_fold` の `INSERT_DAY_PARTS_SQL`)
-//! しか無く、読む口が 1 本も無かった。
+//! 最低賃金の検証タブの条件 3 (同じ乗務員の同じ日に勤務が 2 本重なっていないか) は、
+//! **乗務員 × 暦日で `SUM` しただけ**の値が 1440 を超えるかで見る。足す行は 2 種類:
 //!
-//! **読むだけ。1 行も書かない。計算は `SUM` だけ** — 按分・打ち切り・その他の式は
-//! 入れない (定義はユーザー確定)。1440 を超えたかの判定も呼ぶ側に任せる。
+//! - `kintai.day_parts` の行 — **0 時をまたぐ勤務だけ**を暦日に配った行 (1 行 ≤ 1440 の
+//!   CHECK 付き、`migrations/001_kintai_schema.sql`)。`kosoku.rs` の `daily_summary` は
+//!   1 日で終わる勤務の内訳を出さないので、`kintai_fold` もその勤務の day_parts を積まない
+//! - `kintai.day_summaries` の行のうち、**同じ勤務 (`shift_start_at`) の day_parts が
+//!   1 行も無いもの** — その日のうちに終わった勤務。行の拘束がそのまま暦日の値で、
+//!   `date` は始業日 (`migrations/002` の CHECK) = その暦日
+//!
+//! 勤務が day_parts を 1 行でも持てば day_summaries 側からは足さない。この判定
+//! (`NOT EXISTS`) には月の条件を入れない — 月末に始まり翌月へまたぐ勤務を、day_parts が
+//! 月外にしか無いからと day_summaries 側で数え直さないため。
+//!
+//! **読むだけ。1 行も書かない。計算は `SUM` だけ** — 保存済みの値を足すだけで、按分・
+//! 打ち切り・その他の式は入れない (定義はユーザー確定)。1440 を超えたかの判定も呼ぶ側に任せる。
 //!
 //! ## ファイル名は `day_parts.rs` で固定 (`kintai` / `kosoku` で始めない)
 //!
@@ -91,13 +99,28 @@ fn month_date_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
 }
 
 /// 乗務員 × 暦日 の `SUM(restraint_minutes)`。**これ以外の計算はしない。**
+/// 足す行はモジュール docs のとおり (day_parts + day_parts を持たない勤務の day_summaries)。
 const SELECT_SQL: &str = r#"
 SELECT driver_cd,
        to_char(date, 'YYYY-MM-DD') AS date,
        SUM(restraint_minutes)::bigint AS restraint_minutes
-  FROM kintai.day_parts
- WHERE tenant_id = $1
-   AND date >= $2 AND date < $3
+  FROM (
+        SELECT driver_cd, date, restraint_minutes
+          FROM kintai.day_parts
+         WHERE tenant_id = $1
+           AND date >= $2 AND date < $3
+        UNION ALL
+        SELECT s.driver_cd, s.date, s.restraint_minutes
+          FROM kintai.day_summaries s
+         WHERE s.tenant_id = $1
+           AND s.date >= $2 AND s.date < $3
+           AND NOT EXISTS (
+                 SELECT 1
+                   FROM kintai.day_parts p
+                  WHERE p.tenant_id = s.tenant_id
+                    AND p.driver_cd = s.driver_cd
+                    AND p.shift_start_at = s.shift_start_at)
+       ) u
  GROUP BY driver_cd, date
  ORDER BY driver_cd, date
 "#;
@@ -118,8 +141,8 @@ fn row_to_item(r: &sqlx::postgres::PgRow) -> Result<serde_json::Value, (StatusCo
     }))
 }
 
-/// GET /api/kintai/day-parts?month=YYYY-MM — `kintai.day_parts` を 乗務員 × 暦日 で
-/// `SUM` して返す。データが 0 件の月は **200 + 空の `items`**。
+/// GET /api/kintai/day-parts?month=YYYY-MM — 暦日の拘束 (モジュール docs) を
+/// 乗務員 × 暦日 で `SUM` して返す。データが 0 件の月は **200 + 空の `items`**。
 pub async fn day_parts(
     Query(params): Query<DayPartsQuery>,
     Extension(pg): Extension<DynKintaiPgStore>,
