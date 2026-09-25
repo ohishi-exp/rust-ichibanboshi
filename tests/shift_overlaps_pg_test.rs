@@ -4,7 +4,7 @@
 //! ここでしか確かめられないのは、**開区間の重なり判定 (接しているだけは重ならない)**、
 //! **前月末に始まり対象月へ跨る組が正しい月に出るか**、**互いに重なる 3 本が全組
 //! (3 組) 出るか**、**テナント/乗務員の分離**。どれも実 DB を往復させないと分からない
-//! (`tests/day_parts_pg_test.rs` と同じ理由)。
+//! (`tests/stale_months_pg_test.rs` と同じ理由)。
 //!
 //! `KINTAI_TEST_DATABASE_URL` が無ければ**丸ごと skip** する (CI の test job は
 //! postgres service を持つので実際に走る)。手元で回すなら (**このタスク専用の
@@ -26,7 +26,7 @@ use rust_ichibanboshi::kintai_push::{jst_at, KintaiPgStore};
 use rust_ichibanboshi::routes::kintai_timecard::ReadTenant;
 use rust_ichibanboshi::routes::shift_overlaps::{shift_overlaps, ShiftOverlapsQuery};
 
-// ── 前提 (tests/day_parts_pg_test.rs と同じ形) ───────────────────────────────
+// ── 前提 (tests/stale_months_pg_test.rs と同じ形) ────────────────────────────
 
 fn database_url() -> Option<String> {
     std::env::var("KINTAI_TEST_DATABASE_URL")

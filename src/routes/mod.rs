@@ -1,5 +1,4 @@
 pub mod costs_daily;
-pub mod day_parts;
 pub mod dtako_autoload;
 pub mod dtako_day;
 pub mod dtako_worktime;
