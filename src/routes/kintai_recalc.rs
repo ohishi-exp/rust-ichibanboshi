@@ -286,11 +286,19 @@ async fn run(
     // `with_unko_diff_sink` をさらに重ねるのは運行の突合 (Refs #205 の 37) — オンプレ
     // (押し込み済みの `kintai_events`) に在って GCP (alc の etags) に無い運行の一覧。
     // これも同じ `fetch_etags` の応答が材料で、判定には使わず応答へ素通しするだけ
+    //
+    // 読みの遡り起点 (Refs ohishi-exp/nuxt-dtako-admin#1123) は**ここで 1 回だけ**引き、
+    // 月ゲートと畳みに同じ値を渡す — 別々に引くと封の材料と畳んだ入力の窓が割れうる
+    let anchors = crate::kintai_fold::month_anchors(&repo, &req.month)
+        .await
+        .map_err(|e| map_push_err(e.into()))?;
     #[allow(clippy::type_complexity)]
     let (((gate, gate_warnings, gate_blocking), unsplit, unsplit_total), unko_diff) =
         crate::kintai_http_repo::with_unko_diff_sink(crate::kintai_http_repo::with_unsplit_sink(
             crate::kintai_http_repo::with_warning_sink_blocking(
-                crate::kintai_fold::month_gate_report(&repo, &st, &params, &req.month, req.apply),
+                crate::kintai_fold::month_gate_report_with_anchors(
+                    &repo, &st, &params, &req.month, req.apply, &anchors,
+                ),
             ),
         ))
         .await;
@@ -344,7 +352,9 @@ async fn run(
     // 単純に倍になる。上流 warnings を握り潰さない
     // ([`crate::kintai_http_repo::with_warning_sink_blocking`])
     let (all_units, warnings, fold_blocking) = crate::kintai_http_repo::with_warning_sink_blocking(
-        crate::kintai_fold::fold_month(&repo, &params, &req.month, None, req.today),
+        crate::kintai_fold::fold_month_with_anchors(
+            &repo, &params, &req.month, None, req.today, &anchors,
+        ),
     )
     .await;
     let all_units = all_units.map_err(map_push_err)?;
