@@ -394,10 +394,6 @@ pub async fn run(
             "/kintai/day-summaries",
             get(routes::kintai_day_summaries::day_summaries),
         )
-        // day_parts を 乗務員 × 暦日 で SUM して返す (Refs ohishi-exp/nuxt-dtako-admin#1123)。
-        // 読むだけ・計算は SUM だけ (ファイル名は kintai/kosoku で始めない —
-        // day_parts.rs のモジュール doc 参照、logic_version は動かさない)
-        .route("/kintai/day-parts", get(routes::day_parts::day_parts))
         // 同じ乗務員の勤務の時間帯が重なっている組を返す (Refs
         // ohishi-exp/nuxt-dtako-admin#1123)。読むだけ・保存値の比較だけ (ファイル名は
         // kintai/kosoku で始めない — shift_overlaps.rs のモジュール doc 参照、
