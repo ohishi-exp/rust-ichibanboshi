@@ -398,6 +398,14 @@ pub async fn run(
         // 読むだけ・計算は SUM だけ (ファイル名は kintai/kosoku で始めない —
         // day_parts.rs のモジュール doc 参照、logic_version は動かさない)
         .route("/kintai/day-parts", get(routes::day_parts::day_parts))
+        // 同じ乗務員の勤務の時間帯が重なっている組を返す (Refs
+        // ohishi-exp/nuxt-dtako-admin#1123)。読むだけ・保存値の比較だけ (ファイル名は
+        // kintai/kosoku で始めない — shift_overlaps.rs のモジュール doc 参照、
+        // logic_version は動かさない)
+        .route(
+            "/kintai/shift-overlaps",
+            get(routes::shift_overlaps::shift_overlaps),
+        )
         .route("/kintai/version", get(routes::kintai_version::version))
         // 月別 stale (畳み直しが要るか) を 1 往復で返す軽い口 (Refs #620 の 1)。
         // 読むだけ・既存の kintai.day_summaries 突合を月単位に割っただけ (ファイル名

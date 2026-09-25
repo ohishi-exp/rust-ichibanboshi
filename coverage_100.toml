@@ -130,6 +130,12 @@ path = "src/routes/sales.rs"
 [[files]]
 path = "src/routes/schema.rs"
 
+# 同じ乗務員の勤務の時間帯が重なっている組を返す口 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+# day_parts.rs / stale_months.rs と同じく pg テストが要る形のまま登録 (CI の
+# Coverage regression check は postgres service 込みで cov-check を回す)
+[[files]]
+path = "src/routes/shift_overlaps.rs"
+
 # 月別 stale (畳み直しが要るか) を 1 往復で返す軽い口 (Refs #620 の 1)。実測
 # 248/248 で 100%。kintai_day_summaries.rs と同じく pg テストが要る形のまま登録
 # (CI の Coverage regression check は postgres service 込みで cov-check を回す)
