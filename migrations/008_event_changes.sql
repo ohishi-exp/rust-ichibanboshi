@@ -44,6 +44,8 @@ CREATE POLICY tenant_isolation_event_changes ON kintai.event_changes
     USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
 
 -- 005 の既定権限に頼らず明示する (006 と同じ。新表の GRANT 漏れで本番 502 の実績)。
--- 書く側は追記だけ (前後の記録を後から書き換える経路は無い)
+-- GRANT は SELECT, INSERT だけ明示するが、005 の ALTER DEFAULT PRIVILEGES で writer には
+-- UPDATE / DELETE も付く (verify_kintai_rls.sh が全表に 4 権限を要求するため REVOKE しない)。
+-- 追記専用はアプリ側 (書き込み経路が INSERT だけ) で守る
 GRANT SELECT, INSERT ON kintai.event_changes TO kintai_writer;
 GRANT SELECT ON kintai.event_changes TO kintai_reader;
