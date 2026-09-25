@@ -662,6 +662,11 @@ allowlist は打刻の 2 本だけ)。**あそこに読み出し経路を足さ�
 - **指紋の材料に `KosokuParams` を入れる。** `restraint_rounding` などは TOML で再ビルド
   無しに変えられて出力を変えるため。`KINTAI_OUTPUT_SHA` は `build.rs` が焼く内容
   ハッシュなので「上げ忘れ」は原理的に存在しない
+- **打刻の置き換えは前後を `kintai.event_changes` に残す** (008、Refs
+  ohishi-exp/nuxt-dtako-admin#1133)。`replace_window` が DELETE の直前に同じ
+  トランザクションで `change_log::record_changes` を呼ぶ (旧 events の SELECT 1 文 +
+  INSERT 1 文)。初回取り込みは記録しない / 日ごと消えたら `after` = NULL。読み口は
+  `GET /api/kintai/change-log` (`src/routes/change_log.rs`)。どちらも glob の外の名前
 - 再計算の単位は **(乗務員, 月)**。勤務が日を跨ぐので日単独では計算できない
 - `src/kintai*.rs` は `build.rs` の glob に自動で入るため、この 2 モジュールを触ると
   `KINTAI_OUTPUT_SHA` が回転して relay の上流キャッシュが全月 stale になる

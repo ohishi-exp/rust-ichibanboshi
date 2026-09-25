@@ -416,6 +416,9 @@ pub async fn run(
         // (pub) を呼ぶだけ (ファイル名は kintai/kosoku で始めない — unko_gaps.rs
         // のモジュール doc 参照、logic_version は動かさない)
         .route("/kintai/unko-gaps", get(routes::unko_gaps::unko_gaps))
+        // 取り込み後に打刻が直された前後の記録 (Refs ohishi-exp/nuxt-dtako-admin#1133)。
+        // 読むだけ (ファイル名は kintai/kosoku で始めない — logic_version は動かさない)
+        .route("/kintai/change-log", get(routes::change_log::change_log))
         // 乗務員CD + 日付 → 運行NO・全イベント・修正用リンク (Refs #205 の 57)。
         // 読むだけ・既存の events 取得を再利用する (ファイル名は kintai/kosoku で
         // 始めない — dtako_day.rs のモジュール doc 参照、logic_version は動かさない)
