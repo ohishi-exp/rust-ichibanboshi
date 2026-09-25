@@ -1299,7 +1299,7 @@ async fn compute_month_digests(
     };
     // 運行の突合 (Refs #205 の 37)。両側とも既に読んでいるものだけで組む —
     // GCP 側は直前の etags、オンプレ側は押し込み済みの kintai_events
-    measure_unko_diff(store, month, from, to).await;
+    measure_unko_diff(store, month, from, to, anchors).await;
     let punch_digest = match store.stored_month_punch_digest(from, to).await {
         Ok(d) => d,
         Err(e) => {
@@ -1327,6 +1327,7 @@ async fn measure_unko_diff(
     month: &str,
     from: DateTime<FixedOffset>,
     to: DateTime<FixedOffset>,
+    anchors: &HeadAnchors,
 ) {
     let Some(gcp) = crate::kintai_http_repo::collected_etag_unko_nos() else {
         return;
@@ -1338,17 +1339,18 @@ async fn measure_unko_diff(
             return;
         }
     };
-    let onprem: Vec<crate::kintai_http_repo::OnpremOperation> = rows
-        .into_iter()
-        .map(|(driver_cd, unko_no, first_date, last_date)| {
-            crate::kintai_http_repo::OnpremOperation {
-                driver_cd,
-                unko_no,
-                first_date,
-                last_date,
-            }
-        })
-        .collect();
+    let onprem: Vec<crate::kintai_http_repo::OnpremOperation> =
+        operations_in_driver_windows(rows, month, anchors)
+            .into_iter()
+            .map(|(driver_cd, unko_no, first_date, last_date)| {
+                crate::kintai_http_repo::OnpremOperation {
+                    driver_cd,
+                    unko_no,
+                    first_date,
+                    last_date,
+                }
+            })
+            .collect();
     // 逆方向を「対象月に始まった運行だけ」でも数えるために月を渡す (Refs #205 の 37)。
     // etags は読取日で引くので窓の中に前月以前に始まった運行が混ざり、それは
     // オンプレの当月分と一致しなくて当然 — 異常かどうかは月で絞ってから見る
@@ -1368,6 +1370,33 @@ async fn measure_unko_diff(
         s.other_month_only_ops + s.also_in_month_ops,
     );
     tracing::info!(a, b, "kintai unko diff gcp-only split");
+}
+
+/// 突合に入れる運行を**乗務員ごとの窓**に絞る (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+///
+/// 取得は全員の始端 (`from_global`) から 1 回だが、fold の入力は乗務員ごとに
+/// `[起点 or 月初, to)` へ切り戻している ([`clip_to_anchors`])。突合も同じにしないと、
+/// 1 人の起点で**起点の無い他の乗務員の前月末の運行**まで数え、そこに GCP 側の欠けが
+/// あると fold が読みもしない運行で「dtako 入力欠け」が立ち当月の封を止める。
+///
+/// 材料が暦日 (`last_date`) しか持たないので、判定は日単位 — 運行の最後の記録が
+/// 窓の始端の日以降なら入れる。起点の無い乗務員は始端が月初 0:00 なので正確、
+/// 起点のある乗務員は**起点の日のうち起点より前**に終わった運行まで入る (広い側)。
+fn operations_in_driver_windows(
+    rows: Vec<(i64, String, NaiveDate, NaiveDate)>,
+    month: &str,
+    anchors: &HeadAnchors,
+) -> Vec<(i64, String, NaiveDate, NaiveDate)> {
+    let Some((first, _)) = month_date_bounds(month) else {
+        return rows;
+    };
+    let start = |cd: i64| {
+        let anchor = u64::try_from(cd).ok().and_then(|d| anchors.get(&d));
+        anchor.and_then(|a| parse_dt(a)).map_or(first, |a| a.date())
+    };
+    rows.into_iter()
+        .filter(|(cd, _, _, last)| *last >= start(*cd))
+        .collect()
 }
 
 /// **`unko_no` 付きの行を一度でも持った乗務員CD** (Refs #205 の 39)。
@@ -2436,6 +2465,41 @@ mod tests {
     #[test]
     fn push_window_gap_returns_none_for_a_bad_month() {
         assert!(push_window_gap_warning("nope", &[], ymd(2026, 7, 15)).is_none());
+    }
+
+    /// 突合は乗務員ごとの窓 (Refs ohishi-exp/nuxt-dtako-admin#1123)。起点の無い乗務員の
+    /// 前月末の運行は出ず、起点のある乗務員の起点以降の前月の運行は出る。
+    #[test]
+    fn unko_diff_counts_operations_in_each_drivers_window() {
+        let op = |cd: i64, u: &str, f: NaiveDate, l: NaiveDate| (cd, u.to_string(), f, l);
+        let rows = vec![
+            // 1731 (起点 2/21 05:00) の閉じ忘れ運行 — 出る
+            op(1731, "A", ymd(2026, 2, 21), ymd(2026, 3, 2)),
+            // 1731 の起点より前の日に終わった運行 — 出ない
+            op(1731, "B", ymd(2026, 2, 18), ymd(2026, 2, 20)),
+            // 起点の無い 1130 の前月末の運行 — 出ない (from_global では読まれるが)
+            op(1130, "C", ymd(2026, 2, 25), ymd(2026, 2, 27)),
+            // 1130 の月初をまたぐ運行 (最後の記録が当月) — 今までどおり出る
+            op(1130, "D", ymd(2026, 2, 28), ymd(2026, 3, 1)),
+            op(1130, "E", ymd(2026, 3, 10), ymd(2026, 3, 10)),
+        ];
+        let anchors: HeadAnchors = [(1731, "2026-02-21 05:00:00".to_string())]
+            .into_iter()
+            .collect();
+        let got: Vec<String> = operations_in_driver_windows(rows.clone(), "2026-03", &anchors)
+            .into_iter()
+            .map(|(_, u, _, _)| u)
+            .collect();
+        assert_eq!(got, vec!["A", "D", "E"]);
+        // 起点が無ければ全員月初から (前月末だけの運行は落ちる)
+        let none = operations_in_driver_windows(rows.clone(), "2026-03", &HeadAnchors::new());
+        let none: Vec<&str> = none.iter().map(|(_, u, _, _)| u.as_str()).collect();
+        assert_eq!(none, vec!["A", "D", "E"]);
+        // 月が壊れていれば絞らない
+        assert_eq!(
+            operations_in_driver_windows(rows.clone(), "x", &anchors),
+            rows
+        );
     }
 
     #[test]

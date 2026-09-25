@@ -17,7 +17,7 @@
 //! | `time_card_dstate` | 両方 | 読み窓 (`month_range` の始端を遡り起点まで下げたもの、下記) | `EVENTS_SQL` / dailyJson の打刻 30/31 |
 //! | `time_card_dtako` | kosoku-daily | 読み窓 (同上) | `EVENTS_SQL` 2 本目 |
 //! | `time_card_dtako_state` | kosoku-daily | 全体 (マスタ) | `EVENTS_SQL` の JOIN |
-//! | `dtako_events` | kosoku-daily | 前月初と読み窓の始端の早いほう〜 (下記) | `EVENTS_SQL` 3/4 本目 |
+//! | `dtako_events` | kosoku-daily | 読み窓の始端が属する月の前月初〜 (下記) | `EVENTS_SQL` 3/4 本目 |
 //! | `dtako_cars` | kosoku-daily | 全体 (マスタ) | `EVENTS_SQL` の JOIN (`車輌名`) |
 //! | `dtako_ferry_rows` | kosoku-daily | 月 (`exact_month_range`) | `FERRY_SQL` |
 //! | `dtako_rows` | kosoku-daily | 月 (出庫 or 帰庫) | `FERRY_SQL` の JOIN |
@@ -73,7 +73,8 @@
 //!
 //! `kosoku-daily` は乗務員ごとに窓を遡り起点 (`kintai_repo::month_head_anchors`) まで
 //! 広げて読む。打刻 2 表の範囲は全乗務員の起点の最小 (`lookback_from`) から取り、
-//! `dtako_events` は前月初とその早いほうから取る。月初のままだと、前月末の打刻が
+//! `dtako_events` はその始端が属する月の前月初から取る (起点の前に始まって窓の中で
+//! 終わる休息も読まれるため、月初からの読みと同じ 1 か月の余裕を持たせる)。月初のままだと、前月末の打刻が
 //! 後から直っても etag が動かず relay が古い値を返し続ける。起点は
 //! `mariadb_month_head_anchors` を**同じ関数のまま**呼んで求める (決め方を 2 つにしない)。
 //!
@@ -247,7 +248,9 @@ struct VersionRanges {
     to: String,
     mfrom: String,
     mto: String,
-    /// `dtako_events` の始端 — 前月初と `from` の早いほう
+    /// `dtako_events` の始端 — `from` の属する月の前月初 (起点が無ければ今までどおり
+    /// 対象月の前月初)。窓の前に始まって窓の中で終わる休息 (`EVENTS_SQL` 第 4
+    /// ブランチ) の余裕を、遡った始端に対しても同じだけ取る
     efrom: String,
 }
 
@@ -259,7 +262,8 @@ fn version_ranges(
     let (month_start, to) = month_range(month)?;
     let (mfrom, mto) = exact_month_range(month)?;
     let from = crate::kintai_repo::lookback_from(&month_start, anchors);
-    let efrom = prev_month_start(month)?.min(from.clone());
+    // 休息は窓の前に始まって窓の中で終わる区間も読まれる — 始端の属する月の前月初から
+    let efrom = prev_month_start(from.get(..7)?)?;
     Some(VersionRanges {
         from,
         to,
@@ -435,10 +439,11 @@ mod tests {
         assert!(version_ranges("2026-13", &Default::default()).is_none());
     }
 
-    /// 起点があれば打刻 2 表の始端がそこまで下がり、`dtako_events` は前月初より
-    /// 前に遡るときだけ下がる。フェリー・daily 系 (`mfrom`) は動かない。
+    /// 起点があれば打刻 2 表の始端がそこまで下がり、`dtako_events` は始端の属する
+    /// 月の前月初から。フェリー・daily 系 (`mfrom`) は動かない。
     #[test]
     fn version_ranges_follow_the_earliest_anchor() {
+        // 前月内の起点 (1194 型) — 始端は 3 月なので休息は 2 月初から
         let anchors = [
             (1194, "2026-03-31 21:36:28".to_string()),
             (1300, "2026-03-30 08:00:00".to_string()),
@@ -448,17 +453,17 @@ mod tests {
         let r = version_ranges("2026-04", &anchors).unwrap();
         assert_eq!(r.from, "2026-03-30 08:00:00");
         assert_eq!(r.mfrom, "2026-04-01 00:00:00");
-        assert_eq!(r.efrom, "2026-03-01 00:00:00", "前月初の方が早い");
+        assert_eq!(r.efrom, "2026-02-01 00:00:00");
 
-        // 閉じ忘れ運行 (1731 型) — 前月初より前まで遡る
+        // 前々月の起点 (1731 型の閉じ忘れ運行) — 2/20 20:00 に始まり起点 2/21 05:00 の
+        // 後に終わる休息も画面は読むので、etag も 1 月初から数える
         let fossil = [(1731, "2026-02-21 05:00:00".to_string())]
             .into_iter()
             .collect();
-        let r = version_ranges("2026-03", &fossil).unwrap();
-        assert_eq!(r.from, "2026-02-21 05:00:00");
-        assert_eq!(r.efrom, "2026-02-01 00:00:00", "前月初の方が早い");
         let r = version_ranges("2026-04", &fossil).unwrap();
-        assert_eq!(r.efrom, "2026-02-21 05:00:00", "前月初より前なら起点まで");
+        assert_eq!(r.from, "2026-02-21 05:00:00");
+        assert_eq!(r.efrom, "2026-01-01 00:00:00");
+        assert!(r.efrom.as_str() <= "2026-02-20 20:00:00");
     }
 
     #[test]
