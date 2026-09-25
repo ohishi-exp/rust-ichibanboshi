@@ -14,6 +14,7 @@ pub mod kyuyo;
 pub mod restraint;
 pub mod sales;
 pub mod schema;
+pub mod shift_overlaps;
 pub mod stale_months;
 pub mod surcharge;
 pub mod unchin;
