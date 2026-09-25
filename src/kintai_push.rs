@@ -770,6 +770,14 @@ impl KintaiPgStore {
             .bind(self.tenant_id.to_string())
             .execute(&mut *tx)
             .await?;
+        // 消す前に旧 events を読み、変わった日の前後を残す (Refs nuxt-dtako-admin#1133)
+        crate::change_log::record_changes(
+            &mut tx,
+            self.tenant_id,
+            plans,
+            (&d_drivers, &d_from, &d_to),
+        )
+        .await?;
 
         sqlx::query(DELETE_DAYS_SQL)
             .bind(self.tenant_id)

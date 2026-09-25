@@ -84,6 +84,9 @@ path = "src/rdp_defaults.rs"
 [[files]]
 path = "src/cf_access.rs"
 
+[[files]]
+path = "src/change_log.rs"
+
 # --- 給与 (給与大臣) ---
 
 [[files]]
@@ -93,6 +96,9 @@ path = "src/kyuyo/introspect.rs"
 path = "src/kyuyo/logic.rs"
 
 # --- routes (全て MockRepo / wiremock でカバー) ---
+
+[[files]]
+path = "src/routes/change_log.rs"
 
 [[files]]
 path = "src/routes/employees.rs"
