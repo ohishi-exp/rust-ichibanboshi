@@ -14,10 +14,10 @@
 //!
 //! | テーブル | 消費者 | 範囲 | 根拠 |
 //! |---|---|---|---|
-//! | `time_card_dstate` | 両方 | 月 (`month_range`) | `EVENTS_SQL` / dailyJson の打刻 30/31 |
-//! | `time_card_dtako` | kosoku-daily | 月 (`month_range`) | `EVENTS_SQL` 2 本目 |
+//! | `time_card_dstate` | 両方 | 読み窓 (`month_range` の始端を遡り起点まで下げたもの、下記) | `EVENTS_SQL` / dailyJson の打刻 30/31 |
+//! | `time_card_dtako` | kosoku-daily | 読み窓 (同上) | `EVENTS_SQL` 2 本目 |
 //! | `time_card_dtako_state` | kosoku-daily | 全体 (マスタ) | `EVENTS_SQL` の JOIN |
-//! | `dtako_events` | kosoku-daily | 前月初〜 (下記) | `EVENTS_SQL` 3/4 本目 |
+//! | `dtako_events` | kosoku-daily | 前月初と読み窓の始端の早いほう〜 (下記) | `EVENTS_SQL` 3/4 本目 |
 //! | `dtako_cars` | kosoku-daily | 全体 (マスタ) | `EVENTS_SQL` の JOIN (`車輌名`) |
 //! | `dtako_ferry_rows` | kosoku-daily | 月 (`exact_month_range`) | `FERRY_SQL` |
 //! | `dtako_rows` | kosoku-daily | 月 (出庫 or 帰庫) | `FERRY_SQL` の JOIN |
@@ -68,6 +68,14 @@
 //! 範囲は `[前月初, 翌月+1日)` に広げる — 月 M の応答は「前月に開始して M 月に
 //! 終わる区間」(`EVENTS_SQL` 第 4 ブランチ) を含むため、前月分の増減も月 M の
 //! マーカーを動かす必要がある (上位集合原則)。
+//!
+//! ## 読み窓は月初をまたぐ運行・勤務の開始まで遡る (Refs ohishi-exp/nuxt-dtako-admin#1123)
+//!
+//! `kosoku-daily` は乗務員ごとに窓を遡り起点 (`kintai_repo::month_head_anchors`) まで
+//! 広げて読む。打刻 2 表の範囲は全乗務員の起点の最小 (`lookback_from`) から取り、
+//! `dtako_events` は前月初とその早いほうから取る。月初のままだと、前月末の打刻が
+//! 後から直っても etag が動かず relay が古い値を返し続ける。起点は
+//! `mariadb_month_head_anchors` を**同じ関数のまま**呼んで求める (決め方を 2 つにしない)。
 //!
 //! ## 追加 GRANT が要る (デプロイ前提条件)
 //!
@@ -231,6 +239,36 @@ fn prev_month_start(month: &str) -> Option<String> {
     Some(format!("{prev} 00:00:00"))
 }
 
+/// `VERSION_SQL` に渡す範囲 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionRanges {
+    /// 打刻 2 表の始端 — 読み窓の始端 (遡り起点の最小、無ければ月初)
+    from: String,
+    to: String,
+    mfrom: String,
+    mto: String,
+    /// `dtako_events` の始端 — 前月初と `from` の早いほう
+    efrom: String,
+}
+
+/// 月と遡り起点から `VERSION_SQL` の範囲を決める。起点が無ければ今までと同じ範囲。
+fn version_ranges(
+    month: &str,
+    anchors: &std::collections::BTreeMap<u64, String>,
+) -> Option<VersionRanges> {
+    let (month_start, to) = month_range(month)?;
+    let (mfrom, mto) = exact_month_range(month)?;
+    let from = crate::kintai_repo::lookback_from(&month_start, anchors);
+    let efrom = prev_month_start(month)?.min(from.clone());
+    Some(VersionRanges {
+        from,
+        to,
+        mfrom,
+        mto,
+        efrom,
+    })
+}
+
 /// MariaDB 実装。`MariadbKintaiEventsRepo` と同じく pool は lazy —
 /// DB 停止中でも起動は失敗せず、実際に読むときに 502。
 pub struct MariadbKintaiVersionRepo {
@@ -260,26 +298,27 @@ impl KintaiVersionApi for MariadbKintaiVersionRepo {
         // イベント系はデータクエリと同じ [月初, 翌月+1日)、フェリー系・daily 系は
         // その月ちょうど [月初, 翌月初) — 範囲がデータクエリとズレると
         // 「データは変わったのに etag が変わらない」を作り込む
-        let (from, to) = month_range(month)
-            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
-        let (mfrom, mto) = exact_month_range(month)
-            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
-        let efrom = prev_month_start(month)
-            .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        // 読み窓の始端は月初をまたぐ運行・勤務の開始まで遡る (モジュール docs)
+        let bad_month = || KintaiRepoError::QueryFailed(format!("bad month: {month}"));
+        let (month_start, month_to) = month_range(month).ok_or_else(bad_month)?;
         let mut conn = self
             .pool
             .get_conn()
             .await
             .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        let anchors =
+            crate::kintai_repo::mariadb_month_head_anchors(&mut conn, &month_start, &month_to)
+                .await?;
+        let r = version_ranges(month, &anchors).ok_or_else(bad_month)?;
         let rows: Vec<MarkerRow> = conn
             .exec(
                 VERSION_SQL,
                 params! {
-                    "from" => &from,
-                    "to" => &to,
-                    "mfrom" => &mfrom,
-                    "mto" => &mto,
-                    "efrom" => &efrom,
+                    "from" => &r.from,
+                    "to" => &r.to,
+                    "mfrom" => &r.mfrom,
+                    "mto" => &r.mto,
+                    "efrom" => &r.efrom,
                 },
             )
             .await
@@ -382,6 +421,44 @@ mod tests {
             .next()
             .unwrap();
         assert!(!events_branch.contains("CRC32"));
+    }
+
+    /// 遡り起点が無い月は今までと同じ範囲 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+    #[test]
+    fn version_ranges_without_anchors_keep_the_month_window() {
+        let r = version_ranges("2026-04", &Default::default()).unwrap();
+        assert_eq!(r.from, "2026-04-01 00:00:00");
+        assert_eq!(r.to, "2026-05-02 00:00:00");
+        assert_eq!(r.mfrom, "2026-04-01 00:00:00");
+        assert_eq!(r.mto, "2026-05-01 00:00:00");
+        assert_eq!(r.efrom, "2026-03-01 00:00:00");
+        assert!(version_ranges("2026-13", &Default::default()).is_none());
+    }
+
+    /// 起点があれば打刻 2 表の始端がそこまで下がり、`dtako_events` は前月初より
+    /// 前に遡るときだけ下がる。フェリー・daily 系 (`mfrom`) は動かない。
+    #[test]
+    fn version_ranges_follow_the_earliest_anchor() {
+        let anchors = [
+            (1194, "2026-03-31 21:36:28".to_string()),
+            (1300, "2026-03-30 08:00:00".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let r = version_ranges("2026-04", &anchors).unwrap();
+        assert_eq!(r.from, "2026-03-30 08:00:00");
+        assert_eq!(r.mfrom, "2026-04-01 00:00:00");
+        assert_eq!(r.efrom, "2026-03-01 00:00:00", "前月初の方が早い");
+
+        // 閉じ忘れ運行 (1731 型) — 前月初より前まで遡る
+        let fossil = [(1731, "2026-02-21 05:00:00".to_string())]
+            .into_iter()
+            .collect();
+        let r = version_ranges("2026-03", &fossil).unwrap();
+        assert_eq!(r.from, "2026-02-21 05:00:00");
+        assert_eq!(r.efrom, "2026-02-01 00:00:00", "前月初の方が早い");
+        let r = version_ranges("2026-04", &fossil).unwrap();
+        assert_eq!(r.efrom, "2026-02-21 05:00:00", "前月初より前なら起点まで");
     }
 
     #[test]

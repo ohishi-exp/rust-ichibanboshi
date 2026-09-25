@@ -97,8 +97,14 @@ use sha2::{Digest, Sha256};
 use crate::kintai_push::{
     jst_day_bounds, KintaiPgStore, KintaiPushError, DATETIME_FORMAT, PUSHED_SOURCES,
 };
-use crate::kintai_repo::{exact_month_range, month_range, DynKintaiEventsRepo};
+use crate::kintai_repo::{
+    exact_month_range, lookback_from, month_range, DynKintaiEventsRepo, KintaiRepoError,
+};
 use crate::kosoku::{daily_summary, drop_duplicate_rows, DaySummary, KosokuParams, ShiftSource};
+
+/// 乗務員CD → 読みの遡り起点 (`YYYY-MM-DD HH:MM:SS`)。
+/// [`crate::kintai_repo::KintaiEventsApi::fetch_month_head_anchors`] の戻り値。
+pub type HeadAnchors = std::collections::BTreeMap<u64, String>;
 
 /// `build.rs` が焼き込む「出力に効くコード」の内容ハッシュ (16 桁 hex)。
 ///
@@ -970,11 +976,106 @@ fn push_window_gap_warning(
     Some(format!("push 窓ずれ: {month} の fold が読む {spill} に打刻が 0 行 — 翌月が未 push なら月跨ぎ勤務の終業打刻が欠ける"))
 }
 
+// ── 月初をまたぐ運行・勤務 (Refs ohishi-exp/nuxt-dtako-admin#1123) ─────────
+//
+// 月初 0:00 から読むと、前月に始業した勤務の続き (月初の休息・運行終了・終業) だけが
+// 見え、休息の終わりを始業とする余分な勤務を当月に立てる (乗務員 1194 の 2026-04)。
+// 窓を「月初をまたぐ運行・勤務の開始」まで乗務員ごとに遡らせて直す。
+//
+// - 読みは全員で 1 回: 始端は起点の最小 ([`lookback_from`])。乗務員ごとの窓へは
+//   読んだ後に [`clip_to_anchors`] で切り戻す — 指紋は行まるごとなので、切り戻さ
+//   ないと他人の起点で自分の行 (と指紋) が動き、毎回 stale になる
+// - 当月への絞り込み (`kosoku::daily_summary` の始業日) と DELETE の範囲は変えない。
+//   前月始業の勤務は今までどおり当月に出ない
+
+/// 対象月の遡り起点を引く。月が壊れていれば読む前に落とす。
+pub async fn month_anchors(
+    repo: &DynKintaiEventsRepo,
+    month: &str,
+) -> Result<HeadAnchors, KintaiRepoError> {
+    let (from, to) = month_range(month)
+        .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+    repo.fetch_month_head_anchors(&from, &to).await
+}
+
+/// 読む窓 `[from, to)`。`driver` 指定ならその乗務員の起点 (無ければ月初)、
+/// 省略なら全員の最小 ([`lookback_from`])。
+pub fn read_window(
+    month: &str,
+    anchors: &HeadAnchors,
+    driver: Option<u64>,
+) -> Result<(String, String), KintaiRepoError> {
+    let (from, to) = month_range(month)
+        .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+    let from = match driver {
+        Some(d) => anchors.get(&d).cloned().unwrap_or(from),
+        None => lookback_from(&from, anchors),
+    };
+    Ok((from, to))
+}
+
+/// 乗務員ごとに `[起点 or 月初, to)` へ切り戻す。**切り戻した後に 0 行の乗務員は
+/// 落とす** — 広げた窓のせいで現れただけの乗務員に単位を立てない (今までの母集団を
+/// 保つ)。
+///
+/// 述語は HTTP 実装の読み ([`crate::kintai_http_repo`] の `in_window`) と同じ
+/// [`crate::kintai_http_repo::window_holds`]。起点の無い乗務員は、月初から読んだ
+/// ときと同じ行の集合に戻る。時刻が読めない行は落とさない (読み先が窓で絞って
+/// 返したものなので、今までも入っていた)。
+pub fn clip_to_anchors(
+    by_driver: Vec<(u64, Vec<serde_json::Value>)>,
+    month: &str,
+    anchors: &HeadAnchors,
+) -> Vec<(u64, Vec<serde_json::Value>)> {
+    let Some((month_start, to)) = month_range(month) else {
+        return by_driver;
+    };
+    let (Some(month_start), Some(to)) = (parse_dt(&month_start), parse_dt(&to)) else {
+        return by_driver;
+    };
+    let at = |r: &serde_json::Value, k: &str| r.get(k).and_then(|v| v.as_str()).and_then(parse_dt);
+    by_driver
+        .into_iter()
+        .filter_map(|(cd, rows)| {
+            let from = anchors
+                .get(&cd)
+                .and_then(|a| parse_dt(a))
+                .unwrap_or(month_start);
+            let rows: Vec<serde_json::Value> = rows
+                .into_iter()
+                .filter(|r| match at(r, "datetime") {
+                    Some(start) => {
+                        let end = at(r, "end_datetime");
+                        crate::kintai_http_repo::window_holds(start, end, from, to)
+                    }
+                    None => true,
+                })
+                .collect();
+            (!rows.is_empty()).then_some((cd, rows))
+        })
+        .collect()
+}
+
+/// 遡った乗務員を 1 行ずつ warnings に出す (封は止めない — 診断)。
+fn record_lookback_warnings(month: &str, anchors: &HeadAnchors) {
+    let Some(first) = month_date_bounds(month).map(|(f, _)| f) else {
+        return;
+    };
+    for (cd, at) in anchors {
+        let days = parse_dt(at).map_or(0, |a| (first - a.date()).num_days());
+        let w = format!("読み窓の遡り: {month} の {cd} を {days} 日前 ({at}) から読む");
+        tracing::info!("{w}");
+        crate::kintai_http_repo::record_diagnostic_warning(&w);
+    }
+}
+
 /// 対象月を**生イベント 1 回読み**で乗務員ごとに畳む。返すのは乗務員CD 昇順。
 ///
 /// 期間は [`month_range`] = `[月初, 翌月 2 日)`。読み出し経路と同じで、日跨ぎ勤務の
 /// 終業打刻を拾うために翌月へはみ出す (push の `exact_month_range` とは違う —
-/// あちらは「その日の全部を見た上で署名する」必要があるため)。
+/// あちらは「その日の全部を見た上で署名する」必要があるため)。**始端は月初を
+/// またぐ運行・勤務の開始まで遡る** ([`read_window`] / [`clip_to_anchors`]、Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。
 ///
 /// 読みは [`KintaiEventsApi::fetch_all_events_between`] **1 回だけ**。乗務員で分ける
 /// のは [`crate::kosoku::split_by_driver`] で、これは in-process の純粋関数なので
@@ -1007,8 +1108,29 @@ pub async fn fold_month(
     driver: Option<u64>,
     today: Option<NaiveDate>,
 ) -> Result<Vec<(u64, FoldUnit, String)>, KintaiPushError> {
-    let (from, to) = month_range(month)
-        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
+    month_bounds(month)?;
+    let anchors = month_anchors(repo, month).await?;
+    fold_month_with_anchors(repo, params, month, driver, today, &anchors).await
+}
+
+/// 月が `YYYY-MM` として読めるか (読みの窓 `[月初, 翌月 2 日)` を返す)。
+fn month_bounds(month: &str) -> Result<(String, String), KintaiPushError> {
+    month_range(month).ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))
+}
+
+/// [`fold_month`] の本体 — 遡り起点を呼び出し側から受け取る (Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。[`recalc_month`] が月ゲートと畳みに**同じ
+/// 起点**を渡すための口。窓は [`read_window`]、切り戻しは [`clip_to_anchors`]。
+pub async fn fold_month_with_anchors(
+    repo: &DynKintaiEventsRepo,
+    params: &KosokuParams,
+    month: &str,
+    driver: Option<u64>,
+    today: Option<NaiveDate>,
+    anchors: &HeadAnchors,
+) -> Result<Vec<(u64, FoldUnit, String)>, KintaiPushError> {
+    month_bounds(month)?;
+    let (from, to) = read_window(month, anchors, None)?;
     let rows = repo.fetch_all_events_between(&from, &to).await?;
     tracing::debug!("fold {month}: read {} rows in 1 fetch_all", rows.len());
     // はみ出した先の 1 日が push されているかを確かめる (Refs #205 の 30)
@@ -1016,7 +1138,9 @@ pub async fn fold_month(
         tracing::warn!("{w}");
         crate::kintai_http_repo::record_warning(&w);
     }
-    let mut units: Vec<(u64, FoldUnit, String)> = crate::kosoku::split_by_driver(rows)
+    record_lookback_warnings(month, anchors);
+    let by_driver = clip_to_anchors(crate::kosoku::split_by_driver(rows), month, anchors);
+    let mut units: Vec<(u64, FoldUnit, String)> = by_driver
         .into_iter()
         .filter(|(cd, _)| driver.is_none_or(|want| want == *cd))
         .map(|(cd, rows)| {
@@ -1144,14 +1268,25 @@ pub(crate) async fn write_fold_gate_best_effort(
 /// [`store_units`] が正しくエラーを返すので、ここで倒しても失敗は隠れない。
 ///
 /// 打刻側 ([`KintaiPgStore::stored_month_punch_digest`]) の窓は [`fold_month`] が
-/// 実際に読む [`month_range`] と**同じ**にする。窓がずれると、fold の入力が
+/// 実際に読む窓 ([`read_window`]) と**同じ**にする。窓がずれると、fold の入力が
 /// 変わっているのに月ゲートだけ古い窓を見て「変わっていない」と誤判定しうる。
+///
+/// **窓の始端は [`fold_month_with_anchors`] と同じ遡り起点** (Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。打刻の指紋・運行の突合・dtako の指紋の
+/// どれも、起点がある月だけ始端を下げる (無い月は今までと同じ範囲)。月初のままだと、
+/// 封じた後に前月末の打刻が push されても指紋が動かず「変わっていない」と誤判定する。
 async fn compute_month_digests(
     repo: &DynKintaiEventsRepo,
     store: &KintaiPgStore,
     month: &str,
+    anchors: &HeadAnchors,
 ) -> Result<Option<(String, String)>, KintaiPushError> {
-    let dtako_digest = match repo.fetch_dtako_month_digest(month).await {
+    let (from_s, to_s) = read_window(month, anchors, None)?;
+    let bad_month = || KintaiPushError::NotConfigured(format!("bad month: {month}"));
+    let from = tz(parse_dt(&from_s).ok_or_else(bad_month)?);
+    let to = tz(parse_dt(&to_s).ok_or_else(bad_month)?);
+    let since = (!anchors.is_empty()).then(|| from.date_naive());
+    let dtako_digest = match repo.fetch_dtako_month_digest_since(month, since).await {
         Ok(Some(d)) => d,
         Ok(None) => {
             tracing::info!(month = %month, "kintai month-gate unavailable (no alc etags endpoint)");
@@ -1162,11 +1297,6 @@ async fn compute_month_digests(
             return Ok(None);
         }
     };
-    let (from_s, to_s) = month_range(month)
-        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
-    let bad_month = || KintaiPushError::NotConfigured(format!("bad month: {month}"));
-    let from = tz(parse_dt(&from_s).ok_or_else(bad_month)?);
-    let to = tz(parse_dt(&to_s).ok_or_else(bad_month)?);
     // 運行の突合 (Refs #205 の 37)。両側とも既に読んでいるものだけで組む —
     // GCP 側は直前の etags、オンプレ側は押し込み済みの kintai_events
     measure_unko_diff(store, month, from, to).await;
@@ -1316,8 +1446,30 @@ pub async fn month_gate_report(
     month: &str,
     apply: bool,
 ) -> Result<MonthGate, KintaiPushError> {
-    let Some((dtako_digest, punch_digest)) = compute_month_digests(repo, store, month).await?
-    else {
+    month_bounds(month)?;
+    // 起点が引けなければ判定しない (安全側) — 読めない理由は畳みの側が口で返す
+    let anchors = match month_anchors(repo, month).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(month = %month, error = %e, "kintai month-gate anchors failed");
+            return Ok(MonthGate::Unavailable);
+        }
+    };
+    month_gate_report_with_anchors(repo, store, params, month, apply, &anchors).await
+}
+
+/// [`month_gate_report`] の本体 — 遡り起点を呼び出し側から受け取る
+/// ([`fold_month_with_anchors`] と同じ値を渡すため)。
+pub async fn month_gate_report_with_anchors(
+    repo: &DynKintaiEventsRepo,
+    store: &KintaiPgStore,
+    params: &KosokuParams,
+    month: &str,
+    apply: bool,
+    anchors: &HeadAnchors,
+) -> Result<MonthGate, KintaiPushError> {
+    let digests = compute_month_digests(repo, store, month, anchors).await?;
+    let Some((dtako_digest, punch_digest)) = digests else {
         return Ok(MonthGate::Unavailable);
     };
     let version = logic_version(params);
@@ -1377,15 +1529,20 @@ pub async fn recalc_month(
     apply: bool,
     today: Option<NaiveDate>,
 ) -> Result<FoldReport, KintaiPushError> {
+    month_bounds(month)?;
+    // 遡り起点は 1 回だけ引き、月ゲートと畳みに同じ値を渡す (Refs
+    // ohishi-exp/nuxt-dtako-admin#1123)。ずれると封の材料と畳んだ入力の窓が割れる
+    let anchors = month_anchors(repo, month).await?;
     if driver.is_none() {
-        match month_gate_report(repo, store, params, month, apply).await? {
+        match month_gate_report_with_anchors(repo, store, params, month, apply, &anchors).await? {
             MonthGate::Hit(report) => return Ok(report),
             MonthGate::Miss {
                 dtako_digest,
                 punch_digest,
                 logic_version,
             } => {
-                let units = fold_month(repo, params, month, driver, today).await?;
+                let units =
+                    fold_month_with_anchors(repo, params, month, driver, today, &anchors).await?;
                 let report = store_units(store, params, month, units, apply).await?;
                 // warnings が確認できた回 (Some(false)) だけ刻む。None (収集器の外) や
                 // Some(true) では書かない — 迷ったら書かない側 (Refs #205-17)
@@ -1404,7 +1561,7 @@ pub async fn recalc_month(
             MonthGate::Unavailable => {}
         }
     }
-    let units = fold_month(repo, params, month, driver, today).await?;
+    let units = fold_month_with_anchors(repo, params, month, driver, today, &anchors).await?;
     store_units(store, params, month, units, apply).await
 }
 
@@ -1442,7 +1599,10 @@ pub async fn recalc_drivers(
     // 月ゲート (実装計画 13) — **読むだけで書かない** (理由は recalc_month docs)。
     // ここで一致すれば、名指しした乗務員が全員すでに最新の指紋で保存済みという
     // ことなので、fold_month の全量読みごと省いて "unchanged" 扱いで返す
-    if let MonthGate::Hit(_) = month_gate_report(repo, store, params, month, apply).await? {
+    month_bounds(month)?;
+    let anchors = month_anchors(repo, month).await?;
+    let gate = month_gate_report_with_anchors(repo, store, params, month, apply, &anchors).await?;
+    if let MonthGate::Hit(_) = gate {
         tracing::info!(month = %month, n = drivers.len(), "kintai month-gate skip");
         let mut report = new_report(params, apply);
         report.drivers = drivers.len();
@@ -1452,7 +1612,7 @@ pub async fn recalc_drivers(
     // 実時計 — `recalc_drivers` は今回の注入経路の対象外 (Refs #286-1、呼び出し元
     // docs 参照)。名指しした乗務員だけを畳む窓の受け口が使う経路で、月ゲートを
     // 「読むだけで書かない」ぶん push 窓ずれ警告の有無が判定を左右しない
-    let all = fold_month(repo, params, month, None, None).await?;
+    let all = fold_month_with_anchors(repo, params, month, None, None, &anchors).await?;
     recalc_drivers_from_units(store, params, month, drivers, all, apply).await
 }
 

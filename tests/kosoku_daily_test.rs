@@ -1522,3 +1522,130 @@ async fn compare_view_keeps_a_non_zero_ferry_deduction() {
     let d = &serde_json::from_str::<Value>(&body).unwrap()["days"][0];
     assert!(d["ferry_minus_minutes"].as_i64().unwrap() > 0);
 }
+
+// --- 月初をまたぐ運行・勤務 (Refs ohishi-exp/nuxt-dtako-admin#1123) ---
+
+/// [`MockRepo`] に遡り起点を足した fake。
+struct AnchoredRepo {
+    inner: Arc<MockRepo>,
+    anchors: std::collections::BTreeMap<u64, String>,
+}
+
+#[async_trait]
+impl KintaiEventsApi for AnchoredRepo {
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        self.inner.fetch_events_between(from, to, driver).await
+    }
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        self.inner.fetch_all_events_between(from, to).await
+    }
+    async fn fetch_ferry_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: Option<u64>,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        self.inner.fetch_ferry_between(from, to, driver).await
+    }
+    async fn fetch_month_head_anchors(
+        &self,
+        _month_start: &str,
+        _to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        Ok(self.anchors.clone())
+    }
+}
+
+/// 1194 の 2026-04 を 7 月にずらした形 (6/30 始業 → 7/1 休息 2 本 → 運行終了・終業)。
+fn cross_month_rows() -> Vec<Value> {
+    let d = |v: Value| {
+        let mut v = v;
+        v["driver_id"] = json!(1194);
+        v
+    };
+    vec![
+        d(tc("2026-06-30 21:36:28", "始業")),
+        d(dtako(
+            "2026-06-30 21:39:47",
+            "運行開始",
+            "26063021394700000043241",
+        )),
+        d(ev("2026-06-30 21:39:47", "2026-07-01 00:28:25", "運転")),
+        d(ev("2026-07-01 00:28:25", "2026-07-01 04:38:56", "休息")),
+        d(ev("2026-07-01 04:45:36", "2026-07-01 08:30:26", "休息")),
+        d(dtako(
+            "2026-07-01 16:15:46",
+            "運行終了",
+            "26063021394700000043241",
+        )),
+        d(tc("2026-07-01 17:07:48", "終業")),
+    ]
+}
+
+fn anchored(rows: Vec<Value>) -> (Arc<MockRepo>, DynKintaiEventsRepo) {
+    let inner = MockRepo::with_rows(rows);
+    let anchors = [(1194, "2026-06-30 21:36:28".to_string())]
+        .into_iter()
+        .collect();
+    let repo: DynKintaiEventsRepo = Arc::new(AnchoredRepo {
+        inner: inner.clone(),
+        anchors,
+    });
+    (inner, repo)
+}
+
+/// 起点のある乗務員は窓の始端がそこまで下がり、前月始業の勤務の続きが当月の
+/// 勤務に化けない。起点の無い乗務員は今までどおり月初から。
+#[tokio::test]
+async fn a_driver_with_an_anchor_is_read_from_the_anchor() {
+    let (inner, repo) = anchored(cross_month_rows());
+    let (status, body) = call(
+        app(repo.clone()),
+        "/api/kintai/kosoku-daily?month=2026-07&driver=1194",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["days"], json!([]), "6/30 始業の勤務は 7 月に出ない");
+    let (_, other) = call(
+        app(repo),
+        "/api/kintai/kosoku-daily?month=2026-07&driver=1130",
+    )
+    .await;
+    assert!(other.contains("\"days\""));
+    let calls = inner.calls.lock().unwrap().clone();
+    assert_eq!(calls[0].0, "2026-06-30 21:36:28");
+    assert_eq!(calls[1].0, "2026-07-01 00:00:00", "起点が無ければ月初");
+}
+
+/// 全乗務員の読みは起点の最小から 1 回、乗務員ごとの窓へ切り戻してから畳む。
+#[tokio::test]
+async fn bulk_reads_once_from_the_earliest_anchor() {
+    let (inner, repo) = anchored(cross_month_rows());
+    let (status, body) = call(app(repo), "/api/kintai/kosoku-daily?month=2026-07").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *inner.all_calls.lock().unwrap(),
+        vec![(
+            "2026-06-30 21:36:28".to_string(),
+            "2026-08-02 00:00:00".to_string()
+        )]
+    );
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let drivers = body["drivers"].as_array().unwrap();
+    let days = drivers
+        .iter()
+        .find(|d| d["driver"] == 1194)
+        .map(|d| d["days"].clone())
+        .unwrap_or(json!([]));
+    assert_eq!(days, json!([]), "7/1 始業の余分な勤務が無い");
+}

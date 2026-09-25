@@ -610,3 +610,178 @@ async fn test_http_without_any_fallback_stays_http() {
             .expect("build repo");
     assert_eq!(backend, "http");
 }
+
+// ── 5. 月初をまたぐ運行・勤務 (Refs ohishi-exp/nuxt-dtako-admin#1123) ────────
+
+/// 乗務員 1194 の 2026-04 と同じ形。**前月 3/31 に始業・運行開始し、4/1 に休息 2 本を
+/// 挟んで運行終了・終業する**勤務。
+///
+/// 打刻と運行の確定イベントは `kintai.kintai_events` に、休息と運転は上流 (alc) に置く
+/// — GCP の読み経路 (`HttpKintaiEventsRepo` + Pg fallback) そのもの。
+const CROSS_DRIVER: i64 = 1194;
+const CROSS_UNKO: &str = "26033121394700000043241";
+
+async fn push_cross_month_shift(store: &KintaiPgStore) {
+    push(
+        store,
+        &[
+            timecard_row("2026-03-31 21:36:28", CROSS_DRIVER, "始業"),
+            dtako_row("2026-03-31 21:39:47", CROSS_DRIVER, "運行開始", CROSS_UNKO),
+            dtako_row("2026-04-01 16:15:46", CROSS_DRIVER, "運行終了", CROSS_UNKO),
+            timecard_row("2026-04-01 17:07:48", CROSS_DRIVER, "終業"),
+        ],
+    )
+    .await;
+}
+
+/// 上流 (全乗務員版) に 1194 の運行 1 本を置く。区間は実データと同じ並び。
+async fn stub_cross_month_upstream(server: &MockServer) {
+    let unko22 = &CROSS_UNKO[..22];
+    let row = |start: &str, end: &str, name: &str| {
+        json!([
+            unko22,
+            "帯広100か1194",
+            "1194",
+            "1194",
+            start,
+            end,
+            "0",
+            name
+        ])
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/dtako/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "x", "date_to": "y"},
+            "drivers": [{
+                "driver": {"cd": "1194", "name": "テスト乗務員"},
+                "operations": [{
+                    "unko_no": unko22,
+                    "crew_role": 1,
+                    "departure_at": null,
+                    "return_at": null,
+                    "headers": KUDGIVT_HEADERS,
+                    "rows": [
+                        row("2026/03/31 21:39:47", "2026/04/01 00:28:25", "運転"),
+                        row("2026/04/01 00:28:25", "2026/04/01 04:38:56", "休息"),
+                        row("2026/04/01 04:38:56", "2026/04/01 04:45:36", "運転"),
+                        row("2026/04/01 04:45:36", "2026/04/01 08:30:26", "休息"),
+                        row("2026/04/01 08:30:26", "2026/04/01 16:15:46", "運転"),
+                    ],
+                }],
+            }],
+            "next_after_driver_cd": null,
+            "warnings": [],
+        })))
+        .mount(server)
+        .await;
+}
+
+/// **4 月の fold は 3/31 に始まった勤務の続きを 4/1 始業の勤務として立てない。**
+///
+/// 月初 0:00 から読むと始業も運行開始も見えず、休息の終わりを始業とする勤務が
+/// 2 本 (4/1 04:38〜04:45 と 08:30〜17:07) 立ち、3 月が持つ打刻の勤務
+/// (3/31 21:36〜4/1 17:07) と重なっていた。読む窓を月初をまたぐ勤務の始業まで
+/// 遡らせれば、勤務は 3/31 始業になり 4 月の出力から外れる。
+#[tokio::test]
+async fn test_april_fold_does_not_restart_a_shift_begun_on_march_31() {
+    use rust_ichibanboshi::kintai_fold::fold_month;
+    use rust_ichibanboshi::kosoku::KosokuParams;
+
+    let (store, pg) = require_db!();
+    push_cross_month_shift(&store).await;
+    let server = MockServer::start().await;
+    stub_cross_month_upstream(&server).await;
+    let fallback: DynKintaiEventsRepo = Arc::new(pg);
+    let repo: DynKintaiEventsRepo = Arc::new(
+        HttpKintaiEventsRepo::new(
+            &events_cfg(&server.uri(), store.tenant_id()),
+            Some(fallback),
+        )
+        .expect("build http repo"),
+    );
+    let params = KosokuParams::default();
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 1);
+
+    let april = fold_month(&repo, &params, "2026-04", None, today)
+        .await
+        .expect("april");
+    let starts: Vec<String> = april
+        .iter()
+        .filter(|(cd, ..)| *cd == CROSS_DRIVER as u64)
+        .flat_map(|(_, u, _)| u.shifts.iter().map(|s| s.start_at.to_string()))
+        .collect();
+    assert!(starts.is_empty(), "4/1 始業の余分な勤務: {starts:?}");
+
+    // 3 月は今までどおり 3/31 始業の 1 本を持つ
+    let march = fold_month(&repo, &params, "2026-03", None, today)
+        .await
+        .expect("march");
+    let (_, unit, _) = march
+        .iter()
+        .find(|(cd, ..)| *cd == CROSS_DRIVER as u64)
+        .expect("1194 の 3 月");
+    assert_eq!(unit.shifts.len(), 1, "{:?}", unit.shifts);
+    assert_eq!(unit.shifts[0].shift_source, "timecard");
+}
+
+/// **Pg の遡り起点 SQL** (`fetch_month_head_anchors`) を実 Postgres で。
+///
+/// - 運行: 窓に `運行終了` がある運行だけ。窓に `運行終了` 以外 (休息開始) しか無い
+///   前月開始の運行は起点にしない (MariaDB の `state = 11` と同じ意味)
+/// - 打刻: 月初時点で開いた始業 + 当月の最初が終業。当月の最初が始業なら化石として捨てる
+#[tokio::test]
+async fn test_pg_head_anchors_follow_the_mariadb_rules() {
+    let (store, repo) = require_db!();
+    push(
+        &store,
+        &[
+            // 1194 — 運行終了も打刻も (早い方 = 始業)
+            timecard_row("2026-03-31 21:36:28", 1194, "始業"),
+            dtako_row("2026-03-31 21:39:47", 1194, "運行開始", CROSS_UNKO),
+            dtako_row("2026-04-01 16:15:46", 1194, "運行終了", CROSS_UNKO),
+            timecard_row("2026-04-01 17:07:48", 1194, "終業"),
+            // 1731 — 運行終了だけ (閉じ忘れ運行、打刻なし)
+            dtako_row(
+                "2026-04-02 10:00:00",
+                1731,
+                "運行終了",
+                "26022105000000000017311",
+            ),
+            // 1300 — 前月開始だが窓には運行終了が無い
+            dtako_row(
+                "2026-04-01 03:00:00",
+                1300,
+                "休息開始",
+                "26033010000000000013001",
+            ),
+            // 1400 — 終業を打ち忘れた前月の始業、当月の最初は始業 (化石)
+            timecard_row("2026-03-20 08:00:00", 1400, "始業"),
+            timecard_row("2026-04-02 08:00:00", 1400, "始業"),
+            timecard_row("2026-04-02 17:00:00", 1400, "終業"),
+            // 1401 — 打刻だけ (開いた始業 + 当月の最初が終業)
+            timecard_row("2026-03-30 17:00:00", 1401, "終業"),
+            timecard_row("2026-03-31 22:00:00", 1401, "始業"),
+            timecard_row("2026-04-01 06:00:00", 1401, "終業"),
+            // 1402 — 前月の始業は閉じている
+            timecard_row("2026-03-31 08:00:00", 1402, "始業"),
+            timecard_row("2026-03-31 17:00:00", 1402, "終業"),
+            timecard_row("2026-04-01 17:00:00", 1402, "終業"),
+        ],
+    )
+    .await;
+
+    let got = repo
+        .fetch_month_head_anchors("2026-04-01 00:00:00", "2026-05-02 00:00:00")
+        .await
+        .expect("anchors");
+    let got: Vec<(u64, &str)> = got.iter().map(|(d, a)| (*d, a.as_str())).collect();
+    assert_eq!(
+        got,
+        vec![
+            (1194, "2026-03-31 21:36:28"),
+            (1401, "2026-03-31 22:00:00"),
+            (1731, "2026-02-21 05:00:00"),
+        ]
+    );
+}
