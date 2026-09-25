@@ -2338,3 +2338,268 @@ fn store_units_reads_the_stored_state_outside_the_loop() {
         "一括読みは loop の外 (中なら往復が減らない)"
     );
 }
+
+// ── 月初をまたぐ運行・勤務 (Refs ohishi-exp/nuxt-dtako-admin#1123) ─────────────
+//
+// `StubRepo` は窓を見ないので、ここだけ窓で絞る `WindowRepo` を使う。遡り起点は
+// MariaDB / Pg と同じ規則 (`month_head_anchors`) で行から求める。
+
+/// 窓で絞る stub。dtako 側 digest は固定値で、`since` の受け取りを記録する。
+struct WindowRepo {
+    rows: Vec<serde_json::Value>,
+    since: std::sync::Mutex<Vec<Option<NaiveDate>>>,
+}
+
+fn at_of(r: &serde_json::Value, k: &str) -> String {
+    r[k].as_str().unwrap_or_default().to_string()
+}
+
+#[async_trait]
+impl KintaiEventsApi for WindowRepo {
+    async fn fetch_events_between(
+        &self,
+        from: &str,
+        to: &str,
+        driver: u64,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        let all = self.fetch_all_events_between(from, to).await?;
+        Ok(all
+            .into_iter()
+            .filter(|r| r["driver_id"].as_u64() == Some(driver))
+            .collect())
+    }
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        Ok(self
+            .rows
+            .iter()
+            .filter(|r| {
+                let (s, e) = (at_of(r, "datetime"), at_of(r, "end_datetime"));
+                (s.as_str() >= from && s.as_str() < to)
+                    || (!e.is_empty() && s.as_str() < from && e.as_str() >= from && e.as_str() < to)
+            })
+            .cloned()
+            .collect())
+    }
+    async fn fetch_ferry_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
+        Ok(Vec::new())
+    }
+    async fn fetch_dtako_month_digest_since(
+        &self,
+        _month: &str,
+        since: Option<NaiveDate>,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        self.since.lock().unwrap().push(since);
+        Ok(Some("window-digest".to_string()))
+    }
+    async fn fetch_month_head_anchors(
+        &self,
+        month_start: &str,
+        to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        let inside = |r: &&serde_json::Value| {
+            let s = at_of(r, "datetime");
+            s.as_str() >= month_start && s.as_str() < to
+        };
+        let runs: Vec<(u64, String)> = self
+            .rows
+            .iter()
+            .filter(inside)
+            .filter(|r| r["source"] == "dtako" && r["state"] == "運行終了")
+            .map(|r| (DRIVER, r["unko_no"].as_str().unwrap().to_string()))
+            .collect();
+        let tc = |state: &str| {
+            self.rows
+                .iter()
+                .filter(|r| r["source"] == "timecard" && r["state"] == state)
+                .map(|r| at_of(r, "datetime"))
+                .filter(|a| a.as_str() < month_start)
+                .max()
+        };
+        let first = self
+            .rows
+            .iter()
+            .filter(inside)
+            .filter(|r| r["source"] == "timecard")
+            .min_by_key(|r| at_of(r, "datetime"))
+            .map(|r| r["state"].as_str().unwrap().to_string());
+        let punch = rust_ichibanboshi::kintai_repo::HeadPunch {
+            driver: DRIVER,
+            first_state: first,
+            last_start: tc("始業"),
+            last_end: tc("終業"),
+        };
+        Ok(rust_ichibanboshi::kintai_repo::month_head_anchors(
+            month_start,
+            &runs,
+            &[punch],
+        ))
+    }
+}
+
+/// 乗務員 1194 の 2026-04 と同じ形 (3/31 始業・運行開始 → 4/1 休息 2 本 → 運行終了・終業)。
+fn cross_month_rows() -> Vec<serde_json::Value> {
+    const U: &str = "26033121394700000043241";
+    let mut drive = rest("2026-03-31 21:39:47", "2026-04-01 00:28:25");
+    drive["state"] = json!("運転");
+    vec![
+        punch("2026-03-31 21:36:28", "始業"),
+        run("2026-03-31 21:39:47", "運行開始", U),
+        drive,
+        rest("2026-04-01 00:28:25", "2026-04-01 04:38:56"),
+        rest("2026-04-01 04:45:36", "2026-04-01 08:30:26"),
+        run("2026-04-01 16:15:46", "運行終了", U),
+        punch("2026-04-01 17:07:48", "終業"),
+    ]
+}
+
+fn window_repo(rows: Vec<serde_json::Value>) -> (std::sync::Arc<WindowRepo>, DynKintaiEventsRepo) {
+    let r = std::sync::Arc::new(WindowRepo {
+        rows,
+        since: std::sync::Mutex::new(Vec::new()),
+    });
+    let d: DynKintaiEventsRepo = r.clone();
+    (r, d)
+}
+
+async fn dates_in(pool: &sqlx::PgPool, t: uuid::Uuid, table: &str, col: &str) -> Vec<NaiveDate> {
+    let sql = format!("SELECT {col} FROM kintai.{table} WHERE tenant_id = $1 ORDER BY 1");
+    sqlx::query_scalar(&sql)
+        .bind(t)
+        .fetch_all(pool)
+        .await
+        .expect("dates")
+}
+
+/// **4 月を畳み直すと 4/1 始業の余分な勤務が消え、3 月の 3/31 始業の勤務だけが残る。**
+/// 修正前の窓で保存された行 (本番の状態) から始めて、畳み直しで直ることまで見る。
+#[tokio::test]
+async fn refolding_april_removes_the_shifts_restarted_from_march_31() {
+    use rust_ichibanboshi::kintai_fold::{fold_month_with_anchors, recalc_drivers_from_units};
+
+    let (store, pool) = require_db!();
+    let t = store.tenant_id();
+    let (_r, repo) = window_repo(cross_month_rows());
+    let april = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+
+    // 修正前の窓 (起点なし) で畳んで保存した状態 = 本番で重なっていた 2 本
+    let empty = Default::default();
+    let old = fold_month_with_anchors(&repo, &params(), "2026-04", None, None, &empty)
+        .await
+        .expect("old fold");
+    recalc_drivers_from_units(&store, &params(), "2026-04", &[DRIVER], old, true)
+        .await
+        .expect("store old");
+    assert_eq!(
+        dates_in(&pool, t, "shifts", "date_start").await,
+        vec![april, april]
+    );
+
+    // 畳み直し — 4 月には 1194 の勤務が 1 本も残らない
+    let r = recalc_month(&repo, &store, &params(), "2026-04", None, true, None)
+        .await
+        .expect("april");
+    assert_eq!(r.drivers_written, 1, "余分な 2 本を消す書き込み");
+    assert!(dates_in(&pool, t, "shifts", "date_start").await.is_empty());
+    assert!(dates_in(&pool, t, "day_summaries", "date").await.is_empty());
+
+    // 3 月は 3/31 始業の 1 本、暦日は 3/31 と 4/1
+    recalc_month(&repo, &store, &params(), "2026-03", None, true, None)
+        .await
+        .expect("march");
+    let march31 = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+    assert_eq!(
+        dates_in(&pool, t, "shifts", "date_start").await,
+        vec![march31]
+    );
+    assert_eq!(
+        dates_in(&pool, t, "day_parts", "date").await,
+        vec![march31, april]
+    );
+
+    // 2 回目は何も書かない (指紋が安定している)
+    let again = recalc_month(&repo, &store, &params(), "2026-04", None, true, None)
+        .await
+        .expect("april again");
+    assert_eq!(again.drivers_written, 0);
+    assert!(!again.wrote_anything());
+}
+
+/// **月ゲートの材料も同じ起点まで下がる。** dtako 側は起点がある月だけ `since` を
+/// 受け取り、打刻側の指紋は前月末 (起点以降) の打刻が変われば動く。起点が無ければ
+/// 今までどおり (前月末の打刻は指紋に入らない)。
+#[tokio::test]
+async fn the_month_gate_looks_back_to_the_same_anchor() {
+    use rust_ichibanboshi::kintai_fold::month_gate_report_with_anchors;
+
+    let (store, _pool) = require_db!();
+    let (r, repo) = window_repo(cross_month_rows());
+    let (_plain, plain_repo) = window_repo(vec![punch("2026-04-10 08:00:00", "始業")]);
+
+    let punch_digest = |g: MonthGate| match g {
+        MonthGate::Miss { punch_digest, .. } => punch_digest,
+        other => panic!("miss のはず: {other:?}"),
+    };
+    let gate = |repo: DynKintaiEventsRepo| {
+        let store = &store;
+        async move {
+            month_gate_report(&repo, store, &params(), "2026-04", true)
+                .await
+                .expect("gate")
+        }
+    };
+    let insert = |at: &'static str, state: &'static str| {
+        let store = &store;
+        async move {
+            sqlx::query(
+                "INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source) \
+                 VALUES ($1, $2, $3, $4, 'timecard')",
+            )
+            .bind(store.tenant_id())
+            .bind(DRIVER as i64)
+            .bind(chrono::DateTime::parse_from_str(&format!("{at} +0900"), "%Y-%m-%d %H:%M:%S %z").unwrap())
+            .bind(state)
+            .execute(store.pool())
+            .await
+            .expect("insert punch");
+        }
+    };
+
+    insert("2026-03-31 21:36:28", "始業").await;
+    let with_before = punch_digest(gate(repo.clone()).await);
+    let without_before = punch_digest(gate(plain_repo.clone()).await);
+    assert_eq!(
+        r.since.lock().unwrap().clone(),
+        vec![NaiveDate::from_ymd_opt(2026, 3, 31)],
+        "起点がある月だけ dtako の範囲を下げる"
+    );
+    assert_eq!(_plain.since.lock().unwrap().clone(), vec![None]);
+
+    // 前月末 (起点より後) の打刻が直った
+    insert("2026-03-31 23:00:00", "終業").await;
+    let with_after = punch_digest(gate(repo.clone()).await);
+    let without_after = punch_digest(gate(plain_repo).await);
+    assert_ne!(
+        with_before, with_after,
+        "起点のある月は前月末の変化で外れる"
+    );
+    assert_eq!(without_before, without_after, "起点が無い月は今までどおり");
+
+    // 起点を明示して渡す口も同じ値
+    let anchors = rust_ichibanboshi::kintai_fold::month_anchors(&repo, "2026-04")
+        .await
+        .expect("anchors");
+    let direct =
+        month_gate_report_with_anchors(&repo, &store, &params(), "2026-04", true, &anchors)
+            .await
+            .expect("direct");
+    assert_eq!(punch_digest(direct), with_after);
+}

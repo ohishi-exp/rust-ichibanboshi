@@ -326,6 +326,113 @@ pub trait KintaiEventsApi: Send + Sync {
     ) -> Result<Option<String>, KintaiRepoError> {
         Ok(None)
     }
+
+    /// [`fetch_dtako_month_digest`] の始端を `since` (日付) まで下げた版 (Refs
+    /// ohishi-exp/nuxt-dtako-admin#1123)。fold が月初より前から読む月だけ `Some` で
+    /// 呼ばれる。**既定は `since` を無視して今までの範囲** — 月ゲートを上書きしない
+    /// 実装 (MariaDB・mock) の挙動を変えないため。
+    ///
+    /// [`fetch_dtako_month_digest`]: KintaiEventsApi::fetch_dtako_month_digest
+    async fn fetch_dtako_month_digest_since(
+        &self,
+        month: &str,
+        _since: Option<chrono::NaiveDate>,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        self.fetch_dtako_month_digest(month).await
+    }
+
+    /// **月初をまたいで続く運行・勤務の始まり**を乗務員ごとに返す (Refs
+    /// ohishi-exp/nuxt-dtako-admin#1123)。値は `YYYY-MM-DD HH:MM:SS`。
+    ///
+    /// fold と画面は対象月を `[月初, 翌月 2 日)` で読むので、前月に始業した勤務の
+    /// 続き (月初の休息・運行終了・終業) だけが見え、休息の終わりを始業とする余分な
+    /// 勤務を当月に立てていた (乗務員 1194 の 2026-04)。ここが返す時刻まで窓を
+    /// 遡らせれば、勤務は前月始業のまま組まれ、当月の出力 (始業日で絞る) から外れる。
+    /// 規則は [`month_head_anchors`]。
+    ///
+    /// **既定は空** (= 遡らない)。打刻と運行の確定イベントを持つ実装だけが上書きする。
+    async fn fetch_month_head_anchors(
+        &self,
+        _month_start: &str,
+        _to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        Ok(std::collections::BTreeMap::new())
+    }
+}
+
+/// 月初時点の打刻の姿 (乗務員 1 名ぶん)。[`month_head_anchors`] の材料。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeadPunch {
+    pub driver: u64,
+    /// 窓 `[月初, to)` で最初の打刻 (`始業` / `終業`)。無ければ `None`。
+    pub first_state: Option<String>,
+    /// 月初より前の最後の始業 (`YYYY-MM-DD HH:MM:SS`)。
+    pub last_start: Option<String>,
+    /// 月初より前の最後の終業。
+    pub last_end: Option<String>,
+}
+
+/// 乗務員ごとの遡り起点 (Refs ohishi-exp/nuxt-dtako-admin#1123)。**日数の上限は
+/// 置かない** — どこまで遡るかはデータで決める (ユーザー決定)。
+///
+/// | 種類 | 条件 | 値 |
+/// |---|---|---|
+/// | 運行 | 窓に `運行終了` があり、`unko_no` 先頭 12 桁 (運行開始日時) が月初より前 | その運行開始日時 |
+/// | 打刻 | 月初時点で始業が開いている (最後の始業 > 最後の終業) **かつ** 窓で最初の打刻が終業 | その始業 |
+///
+/// 両方あれば早いほう。打刻の 2 つ目の条件は「終業を打ち忘れた数週間前の始業」が
+/// 起点になり続けるのを抑える — 当月の最初が始業なら、前月の始業は閉じていないまま
+/// 捨てられる (`kosoku::shifts_from_timecard` が次の始業で置き換えるのと同じ意味)。
+///
+/// `run_ends` は `(乗務員CD, unko_no)`。`month_start` は `YYYY-MM-DD HH:MM:SS` で、
+/// 比較は同じ形の文字列同士で行う。
+pub fn month_head_anchors(
+    month_start: &str,
+    run_ends: &[(u64, String)],
+    punches: &[HeadPunch],
+) -> std::collections::BTreeMap<u64, String> {
+    let mut out: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    let mut offer = |driver: u64, at: String| {
+        let slot = out.entry(driver).or_insert_with(|| at.clone());
+        if at < *slot {
+            *slot = at;
+        }
+    };
+    for (driver, unko_no) in run_ends {
+        let Some(start) = crate::kintai_http_repo::unko_no_start_datetime(unko_no) else {
+            continue;
+        };
+        let start = start.format("%Y-%m-%d %H:%M:%S").to_string();
+        if start.as_str() < month_start {
+            offer(*driver, start);
+        }
+    }
+    for p in punches {
+        let Some(start) = p.last_start.as_deref() else {
+            continue;
+        };
+        let open = p.last_end.as_deref().is_none_or(|end| start > end);
+        let closes_first = p.first_state.as_deref() == Some("終業");
+        if open && closes_first && start < month_start {
+            offer(p.driver, start.to_string());
+        }
+    }
+    out
+}
+
+/// 読みの始端 = 遡り起点のうち最も早いもの、無ければ月初 (Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。**読みは全員で 1 回**なので、窓の始端は
+/// 全乗務員の最小に揃え、乗務員ごとの窓へは読んだ後に切り戻す
+/// (`kintai_fold::clip_to_anchors`)。
+pub fn lookback_from(
+    month_start: &str,
+    anchors: &std::collections::BTreeMap<u64, String>,
+) -> String {
+    anchors
+        .values()
+        .map(String::as_str)
+        .fold(month_start, |a, b| a.min(b))
+        .to_string()
 }
 
 pub type DynKintaiEventsRepo = Arc<dyn KintaiEventsApi>;
@@ -633,6 +740,85 @@ SELECT t.driver_id
  WHERE t.datetime >= :from AND t.datetime < :to AND t.driver_id > 0
  ORDER BY driver_id
 "#;
+
+/// 窓の中の**運行終了**と、その `unko_no` (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+/// 月初をまたぐ運行を見つける材料 ([`month_head_anchors`] の運行の行)。
+///
+/// 運行開始日時は `unko_no` の先頭 12 桁から Rust 側で取る — `state = 10` の行と
+/// 突き合わせない (運行開始の行が無い運行でも引けるように)。月初より前かの判定も
+/// Rust 側。`datetime` の索引で窓を絞るのは [`ALL_EVENTS_SQL`] と同じ。
+const HEAD_RUN_ENDS_SQL: &str = r#"
+SELECT t.driver_id, t.unko_no
+  FROM time_card_dtako t
+ WHERE t.state = 11 AND t.datetime >= :from AND t.datetime < :to
+   AND t.driver_id > 0 AND t.unko_no IS NOT NULL
+"#;
+
+/// 窓に打刻がある乗務員ごとの「月初時点の打刻の姿」(Refs
+/// ohishi-exp/nuxt-dtako-admin#1123、[`HeadPunch`])。
+///
+/// 相関サブクエリは 3 本とも `time_card_dstate` を乗務員 (`id`) と `datetime` で
+/// 引く ([`EVENTS_SQL`] の単一乗務員ブランチと同じ経路)。`MAX(… < :from)` は
+/// 月初から遡って最初に当たった 1 行で止まる。同時刻の始業・終業は始業を先に置く
+/// (`state` 30 < 31)。
+const HEAD_PUNCHES_SQL: &str = r#"
+SELECT f.id AS driver_id,
+       (SELECT IF(s.state = 30, '始業', '終業')
+          FROM time_card_dstate s
+         WHERE s.id = f.id AND s.state IN (30, 31)
+           AND s.datetime >= :from AND s.datetime < :to
+         ORDER BY s.datetime, s.state
+         LIMIT 1) AS first_state,
+       (SELECT DATE_FORMAT(MAX(b.datetime), '%Y-%m-%d %H:%i:%s')
+          FROM time_card_dstate b
+         WHERE b.id = f.id AND b.state = 30 AND b.datetime < :from) AS last_start,
+       (SELECT DATE_FORMAT(MAX(e.datetime), '%Y-%m-%d %H:%i:%s')
+          FROM time_card_dstate e
+         WHERE e.id = f.id AND e.state = 31 AND e.datetime < :from) AS last_end
+  FROM (SELECT DISTINCT d.id
+          FROM time_card_dstate d
+         WHERE d.datetime >= :from AND d.datetime < :to AND d.id > 0) f
+"#;
+
+/// `HEAD_PUNCHES_SQL` の 1 行 (列の順序と 1:1)。
+type HeadPunchRow = (i64, Option<String>, Option<String>, Option<String>);
+
+/// [`HeadPunchRow`] を [`HeadPunch`] へ。0 以下の CD は SQL で落としてある。
+fn head_punch(row: HeadPunchRow) -> HeadPunch {
+    let (driver, first_state, last_start, last_end) = row;
+    HeadPunch {
+        driver: driver.max(0) as u64,
+        first_state,
+        last_start,
+        last_end,
+    }
+}
+
+/// MariaDB から遡り起点を引く (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+///
+/// 接続を受け取るのは、画面の etag ([`crate::kintai_version`]) が**自分の pool** で
+/// 同じ起点を引くため — 起点の決め方を 2 実装にしない。
+pub(crate) async fn mariadb_month_head_anchors(
+    conn: &mut mysql_async::Conn,
+    from: &str,
+    to: &str,
+) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+    let q = |e: mysql_async::Error| KintaiRepoError::QueryFailed(e.to_string());
+    let runs: Vec<(i64, String)> = conn
+        .exec(HEAD_RUN_ENDS_SQL, params! { "from" => from, "to" => to })
+        .await
+        .map_err(q)?;
+    let punches: Vec<HeadPunchRow> = conn
+        .exec(HEAD_PUNCHES_SQL, params! { "from" => from, "to" => to })
+        .await
+        .map_err(q)?;
+    let runs: Vec<(u64, String)> = runs
+        .into_iter()
+        .map(|(d, u)| (d.max(0) as u64, u))
+        .collect();
+    let punches: Vec<HeadPunch> = punches.into_iter().map(head_punch).collect();
+    Ok(month_head_anchors(from, &runs, &punches))
+}
 
 /// 休息だけを `運行NO` 付きで両表から読む (Refs #205 の 41)。
 ///
@@ -1014,6 +1200,20 @@ impl KintaiEventsApi for MariadbKintaiEventsRepo {
         Ok(rows.into_iter().map(all_row_to_json).collect())
     }
 
+    /// 月初をまたぐ運行・勤務の始まり ([`mariadb_month_head_anchors`])。
+    async fn fetch_month_head_anchors(
+        &self,
+        month_start: &str,
+        to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| KintaiRepoError::QueryFailed(format!("connect: {e}")))?;
+        mariadb_month_head_anchors(&mut conn, month_start, to).await
+    }
+
     /// 既定実装 (読んでから捨てる) を上書きし、**`dtako_events` を読まない**。
     async fn fetch_timecard_events_between(
         &self,
@@ -1205,6 +1405,156 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KintaiRepoError::NotConfigured));
+    }
+
+    // ── 月初をまたぐ運行・勤務の起点 (Refs ohishi-exp/nuxt-dtako-admin#1123) ──
+
+    const APRIL: &str = "2026-04-01 00:00:00";
+
+    fn punch(
+        driver: u64,
+        first: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> HeadPunch {
+        HeadPunch {
+            driver,
+            first_state: first.map(str::to_string),
+            last_start: start.map(str::to_string),
+            last_end: end.map(str::to_string),
+        }
+    }
+
+    /// 1194 の 2026-04: 運行は 3/31 21:39:47 開始、始業は 3/31 21:36:28 — 早い方。
+    #[test]
+    fn the_earlier_of_run_and_punch_wins() {
+        let runs = vec![(1194, "26033121394700000043241".to_string())];
+        let punches = vec![punch(
+            1194,
+            Some("終業"),
+            Some("2026-03-31 21:36:28"),
+            Some("2026-03-30 17:00:00"),
+        )];
+        let got = month_head_anchors(APRIL, &runs, &punches);
+        assert_eq!(
+            got.get(&1194).map(String::as_str),
+            Some("2026-03-31 21:36:28")
+        );
+        // 運行だけなら運行開始日時
+        let got = month_head_anchors(APRIL, &runs, &[]);
+        assert_eq!(
+            got.get(&1194).map(String::as_str),
+            Some("2026-03-31 21:39:47")
+        );
+        // 打刻の方が遅ければ運行が勝つ (順番に依らない)
+        let late = vec![punch(1194, Some("終業"), Some("2026-03-31 23:00:00"), None)];
+        let got = month_head_anchors(APRIL, &runs, &late);
+        assert_eq!(
+            got.get(&1194).map(String::as_str),
+            Some("2026-03-31 21:39:47")
+        );
+    }
+
+    /// 当月に始まった運行と、読めない `unko_no` は起点にならない。
+    #[test]
+    fn runs_begun_in_the_month_or_unreadable_do_not_anchor() {
+        let runs = vec![
+            (1300, "26040108000000000043241".to_string()),
+            (1301, "U1".to_string()),
+            (1302, "269999123456000".to_string()),
+        ];
+        assert!(month_head_anchors(APRIL, &runs, &[]).is_empty());
+    }
+
+    /// 閉じ忘れ運行 (1731 型) は日数の上限なしで遡る。
+    #[test]
+    fn a_long_forgotten_run_still_anchors() {
+        let runs = vec![(1731, "26022105000000000012341".to_string())];
+        let got = month_head_anchors("2026-03-01 00:00:00", &runs, &[]);
+        assert_eq!(
+            got.get(&1731).map(String::as_str),
+            Some("2026-02-21 05:00:00")
+        );
+    }
+
+    /// 打刻は「月初時点で開いている始業」かつ「当月の最初が終業」のときだけ。
+    #[test]
+    fn a_punch_anchors_only_when_open_and_closed_first_in_the_month() {
+        let s = Some("2026-03-20 08:00:00");
+        let cases = [
+            // 終業が無い / 始業より前 → 開いている。当月の最初が終業 → 遡る
+            (punch(1, Some("終業"), s, None), true),
+            (punch(2, Some("終業"), s, Some("2026-03-19 17:00:00")), true),
+            // 当月の最初が始業 → 前月の始業は捨てられる (終業忘れの化石)
+            (punch(3, Some("始業"), s, None), false),
+            // 当月に打刻が無い
+            (punch(4, None, s, None), false),
+            // 閉じている (終業が始業より後)
+            (
+                punch(5, Some("終業"), s, Some("2026-03-20 17:00:00")),
+                false,
+            ),
+            // 前月に始業が無い
+            (punch(6, Some("終業"), None, None), false),
+            // 始業が月初以降 (材料の取り違え) は採らない
+            (punch(7, Some("終業"), Some(APRIL), None), false),
+        ];
+        for (p, want) in cases {
+            let cd = p.driver;
+            let got = month_head_anchors(APRIL, &[], &[p]);
+            assert_eq!(got.contains_key(&cd), want, "乗務員 {cd}");
+        }
+    }
+
+    #[test]
+    fn lookback_from_is_the_earliest_anchor_or_the_month_start() {
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(lookback_from(APRIL, &none), APRIL);
+        let anchors = [
+            (1, "2026-03-31 21:36:28".to_string()),
+            (2, "2026-03-30 08:00:00".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(lookback_from(APRIL, &anchors), "2026-03-30 08:00:00");
+    }
+
+    #[test]
+    fn head_punch_maps_the_row_columns() {
+        let p = head_punch((1194, Some("終業".into()), Some("a".into()), None));
+        assert_eq!(p, punch(1194, Some("終業"), Some("a"), None));
+    }
+
+    /// MariaDB は CI に無いので SQL を文字列で固定する (運行終了は `state = 11`、
+    /// 打刻は 30 = 始業 / 31 = 終業、月初より前の MAX と窓の最初)。
+    #[test]
+    fn the_head_sql_reads_run_ends_and_the_punch_edges() {
+        assert!(HEAD_RUN_ENDS_SQL.contains("FROM time_card_dtako t"));
+        assert!(HEAD_RUN_ENDS_SQL.contains("t.state = 11"));
+        assert!(HEAD_RUN_ENDS_SQL.contains("t.datetime >= :from AND t.datetime < :to"));
+        assert!(HEAD_PUNCHES_SQL.contains("IF(s.state = 30, '始業', '終業')"));
+        assert!(HEAD_PUNCHES_SQL.contains("ORDER BY s.datetime, s.state"));
+        assert!(HEAD_PUNCHES_SQL.contains("b.state = 30 AND b.datetime < :from"));
+        assert!(HEAD_PUNCHES_SQL.contains("e.state = 31 AND e.datetime < :from"));
+        assert!(
+            !HEAD_PUNCHES_SQL.contains("COALESCE"),
+            "索引を殺す関数を当てない"
+        );
+    }
+
+    /// 既定は遡らない (空)、dtako 指紋の `since` 版は今までの範囲に落ちる。
+    #[tokio::test]
+    async fn the_defaults_do_not_look_back() {
+        let got = DisabledKintaiEventsRepo
+            .fetch_month_head_anchors(APRIL, "2026-05-02 00:00:00")
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+        let d = DisabledKintaiEventsRepo
+            .fetch_dtako_month_digest_since("2026-04", chrono::NaiveDate::from_ymd_opt(2026, 3, 31))
+            .await
+            .unwrap();
+        assert!(d.is_none());
     }
 
     fn row(driver: Option<i64>, source: &str) -> serde_json::Value {

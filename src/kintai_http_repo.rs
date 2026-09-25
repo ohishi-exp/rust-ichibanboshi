@@ -1334,11 +1334,24 @@ fn row_to_event(cols: &EventCols, row: &[String], op_unko_no: &str) -> Option<Ra
 ///
 /// 2 つは `開始日時` の条件で排他なので重複しない。
 fn in_window(ev: &RawEvent, from: NaiveDateTime, to: NaiveDateTime) -> bool {
-    if ev.start >= from && ev.start < to {
+    window_holds(ev.start, ev.end, from, to)
+}
+
+/// [`in_window`] の中身。**開始・終了 (区間なら) だけで判定する**ので、fold が
+/// 読んだ行を乗務員ごとの窓へ切り戻すとき (`kintai_fold`、Refs
+/// ohishi-exp/nuxt-dtako-admin#1123) も同じ述語を使う — 絞り方が 2 実装に
+/// ならないように。
+pub(crate) fn window_holds(
+    start: NaiveDateTime,
+    end: Option<NaiveDateTime>,
+    from: NaiveDateTime,
+    to: NaiveDateTime,
+) -> bool {
+    if start >= from && start < to {
         return true;
     }
-    match ev.end {
-        Some(end) => ev.start < from && end >= from && end < to,
+    match end {
+        Some(end) => start < from && end >= from && end < to,
         None => false,
     }
 }
@@ -1479,6 +1492,20 @@ pub(crate) const MAX_TAIL_GAP_DAYS: i64 = 7;
 /// 運行日を添えるため (Refs #205 の 41)。読み方は 1 か所に置く。
 pub(crate) fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(unko_no.get(..UNKO_NO_DATE_DIGITS)?, "%y%m%d").ok()
+}
+
+/// `unko_no` の先頭 12 桁 (`YYMMDDHHMMSS`) = **運行開始日時** (Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。裏取りは [`unko_no_start_date`] と同じ実測。
+///
+/// fold の読み窓を月初をまたぐ運行の開始まで遡らせるのに使う
+/// ([`crate::kintai_repo::month_head_anchors`])。日付版は 6 桁しか要らない呼び出し
+/// (短い fixture を含む) のために別に残す。
+///
+/// `routes/dtako_day.rs` にも同じ 1 行があるが、あちらは `build.rs` の glob の外に
+/// 置くために別に持っている。fold の出力を決めるこちらを glob の外から借りると、
+/// 変えても `logic_version` が回らなくなるのでここに置く。
+pub(crate) fn unko_no_start_datetime(unko_no: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(unko_no.get(..12)?, "%y%m%d%H%M%S").ok()
 }
 
 /// etags の一覧から測った「入力がどこまで届いているか」(Refs #205 の 21)。
@@ -2090,18 +2117,48 @@ impl KintaiEventsApi for HttpKintaiEventsRepo {
         }
     }
 
+    /// 月初をまたぐ運行・勤務の始まり (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+    /// 材料は打刻と運行の確定イベントで、上流 (alc) に口が無い — フェリーと同じく
+    /// `fallback` へ委譲する。**無ければ空** (= 遡らない、今までどおりの窓) —
+    /// 読めないものを 503 にすると、打刻を持たない実行形態で fold ごと止まる。
+    async fn fetch_month_head_anchors(
+        &self,
+        month_start: &str,
+        to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        match &self.fallback {
+            Some(fb) => fb.fetch_month_head_anchors(month_start, to).await,
+            None => Ok(std::collections::BTreeMap::new()),
+        }
+    }
+
     async fn fetch_dtako_month_digest(
         &self,
         month: &str,
     ) -> Result<Option<String>, KintaiRepoError> {
-        let (from, to) = month_etags_bounds(month)
+        self.fetch_dtako_month_digest_since(month, None).await
+    }
+
+    /// 始端を `since` まで下げた月ゲートの dtako 指紋 (Refs
+    /// ohishi-exp/nuxt-dtako-admin#1123)。fold が月初より前から読む月は、その分の
+    /// 運行の CSV も封の材料に入れる。`None` (遡らない月) は今までと同じ範囲。
+    ///
+    /// 末尾検知の母集団 (`InputCoverage` の `window_start`) は**月初のまま** —
+    /// 前月に始まった運行を数えないのはそちらの docs の決定で、ここでは動かさない。
+    async fn fetch_dtako_month_digest_since(
+        &self,
+        month: &str,
+        since: Option<NaiveDate>,
+    ) -> Result<Option<String>, KintaiRepoError> {
+        let (first, to) = month_etags_bounds(month)
             .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
+        let from = since.map_or(first, |d| d.min(first));
         let pairs = self.fetch_etags(from, to).await?;
         // 入力の欠けは alc からは見えない (索引に無い運行は warnings に出ない) ので、
         // 引いてきた一覧の形から自分で見つけて `record_warning` へ流す (Refs #205 の 21)
         // `None` (alc に口が無い) は「欠けている」ではなく「判定できない」— 検知しない
         if let Some(p) = pairs.as_deref() {
-            let cov = InputCoverage::measure(p, from, to, today_jst());
+            let cov = InputCoverage::measure(p, first, to, today_jst());
             // **警告の有無に関わらず毎回出す** (閾値を後から締めるための実測値)。
             // マクロは 1 行に収める (CLAUDE.md — 折り返すと行カバレッジに乗らない)
             let (gap, cover) = (cov.gap_days().unwrap_or(-1), cov.summary());
@@ -2853,6 +2910,38 @@ mod tests {
         assert_eq!(unko_no_start_date("U1"), None, "6 桁に満たない");
         assert_eq!(unko_no_start_date("269999123456"), None, "日付として不正");
         assert_eq!(unko_no_start_date("26060X10055500"), None, "数字でない");
+    }
+
+    /// 先頭 12 桁 = 運行開始日時 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+    #[test]
+    fn unko_no_start_datetime_reads_the_leading_12_digits() {
+        let got = unko_no_start_datetime("26033121394700000043241");
+        assert_eq!(got, Some(dt("2026-03-31 21:39:47")), "1194 の実物");
+        let short_tail = unko_no_start_datetime("2602241025060000000272");
+        assert_eq!(short_tail, Some(dt("2026-02-24 10:25:06")), "22 桁");
+        assert_eq!(unko_no_start_datetime("260331"), None, "12 桁に満たない");
+        assert_eq!(
+            unko_no_start_datetime("269999123456"),
+            None,
+            "日付として不正"
+        );
+        assert_eq!(
+            unko_no_start_datetime("260331256000"),
+            None,
+            "時刻として不正"
+        );
+    }
+
+    /// 切り出した述語は区間の 2 ブランチと点をそのまま判定する。
+    #[test]
+    fn window_holds_matches_the_two_sql_branches() {
+        let (from, to) = (dt("2026-04-01 00:00:00"), dt("2026-05-02 00:00:00"));
+        let before = dt("2026-03-31 21:36:28");
+        assert!(!window_holds(before, None, from, to), "点は開始で判定");
+        let inside = Some(dt("2026-04-01 04:38:56"));
+        assert!(window_holds(before, inside, from, to), "期間内に終わる区間");
+        assert!(window_holds(from, None, from, to), "下端は含む");
+        assert!(!window_holds(to, None, from, to), "上端は含まない");
     }
 
     /// `driver_cds` 無し (alc がまだ返さない現行環境相当)。

@@ -77,7 +77,7 @@ use chrono::{DateTime, FixedOffset};
 use sqlx::Row;
 
 use crate::kintai_push::{jst_at, KintaiPgStore, PUSHED_SOURCES};
-use crate::kintai_repo::{KintaiEventsApi, KintaiRepoError};
+use crate::kintai_repo::{month_head_anchors, HeadPunch, KintaiEventsApi, KintaiRepoError};
 
 /// 単一乗務員ぶんの打刻。`kintai_events_driver_time`
 /// (`tenant_id, driver_cd, occurred_at` INCLUDE `state, source, unko_no`) だけで
@@ -115,6 +115,48 @@ SELECT to_char(occurred_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') A
    AND occurred_at >= $2 AND occurred_at < $3
    AND source = ANY($4)
  ORDER BY driver_cd, occurred_at, source COLLATE "C"
+"#;
+
+/// 窓の中の**運行終了**と、その `unko_no` (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+///
+/// MariaDB の `HEAD_RUN_ENDS_SQL` (`state = 11`) と同じ意味で、`source = 'dtako'`
+/// の `運行終了` に絞る。`MONTH_OPERATIONS_SQL` (`kintai_push`) は流用しない —
+/// あちらは `state` で絞らず「窓の中に何かある運行」を拾うので、月初より前に
+/// 始まって窓の中に休息だけ持つ運行まで起点にしてしまい、MariaDB とずれる。
+/// 月初より前に始まったかの判定は Rust 側 ([`month_head_anchors`])。
+const HEAD_RUN_ENDS_SQL: &str = r#"
+SELECT driver_cd, unko_no
+  FROM kintai.kintai_events
+ WHERE tenant_id = $1 AND source = 'dtako' AND state = '運行終了'
+   AND occurred_at >= $2 AND occurred_at < $3
+   AND unko_no IS NOT NULL AND driver_cd > 0
+"#;
+
+/// 窓に打刻がある乗務員ごとの「月初時点の打刻の姿」(MariaDB の `HEAD_PUNCHES_SQL`
+/// と同じ形)。相関サブクエリは 3 本とも `kintai_events_driver_time`
+/// (`tenant_id, driver_cd, occurred_at`) を乗務員で引く。同時刻の始業・終業は
+/// 始業を先に置く (`COLLATE "C"` で 始 < 終)。
+const HEAD_PUNCHES_SQL: &str = r#"
+SELECT f.driver_cd,
+       (SELECT s.state
+          FROM kintai.kintai_events s
+         WHERE s.tenant_id = $1 AND s.driver_cd = f.driver_cd AND s.source = 'timecard'
+           AND s.state IN ('始業', '終業')
+           AND s.occurred_at >= $2 AND s.occurred_at < $3
+         ORDER BY s.occurred_at, s.state COLLATE "C"
+         LIMIT 1) AS first_state,
+       (SELECT to_char(max(b.occurred_at) AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
+          FROM kintai.kintai_events b
+         WHERE b.tenant_id = $1 AND b.driver_cd = f.driver_cd AND b.source = 'timecard'
+           AND b.state = '始業' AND b.occurred_at < $2) AS last_start,
+       (SELECT to_char(max(e.occurred_at) AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
+          FROM kintai.kintai_events e
+         WHERE e.tenant_id = $1 AND e.driver_cd = f.driver_cd AND e.source = 'timecard'
+           AND e.state = '終業' AND e.occurred_at < $2) AS last_end
+  FROM (SELECT DISTINCT driver_cd
+          FROM kintai.kintai_events
+         WHERE tenant_id = $1 AND source = 'timecard' AND driver_cd > 0
+           AND occurred_at >= $2 AND occurred_at < $3) f
 "#;
 
 /// `kintai.kintai_events` から打刻を読む [`KintaiEventsApi`] 実装。
@@ -220,6 +262,54 @@ impl KintaiEventsApi for PgKintaiEventsRepo {
             .await
             .map_err(db_err)?;
         rows.iter().map(all_row_to_json).collect()
+    }
+
+    /// 月初をまたぐ運行・勤務の始まり (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+    /// 規則は [`month_head_anchors`] で MariaDB 版と共通。**前月ぶんが push 済みで
+    /// あることが前提** — 未 push なら起点が無い = 今までどおりの窓になるだけ。
+    async fn fetch_month_head_anchors(
+        &self,
+        month_start: &str,
+        to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        let (from_at, to_at) = window(month_start, to)?;
+        let runs = sqlx::query(HEAD_RUN_ENDS_SQL)
+            .bind(self.tenant_id)
+            .bind(from_at)
+            .bind(to_at)
+            .fetch_all(self.store.pool())
+            .await
+            .map_err(db_err)?;
+        let punches = sqlx::query(HEAD_PUNCHES_SQL)
+            .bind(self.tenant_id)
+            .bind(from_at)
+            .bind(to_at)
+            .fetch_all(self.store.pool())
+            .await
+            .map_err(db_err)?;
+        let runs: Vec<(u64, String)> = runs
+            .iter()
+            .map(|r| {
+                let cd = r.try_get::<i64, _>("driver_cd").map_err(db_err)?;
+                Ok((
+                    cd as u64,
+                    r.try_get::<String, _>("unko_no").map_err(db_err)?,
+                ))
+            })
+            .collect::<Result<_, KintaiRepoError>>()?;
+        let punches: Vec<HeadPunch> = punches
+            .iter()
+            .map(|r| {
+                let opt = |k: &str| r.try_get::<Option<String>, _>(k).map_err(db_err);
+                Ok(HeadPunch {
+                    driver: r.try_get::<i64, _>("driver_cd").map_err(db_err)? as u64,
+                    first_state: opt("first_state")?,
+                    last_start: opt("last_start")?,
+                    last_end: opt("last_end")?,
+                })
+            })
+            .collect::<Result<_, KintaiRepoError>>()?;
+        Ok(month_head_anchors(month_start, &runs, &punches))
     }
 
     /// フェリー区間は `kintai` スキーマに無い。**突合はオンプレ専用** (#205 の決定 8:
