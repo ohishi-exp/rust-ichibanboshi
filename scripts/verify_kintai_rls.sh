@@ -187,21 +187,22 @@ expect_eq "kintai_reader は NOINHERIT" \
 expect_eq "kintai_reader は superuser ではない" \
   "$(as "$SUPER_URL" "SELECT rolsuper FROM pg_roles WHERE rolname='kintai_reader'")" "f"
 
-echo "== RLS が 8 表とも有効で、テナント分離ポリシーが 1 本ずつある"
+echo "== RLS が 9 表とも有効で、テナント分離ポリシーが 1 本ずつある"
 # 6 -> 7 は 004 (kintai.fold_gate、Refs #205 実装計画 13) を足した分。
 # 7 -> 8 は 006 (kintai.wage_snapshot、Refs #291) を足した分。
+# 8 -> 9 は 008 (kintai.event_changes、Refs ohishi-exp/nuxt-dtako-admin#1133) を足した分。
 #
 # **表を足したらこの 3 つの数を上げる。** 数え上げを動的 (「RLS 無効の表が 0 件」)
 # にすると、RLS を付け忘れた表が 0 件のまま通ってしまう — この検査は「表の数だけ
 # ポリシーがある」ことを人が意識して更新することで成り立っている。
 expect_eq "relrowsecurity = true の表の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "8"
+       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "9"
 expect_eq "policy の数" \
-  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "8"
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "9"
 expect_eq "WITH CHECK を明示していない (= USING が WITH CHECK として効く) policy の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies
-       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "8"
+       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "9"
 
 # ── 3. reader / writer で実際に繋ぐ ────────────────────────────────────
 # migration はパスワードを持たないので、検証用にここで付ける (テスト scaffolding)。
@@ -282,6 +283,22 @@ INSERT INTO kintai.wage_snapshot (tenant_id, comp_id, ym, restraint_source, driv
 VALUES ('$TENANT_A', 'comp-a', '2026-04-01', 'gcp', 1001, 'wage-1', 'missing');" \
   "wage_snapshot_timecard_kosoku_check"
 as "$SUPER_URL" "DELETE FROM kintai.wage_snapshot" >/dev/null
+
+# 打刻の変更記録 (008)。push が置き換えの瞬間に writer で書き、読み口が読む。
+echo "== event_changes も writer で往復でき、前後とも無い行は CHECK で止まる"
+expect_ok_sql "writer が event_changes を INSERT" "$WRITER_URL" "
+INSERT INTO kintai.event_changes (tenant_id, driver_cd, date, before, after)
+VALUES ('$TENANT_A', 1194, '2026-02-06', '[{\"state\":\"始業\"}]', NULL),
+       ('$TENANT_B', 1194, '2026-02-06', '[{\"state\":\"始業\"}]', NULL);"
+expect_eq "writer が event_changes を SELECT" \
+  "$(as "$WRITER_URL" "SELECT count(*) FROM kintai.event_changes WHERE tenant_id='$TENANT_A'")" "1"
+expect_err "before も after も NULL の行は入らない" "$WRITER_URL" "
+INSERT INTO kintai.event_changes (tenant_id, driver_cd, date, before, after)
+VALUES ('$TENANT_A', 1194, '2026-02-07', NULL, NULL);" \
+  "event_changes_has_side"
+expect_eq "reader は event_changes も自テナントしか見えない" \
+  "$(as "$READER_URL" "SET app.current_tenant_id = '$TENANT_A'; SELECT count(DISTINCT tenant_id) FROM kintai.event_changes")" "1"
+as "$SUPER_URL" "DELETE FROM kintai.event_changes" >/dev/null
 
 # paper_drift だけ writer で 1 度も触られていなかった (他 6 表は下で触る)。
 # 「触っていない表は権限が壊れていても気付けない」を残さない。
