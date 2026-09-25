@@ -1568,3 +1568,251 @@ async fn test_unko_diff_defaults_to_empty_without_a_comparison() {
     assert!(diff.items.is_empty());
     assert_eq!(diff.gcp_only, 0);
 }
+
+// ── 月初をまたぐ運行・勤務 (Refs ohishi-exp/nuxt-dtako-admin#1123) ────────────
+
+/// 打刻の読み先 (fallback) の代役。遡り起点と打刻を固定値で返す。
+struct AnchorFallback {
+    anchors: std::collections::BTreeMap<u64, String>,
+    punches: Vec<Value>,
+}
+
+#[async_trait]
+impl KintaiEventsApi for AnchorFallback {
+    async fn fetch_events_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: u64,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        let at = |r: &Value| r["datetime"].as_str().unwrap_or_default().to_string();
+        Ok(self
+            .punches
+            .iter()
+            .filter(|r| at(r).as_str() >= from && at(r).as_str() < to)
+            .cloned()
+            .collect())
+    }
+
+    async fn fetch_ferry_between(
+        &self,
+        _from: &str,
+        _to: &str,
+        _driver: Option<u64>,
+    ) -> Result<Vec<Value>, KintaiRepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_month_head_anchors(
+        &self,
+        _month_start: &str,
+        _to: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
+        Ok(self.anchors.clone())
+    }
+}
+
+fn anchor_fallback(anchors: &[(u64, &str)], punches: Vec<Value>) -> DynKintaiEventsRepo {
+    Arc::new(AnchorFallback {
+        anchors: anchors.iter().map(|(d, a)| (*d, a.to_string())).collect(),
+        punches,
+    })
+}
+
+/// 起点は上流 (alc) に口が無いので fallback へ委譲する。無ければ空 (遡らない)。
+#[tokio::test]
+async fn test_head_anchors_come_from_the_fallback_or_nowhere() {
+    let with = HttpKintaiEventsRepo::new(
+        &cfg("http://127.0.0.1:1"),
+        Some(anchor_fallback(
+            &[(1194, "2026-03-31 21:36:28")],
+            Vec::new(),
+        )),
+    )
+    .unwrap();
+    let got = with
+        .fetch_month_head_anchors("2026-04-01 00:00:00", "2026-05-02 00:00:00")
+        .await
+        .unwrap();
+    assert_eq!(
+        got.get(&1194).map(String::as_str),
+        Some("2026-03-31 21:36:28")
+    );
+
+    let without = repo("http://127.0.0.1:1")
+        .fetch_month_head_anchors("2026-04-01 00:00:00", "2026-05-02 00:00:00")
+        .await
+        .unwrap();
+    assert!(without.is_empty(), "打刻を持たない形では遡らない");
+}
+
+/// 起点のある月だけ etags の始端を下げる。月初より後の `since` は月初のまま。
+#[tokio::test]
+async fn test_month_digest_since_lowers_only_the_start_of_the_window() {
+    let server = MockServer::start().await;
+    for date_from in ["2026-03-31", "2026-04-01"] {
+        Mock::given(method("GET"))
+            .and(path("/api/dtako/events/etags"))
+            .and(query_param("date_from", date_from))
+            .and(query_param("date_to", "2026-05-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "period": {"date_from": date_from, "date_to": "2026-05-01"},
+                "items": [{"unko_no": "2603312139470000004324", "etag": "e1"}],
+                "warnings": [],
+            })))
+            .expect(if date_from == "2026-03-31" { 1 } else { 2 })
+            .mount(&server)
+            .await;
+    }
+    let r = repo(&server.uri());
+    let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 3, d);
+    assert!(r
+        .fetch_dtako_month_digest_since("2026-04", day(31))
+        .await
+        .unwrap()
+        .is_some());
+    // 遡らない月 (None) と、月初より後を渡された場合は今までの範囲
+    assert!(r
+        .fetch_dtako_month_digest_since("2026-04", None)
+        .await
+        .unwrap()
+        .is_some());
+    let later = chrono::NaiveDate::from_ymd_opt(2026, 4, 3);
+    assert!(r
+        .fetch_dtako_month_digest_since("2026-04", later)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// **陰性対照 (GCP の読み経路)**: 他人の起点で読みが広がっても、月をまたがない
+/// 乗務員の行と指紋は起点なし (= 修正前) と同じ。
+///
+/// 1130 は 6/30 夕方に 7 月の窓の外の運行を持つ。1194 の起点 (6/30 21:36) で窓が
+/// 広がるとこの運行も読まれるが、1130 の窓は月初のままなので切り戻される。
+#[tokio::test]
+async fn test_other_drivers_anchor_does_not_move_a_driver_that_does_not_straddle() {
+    use rust_ichibanboshi::kintai_fold::{fold_month, fold_month_with_anchors};
+    use rust_ichibanboshi::kosoku::KosokuParams;
+
+    let server = MockServer::start().await;
+    let heads = &[
+        "運行NO",
+        "対象乗務員CD",
+        "開始日時",
+        "終了日時",
+        "イベント名",
+    ];
+    let op_1130 = operation(
+        "OP-1130",
+        heads,
+        vec![
+            vec![
+                "OP-1130",
+                "1130",
+                "2026/06/30 19:00:00",
+                "2026/06/30 22:00:00",
+                "運転",
+            ],
+            vec![
+                "OP-1130",
+                "1130",
+                "2026/06/30 22:30:00",
+                "2026/06/30 23:30:00",
+                "休憩",
+            ],
+            vec![
+                "OP-1130",
+                "1130",
+                "2026/07/03 02:00:00",
+                "2026/07/03 11:00:00",
+                "休息",
+            ],
+            vec![
+                "OP-1130",
+                "1130",
+                "2026/07/03 13:00:00",
+                "2026/07/03 18:00:00",
+                "運転",
+            ],
+            vec![
+                "OP-1130",
+                "1130",
+                "2026/07/04 02:00:00",
+                "2026/07/04 11:00:00",
+                "休息",
+            ],
+        ],
+    );
+    let op_1194 = operation(
+        "OP-1194",
+        heads,
+        vec![
+            vec![
+                "OP-1194",
+                "1194",
+                "2026/07/01 00:28:25",
+                "2026/07/01 04:38:56",
+                "休息",
+            ],
+            vec![
+                "OP-1194",
+                "1194",
+                "2026/07/01 04:45:36",
+                "2026/07/01 08:30:26",
+                "休息",
+            ],
+        ],
+    );
+    Mock::given(method("GET"))
+        .and(query_param_is_missing("driver_cd"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "period": {"date_from": "x", "date_to": "y"},
+            "drivers": [
+                {"driver": {"cd": "1130", "name": "a"}, "operations": [op_1130]},
+                {"driver": {"cd": "1194", "name": "b"}, "operations": [op_1194]},
+            ],
+            "next_after_driver_cd": null,
+            "warnings": [],
+        })))
+        .mount(&server)
+        .await;
+    let tc = |at: &str, state: &str| json!({"datetime": at, "end_datetime": null, "driver_id": 1194, "source": "timecard", "state": state});
+    let punches = vec![
+        tc("2026-06-30 21:36:28", "始業"),
+        tc("2026-07-01 17:07:48", "終業"),
+    ];
+    let fb = anchor_fallback(&[(1194, "2026-06-30 21:36:28")], punches);
+    let repo: DynKintaiEventsRepo =
+        Arc::new(HttpKintaiEventsRepo::new(&cfg(&server.uri()), Some(fb)).unwrap());
+    let params = KosokuParams::default();
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 15);
+
+    let new = fold_month(&repo, &params, "2026-07", None, today)
+        .await
+        .unwrap();
+    let empty = Default::default();
+    let old = fold_month_with_anchors(&repo, &params, "2026-07", None, today, &empty)
+        .await
+        .unwrap();
+    let pick = |v: &[(u64, rust_ichibanboshi::kintai_fold::FoldUnit, String)], cd: u64| {
+        v.iter().find(|(d, ..)| *d == cd).cloned()
+    };
+    let (n, o) = (pick(&new, 1130).unwrap(), pick(&old, 1130).unwrap());
+    assert!(
+        !n.1.shifts.is_empty(),
+        "1130 の勤務が立っていないと比べる意味が無い"
+    );
+    assert_eq!(n, o, "行も指紋も修正前と同じ");
+    // 1194 は 6/30 始業の勤務になり、7 月には何も立たない (修正前は休息由来が立つ)
+    assert!(pick(&new, 1194).is_none_or(|(_, u, _)| u.shifts.is_empty()));
+    assert!(pick(&old, 1194).is_some_and(|(_, u, _)| !u.shifts.is_empty()));
+}

@@ -341,9 +341,12 @@ SELECT encode(sha256(convert_to(coalesce(string_agg(
 /// (= オンプレ MariaDB の `time_card_dtako`) 由来の行だけ ([`PUSHED_SOURCES`])。
 /// 打刻だけの行 (`timecard`) は `unko_no` が NULL なので自然に落ちる。
 ///
-/// **窓は [`crate::kintai_repo::month_range`]** — `fold_month` が実際に読む窓と
-/// 同じにする。ずらすと「fold の入力には在るのに突合には出ない」運行ができる。
-/// 日付は署名 SQL と同じく JST の暦日で返す。
+/// **窓は `fold_month` が実際に読む窓と同じにする** — 終端は
+/// [`crate::kintai_repo::month_range`] (翌月 2 日)、始端は月初。ただし月初をまたぐ
+/// 運行・勤務の遡り起点がある月は、始端を起点の最小 (`from_global`、
+/// [`crate::kintai_fold::read_window`]) まで下げる (Refs ohishi-exp/nuxt-dtako-admin#1123)。
+/// 窓は呼び出し側 ([`crate::kintai_fold`] の月ゲート) が渡す。ずらすと「fold の入力には
+/// 在るのに突合には出ない」運行ができる。日付は署名 SQL と同じく JST の暦日で返す。
 pub const MONTH_OPERATIONS_SQL: &str = r#"
 SELECT driver_cd,
        unko_no,

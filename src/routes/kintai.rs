@@ -33,6 +33,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
+use crate::kintai_fold::{clip_to_anchors, month_anchors, read_window};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
 use crate::kosoku::{
@@ -729,8 +730,13 @@ pub async fn tail_gap_probe(
 /// in-service gate へ移すこと。
 ///
 /// 勤務は**始業日**で当月に振り分ける。月初の勤務は前月末に始まった休息の終わりを
-/// 始業とするが、その区間は `EVENTS_SQL` が「期間内に終わる区間」として拾うので、
-/// 範囲は `/events` と同じでよい。
+/// 始業とするが、その区間は `EVENTS_SQL` が「期間内に終わる区間」として拾う。
+///
+/// **窓の始端は月初をまたぐ運行・勤務の開始まで遡る** (Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。前月に始業して当月に終わる勤務は、始業を
+/// 知らないと休息の終わりを始業とする当月の勤務に化けるため。遡り方は fold
+/// ([`crate::kintai_fold::read_window`]) と同じ — 画面と保存値を割らない。
+/// 診断口 (`/events`・`rest-diff`・`reading-dates`) の窓は変えない。
 ///
 /// ## `driver` を省略すると全乗務員 (Refs #125)
 ///
@@ -777,8 +783,13 @@ pub async fn kosoku_daily(
             ))
         }
     };
+    // 窓は fold と同じく月初をまたぐ運行・勤務の開始まで遡らせる — 月初 0:00 から
+    // 読むと前月始業の勤務の続きが当月始業の勤務に化ける (Refs
+    // ohishi-exp/nuxt-dtako-admin#1123)。単一乗務員なので窓はその乗務員の起点から
+    let anchors = month_anchors(&repo, &month).await.map_err(map_repo_err)?;
+    let (from, to) = read_window(&month, &anchors, Some(driver)).map_err(map_repo_err)?;
     let rows = repo
-        .fetch_events(&month, driver)
+        .fetch_events_between(&from, &to, driver)
         .await
         .map_err(map_repo_err)?;
     let view = parse_view(params.view.as_deref());
@@ -896,7 +907,14 @@ async fn kosoku_daily_all(
     params_cfg: &KosokuParams,
     view: ResponseView,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let rows = repo.fetch_all_events(month).await.map_err(map_repo_err)?;
+    // 窓は fold と同じ: 全員で 1 回読み、乗務員ごとの起点へ切り戻す (Refs
+    // ohishi-exp/nuxt-dtako-admin#1123、`kintai_fold::clip_to_anchors`)
+    let anchors = month_anchors(&repo, month).await.map_err(map_repo_err)?;
+    let (from, to) = read_window(month, &anchors, None).map_err(map_repo_err)?;
+    let rows = repo
+        .fetch_all_events_between(&from, &to)
+        .await
+        .map_err(map_repo_err)?;
     // 全乗務員ぶんを 1 回で引いて乗務員ごとに分ける (Refs #146)。取れなければ空 =
     // 控除 0 で続ける — 突合の付帯情報のために日別サマリを落とさない
     let ferry_by_driver = match repo.fetch_ferry(month, None).await {
@@ -906,7 +924,7 @@ async fn kosoku_daily_all(
             Default::default()
         }
     };
-    let drivers: Vec<serde_json::Value> = split_by_driver(rows)
+    let drivers: Vec<serde_json::Value> = clip_to_anchors(split_by_driver(rows), month, &anchors)
         .into_iter()
         // 乗務員CD=0 は打刻の紐付かないデジタコ運行 (構内移動・回送・乗務員未確定等) で
         // 実在の従業員ではない (Refs #284)。基準は kintai_repo.rs の
