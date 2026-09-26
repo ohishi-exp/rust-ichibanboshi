@@ -192,6 +192,16 @@ struct DriverGaps {
     truncated: bool,
 }
 
+/// 乗務員CD 指定時の、その乗務員の対象月のオンプレ側の運行件数 (無ければ 0)。
+/// 指定なしは `None`。指定時は `also_in_month` の絞り込みが外れる ([`build_gaps`]) ので、
+/// 呼び出し側が「0 件 = 照らし合わせる相手が無い」を見分けるための材料として返す。
+fn onprem_count_for(
+    onprem_in_month: &HashMap<i64, usize>,
+    driver_cd: Option<i64>,
+) -> Option<usize> {
+    driver_cd.map(|cd| onprem_in_month.get(&cd).copied().unwrap_or(0))
+}
+
 fn cap_sorted(mut v: Vec<String>, max: usize) -> (Vec<String>, bool) {
     v.sort_unstable();
     let truncated = v.len() > max;
@@ -378,6 +388,7 @@ pub async fn unko_gaps(
     Ok(Json(serde_json::json!({
         "month": month,
         "driver_cd": q.driver_cd,
+        "onprem_operations_in_month": onprem_count_for(&onprem_in_month, q.driver_cd),
         "gcp_etags_available": gcp_etags_available,
         "driver_cds_available": driver_cds_available,
         "unko_no_digits": 22,
@@ -570,6 +581,17 @@ mod tests {
         let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, Some(9999));
         assert_eq!(drivers.len(), 1, "{drivers:?}");
         assert_eq!(drivers[0].driver_cd, "9999");
+    }
+
+    #[test]
+    fn onprem_count_is_reported_only_for_an_explicit_driver_cd() {
+        let mut in_month = HashMap::new();
+        in_month.insert(1445, 5);
+        // 指定なしは返さない (候補の絞り込みが効いているので要らない)
+        assert_eq!(onprem_count_for(&in_month, None), None);
+        assert_eq!(onprem_count_for(&in_month, Some(1445)), Some(5));
+        // オンプレ側に 1 件も無い乗務員は 0 (= 照らし合わせる相手が無い)
+        assert_eq!(onprem_count_for(&in_month, Some(1590)), Some(0));
     }
 
     #[test]
