@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-exposure.sh の陰性対照。wrangler.toml を tomllib で読んだ dict を 1 か所ずつ崩して TOML に書き戻し、
-# (a)〜(e)・(g) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# (a)〜(e)・(g)〜(i) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
 # 文字列の特定の表の直前に行を挿す作りにはしない (表の中身に紛れて別の表のキーになる — rust-alc-api#698)。
 # CI で check-exposure.sh の直後に走る。
 #
@@ -110,6 +110,24 @@ mutate 1 "(d) vpc_services を env 側へ動かす" \
 mutate 1 "(e) vars に LOCAL_SQL_ADDR" 'cfg.setdefault("vars", {})["LOCAL_SQL_ADDR"] = "127.0.0.1:1433"'
 # (g)
 mutate 1 "(g) vars に LOCAL_KYUYO_SQL_JSON" 'cfg.setdefault("vars", {})["LOCAL_KYUYO_SQL_JSON"] = "{}"'
+# (h)
+mutate 1 "(h) services を消す" 'del cfg["services"]'
+mutate 1 "(h) AUTH_KYUYO の binding 名を変える" 'cfg["services"][0]["binding"] = "OTHER_AUTH"'
+mutate 1 "(h) AUTH_KYUYO を別の worker へ向ける" 'cfg["services"][0]["service"] = "stub-auth"'
+mutate 1 "(h) AUTH_KYUYO の entrypoint を変える" 'cfg["services"][0]["entrypoint"] = "InternalEntrypoint"'
+mutate 1 "(h) AUTH_KYUYO の entrypoint を消す (default export)" 'del cfg["services"][0]["entrypoint"]'
+mutate 1 "(h) AUTH_KYUYO を 2 つにする" 'cfg["services"].append(dict(cfg["services"][0], service="stub-auth"))'
+mutate 1 "(h) services を env 側へ動かす" \
+  'cfg["env"] = {"prod": {"services": cfg.pop("services")}}'
+# (i)
+mutate 1 "(i) durable_objects を消す" 'del cfg["durable_objects"]'
+mutate 1 "(i) KYUYO_STATE の name を変える" 'cfg["durable_objects"]["bindings"][0]["name"] = "OTHER_STATE"'
+mutate 1 "(i) KYUYO_STATE の class_name を変える" 'cfg["durable_objects"]["bindings"][0]["class_name"] = "Other"'
+mutate 1 "(i) KYUYO_STATE に script_name (他 Worker の DO)" \
+  'cfg["durable_objects"]["bindings"][0]["script_name"] = "other-worker"'
+mutate 1 "(i) migrations を消す" 'del cfg["migrations"]'
+mutate 1 "(i) new_sqlite_classes を new_classes (KV 型) にする" \
+  'cfg["migrations"][0]["new_classes"] = cfg["migrations"][0].pop("new_sqlite_classes")'
 # (f) は warning だけ: service_id を実値らしくしても、プレースホルダのままでも exit 0
 mutate 0 "(f) service_id を入れた (warning 無し)" \
   'cfg["vpc_services"][0]["service_id"] = "11111111-1111-1111-1111-111111111111"'

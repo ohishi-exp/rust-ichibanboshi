@@ -34,9 +34,10 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/kintai_version.rs` + `src/routes/kintai_version.rs` | `/api/kintai/version` 月別バージョン (ETag) — `daily`/`kosoku-daily` の全ソーステーブル (11 個) の COUNT+CRC32 マーカーを `VERSION_SQL` 1 本で取り sha256 に畳む (#184、下記) |
 | `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/kosoku_paper.rs` | 紙のタイムカード表 (社内 CakePHP) の日別拘束の**再現** — 突合用に `paper_drift_by_date` (cause `rounding`) / `paper_outside_by_date` (紙だけが数える分: 勤務外・運行行欠けの対二重・イベント重複の二重、cause `paper-outside`) / `ours_outside_by_date` (こちらだけが数える分: 紙の材料に無い拘束、cause `ours-outside`) を `kosoku-daily?view=compare` に載せる (nuxt-dtako-admin#501/#546、#182)。**coverage 100% 対象** |
-| `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記) |
+| `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記)。**応答型 (`PayrollResponse` 等 9 つ) の定義は `workers/kyuyo/logic/src/api.rs`** (Worker と共有、#322。JSON の形はそちらの unit test が固定) |
 | `src/kyuyo/mod.rs` の `logic` | 給与の純粋ロジック (項目マッピング・行組み立て)。**本体は `workers/kyuyo/logic/src/payroll.rs`** (Worker 側 crate `kyuyo-logic`、#322)。オンプレ版は root `Cargo.toml` の path 依存 + `pub use kyuyo_logic::payroll as logic` で並走期間だけ借りている (オンプレ廃止時に依存を外す)。テストは `workers/kyuyo/logic/tests/payroll_test.rs`、**coverage 100% gate は `workers/kyuyo/coverage_100.toml` (worker-kyuyo.yml が判定)** |
 | `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層 |
+| `src/kyuyo/store.rs` | 給与の SQLite derived store。**DDL・版・scope の鍵は `workers/kyuyo/logic/src/store_keys.rs`** (Worker の DO `KyuyoState` と共有、#322) |
 | `src/kyuyo/introspect.rs` | `/api/kyuyo/*` の in-service gate (auth-worker introspect + email allowlist) |
 
 ## entrypoint / Axum router (`src/server.rs::run`)

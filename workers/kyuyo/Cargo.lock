@@ -353,12 +353,16 @@ name = "kyuyo-worker"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "js-sys",
  "kyuyo-logic",
  "send_wrapper",
+ "serde",
+ "serde-wasm-bindgen",
  "tiberius",
  "tokio",
  "tokio-util",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "worker",
  "worker-sys",
 ]

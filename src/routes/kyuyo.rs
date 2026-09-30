@@ -13,22 +13,20 @@ use axum::extract::Query;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::kyuyo::introspect::{authorize, KyuyoAuthState};
 use crate::kyuyo::logic::{
     build_companies, build_employee_rows, build_payroll_rows, kydata_db_name, month_period,
-    nendo_for_month, parse_month, CompanyInfo, EmployeeRow, PayrollRow, RawKoumokuRow,
-    ALLOWED_COMPANIES,
+    nendo_for_month, parse_month, EmployeeRow, PayrollRow, RawKoumokuRow, ALLOWED_COMPANIES,
 };
 use crate::kyuyo::repo::{DynKyuyoRepo, KyuyoRepoError};
 use crate::kyuyo::store::{DynKyuyoStore, PayrollSyncedRow};
-
-/// エラーレスポンス本文。
-#[derive(Serialize, Debug)]
-pub struct ErrorBody {
-    pub error: String,
-}
+// 応答型は Worker (workers/kyuyo) と共有する (Refs #322)。JSON の形はそちらの unit test が固定する
+pub use kyuyo_logic::api::{
+    AccessResponse, CompaniesResponse, DatabasesResponse, EmployeesResponse, ErrorBody,
+    PayrollResponse, SyncResponse, SyncedMonthEntry, SyncedMonthsResponse,
+};
 
 type ApiError = (StatusCode, Json<ErrorBody>);
 
@@ -124,12 +122,6 @@ fn map_repo_err(e: KyuyoRepoError) -> ApiError {
 // GET /api/kyuyo/databases (高速な DB 名一覧 — 差分更新用)
 // ══════════════════════════════════════════════════════════════
 
-#[derive(Serialize, Debug)]
-pub struct DatabasesResponse {
-    /// `KYDATA{会社4桁}_{年度3桁}C` 形式の DB 名一覧 (昇順)。
-    pub databases: Vec<String>,
-}
-
 /// KYDATA DB 名の一覧のみ (`sys.databases` メタデータ、ミリ秒)。
 /// 消費側 (nuxt-dtako-admin) が D1 に持つリストとの差分更新に使う。
 /// 会社名・権限チェック込みの完全版は [`companies`] (遅い方)。
@@ -159,12 +151,6 @@ pub async fn databases(
 // ══════════════════════════════════════════════════════════════
 // GET /api/kyuyo/companies
 // ══════════════════════════════════════════════════════════════
-
-#[derive(Serialize, Debug)]
-pub struct CompaniesResponse {
-    pub companies: Vec<CompanyInfo>,
-    pub warnings: Vec<String>,
-}
 
 /// 会社コード×アクセス可能年度の一覧。アクセス不可 DB は warnings で列挙する
 /// (restore 由来の権限抜け検知、#82 受け入れ条件)。
@@ -218,24 +204,6 @@ pub struct EmployeesQuery {
     /// 参照する年度 DB を決めるための月 "YYYY-MM"。
     /// **賃金期間の絞り込みには使わない** (社員マスタは支給実績と独立)。
     pub month: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct EmployeesResponse {
-    pub company: String,
-    /// `KYCOMSTD.SELDATA.CONAME1` 由来の正式会社名 (取れなければ空文字 + warning)。
-    /// 消費側 (社員マスタ) はこれを会社ラベルに使う (Refs nuxt-dtako-admin#367)。
-    pub company_name: String,
-    pub month: String,
-    /// 参照した年度 DB 名。
-    pub database: String,
-    pub employees: Vec<EmployeeRow>,
-    pub warnings: Vec<String>,
-    /// このデータの出どころ (Refs #106): "cache" = SQLite derived store /
-    /// "live" = OHKEN 直読み (write-through でキャッシュ済み)。
-    pub source: &'static str,
-    /// キャッシュの鮮度 (RFC3339)。live 読みでは今回の取得時刻。
-    pub synced_at: String,
 }
 
 /// 社員マスタの live 読み結果 (read-through と sync の共通部)。
@@ -371,21 +339,6 @@ pub struct PayrollQuery {
     pub month: String,
 }
 
-#[derive(Serialize, Debug)]
-pub struct PayrollResponse {
-    pub company: String,
-    pub month: String,
-    /// 参照した年度 DB 名。
-    pub database: String,
-    pub rows: Vec<PayrollRow>,
-    pub warnings: Vec<String>,
-    /// このデータの出どころ (Refs #106): "cache" = SQLite derived store /
-    /// "live" = OHKEN 直読み (write-through でキャッシュ済み)。
-    pub source: &'static str,
-    /// キャッシュの鮮度 (RFC3339)。live 読みでは今回の取得時刻。
-    pub synced_at: String,
-}
-
 /// 給与明細の live 読み結果 (read-through と sync の共通部)。
 struct PayrollLive {
     rows: Vec<PayrollRow>,
@@ -518,19 +471,6 @@ pub async fn payroll(
 // GET /api/kyuyo/synced-months (sync 済み月の一覧、Refs nuxt-dtako-admin#460)
 // ══════════════════════════════════════════════════════════════
 
-#[derive(Serialize, Debug)]
-pub struct SyncedMonthEntry {
-    pub company: String,
-    pub month: String,
-    pub synced_at: String,
-    pub row_count: i64,
-}
-
-#[derive(Serialize, Debug)]
-pub struct SyncedMonthsResponse {
-    pub entries: Vec<SyncedMonthEntry>,
-}
-
 /// derived store に給与明細が入っている (会社, 月) の一覧。消費側 (nuxt-dtako-admin
 /// の月タブ) が「給与取り込み済み」バッジを出すためのメタデータのみ — 金額は返さない。
 /// OHKEN には触らない (SQLite のみ、ミリ秒)。
@@ -572,19 +512,6 @@ pub struct SyncQuery {
     pub company: String,
     /// 対象月 "YYYY-MM"。
     pub month: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct SyncResponse {
-    pub company: String,
-    pub month: String,
-    pub database: String,
-    /// 保存した給与明細の行数。
-    pub payroll_rows: usize,
-    /// 保存した社員マスタの人数。
-    pub employees: usize,
-    pub synced_at: String,
-    pub warnings: Vec<String>,
 }
 
 /// キャッシュの有無に関わらず OHKEN から引き直して derived store を上書きする
@@ -663,20 +590,6 @@ pub async fn sync(
 // ══════════════════════════════════════════════════════════════
 // GET /api/kyuyo/access (allowlist 判定だけ。DB も derived store も触らない)
 // ══════════════════════════════════════════════════════════════
-
-/// 「この人は給与データを見てよいか」の答え。
-///
-/// **`allowed` は常に `true`** — allowlist 外なら [`authorize`] が 403 を返して
-/// ここへ来ない。`{allowed: false}` を返す分岐を作らないのは、**呼び出し側が
-/// status を無視して body だけ読む実装になるのを防ぐため**。この口の答えは
-/// HTTP status が正で、body は「誰として通ったか」を添えるだけ。
-#[derive(Serialize, Debug)]
-pub struct AccessResponse {
-    /// 常に `true` (上の docs 参照)。
-    pub allowed: bool,
-    /// 判定に使った email (introspect 応答由来)。
-    pub email: String,
-}
 
 /// 給与データの閲覧可否だけを答える (Refs ohishi-exp/nuxt-dtako-admin#951)。
 ///
