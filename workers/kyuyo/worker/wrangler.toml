@@ -1,0 +1,39 @@
+# ichibanboshi-kyuyo: 給与大臣 (/api/kyuyo/*) の Worker 化の PoC。Service Binding 専用の POST /probe だけを持つ (Refs ohishi-exp/rust-ichibanboshi#322)。
+#
+# ★ 外から届く口を持たない:
+#   - fetch は Service Binding からだけ届く `POST /probe` (route・workers.dev・preview なし。同一アカウントで binding を宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない)
+#   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
+#   - SQL Server への口 (vpc_services) はトップレベルにだけ置く
+#   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
+#
+# SQL Server の資格情報は Secrets Store の secret (JSON。キー user/pass。値は repo に書かない)
+name = "ichibanboshi-kyuyo"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "worker-build --release"
+
+# Workers Logs (ログは stage と所要ミリ秒だけ)
+[observability]
+enabled = true
+
+# ログに出る版の元
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# SQL Server への口。宛先の Tunnel・host:port は VPC Service 側に閉じる (コードの connect() の宛先は名目)。
+# service_id はプレースホルダ (VPC Service 作成後に入れる)
+[[vpc_services]]
+binding = "KYUYO_VPC"
+service_id = "00000000-0000-0000-0000-000000000000"
+remote = true
+
+# SQL Server の資格情報。store_id / secret_name はプレースホルダ (secret 投入後に入れる)
+[[secrets_store_secrets]]
+binding = "KYUYO_SQL"
+store_id = "00000000000000000000000000000000"
+secret_name = "SET_AFTER_SECRET_CREATION"

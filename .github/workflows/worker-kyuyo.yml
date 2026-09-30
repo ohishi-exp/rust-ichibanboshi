@@ -1,0 +1,69 @@
+name: worker-kyuyo
+
+# workers/kyuyo (給与大臣 Worker の PoC、Refs #322)。
+#   - pull_request / main への push → Worker の build・公開範囲の検査・wrangler deploy --dry-run
+# deploy はしない (本番 deploy の job は後続で足す)。v*.*.* タグには当てない。
+# secret も token も使わない。
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'workers/kyuyo/**'
+      - '.github/workflows/worker-kyuyo.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # README と揃える
+  WRANGLER_VERSION: 4.144.0
+
+jobs:
+  worker:
+    name: Worker build + exposure + wrangler dry-run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/kyuyo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: kyuyo-worker
+          workspaces: workers/kyuyo -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build (wasm32-unknown-unknown)
+        working-directory: .
+        run: cargo build --manifest-path workers/kyuyo/Cargo.toml --target wasm32-unknown-unknown
+
+      # wrangler.toml の [build] command と同じ版
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      - name: worker-build --release
+        working-directory: workers/kyuyo/worker
+        run: worker-build --release
+
+      - name: Exposure check
+        run: bash scripts/check-exposure.sh worker/wrangler.toml
+
+      - name: Exposure check (negative control)
+        run: bash scripts/check-exposure-test.sh worker/wrangler.toml
+
+      # secret も token も要らない (build と設定の検証だけ)
+      - name: wrangler deploy --dry-run
+        working-directory: workers/kyuyo/worker
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
