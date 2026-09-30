@@ -2,7 +2,7 @@
 name = "rust-ichibanboshi"
 version = "0.1.0"
 edition = "2021"
-description = "一番星 SQL Server sales data API — Windows Service with Cloudflare Tunnel"
+description = "一番星 SQL Server sales data API — Linux service with Cloudflare Tunnel"
 
 [[bin]]
 name = "ichibanboshi"
@@ -71,9 +71,6 @@ jsonwebtoken = "9"
 [build-dependencies]
 # build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ、Refs #191)
 sha2 = "0.10"
-
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

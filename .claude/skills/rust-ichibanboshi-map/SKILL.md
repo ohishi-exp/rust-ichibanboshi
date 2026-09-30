@@ -18,14 +18,13 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 
 | ファイル | 役割 |
 |---|---|
-| `src/main.rs` | clap entrypoint。`--console` で console、Windows では `service::run_service`、それ以外は console |
+| `src/main.rs` | clap entrypoint。`--console` の有無に関わらず console 起動 (フラグは互換のため残置) |
 | `src/lib.rs` | crate ルート (`rust_ichibanboshi`) — 各 module re-export |
 | `src/server.rs` | `run()` — pool 生成 + Axum Router 組み立て + graceful shutdown |
 | `src/config.rs` | `Config` / `AppArgs` (clap) / TOML 読み込み / `addr()` |
 | `src/db.rs` | `create_pool` — bb8-tiberius pool (named instance / NotSupported 暗号化) |
 | `src/repo.rs` | `TiberiusRepo` / `DynRepo` trait — SQL クエリ本体 (DB 層) |
 | `src/auth.rs` | `JwtSecret` / JWT 検証 |
-| `src/service.rs` | `windows-service` 統合 (cfg(windows) のみ) |
 | `src/routes/health.rs` | `/health` |
 | `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
 | `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
@@ -72,9 +71,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - **月計テーブルは締め時点スナップショット** — 締め後の遡り修正は再集計されないため日報明細と差が出る。
 - **SQL Server 接続**: host `172.18.21.102`、名前付きインスタンス `softec`
   (`using_named_connection()` 必須)、DB `CAPE#01`、`EncryptionLevel::NotSupported`、文字コード Shift_JIS。
-- **Windows / Linux 両対応の罠**: Cargo.toml description は "Windows Service"、`wix/main.wxs` +
-  `windows-service` dep (cfg(windows)) があるが、**実運用は Linux systemd** (CLAUDE.md / deploy.sh)。
-  `--console` 無し起動は OS により分岐 (Windows=service, それ以外=console)。
+- **実運用は Linux systemd と Cloud Run。** Windows サービスと MSI は #322 で撤去済み。
 - **CF Access Service Token 必須**: Tunnel 経由のリクエストは `CF-Access-Client-Id/Secret` 無しだと 403。
 
 ## CI / deploy から見た立ち位置

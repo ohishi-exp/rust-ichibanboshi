@@ -7,7 +7,7 @@ use tracing::info;
 #[command(name = "ichibanboshi")]
 #[command(about = "一番星 売上データ API — SQL Server bridge")]
 pub struct AppArgs {
-    /// Run in console mode instead of Windows Service mode
+    /// 互換のため受け付ける (現在は常に console)
     #[arg(long, default_value_t = false)]
     pub console: bool,
 
