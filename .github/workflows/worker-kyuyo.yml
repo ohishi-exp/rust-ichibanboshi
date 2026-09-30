@@ -1,7 +1,7 @@
 name: worker-kyuyo
 
 # workers/kyuyo (給与大臣 Worker の PoC、Refs #322)。
-#   - pull_request / main への push → Worker の build・公開範囲の検査・wrangler deploy --dry-run
+#   - pull_request / main への push → logic の test、Worker の build・公開範囲の検査・wrangler deploy --dry-run
 # deploy はしない (本番 deploy の job は後続で足す)。v*.*.* タグには当てない。
 # secret も token も使わない。
 on:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   worker:
-    name: Worker build + exposure + wrangler dry-run
+    name: Logic test + Worker build + exposure + wrangler dry-run
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -45,6 +45,10 @@ jobs:
           shared-key: kyuyo-worker
           workspaces: workers/kyuyo -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test (kyuyo-logic)
+        working-directory: .
+        run: cargo test --manifest-path workers/kyuyo/Cargo.toml -p kyuyo-logic
 
       - name: Build (wasm32-unknown-unknown)
         working-directory: .

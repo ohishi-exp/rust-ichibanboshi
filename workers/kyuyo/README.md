@@ -8,6 +8,7 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 
 | パス | 中身 |
 |---|---|
+| `logic/` | crate `kyuyo-logic`。Worker に依存しない純粋ロジック (`/probe` の経路判定・失敗の stage と応答の写像・資格情報 JSON の検証)。std のみで `cargo test` できる |
 | `worker/` | crate `kyuyo-worker` (cdylib)。`#[event(fetch)]` (`POST /probe`) を持つ Worker 本体 |
 | `worker/src/tcp.rs` | VPC binding の JS `connect()` を呼ぶ extern |
 | `worker/src/transport.rs` | socket を開いて `tokio_util::compat` で tiberius に渡せる形にする |
@@ -28,7 +29,7 @@ Service Binding を宣言した worker
 (`EncryptionLevel::NotSupported`、database `master`) → `SELECT 1`。
 
 - 成功: 200 `{"ok":true}`
-- 失敗: 502 `{"ok":false,"stage":"secret|connect|login|query"}`
+- 失敗: 502 `{"ok":false,"stage":"secret|connect|login|query"}` (写像は `logic/` の `reply_for_probe`)
   - `secret` — JSON が読めない・キー欠け・空
   - `connect` — TCP が開けない、または 20 秒以内にログインまで終わらない
   - `login` — TDS のログインが拒否された
@@ -73,7 +74,8 @@ worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回�
 ## ビルドと検査
 
 ```sh
-cargo build --manifest-path workers/kyuyo/Cargo.toml --target wasm32-unknown-unknown   # repo ルートで
+cargo test --manifest-path workers/kyuyo/Cargo.toml -p kyuyo-logic                      # repo ルートで
+cargo build --manifest-path workers/kyuyo/Cargo.toml --target wasm32-unknown-unknown
 bash scripts/check-exposure.sh worker/wrangler.toml                                     # workers/kyuyo で
 bash scripts/check-exposure-test.sh worker/wrangler.toml
 cd worker

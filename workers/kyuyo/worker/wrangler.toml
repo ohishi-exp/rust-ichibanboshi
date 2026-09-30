@@ -1,7 +1,7 @@
 # ichibanboshi-kyuyo: 給与大臣 (/api/kyuyo/*) の Worker 化の PoC。Service Binding 専用の POST /probe だけを持つ (Refs ohishi-exp/rust-ichibanboshi#322)。
 #
 # ★ 外から届く口を持たない:
-#   - fetch は Service Binding からだけ届く `POST /probe` (route・workers.dev・preview なし。同一アカウントで binding を宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない)
+#   - fetch は Service Binding からだけ届く `POST /probe` (route・workers.dev・preview なし。同一アカウントで binding を宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない。認可は後続の実 API で auth-worker 経由に入れる)
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
 #   - SQL Server への口 (vpc_services) はトップレベルにだけ置く
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
