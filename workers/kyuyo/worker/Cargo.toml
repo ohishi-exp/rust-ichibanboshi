@@ -1,0 +1,24 @@
+# 給与大臣 Worker の PoC (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く POST /probe (fetch) だけを持つ。
+# SQL Server へは Workers VPC の binding KYUYO_VPC (VPC Service 型) から TCP で繋ぎ、tiberius で TDS を話す。
+# 経路・stage と応答の写像・資格情報の検証は ../logic (kyuyo-logic) に置く。
+# tiberius の rustls feature と bb8-tiberius は wasm32 で落ちる (getrandom / mio / rustls-native-certs) ので入れない。
+[package]
+name = "kyuyo-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+kyuyo-logic = { path = "../logic" }
+send_wrapper = "0.6"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
+# tiberius は futures の AsyncRead/Write を要求し、worker::Socket は tokio の AsyncRead/Write を持つので compat で繋ぐ
+tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+wasm-bindgen = "0.2"
+worker = "=0.8.7"
+worker-sys = "=0.8.7"

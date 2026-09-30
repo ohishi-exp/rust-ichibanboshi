@@ -1,0 +1,10 @@
+# 給与大臣 Worker の純粋ロジック (Refs ohishi-exp/rust-ichibanboshi#322)。Worker に依存しないので native で cargo test できる。
+[package]
+name = "kyuyo-logic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

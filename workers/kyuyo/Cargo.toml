@@ -1,0 +1,10 @@
+# 給与大臣 (/api/kyuyo/*) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# repo ルートの package (オンプレ / Cloud Run の本体) とは独立した workspace。
+[workspace]
+members = ["logic", "worker"]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
