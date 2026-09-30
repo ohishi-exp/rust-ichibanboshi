@@ -8,7 +8,7 @@
 //! 1 回の流れ: 資格情報 (Secrets Store `KYUYO_SQL`) を読む → `KYUYO_VPC` から TCP を開く →
 //! tiberius でログイン (社内 LAN 区間は平文 TDS、`EncryptionLevel::NotSupported`) → `SELECT 1`。
 //! 成功は 200 `{"ok":true}`、失敗は 502 `{"ok":false,"stage":"secret|connect|login|query"}`。
-//! 応答にもログにもエラーの生文言・ホスト・ポート・ユーザー名を出さない (ログは stage と所要ミリ秒だけ)。
+//! 応答にもログにもエラーの生文言・ホスト・ポート・ユーザー名を出さない (ログは stage・失敗の種類 `ErrKind`・所要ミリ秒だけ)。
 
 mod tcp;
 mod transport;
@@ -18,7 +18,10 @@ use std::pin::pin;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
-use kyuyo_logic::{parse_creds, reply_for_probe, reply_for_route, route, Creds, Reply, Stage};
+use kyuyo_logic::{
+    log_line, parse_creds, reply_for_probe, reply_for_route, route, Creds, ErrKind, Reply, Stage,
+};
+use tiberius::error::Error as TdsError;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use worker::{console_error, console_log, event, Context, Date, Delay, Env, Request, Response};
 
@@ -37,9 +40,9 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response
     let ms = Date::now().as_millis().saturating_sub(started);
     match outcome {
         Ok(()) => console_log!("kyuyo probe: ok ({ms} ms)"),
-        Err(stage) => console_error!("kyuyo probe: failed at {} ({ms} ms)", stage.as_str()),
+        Err((stage, ref kind)) => console_error!("{}", log_line(stage, kind, ms)),
     }
-    respond(reply_for_probe(outcome))
+    respond(reply_for_probe(outcome.map_err(|(stage, _)| stage)))
 }
 
 fn respond(reply: Reply) -> worker::Result<Response> {
@@ -50,9 +53,28 @@ fn respond(reply: Reply) -> worker::Result<Response> {
         .with_headers(headers))
 }
 
-/// ログインして `SELECT 1` を 1 本流す。エラーの中身は捨てて stage だけ返す。
-async fn probe(env: &Env) -> Result<(), Stage> {
-    let creds = load_creds(env).await?;
+/// tiberius のエラーを失敗の種類に写す。`message` や表示文言は読まない (種類・番号・状態だけ)。
+fn kind_of(e: &TdsError) -> ErrKind {
+    match e {
+        TdsError::Io { kind, .. } => ErrKind::Io(format!("{kind:?}")),
+        TdsError::Server(t) => ErrKind::Server {
+            code: t.code(),
+            class: t.class(),
+            state: t.state(),
+        },
+        TdsError::Protocol(_) => ErrKind::Protocol,
+        TdsError::Encoding(_) => ErrKind::Encoding,
+        TdsError::Tls(_) => ErrKind::Tls,
+        TdsError::Routing { .. } => ErrKind::Routing,
+        _ => ErrKind::Other,
+    }
+}
+
+/// ログインして `SELECT 1` を 1 本流す。エラーの中身は捨てて stage と失敗の種類だけ返す。
+async fn probe(env: &Env) -> Result<(), (Stage, ErrKind)> {
+    let creds = load_creds(env)
+        .await
+        .map_err(|stage| (stage, ErrKind::Other))?;
 
     let mut config = Config::new();
     config.authentication(AuthMethod::sql_server(&creds.user, &creds.pass));
@@ -60,30 +82,33 @@ async fn probe(env: &Env) -> Result<(), Stage> {
     config.database("master");
 
     let mut client = timeout(CONNECT_TIMEOUT, async {
-        let stream = transport::open(env).await.map_err(|_| Stage::Connect)?;
+        let stream = transport::open(env)
+            .await
+            .map_err(|_| (Stage::Connect, ErrKind::Transport))?;
         Client::connect(config, stream)
             .await
-            .map_err(|_| Stage::Login)
+            .map_err(|e| (Stage::Login, kind_of(&e)))
     })
     .await
-    .ok_or(Stage::Connect)??;
+    .ok_or((Stage::Connect, ErrKind::Timeout))??;
 
-    let one = timeout(QUERY_TIMEOUT, async {
+    let one: Option<Result<Option<i32>, ErrKind>> = timeout(QUERY_TIMEOUT, async {
         let row = client
             .simple_query("SELECT 1")
             .await
-            .ok()?
+            .map_err(|e| kind_of(&e))?
             .into_row()
             .await
-            .ok()??;
-        row.get::<i32, _>(0)
+            .map_err(|e| kind_of(&e))?;
+        Ok(row.and_then(|r| r.get::<i32, _>(0)))
     })
-    .await
-    .flatten();
+    .await;
     let _ = client.close().await;
     match one {
-        Some(1) => Ok(()),
-        _ => Err(Stage::Query),
+        None => Err((Stage::Query, ErrKind::Timeout)),
+        Some(Err(kind)) => Err((Stage::Query, kind)),
+        Some(Ok(Some(1))) => Ok(()),
+        Some(Ok(_)) => Err((Stage::Query, ErrKind::Other)),
     }
 }
 
