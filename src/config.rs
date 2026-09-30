@@ -497,10 +497,6 @@ pub struct Config {
     pub bind_addr: String,
 
     #[serde(default)]
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub log_dir: String,
-
-    #[serde(default)]
     pub database: DatabaseConfig,
 
     #[serde(default)]
@@ -1079,7 +1075,6 @@ impl Config {
         Ok(Config {
             port: default_port(),
             bind_addr: default_bind_addr(),
-            log_dir: String::new(),
             database: DatabaseConfig::default(),
             cors: CorsConfig::default(),
             sqlite: SqliteConfig::default(),

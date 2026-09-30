@@ -79,7 +79,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - **`./deploy.sh`**: `cargo build --release --target x86_64-unknown-linux-musl` (GLIBC 不一致回避の
   static link) → scp で `/tmp` → `mv` (atomic) で `/opt/ichibanboshi/`。systemd `ichibanboshi-watcher.path`
   (PathModified) がバイナリ変更を検知して自動 restart。実行先 `ohishi-data.tailea945d.ts.net`。
-- `.github/workflows/`: `ci.yml` / `release.yml` / `tag-release.yml`。
+- `.github/workflows/`: `ci.yml` / `tag-release.yml`。
 - `coverage_100.toml`: `auth.rs` / `config.rs` / `routes/{health,sales,schema}.rs` を 100% 維持
   (全て MockRepo / 純粋関数テストで DB 不要)。`scripts/check_coverage_100.sh` で検証。
 - `deploy/` に `ichibanboshi.service` / `.toml`、`config/ichibanboshi.default.toml`。
