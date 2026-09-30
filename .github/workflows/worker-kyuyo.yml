@@ -51,7 +51,18 @@ jobs:
 
       - name: Test (kyuyo-logic)
         working-directory: .
-        run: cargo test --manifest-path workers/kyuyo/Cargo.toml -p kyuyo-logic
+        run: cargo test --locked --manifest-path workers/kyuyo/Cargo.toml -p kyuyo-logic
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # 行カバレッジ 100% gate (登録簿 workers/kyuyo/coverage_100.toml)。判定は repo ルートの
+      # check_coverage_100.sh を共用する。payroll.rs の email_allowed / normalize_emails は給与の認可の中核
+      - name: Coverage 100% gate (kyuyo-logic)
+        working-directory: .
+        run: |
+          cov="$RUNNER_TEMP/kyuyo-logic-cov.txt"
+          cargo llvm-cov --locked --manifest-path workers/kyuyo/Cargo.toml -p kyuyo-logic --text > "$cov"
+          bash scripts/check_coverage_100.sh --config workers/kyuyo/coverage_100.toml --use-cache "$cov"
 
       - name: Build (wasm32-unknown-unknown)
         working-directory: .

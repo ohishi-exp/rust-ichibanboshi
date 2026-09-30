@@ -1,9 +1,9 @@
-//! kyuyo::logic 純粋関数のテスト (Refs #82)。
+//! kyuyo_logic::payroll 純粋関数のテスト (Refs #82。旧 tests/kyuyo_logic_test.rs、Refs #322)。
 //! スキーマ根拠は docs/kyuyo-daijin-schema.md (#81 実機調査)。
 
 use std::collections::HashMap;
 
-use rust_ichibanboshi::kyuyo::logic::{
+use kyuyo_logic::payroll::{
     build_companies, build_employee_rows, build_payroll_rows, email_allowed, employee_code_key,
     kintai_taikeikouno, kydata_db_name, month_period, nendo_for_month, normalize_company_code,
     normalize_emails, normalize_hire_date, normalize_retire_date, parse_kydata_db_name,
@@ -593,6 +593,21 @@ fn build_employee_rows_maps_and_sorts_by_numeric_code() {
     assert_eq!(rows[0].department, "本社　乗務員");
     assert_eq!(rows[0].taikei, 1);
     assert_eq!(rows[0].kkubun, 2);
+}
+
+#[test]
+fn build_employee_rows_sorts_non_numeric_codes_by_raw_code() {
+    // 数値にならないコード同士は数値キーが並ばない (None 同士) → 生のコードの辞書順で並べる
+    let rows = build_employee_rows(&[
+        raw_employee("T02", "山田　次郎", "本社　乗務員", 1, 0, 2),
+        raw_employee("T01", "山田　太郎", "本社　乗務員", 1, 0, 2),
+    ]);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.employee_code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["T01", "T02"]
+    );
 }
 
 #[test]
