@@ -4,6 +4,8 @@
 # Usage:
 #   bash scripts/check_coverage_100.sh
 #   bash scripts/check_coverage_100.sh --use-cache /path/to/llvm-cov-text.txt
+#   bash scripts/check_coverage_100.sh --config workers/kyuyo/coverage_100.toml --use-cache <text>
+#     (workers/kyuyo は別 workspace。計測は worker-kyuyo.yml が --manifest-path で取って渡す)
 #
 # 前提: cargo-llvm-cov がインストール済み。DB / 外部サービスは不要
 #       (本 repo のテストは全て MockRepo / wiremock / 純粋関数で完結する)。
@@ -31,21 +33,24 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [--use-cache <llvm-cov --text output>]" >&2
+  echo "usage: $0 [--config <registry toml>] [--use-cache <llvm-cov --text output>]" >&2
 }
 
 EXTERNAL_CACHE=""
+CONFIG="coverage_100.toml"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --use-cache)
       [[ $# -ge 2 ]] || { echo "ERROR: --use-cache requires a file argument" >&2; usage; exit 2; }
       EXTERNAL_CACHE="$2"; shift 2 ;;
+    --config)
+      [[ $# -ge 2 ]] || { echo "ERROR: --config requires a file argument" >&2; usage; exit 2; }
+      CONFIG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
 
-CONFIG="coverage_100.toml"
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: $CONFIG not found (repo root から実行すること)" >&2
   exit 1
