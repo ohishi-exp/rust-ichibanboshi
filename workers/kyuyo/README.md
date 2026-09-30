@@ -44,15 +44,17 @@ tiberius の `rustls` feature と `bb8-tiberius` は wasm32 で落ちる (getran
 | 種別 | 名前 | 中身 |
 |---|---|---|
 | Secrets Store | binding `KYUYO_SQL` | JSON。キー `user` / `pass` (両方必須の非空文字列)。SQL Server 認証の資格情報 |
-| binding | `KYUYO_VPC` | VPC Service (TCP、宛先は給与大臣 SQL Server のポート)。`service_id` は作成後に入れる |
+| binding | `KYUYO_VPC` | VPC Service (TCP、宛先は給与大臣 SQL Server のポート)。`service_id` は `wrangler.toml` に入れてある |
 | binding | `CF_VERSION_METADATA` | ログに出る版の元 |
 
-`worker/wrangler.toml` の `service_id` と `secrets_store_secrets` の `store_id` / `secret_name` はプレースホルダ。
+`worker/wrangler.toml` の `service_id` (VPC Service) と `store_id` (Secrets Store) は実 id が入っている。どちらも資格情報でも宛先でもないので public repo に置く (smb-watch と同じ扱い)。宛先の IP・Tunnel ID・account ID は書かない。
 
 ローカル検証専用の `LOCAL_SQL_ADDR` (host:port) と `LOCAL_KYUYO_SQL_JSON` (`KYUYO_SQL` と同じ JSON。
 あるときだけそれを読み、Secrets Store は見ない) は `.dev.vars` にだけ置く。どちらも `vars` に置かない。
 
-応答にもログにも、エラーの生文言・ホスト・ポート・ユーザー名を出さない。ログは stage と所要ミリ秒だけ。
+応答にもログにも、エラーの生文言・ホスト・ポート・ユーザー名を出さない。ログは stage・失敗の種類・所要ミリ秒だけ。
+
+失敗ログは 1 行 `kyuyo probe: failed at login (5019 ms) kind=io:Other`。`kind` は `logic/` の `ErrKind` (`timeout` / `transport` / `io:<ErrorKind の名前>` / `server:<code>/<class>/<state>` / `protocol` / `encoding` / `tls` / `routing` / `other`)。tiberius のエラーからは種類・番号・状態だけを取り、`message` や表示文言は読まない。
 
 ## 公開範囲
 
@@ -62,7 +64,7 @@ tiberius の `rustls` feature と `bb8-tiberius` は wasm32 で落ちる (getran
 - `route` / `routes` が無い、`env` 表が無い (トップレベルだけで運用する)
 - SQL Server への口 `vpc_services` の `KYUYO_VPC` はトップレベルにある
 - `vars` に `LOCAL_SQL_ADDR` と `LOCAL_KYUYO_SQL_JSON` が無い
-- `service_id` がプレースホルダのままなら warning (fail にはしない)
+- `service_id` がプレースホルダのままなら warning (fail にはしない。実 id を入れた今は出ない)
 
 fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。同一アカウントで binding を宣言した
 worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけで、データは返さない。
@@ -84,7 +86,7 @@ worker-build --release
 npx -y wrangler@4.144.0 deploy --dry-run            # login 不要
 ```
 
-CI は `.github/workflows/worker-kyuyo.yml` (PR と main への push で同じことをする。deploy はしない)。
+CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build と dry-run だけ (secret も token も使わない)。タグ `worker-kyuyo-v*` の push だけが本番へ `wrangler deploy` する (`v*.*.*` には当てない)。
 
 ## ローカル検証 (wrangler dev + docker の SQL Server)
 
@@ -112,11 +114,22 @@ CI は `.github/workflows/worker-kyuyo.yml` (PR と main への push で同じ�
 
 `.dev.vars` は `.gitignore` 済み。
 
-## 本番への切り替え (未着手)
+## 本番への切り替え
 
-1. VPC Service (TCP、宛先は給与大臣 SQL Server のポート) を既存の Tunnel に作る
-2. `worker/wrangler.toml` の `service_id` を入れる
-3. Secrets Store に資格情報の JSON (`{"user":"…","pass":"…"}`) を入れ、`store_id` / `secret_name` を入れる
-4. deploy の経路 (job・タグ) を足す。いまの workflow は build と dry-run だけで deploy しない
-5. 呼び出し側 worker に Service Binding を宣言し、`POST /probe` が `{"ok":true}` を返すことを見る
-6. 実 API (`/api/kyuyo/*`) を足し、認可を auth-worker 経由で入れる
+1. [x] VPC Service `ichibanboshi-kyuyo-sql` (TCP) を既存の Tunnel に作り、`service_id` を入れた
+2. [x] Secrets Store に資格情報の JSON (`{"user":"…","pass":"…"}`、secret 名 `KYUYO_SQL`) を入れ、`store_id` / `secret_name` を入れた
+3. [x] 実接続確認: `wrangler dev --remote` で `POST /probe` が `{"ok":true}` を返す
+4. [ ] タグ deploy: `worker-kyuyo-v*` を push (`wrangler deploy --tag`。org secret `CLOUDFLARE_API_TOKEN`)
+5. [ ] 呼び出し側 worker に Service Binding を宣言し、`POST /probe` が `{"ok":true}` を返すことを見る
+6. [ ] 実 API (`/api/kyuyo/*`) を足し、認可を auth-worker 経由で入れる
+
+### 到達面の判断
+
+本番 deploy 後も fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。同一アカウントで binding を
+宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけでデータは返さない。
+認可は後続の実 API (auth-worker 経由) で入れる。
+
+### 罠
+
+- 宛先側のファイアウォールが cloudflared ホストからの接続を許しているか先に確かめる。TCP が捨てられると
+  `stage=login` で `kind=io:Other` (Network connection lost) になり、資格情報の誤りに見える

@@ -17,7 +17,7 @@ preview_urls = false
 [build]
 command = "worker-build --release"
 
-# Workers Logs (ログは stage と所要ミリ秒だけ)
+# Workers Logs (ログは stage・失敗の種類・所要ミリ秒だけ)
 [observability]
 enabled = true
 
@@ -26,14 +26,14 @@ enabled = true
 binding = "CF_VERSION_METADATA"
 
 # SQL Server への口。宛先の Tunnel・host:port は VPC Service 側に閉じる (コードの connect() の宛先は名目)。
-# service_id はプレースホルダ (VPC Service 作成後に入れる)
+# service_id は VPC Service `ichibanboshi-kyuyo-sql` (TCP) の id (資格情報でも宛先でもない)
 [[vpc_services]]
 binding = "KYUYO_VPC"
-service_id = "00000000-0000-0000-0000-000000000000"
+service_id = "01a0f1ff-5248-7141-abbb-c4290d3f9f80"
 remote = true
 
-# SQL Server の資格情報。store_id / secret_name はプレースホルダ (secret 投入後に入れる)
+# SQL Server の資格情報。store_id は Secrets Store の id、secret_name は投入済みの secret 名 (どちらも値そのものではない)
 [[secrets_store_secrets]]
 binding = "KYUYO_SQL"
-store_id = "00000000000000000000000000000000"
-secret_name = "SET_AFTER_SECRET_CREATION"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "KYUYO_SQL"
