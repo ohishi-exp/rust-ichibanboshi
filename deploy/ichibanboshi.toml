@@ -1,6 +1,5 @@
 port = 3100
 bind_addr = "0.0.0.0"
-log_dir = "/opt/ichibanboshi/logs"
 
 [database]
 host = "172.18.21.102"

@@ -7,7 +7,7 @@ use tracing::info;
 #[command(name = "ichibanboshi")]
 #[command(about = "一番星 売上データ API — SQL Server bridge")]
 pub struct AppArgs {
-    /// Run in console mode instead of Windows Service mode
+    /// 互換のため受け付ける (現在は常に console)
     #[arg(long, default_value_t = false)]
     pub console: bool,
 
@@ -495,10 +495,6 @@ pub struct Config {
 
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
-
-    #[serde(default)]
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub log_dir: String,
 
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1079,7 +1075,6 @@ impl Config {
         Ok(Config {
             port: default_port(),
             bind_addr: default_bind_addr(),
-            log_dir: String::new(),
             database: DatabaseConfig::default(),
             cors: CorsConfig::default(),
             sqlite: SqliteConfig::default(),

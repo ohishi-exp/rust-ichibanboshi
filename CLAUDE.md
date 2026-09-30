@@ -36,7 +36,7 @@ test job) が毎 PR で `scripts/check_coverage_100.sh` を回し、1 行でも�
   (rust-alc-api の PR #399 / #400 で 2 回踏んだ罠)。`format!` 等の他のマクロも同様
 - **100% に到達したファイルは登録簿に足す。** 登録漏れは gate が守っていないのと同じ
 - **登録簿にあるのに計測データに現れないファイルは fail する** (スキップしない)。
-  実行行 0 の `mod.rs` や cfg(windows) の `src/service.rs` は登録できない
+  実行行 0 の `mod.rs` は登録できない
 
 ## migration
 
