@@ -1,9 +1,12 @@
-# ichibanboshi-kyuyo: 給与大臣 (/api/kyuyo/*) の Worker 化の PoC。Service Binding 専用の POST /probe だけを持つ (Refs ohishi-exp/rust-ichibanboshi#322)。
+# ichibanboshi-kyuyo: 給与大臣 (/api/kyuyo/*) の Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding 専用の
+# POST /probe と /kyuyo/* を持ち、全リクエストを DO KyuyoState (1 インスタンス) へ転送する。
 #
 # ★ 外から届く口を持たない:
-#   - fetch は Service Binding からだけ届く `POST /probe` (route・workers.dev・preview なし。同一アカウントで binding を宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない。認可は後続の実 API で auth-worker 経由に入れる)
+#   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。同一アカウントで binding を宣言した worker は誰でも叩ける:
+#       POST /probe  … 認可なし。効果は給与大臣 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない
+#       /kyuyo/*     … auth-worker の KyuyoAuthEntrypoint (AUTH_KYUYO) が 200 を返したときだけ DO へ通す
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
-#   - SQL Server への口 (vpc_services) はトップレベルにだけ置く
+#   - SQL Server への口 (vpc_services)・認可 (services の AUTH_KYUYO)・DO (KYUYO_STATE) はトップレベルにだけ置く
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
 #
@@ -37,3 +40,20 @@ remote = true
 binding = "KYUYO_SQL"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "KYUYO_SQL"
+
+# /kyuyo/* の認可。auth-worker の named entrypoint KyuyoAuthEntrypoint (authorize(token) だけを持つ)。
+# allowlist は auth-worker の KV にあり、ここからは選べない
+[[services]]
+binding = "AUTH_KYUYO"
+service = "auth-worker"
+entrypoint = "KyuyoAuthEntrypoint"
+
+# 全リクエストの転送先 (idFromName("kyuyo") の 1 インスタンス)。SQL Server を開く処理はこの中のロックの中だけ。
+# SQLite に給与の derived store (3 表、DDL は kyuyo-logic の store_keys)
+[[durable_objects.bindings]]
+name = "KYUYO_STATE"
+class_name = "KyuyoState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["KyuyoState"]

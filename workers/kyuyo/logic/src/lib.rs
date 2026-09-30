@@ -1,10 +1,16 @@
-//! 給与大臣 Worker (`kyuyo-worker`) の純粋部分: `/probe` の経路判定・失敗の stage と応答の写像・
+//! 給与大臣 Worker (`kyuyo-worker`) の純粋部分: 経路判定 (`/probe` と `/kyuyo/*`)・失敗の stage と応答の写像・
 //! 資格情報 JSON の検証。Worker にも SQL Server にも依存しないので native で `cargo test` できる。
 //!
 //! - [`payroll`] — 給与明細を組み立てる純粋ロジック。オンプレ版 (repo ルートの package) も並走期間だけ
 //!   path 依存で借りている (`src/kyuyo/mod.rs` の re-export)
+//! - [`api`] — `/api/kyuyo/*` の応答型。オンプレ版 (`src/routes/kyuyo.rs`) と Worker が同じ定義を使う
+//! - [`store_keys`] — derived store の DDL と scope の鍵。オンプレ版 (`src/kyuyo/store.rs`) と Worker の DO が共有
+//! - [`auth`] — `/kyuyo/*` の認可 (auth-worker の応答の読み方) と、Worker が返す `/kyuyo/*` の応答
 
+pub mod api;
+pub mod auth;
 pub mod payroll;
+pub mod store_keys;
 
 use serde::Deserialize;
 
@@ -13,18 +19,60 @@ use serde::Deserialize;
 pub enum Route {
     /// `POST /probe`
     Probe,
-    /// パスが `/probe` 以外 (404)
+    /// `/kyuyo/*` の 7 口 (method も合っている)
+    Kyuyo(Endpoint),
+    /// どの口でもない (404)
     NotFound,
-    /// `/probe` で POST 以外 (405)
+    /// 口はあるが method が違う (405)
     MethodNotAllowed,
+}
+
+/// `/kyuyo/*` の口。method はオンプレ版 (`src/server.rs`) と同じ (sync だけ POST、他は GET)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    Access,
+    SyncedMonths,
+    Databases,
+    Companies,
+    Employees,
+    Payroll,
+    Sync,
+}
+
+impl Endpoint {
+    fn from_path(path: &str) -> Option<(Endpoint, &'static str)> {
+        let e = match path {
+            "/kyuyo/access" => (Endpoint::Access, "GET"),
+            "/kyuyo/synced-months" => (Endpoint::SyncedMonths, "GET"),
+            "/kyuyo/databases" => (Endpoint::Databases, "GET"),
+            "/kyuyo/companies" => (Endpoint::Companies, "GET"),
+            "/kyuyo/employees" => (Endpoint::Employees, "GET"),
+            "/kyuyo/payroll" => (Endpoint::Payroll, "GET"),
+            "/kyuyo/sync" => (Endpoint::Sync, "POST"),
+            _ => return None,
+        };
+        Some(e)
+    }
+
+    /// SQL Server を開く口か (DO のロックの中で走らせる)。access と synced-months は DO の SQLite だけ。
+    pub fn opens_sql_server(self) -> bool {
+        !matches!(self, Endpoint::Access | Endpoint::SyncedMonths)
+    }
 }
 
 /// method と path から行き先を決める。
 pub fn route(method: &str, path: &str) -> Route {
-    match (path, method) {
-        ("/probe", "POST") => Route::Probe,
-        ("/probe", _) => Route::MethodNotAllowed,
-        _ => Route::NotFound,
+    if path == "/probe" {
+        return if method == "POST" {
+            Route::Probe
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
+    match Endpoint::from_path(path) {
+        Some((e, want)) if want == method => Route::Kyuyo(e),
+        Some(_) => Route::MethodNotAllowed,
+        None => Route::NotFound,
     }
 }
 
@@ -108,10 +156,10 @@ pub struct Reply {
     pub body: String,
 }
 
-/// 経路判定で弾いた行き先の応答。`Route::Probe` は `None` (probe を走らせる)。
+/// 経路判定で弾いた行き先の応答。`Route::Probe` / `Route::Kyuyo` は `None` (先へ進む)。
 pub fn reply_for_route(route: &Route) -> Option<Reply> {
     let status = match route {
-        Route::Probe => return None,
+        Route::Probe | Route::Kyuyo(_) => return None,
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
     };
@@ -167,8 +215,45 @@ mod tests {
     }
 
     #[test]
+    fn route_kyuyo() {
+        let cases = [
+            ("GET", "/kyuyo/access", Endpoint::Access),
+            ("GET", "/kyuyo/synced-months", Endpoint::SyncedMonths),
+            ("GET", "/kyuyo/databases", Endpoint::Databases),
+            ("GET", "/kyuyo/companies", Endpoint::Companies),
+            ("GET", "/kyuyo/employees", Endpoint::Employees),
+            ("GET", "/kyuyo/payroll", Endpoint::Payroll),
+            ("POST", "/kyuyo/sync", Endpoint::Sync),
+        ];
+        for (method, path, e) in cases {
+            assert_eq!(route(method, path), Route::Kyuyo(e), "{path}");
+            let other = if method == "GET" { "POST" } else { "GET" };
+            assert_eq!(route(other, path), Route::MethodNotAllowed, "{path}");
+        }
+        assert_eq!(route("GET", "/kyuyo/"), Route::NotFound);
+        assert_eq!(route("GET", "/kyuyo/access/"), Route::NotFound);
+        assert_eq!(route("GET", "/api/kyuyo/access"), Route::NotFound);
+    }
+
+    #[test]
+    fn opens_sql_server_only_for_the_five() {
+        assert!(!Endpoint::Access.opens_sql_server());
+        assert!(!Endpoint::SyncedMonths.opens_sql_server());
+        for e in [
+            Endpoint::Databases,
+            Endpoint::Companies,
+            Endpoint::Employees,
+            Endpoint::Payroll,
+            Endpoint::Sync,
+        ] {
+            assert!(e.opens_sql_server(), "{e:?}");
+        }
+    }
+
+    #[test]
     fn unrouted_replies() {
         assert_eq!(reply_for_route(&Route::Probe), None);
+        assert_eq!(reply_for_route(&Route::Kyuyo(Endpoint::Access)), None);
         let r = reply_for_route(&Route::NotFound).unwrap();
         assert_eq!((r.status, r.body.as_str()), (404, r#"{"ok":false}"#));
         let r = reply_for_route(&Route::MethodNotAllowed).unwrap();

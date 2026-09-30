@@ -1,132 +1,62 @@
-//! 給与大臣 Worker の PoC (Refs ohishi-exp/rust-ichibanboshi#322): wasm32 の Worker から tiberius で
-//! 給与大臣の SQL Server に TDS を張れることを確かめる `POST /probe` だけを持つ。
+//! 給与大臣 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。給与大臣 (`/api/kyuyo/*`) をオンプレから移す先。
 //!
-//! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。同一アカウントで
-//! binding を宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと
-//! `SELECT 1` だけで、データは返さない。認可は後続の実 API で auth-worker 経由に入れる。
+//! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //!
-//! 1 回の流れ: 資格情報 (Secrets Store `KYUYO_SQL`) を読む → `KYUYO_VPC` から TCP を開く →
-//! tiberius でログイン (社内 LAN 区間は平文 TDS、`EncryptionLevel::NotSupported`) → `SELECT 1`。
-//! 成功は 200 `{"ok":true}`、失敗は 502 `{"ok":false,"stage":"secret|connect|login|query"}`。
-//! 応答にもログにもエラーの生文言・ホスト・ポート・ユーザー名を出さない (ログは stage・失敗の種類 `ErrKind`・所要ミリ秒だけ)。
+//! fetch は **全リクエストを DO `KyuyoState` (`idFromName("kyuyo")` の 1 インスタンス) へ転送する**。
+//! SQL Server を開く処理は DO のロックの中だけ ([`state`])。
+//!
+//! - `POST /probe` — 認可なし (効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけで、データは返さない。
+//!   到達は binding 専用)。DO のロックの中で走る ([`probe`])
+//! - `/kyuyo/*` — 転送の前に `Authorization: Bearer <token>` を auth-worker の `KyuyoAuthEntrypoint.authorize`
+//!   (binding `AUTH_KYUYO`) に渡す。200 以外はその status と body をそのまま返す。200 なら email を内部ヘッダで
+//!   DO へ添える (DO へのリクエストは新しく組み立てるので、外から来た同名ヘッダは捨てられる)。
+//!   認可を差し替えるローカル専用の分岐は置かない (ローカル検証はスタブの auth worker を binding で繋ぐ)
 
+mod auth;
+mod probe;
+mod state;
 mod tcp;
 mod transport;
 
-use std::future::Future;
-use std::pin::pin;
-use std::time::Duration;
+use kyuyo_logic::auth::{bearer_token, decide, server_error};
+use kyuyo_logic::{reply_for_route, route, Reply, Route};
+use worker::{console_error, event, Context, Env, Request, Response};
 
-use futures_util::future::{select, Either};
-use kyuyo_logic::{
-    log_line, parse_creds, reply_for_probe, reply_for_route, route, Creds, ErrKind, Reply, Stage,
-};
-use tiberius::error::Error as TdsError;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
-use worker::{console_error, console_log, event, Context, Date, Delay, Env, Request, Response};
-
-/// TCP を開いてからログインが終わるまでの上限。応答しない相手で fetch を握り続けない。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// `SELECT 1` の上限。
-const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+pub use crate::state::KyuyoState;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
-    if let Some(reply) = reply_for_route(&route(req.method().as_ref(), &req.path())) {
+    let route = route(req.method().as_ref(), &req.path());
+    if let Some(reply) = reply_for_route(&route) {
         return respond(reply);
     }
-    let started = Date::now().as_millis();
-    let outcome = probe(&env).await;
-    let ms = Date::now().as_millis().saturating_sub(started);
-    match outcome {
-        Ok(()) => console_log!("kyuyo probe: ok ({ms} ms)"),
-        Err((stage, ref kind)) => console_error!("{}", log_line(stage, kind, ms)),
-    }
-    respond(reply_for_probe(outcome.map_err(|(stage, _)| stage)))
+    let email = match route {
+        Route::Kyuyo(_) => {
+            let header = req.headers().get("authorization")?;
+            let token = bearer_token(header.as_deref());
+            let result = match auth::authorize(&env, token).await {
+                Ok(result) => result,
+                Err(_) => {
+                    console_error!("kyuyo auth: rpc failed");
+                    return respond(server_error());
+                }
+            };
+            match decide(result.status, &result.body) {
+                Ok(email) => Some(email),
+                Err(reply) => return respond(reply),
+            }
+        }
+        _ => None,
+    };
+    state::forward(&env, &req, email.as_deref()).await
 }
 
-fn respond(reply: Reply) -> worker::Result<Response> {
+pub(crate) fn respond(reply: Reply) -> worker::Result<Response> {
     let headers = worker::Headers::new();
     headers.set("content-type", "application/json")?;
     Ok(Response::ok(reply.body)?
         .with_status(reply.status)
         .with_headers(headers))
-}
-
-/// tiberius のエラーを失敗の種類に写す。`message` や表示文言は読まない (種類・番号・状態だけ)。
-fn kind_of(e: &TdsError) -> ErrKind {
-    match e {
-        TdsError::Io { kind, .. } => ErrKind::Io(format!("{kind:?}")),
-        TdsError::Server(t) => ErrKind::Server {
-            code: t.code(),
-            class: t.class(),
-            state: t.state(),
-        },
-        TdsError::Protocol(_) => ErrKind::Protocol,
-        TdsError::Encoding(_) => ErrKind::Encoding,
-        TdsError::Tls(_) => ErrKind::Tls,
-        TdsError::Routing { .. } => ErrKind::Routing,
-        _ => ErrKind::Other,
-    }
-}
-
-/// ログインして `SELECT 1` を 1 本流す。エラーの中身は捨てて stage と失敗の種類だけ返す。
-async fn probe(env: &Env) -> Result<(), (Stage, ErrKind)> {
-    let creds = load_creds(env)
-        .await
-        .map_err(|stage| (stage, ErrKind::Other))?;
-
-    let mut config = Config::new();
-    config.authentication(AuthMethod::sql_server(&creds.user, &creds.pass));
-    config.encryption(EncryptionLevel::NotSupported);
-    config.database("master");
-
-    let mut client = timeout(CONNECT_TIMEOUT, async {
-        let stream = transport::open(env)
-            .await
-            .map_err(|_| (Stage::Connect, ErrKind::Transport))?;
-        Client::connect(config, stream)
-            .await
-            .map_err(|e| (Stage::Login, kind_of(&e)))
-    })
-    .await
-    .ok_or((Stage::Connect, ErrKind::Timeout))??;
-
-    let one: Option<Result<Option<i32>, ErrKind>> = timeout(QUERY_TIMEOUT, async {
-        let row = client
-            .simple_query("SELECT 1")
-            .await
-            .map_err(|e| kind_of(&e))?
-            .into_row()
-            .await
-            .map_err(|e| kind_of(&e))?;
-        Ok(row.and_then(|r| r.get::<i32, _>(0)))
-    })
-    .await;
-    let _ = client.close().await;
-    match one {
-        None => Err((Stage::Query, ErrKind::Timeout)),
-        Some(Err(kind)) => Err((Stage::Query, kind)),
-        Some(Ok(Some(1))) => Ok(()),
-        Some(Ok(_)) => Err((Stage::Query, ErrKind::Other)),
-    }
-}
-
-/// 資格情報を読んで検証する (`kyuyo_logic::parse_creds`)。読めない・キー欠け・空は `Stage::Secret` (中身はどこにも出さない)。
-async fn load_creds(env: &Env) -> Result<Creds, Stage> {
-    // ローカル検証 (wrangler dev) だけ: Secrets Store が使えないので var LOCAL_KYUYO_SQL_JSON で代える。
-    // 本番の vars には置かない (scripts/check-exposure.sh が検査する)
-    let json = match text(env, "LOCAL_KYUYO_SQL_JSON") {
-        Some(json) => json,
-        None => env
-            .secret_store("KYUYO_SQL")
-            .map_err(|_| Stage::Secret)?
-            .get()
-            .await
-            .map_err(|_| Stage::Secret)?
-            .ok_or(Stage::Secret)?,
-    };
-    parse_creds(&json)
 }
 
 /// secret / var の文字列 (空は無いものとして扱う)。`.dev.vars` はローカルでは var として見える。
@@ -136,12 +66,4 @@ pub(crate) fn text(env: &Env, name: &str) -> Option<String> {
         .or_else(|_| env.var(name).map(|v| v.to_string()))
         .ok()
         .filter(|s| !s.is_empty())
-}
-
-/// `fut` を `limit` で打ち切る。時間切れは `None`。
-async fn timeout<T>(limit: Duration, fut: impl Future<Output = T>) -> Option<T> {
-    match select(pin!(fut), pin!(Delay::from(limit))).await {
-        Either::Left((v, _)) => Some(v),
-        Either::Right(_) => None,
-    }
 }

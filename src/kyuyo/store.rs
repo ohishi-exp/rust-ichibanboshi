@@ -16,10 +16,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
 use super::logic::{EmployeeRow, PayrollRow};
+use kyuyo_logic::store_keys::{
+    employees_scope, parse_payroll_scope, payroll_scope, CREATE_TABLES_SQL, DROP_TABLES_SQL,
+    PAYROLL_SYNCED_SQL, SCHEMA_VERSION,
+};
 
-/// schema 版。互換を壊す変更をしたら +1 する — 旧版のファイルは open 時に
-/// drop → 再作成され、次の read-through / sync で埋まり直す (derived store)。
-pub const KYUYO_STORE_SCHEMA_VERSION: i32 = 1;
+/// schema 版 (本体は `kyuyo_logic::store_keys`。Worker の DO と共有、Refs #322)。旧版のファイルは
+/// open 時に drop → 再作成され、次の read-through / sync で埋まり直す (derived store)。
+pub const KYUYO_STORE_SCHEMA_VERSION: i32 = SCHEMA_VERSION;
 
 #[derive(Debug)]
 pub enum KyuyoStoreError {
@@ -205,53 +209,19 @@ impl KyuyoStore {
     }
 
     /// schema 初期化。`user_version` が現行版と違えば全テーブル drop → 再作成
-    /// (derived store — データは源泉から再構築できるため migration しない)。
+    /// (derived store — データは源泉から再構築できるため migration しない)。DDL は
+    /// `kyuyo_logic::store_keys` (Worker の DO と共有)。
     fn init(conn: &Connection) -> Result<(), KyuyoStoreError> {
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(q)?;
         if version != KYUYO_STORE_SCHEMA_VERSION {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS kyuyo_payroll;
-                 DROP TABLE IF EXISTS kyuyo_employees;
-                 DROP TABLE IF EXISTS kyuyo_sync_state;",
-            )
-            .map_err(q)?;
+            conn.execute_batch(DROP_TABLES_SQL).map_err(q)?;
         }
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS kyuyo_payroll (
-               company TEXT NOT NULL,
-               month   TEXT NOT NULL,
-               seq     INTEGER NOT NULL,   -- 応答配列の順序保存 (0..)
-               row_json TEXT NOT NULL,
-               PRIMARY KEY (company, month, seq)
-             );
-             CREATE TABLE IF NOT EXISTS kyuyo_employees (
-               company TEXT NOT NULL,
-               nendo   INTEGER NOT NULL,
-               seq     INTEGER NOT NULL,
-               row_json TEXT NOT NULL,
-               PRIMARY KEY (company, nendo, seq)
-             );
-             CREATE TABLE IF NOT EXISTS kyuyo_sync_state (
-               scope TEXT NOT NULL PRIMARY KEY,
-               synced_at TEXT NOT NULL,
-               row_count INTEGER NOT NULL,
-               company_name TEXT NOT NULL DEFAULT '',
-               warnings_json TEXT NOT NULL
-             );
-             PRAGMA user_version = {KYUYO_STORE_SCHEMA_VERSION};",
-        ))
-        .map_err(q)
+        conn.execute_batch(CREATE_TABLES_SQL).map_err(q)?;
+        conn.pragma_update(None, "user_version", KYUYO_STORE_SCHEMA_VERSION)
+            .map_err(q)
     }
-}
-
-fn payroll_scope(company: &str, month: &str) -> String {
-    format!("payroll:{company}:{month}")
-}
-
-fn employees_scope(company: &str, nendo: i32) -> String {
-    format!("employees:{company}:{nendo}")
 }
 
 /// sync_state 1 行 (内部用)。
@@ -494,13 +464,7 @@ impl KyuyoStoreApi for KyuyoStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
-            let mut stmt = guard
-                .prepare(
-                    "SELECT scope, synced_at, row_count FROM kyuyo_sync_state
-                     WHERE scope LIKE 'payroll:%'
-                     ORDER BY scope ASC",
-                )
-                .map_err(q)?;
+            let mut stmt = guard.prepare(PAYROLL_SYNCED_SQL).map_err(q)?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok((
@@ -517,10 +481,7 @@ impl KyuyoStoreApi for KyuyoStore {
             Ok(rows
                 .into_iter()
                 .filter_map(|(scope, synced_at, row_count)| {
-                    let mut parts = scope.splitn(3, ':');
-                    let _kind = parts.next()?;
-                    let company = parts.next()?.to_string();
-                    let month = parts.next()?.to_string();
+                    let (company, month) = parse_payroll_scope(&scope)?;
                     Some(PayrollSyncedRow {
                         company,
                         month,

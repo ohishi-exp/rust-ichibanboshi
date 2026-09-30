@@ -8,7 +8,11 @@
 #   (e) vars に LOCAL_SQL_ADDR (ローカル検証で VPC を迂回して直接繋ぐフラグ) が無い
 #   (g) vars に LOCAL_KYUYO_SQL_JSON (ローカル検証で Secrets Store の代わりに SQL Server の資格情報 JSON を渡す var) が無い
 #   (f) vpc_services の service_id がプレースホルダのままなら warning (fail にはしない。VPC Service 作成後に入れる)
-# (a)〜(e)・(g) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
+#   (h) トップレベルの services に AUTH_KYUYO があり、service = "auth-worker" / entrypoint = "KyuyoAuthEntrypoint" を指す
+#       (/kyuyo/* の認可。別の worker や entrypoint へ差し替えると allowlist を通らずに給与が読める)
+#   (i) トップレベルの durable_objects.bindings に KYUYO_STATE (class_name = "KyuyoState"、script_name 無し =
+#       この Worker 自身の DO) があり、migrations の new_sqlite_classes に KyuyoState がある
+# (a)〜(e)・(g)〜(i) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash scripts/check-exposure.sh worker/wrangler.toml   (workers/kyuyo で)
 set -euo pipefail
@@ -62,6 +66,25 @@ if "LOCAL_SQL_ADDR" in cfg.get("vars", {}):
 if "LOCAL_KYUYO_SQL_JSON" in cfg.get("vars", {}):
     err("vars に LOCAL_KYUYO_SQL_JSON がある (SQL Server の資格情報が vars に載る。ローカルの .dev.vars 専用)")
 
+# (h) 認可の口 AUTH_KYUYO は auth-worker の KyuyoAuthEntrypoint (トップレベル)
+svcs = cfg.get("services")
+auth = [v for v in svcs if isinstance(v, dict) and v.get("binding") == "AUTH_KYUYO"] if isinstance(svcs, list) else []
+if len(auth) != 1:
+    err("トップレベルの services に AUTH_KYUYO が 1 つだけ無い (/kyuyo/* の認可)")
+elif auth[0].get("service") != "auth-worker" or auth[0].get("entrypoint") != "KyuyoAuthEntrypoint":
+    err("services の AUTH_KYUYO が auth-worker の KyuyoAuthEntrypoint を指していない (認可の差し替え)")
+
+# (i) DO KYUYO_STATE はこの Worker 自身の KyuyoState (トップレベル) で、SQLite の migration がある
+dos = cfg.get("durable_objects", {}).get("bindings")
+state = [v for v in dos if isinstance(v, dict) and v.get("name") == "KYUYO_STATE"] if isinstance(dos, list) else []
+if len(state) != 1:
+    err("トップレベルの durable_objects.bindings に KYUYO_STATE が 1 つだけ無い")
+elif state[0].get("class_name") != "KyuyoState" or "script_name" in state[0]:
+    err("KYUYO_STATE が この Worker の KyuyoState を指していない (class_name 違い / script_name あり)")
+migs = cfg.get("migrations")
+if not isinstance(migs, list) or not any(isinstance(m, dict) and "KyuyoState" in (m.get("new_sqlite_classes") or []) for m in migs):
+    err("migrations の new_sqlite_classes に KyuyoState が無い (SQLite の DO として作られない)")
+
 # (f) service_id のプレースホルダ (warning のみ)
 for v in vpcs or []:
     if isinstance(v, dict) and v.get("service_id") == PLACEHOLDER:
@@ -69,5 +92,5 @@ for v in vpcs or []:
 
 if errors:
     sys.exit(1)
-print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services はトップレベル・LOCAL_SQL_ADDR / LOCAL_KYUYO_SQL_JSON 無し")
+print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services はトップレベル・LOCAL_SQL_ADDR / LOCAL_KYUYO_SQL_JSON 無し・AUTH_KYUYO は auth-worker の KyuyoAuthEntrypoint・KYUYO_STATE は自身の SQLite DO")
 PY

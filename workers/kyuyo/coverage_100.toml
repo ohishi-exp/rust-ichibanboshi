@@ -14,3 +14,14 @@ path = "workers/kyuyo/logic/src/lib.rs"
 
 [[files]]
 path = "workers/kyuyo/logic/src/payroll.rs"
+
+# api.rs は応答型 (オンプレ版と共有)、store_keys.rs は derived store の鍵と DDL (オンプレ版と DO が共有)、
+# auth.rs は /kyuyo/* の認可の読み方 (fail-closed の判定を含む)。
+[[files]]
+path = "workers/kyuyo/logic/src/api.rs"
+
+[[files]]
+path = "workers/kyuyo/logic/src/auth.rs"
+
+[[files]]
+path = "workers/kyuyo/logic/src/store_keys.rs"
