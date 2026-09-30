@@ -47,6 +47,55 @@ impl Stage {
     }
 }
 
+/// 失敗の種類。ログ 1 行に出すのはこの分類だけで、エラーの本文 (ホスト・ポート・ユーザー名を含みうる) は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrKind {
+    /// 上限時間内に終わらない
+    Timeout,
+    /// VPC binding からの Socket 取得・connect の失敗
+    Transport,
+    /// I/O エラー。`std::io::ErrorKind` の名前だけ (例 "Other"、"ConnectionReset")
+    Io(String),
+    /// SQL Server が返したエラー (番号・クラス・状態だけ)
+    Server { code: u32, class: u8, state: u8 },
+    /// TDS のプロトコル違反
+    Protocol,
+    /// 文字コードの不一致
+    Encoding,
+    /// TLS のハンドシェイク失敗
+    Tls,
+    /// サーバが別アドレスへの接続を要求した
+    Routing,
+    /// 上のどれでもない
+    Other,
+}
+
+impl ErrKind {
+    /// ログ用の短い名前 (`io:Other`、`server:18456/14/1` など)。
+    pub fn label(&self) -> String {
+        match self {
+            ErrKind::Timeout => "timeout".to_string(),
+            ErrKind::Transport => "transport".to_string(),
+            ErrKind::Io(name) => format!("io:{name}"),
+            ErrKind::Server { code, class, state } => format!("server:{code}/{class}/{state}"),
+            ErrKind::Protocol => "protocol".to_string(),
+            ErrKind::Encoding => "encoding".to_string(),
+            ErrKind::Tls => "tls".to_string(),
+            ErrKind::Routing => "routing".to_string(),
+            ErrKind::Other => "other".to_string(),
+        }
+    }
+}
+
+/// 失敗ログの 1 行。メッセージ本文を受け取らない (stage・種類・所要ミリ秒だけ)。
+pub fn log_line(stage: Stage, kind: &ErrKind, elapsed_ms: u64) -> String {
+    format!(
+        "kyuyo probe: failed at {} ({elapsed_ms} ms) kind={}",
+        stage.as_str(),
+        kind.label()
+    )
+}
+
 /// 応答の status と JSON 本文。
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reply {
@@ -140,6 +189,87 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
             assert_eq!(v, serde_json::json!({"ok": false, "stage": name}));
         }
+    }
+
+    #[test]
+    fn log_line_per_kind() {
+        let cases = [
+            (
+                Stage::Login,
+                ErrKind::Timeout,
+                20000,
+                "kyuyo probe: failed at login (20000 ms) kind=timeout",
+            ),
+            (
+                Stage::Connect,
+                ErrKind::Transport,
+                3,
+                "kyuyo probe: failed at connect (3 ms) kind=transport",
+            ),
+            (
+                Stage::Login,
+                ErrKind::Io("Other".into()),
+                5019,
+                "kyuyo probe: failed at login (5019 ms) kind=io:Other",
+            ),
+            (
+                Stage::Query,
+                ErrKind::Io("ConnectionReset".into()),
+                7,
+                "kyuyo probe: failed at query (7 ms) kind=io:ConnectionReset",
+            ),
+            (
+                Stage::Login,
+                ErrKind::Server {
+                    code: 18456,
+                    class: 14,
+                    state: 1,
+                },
+                12,
+                "kyuyo probe: failed at login (12 ms) kind=server:18456/14/1",
+            ),
+            (
+                Stage::Login,
+                ErrKind::Protocol,
+                1,
+                "kyuyo probe: failed at login (1 ms) kind=protocol",
+            ),
+            (
+                Stage::Login,
+                ErrKind::Encoding,
+                1,
+                "kyuyo probe: failed at login (1 ms) kind=encoding",
+            ),
+            (
+                Stage::Login,
+                ErrKind::Tls,
+                1,
+                "kyuyo probe: failed at login (1 ms) kind=tls",
+            ),
+            (
+                Stage::Login,
+                ErrKind::Routing,
+                1,
+                "kyuyo probe: failed at login (1 ms) kind=routing",
+            ),
+            (
+                Stage::Secret,
+                ErrKind::Other,
+                0,
+                "kyuyo probe: failed at secret (0 ms) kind=other",
+            ),
+        ];
+        for (stage, kind, ms, want) in cases {
+            let line = log_line(stage, &kind, ms);
+            assert_eq!(line, want);
+            assert!(!line.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn log_line_takes_no_message() {
+        // 引数は stage・種類・ミリ秒だけ。本文を渡す口が型に無いことを関数ポインタの型で固定する
+        let _: fn(Stage, &ErrKind, u64) -> String = log_line;
     }
 
     #[test]
