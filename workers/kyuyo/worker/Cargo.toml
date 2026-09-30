@@ -1,4 +1,5 @@
-# 給与大臣 Worker の PoC (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く POST /probe (fetch) だけを持つ。
+# 給与大臣 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く fetch (POST /probe と /kyuyo/*) を
+# DO KyuyoState (1 インスタンス) へ転送する。/kyuyo/* は転送の前に auth-worker の KyuyoAuthEntrypoint (AUTH_KYUYO) で認可する。
 # SQL Server へは Workers VPC の binding KYUYO_VPC (VPC Service 型) から TCP で繋ぎ、tiberius で TDS を話す。
 # 経路・stage と応答の写像・資格情報の検証は ../logic (kyuyo-logic) に置く。
 # tiberius の rustls feature と bb8-tiberius は wasm32 で落ちる (getrandom / mio / rustls-native-certs) ので入れない。
@@ -13,12 +14,17 @@ crate-type = ["cdylib"]
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+js-sys = "0.3"
 kyuyo-logic = { path = "../logic" }
 send_wrapper = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
-# tiberius は futures の AsyncRead/Write を要求し、worker::Socket は tokio の AsyncRead/Write を持つので compat で繋ぐ
+# tiberius は futures の AsyncRead/Write を要求し、worker::Socket は tokio の AsyncRead/Write を持つので compat で繋ぐ。
+# sync は DO の中で SQL Server を開く区間を直列化する Mutex
 tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 worker = "=0.8.7"
 worker-sys = "=0.8.7"

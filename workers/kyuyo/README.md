@@ -1,15 +1,30 @@
 # workers/kyuyo
 
-Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Workers VPC + 既存の Tunnel へ移す前提として、
-**wasm32 の Worker から tiberius で給与大臣の SQL Server に TDS を張れること**を確かめる PoC。
-いまは `POST /probe` (ログインと `SELECT 1` だけ) しか持たない。実 API は後続の PR で足す。
+Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Workers VPC + 既存の Tunnel へ移す先。
+オンプレ版 (repo ルートの `src/routes/kyuyo.rs`) と並走させて応答を比べてから切り替える。
+
+| 口 | 状態 |
+|---|---|
+| `POST /probe` | ログインと `SELECT 1` だけ (認可なし。データは返さない) |
+| `GET /kyuyo/access` | 実装済み。認可の結果の email で `{"allowed":true,"email":…}`、`Cache-Control: no-store`。SQL Server を開かない |
+| `GET /kyuyo/synced-months` | 実装済み。DO の SQLite の sync 済み月 (`{"entries":[…]}`、オンプレ版と同じ形)。SQL Server を開かない |
+| `GET /kyuyo/databases` / `companies` / `employees` / `payroll`、`POST /kyuyo/sync` | 501 `{"error":"not_implemented"}` (#c322-7 で実装) |
+
+パスに `/api` は付かない (呼び出し側の binding から見た path)。method が違えば 405、どの口でもなければ 404 (本文 `{"ok":false}`)。
 
 ## 構成
 
 | パス | 中身 |
 |---|---|
-| `logic/` | crate `kyuyo-logic`。Worker に依存しない純粋ロジック (`/probe` の経路判定・失敗の stage と応答の写像・資格情報 JSON の検証)。std のみで `cargo test` できる |
-| `worker/` | crate `kyuyo-worker` (cdylib)。`#[event(fetch)]` (`POST /probe`) を持つ Worker 本体 |
+| `logic/` | crate `kyuyo-logic`。Worker に依存しない純粋ロジック (経路判定・失敗の stage と応答の写像・資格情報 JSON の検証)。std のみで `cargo test` できる |
+| `logic/src/api.rs` | `/api/kyuyo/*` の応答型。**オンプレ版と Worker が同じ定義を使う** (JSON のキーと順は unit test が固定) |
+| `logic/src/store_keys.rs` | derived store の DDL (3 表)・版・scope の鍵。**オンプレ版の `src/kyuyo/store.rs` と DO が共有** |
+| `logic/src/auth.rs` | auth-worker の `authorize` の戻りの読み方 (200 だけ通す・fail-closed) と `/kyuyo/*` の応答 |
+| `logic/src/payroll.rs` | 給与明細を組み立てる純粋ロジック (オンプレ版も借りている) |
+| `worker/` | crate `kyuyo-worker` (cdylib)。fetch は認可してから全リクエストを DO へ転送する |
+| `worker/src/state.rs` | Durable Object `KyuyoState` (SQLite)。SQL Server を開く処理はこの中のロックの中だけ |
+| `worker/src/auth.rs` | auth-worker の `KyuyoAuthEntrypoint.authorize(token)` (binding `AUTH_KYUYO`) への RPC |
+| `worker/src/probe.rs` | `POST /probe` の本体 (DO のロックの中で走る) |
 | `worker/src/tcp.rs` | VPC binding の JS `connect()` を呼ぶ extern |
 | `worker/src/transport.rs` | socket を開いて `tokio_util::compat` で tiberius に渡せる形にする |
 | `scripts/check-exposure.sh` | `worker/wrangler.toml` の公開範囲の検査 (CI で毎回) |
@@ -19,11 +34,49 @@ repo ルートの package (オンプレ / Cloud Run の本体) とは独立し�
 
 ```text
 Service Binding を宣言した worker
-  └─ ichibanboshi-kyuyo (fetch `POST /probe` だけ)
-       ├─ KYUYO_SQL (Secrets Store): JSON {"user","pass"}
-       └─ KYUYO_VPC (Workers VPC の VPC Service) ── Tunnel ── 社内の給与大臣 SQL Server
-             tiberius 0.12 (default-features = false、tds73 + chrono)、平文 TDS
+  └─ ichibanboshi-kyuyo (fetch)
+       ├─ /kyuyo/* は先に AUTH_KYUYO (auth-worker の KyuyoAuthEntrypoint).authorize(token)
+       └─ 全リクエストを DO KyuyoState (idFromName("kyuyo") の 1 インスタンス) へ転送
+            ├─ SQLite: kyuyo_payroll / kyuyo_employees / kyuyo_sync_state + schema_version
+            └─ ロックの中だけで SQL Server を開く
+                 ├─ KYUYO_SQL (Secrets Store): JSON {"user","pass"}
+                 └─ KYUYO_VPC (Workers VPC の VPC Service) ── Tunnel ── 社内の給与大臣 SQL Server
+                       tiberius 0.12 (default-features = false、tds73 + chrono)、平文 TDS
 ```
+
+## 認可 (`/kyuyo/*`)
+
+fetch は `Authorization: Bearer <token>` を取り出し (無ければ空文字)、auth-worker の `KyuyoAuthEntrypoint.authorize(token)`
+を呼ぶ。戻りは throw しない `{status, body, contentType}`:
+
+- 200 `{"allowed":true,"email":…}` → email を内部ヘッダ `x-kyuyo-authorized-email` に載せて DO へ転送する。DO への
+  リクエストは method と URL だけから新しく組み立てるので、**外から来た同名ヘッダ (や他のヘッダ・本文) は DO に届かない**。
+  200 でも body から email が取れなければ 503 `{"error":"server_error"}` (fail-closed)
+- 200 以外 (401 `unauthorized` / 403 `forbidden` / 503 `kyuyo_allowlist_unset`・`server_error`) → **その status と body をそのまま返す**
+- binding が無い・RPC が落ちた → 503 `{"error":"server_error"}`
+
+認可を差し替えるローカル専用の var や分岐はコードに置かない (fail-open になる)。ローカル検証はスタブの auth worker を
+Service Binding で繋ぐ (下の「ローカル検証」)。
+
+### 並走期間の注意
+
+- **allowlist の正本は 2 か所ある**: オンプレの `[kyuyo] allowed_emails` と auth-worker の KV `kyuyo-allowed-emails`。
+  **オンプレ廃止までは両方を同時に直す** (片方だけ直すと、同じ人がオンプレでは通り Worker では弾かれる、またはその逆)。
+  どちらも空なら 503 (オンプレは `allowed_emails が空`、auth-worker は `kyuyo_allowlist_unset`)
+- **認可で弾いた応答の body は auth-worker のもの** (`{"error":"unauthorized"}` 等)。オンプレ版の `ErrorBody` とキー
+  (`error`) は同じだが文言は違う。**並走比較では認可で弾いた応答は status だけを比べる**
+
+## DO `KyuyoState`
+
+- インスタンスは `idFromName("kyuyo")` の 1 つだけ。`POST /probe` を含む全リクエストがここを通る
+- SQLite に `store_keys` の DDL で 3 表 (オンプレ版の derived store と同じ形) と自前の `schema_version` 表
+  (`PRAGMA user_version` は使わない)。版 (`store_keys::SCHEMA_VERSION`) が違えば 3 表を drop → 再作成する
+  (derived なので migration しない。源泉から作り直せる)
+- DO は await 中に次のリクエストが割り込むので、SQL Server を開く区間は `tokio::sync::Mutex` で直列化する
+  (給与大臣 PC への同時接続を増やさない。オンプレ版の `KyuyoLimiter` と同じ役目)。`/probe` と 5 口がこのロックを通る
+- `access` と `synced-months` は SQL Server を開かない (ロックを取らない)
+
+## `POST /probe`
 
 1 回の流れ: 資格情報を読む → `KYUYO_VPC` から TCP を開く → tiberius でログイン
 (`EncryptionLevel::NotSupported`、database `master`) → `SELECT 1`。
@@ -46,6 +99,8 @@ tiberius の `rustls` feature と `bb8-tiberius` は wasm32 で落ちる (getran
 | Secrets Store | binding `KYUYO_SQL` | JSON。キー `user` / `pass` (両方必須の非空文字列)。SQL Server 認証の資格情報 |
 | binding | `KYUYO_VPC` | VPC Service (TCP、宛先は給与大臣 SQL Server のポート)。`service_id` は `wrangler.toml` に入れてある |
 | binding | `CF_VERSION_METADATA` | ログに出る版の元 |
+| Service Binding | `AUTH_KYUYO` | auth-worker の named entrypoint `KyuyoAuthEntrypoint` (`authorize(token)` だけ) |
+| Durable Object | `KYUYO_STATE` | class `KyuyoState` (SQLite、migration `v1` の `new_sqlite_classes`) |
 
 `worker/wrangler.toml` の `service_id` (VPC Service) と `store_id` (Secrets Store) は実 id が入っている。どちらも資格情報でも宛先でもないので public repo に置く (smb-watch と同じ扱い)。宛先の IP・Tunnel ID・account ID は書かない。
 
@@ -64,11 +119,15 @@ tiberius の `rustls` feature と `bb8-tiberius` は wasm32 で落ちる (getran
 - `route` / `routes` が無い、`env` 表が無い (トップレベルだけで運用する)
 - SQL Server への口 `vpc_services` の `KYUYO_VPC` はトップレベルにある
 - `vars` に `LOCAL_SQL_ADDR` と `LOCAL_KYUYO_SQL_JSON` が無い
+- `services` の `AUTH_KYUYO` が 1 つだけあり、`service = "auth-worker"` / `entrypoint = "KyuyoAuthEntrypoint"` を指す
+  (トップレベル。別の worker・entrypoint へ差し替えると allowlist を通らずに給与が読める)
+- `durable_objects.bindings` の `KYUYO_STATE` が `class_name = "KyuyoState"` で `script_name` を持たない (この Worker 自身の DO)、
+  `migrations` の `new_sqlite_classes` に `KyuyoState` がある
 - `service_id` がプレースホルダのままなら warning (fail にはしない。実 id を入れた今は出ない)
 
 fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。同一アカウントで binding を宣言した
-worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけで、データは返さない。
-認可は後続の実 API で auth-worker 経由に入れる。
+worker は誰でも叩ける: `POST /probe` の効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけでデータは返さない。
+`/kyuyo/*` は auth-worker の認可 (上) を通ったときだけ DO へ届く。
 
 `scripts/check-exposure-test.sh` は wrangler.toml を読んだ dict を 1 か所ずつ崩して書き戻し、各検査が exit 1 になることを確かめる
 (特定の表の直前に行を挿す作りにはしない — 末尾に表が足されると検出できなくなる)。
@@ -98,19 +157,43 @@ CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build 
    docker port mssql-kyuyo 1433
    ```
 
-2. `worker/wrangler.toml` の `vpc_services` は `remote = true` なので、そのまま `wrangler dev` すると
-   Cloudflare API に繋ぎにいく。ローカル専用のコピー (`vpc_services` と `secrets_store_secrets` と `[build]` を外し、
-   `main` をビルド済みの `worker/build/index.js` の絶対パスに向けたもの) を repo の外に作り、その隣に `.dev.vars` を置く:
+2. **元の `worker/wrangler.toml` のまま `wrangler dev` しない** (`vpc_services` が `remote = true` なので
+   Cloudflare API に繋ぎにいく)。ローカル専用のコピー `worker.toml` (`vpc_services` と `secrets_store_secrets` と `[build]` を外し、
+   `main` をビルド済みの `worker/build/index.js` の絶対パスに向けたもの。`services` と DO はそのまま) を repo の外に作り、
+   その隣に `.dev.vars` を置く:
 
    ```sh
    LOCAL_SQL_ADDR=127.0.0.1:<port>
    LOCAL_KYUYO_SQL_JSON={"user":"sa","pass":"<使い捨て>"}
    ```
 
-3. `npx wrangler@4.144.0 dev --port <port>` を起動し、`curl -s -X POST http://127.0.0.1:<port>/probe` が
-   `{"ok":true}` を返すことを見る。陰性対照: pass を誤らせると 502 `stage":"login"`、`LOCAL_SQL_ADDR` を閉じたポートに
-   すると `stage":"connect"`、`GET /probe` は 405、`POST /x` は 404
-4. `docker rm -f mssql-kyuyo`
+3. 同じ場所にスタブの auth worker を置く。名前は `auth-worker`、`KyuyoAuthEntrypoint.authorize(token)` を持ち、
+   token が `ok` なら 200 `{"allowed":true,"email":"stub@example.com"}`、`deny` なら 403 `{"error":"forbidden"}`、
+   それ以外は 401 `{"error":"unauthorized"}` を返すだけのもの:
+
+   ```js
+   // stub.js (stub.toml: name = "auth-worker" / main = "stub.js" / compatibility_date は worker と同じ)
+   import { WorkerEntrypoint } from "cloudflare:workers";
+   const reply = (status, body) => ({ status, body: JSON.stringify(body), contentType: "application/json" });
+   export class KyuyoAuthEntrypoint extends WorkerEntrypoint {
+     async authorize(token) {
+       if (token === "ok") return reply(200, { allowed: true, email: "stub@example.com" });
+       if (token === "deny") return reply(403, { error: "forbidden" });
+       return reply(401, { error: "unauthorized" });
+     }
+   }
+   export default { fetch: () => new Response("stub", { status: 404 }) };
+   ```
+
+4. `npx wrangler@4.144.0 dev -c worker.toml -c stub.toml --port <port>` (1 つ目が主。2 つ目が Service Binding の相手) を起動して見る:
+   - `GET /kyuyo/access` — `Bearer ok` で 200 `{"allowed":true,…}` (`Cache-Control: no-store`)、`Bearer deny` で 403、無しで 401。
+     `x-kyuyo-authorized-email` を外から付けても応答の email は変わらない
+   - `GET /kyuyo/synced-months` — 空なら 200 `{"entries":[]}`
+   - `GET /kyuyo/payroll` — 501
+   - `POST /probe` — `{"ok":true}`。陰性対照: pass を誤らせると 502 `stage":"login"`、`LOCAL_SQL_ADDR` を閉じたポートに
+     すると `stage":"connect"`、`GET /probe` は 405、`POST /x` は 404
+   - `-c stub.toml` を外して起動すると `/kyuyo/*` は 503 `{"error":"server_error"}` (認可に届かなければ通さない)
+5. `docker rm -f mssql-kyuyo`
 
 `.dev.vars` は `.gitignore` 済み。
 
@@ -121,13 +204,14 @@ CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build 
 3. [x] 実接続確認: `wrangler dev --remote` で `POST /probe` が `{"ok":true}` を返す
 4. [ ] タグ deploy: `worker-kyuyo-v*` を push (`wrangler deploy --tag`。org secret `CLOUDFLARE_API_TOKEN`)
 5. [ ] 呼び出し側 worker に Service Binding を宣言し、`POST /probe` が `{"ok":true}` を返すことを見る
-6. [ ] 実 API (`/api/kyuyo/*`) を足し、認可を auth-worker 経由で入れる
+6. [x] 認可 (auth-worker の `KyuyoAuthEntrypoint`)・DO `KyuyoState`・`/kyuyo/access`・`/kyuyo/synced-months` を足した
+7. [ ] 残りの 5 口 (`databases` / `companies` / `employees` / `payroll` / `sync`) を DO のロックの中に実装する (#c322-7)
 
 ### 到達面の判断
 
 本番 deploy 後も fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。同一アカウントで binding を
-宣言した worker は誰でも叩けるが、効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけでデータは返さない。
-認可は後続の実 API (auth-worker 経由) で入れる。
+宣言した worker は誰でも叩けるが、`POST /probe` の効果は給与大臣 SQL Server への 1 回のログインと `SELECT 1` だけで
+データは返さない。`/kyuyo/*` は auth-worker の認可を通ったときだけ応答する。
 
 ### 罠
 
