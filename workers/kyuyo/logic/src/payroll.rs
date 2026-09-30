@@ -1,5 +1,8 @@
 //! 給与大臣 (OHKEN) 読み取りの純粋ロジック (Refs #82)。
 //!
+//! 置き場は Worker 側 (Refs #322。旧 `src/kyuyo/logic.rs`)。オンプレ版 (repo ルートの package) は
+//! 並走期間だけ path 依存で借り、`src/kyuyo/mod.rs` で `kyuyo::logic` として re-export している。
+//!
 //! スキーマの根拠は `docs/kyuyo-daijin-schema.md` (#81 実機調査):
 //! - DB 命名 `KYDATA{会社4桁}_{年度3桁}C`、年度起点は 12 月分 (12 月給与は翌年度 DB)
 //! - `KYUYO` 1 行 = 社員 (`SHAIN`) × 支給回インデックス (`MONTH`)。月の特定は

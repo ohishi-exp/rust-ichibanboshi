@@ -91,9 +91,6 @@ path = "src/change_log.rs"
 [[files]]
 path = "src/kyuyo/introspect.rs"
 
-[[files]]
-path = "src/kyuyo/logic.rs"
-
 # --- routes (全て MockRepo / wiremock でカバー) ---
 
 [[files]]

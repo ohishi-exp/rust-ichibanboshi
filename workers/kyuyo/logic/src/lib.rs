@@ -1,5 +1,10 @@
 //! 給与大臣 Worker (`kyuyo-worker`) の純粋部分: `/probe` の経路判定・失敗の stage と応答の写像・
 //! 資格情報 JSON の検証。Worker にも SQL Server にも依存しないので native で `cargo test` できる。
+//!
+//! - [`payroll`] — 給与明細を組み立てる純粋ロジック。オンプレ版 (repo ルートの package) も並走期間だけ
+//!   path 依存で借りている (`src/kyuyo/mod.rs` の re-export)
+
+pub mod payroll;
 
 use serde::Deserialize;
 

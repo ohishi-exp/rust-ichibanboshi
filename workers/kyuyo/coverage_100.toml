@@ -1,0 +1,16 @@
+# workers/kyuyo の 100% 行カバレッジ登録簿 (Refs #322)。
+#
+# 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
+# coverage_100.toml と同じ)。workers/kyuyo は別 workspace なので計測は worker-kyuyo.yml が取る:
+#
+#   cargo llvm-cov --manifest-path workers/kyuyo/Cargo.toml -p kyuyo-logic --text > cov.txt
+#   bash scripts/check_coverage_100.sh --config workers/kyuyo/coverage_100.toml --use-cache cov.txt
+#
+# payroll.rs は旧 src/kyuyo/logic.rs (repo ルートの登録簿から移した)。email_allowed /
+# normalize_emails は給与閲覧の認可の中核なので、この gate から外さないこと。
+
+[[files]]
+path = "workers/kyuyo/logic/src/lib.rs"
+
+[[files]]
+path = "workers/kyuyo/logic/src/payroll.rs"
