@@ -68,24 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_batch(command, cli.args);
     }
 
-    let args = cli.args;
-    if args.console {
-        run_console(args)
-    } else {
-        #[cfg(windows)]
-        {
-            let _ = args;
-            rust_ichibanboshi::service::run_service().map_err(|e| {
-                eprintln!("Failed to start as service: {e}");
-                eprintln!("Hint: Use --console flag to run in console mode");
-                Box::new(e) as Box<dyn std::error::Error>
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            run_console(args)
-        }
-    }
+    run_console(cli.args)
 }
 
 fn init_tracing() {

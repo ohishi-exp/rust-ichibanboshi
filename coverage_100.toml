@@ -27,8 +27,7 @@
 #   せず fail する (先例はここを WARN で握り潰しており、登録済みなのに一度も
 #   検証されていないファイルが実在した)。
 #   `src/lib.rs` / `src/routes/mod.rs` / `src/kyuyo/mod.rs` は re-export だけで
-#   実行行が 0 なので登録できない。`src/service.rs` は cfg(windows) で Linux CI
-#   ではコンパイルすらされないため同様
+#   実行行が 0 なので登録できない。
 # - 100% に到達したファイルは登録漏れさせない (登録漏れ = gate が守っていない)
 #
 # ## 落とし穴

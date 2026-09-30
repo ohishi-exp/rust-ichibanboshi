@@ -42,7 +42,6 @@ TimeoutStartSec=1800
 # Restart= は付けない (oneshot)。1 日 1 回の timer 起動が事実上のリトライで、
 # 失敗した回は次の起動が同じ月をやり直す。
 # stdout/stderr は既定で journal に落ちる (journalctl -u ichibanboshi-sync)。
-# API 本体の log_dir (/opt/ichibanboshi/logs) とは別経路。
 
 # ConditionPathExists= で config やバイナリの存在を確認する案もあるが、採らない。
 # Condition 不成立は "failed" ではなく "skipped" になり、静かに何もしない日が

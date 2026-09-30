@@ -2,7 +2,7 @@
 name = "rust-ichibanboshi"
 version = "0.1.0"
 edition = "2021"
-description = "一番星 SQL Server sales data API — Windows Service with Cloudflare Tunnel"
+description = "一番星 SQL Server sales data API — Linux service with Cloudflare Tunnel"
 
 [[bin]]
 name = "ichibanboshi"
@@ -36,7 +36,6 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 # 担当者振替の備考2 パース (PHP preg_match /(.+)→(.+)/u 写経用、routes/uriage.rs)
@@ -71,9 +70,6 @@ jsonwebtoken = "9"
 [build-dependencies]
 # build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ、Refs #191)
 sha2 = "0.10"
-
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

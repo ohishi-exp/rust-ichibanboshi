@@ -25,7 +25,5 @@ pub mod repo;
 pub mod restraint_store;
 pub mod routes;
 pub mod server;
-#[cfg(windows)]
-pub mod service;
 pub mod sqlite;
 pub mod wage_snapshot;
