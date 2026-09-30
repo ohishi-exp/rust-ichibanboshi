@@ -8,7 +8,9 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `POST /probe` | ログインと `SELECT 1` だけ (認可なし。データは返さない) |
 | `GET /kyuyo/access` | 実装済み。認可の結果の email で `{"allowed":true,"email":…}`、`Cache-Control: no-store`。SQL Server を開かない |
 | `GET /kyuyo/synced-months` | 実装済み。DO の SQLite の sync 済み月 (`{"entries":[…]}`、オンプレ版と同じ形)。SQL Server を開かない |
-| `GET /kyuyo/databases` / `companies` / `employees` / `payroll`、`POST /kyuyo/sync` | 501 `{"error":"not_implemented"}` (#c322-7 で実装) |
+| `GET /kyuyo/databases` / `companies` | 実装済み。毎回 SQL Server を読む (オンプレ版と同じ応答) |
+| `GET /kyuyo/employees` / `payroll` (`?company=&month=`) | 実装済み。read-through: DO の SQLite にあれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` |
+| `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees を読み直して保存。保存に失敗したら 500 (sync 成功 = 保存が最新) |
 
 パスに `/api` は付かない (呼び出し側の binding から見た path)。method が違えば 405、どの口でもなければ 404 (本文 `{"ok":false}`)。
 
@@ -21,10 +23,15 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `logic/src/store_keys.rs` | derived store の DDL (3 表)・版・scope の鍵。**オンプレ版の `src/kyuyo/store.rs` と DO が共有** |
 | `logic/src/auth.rs` | auth-worker の `authorize` の戻りの読み方 (200 だけ通す・fail-closed) と `/kyuyo/*` の応答 |
 | `logic/src/payroll.rs` | 給与明細を組み立てる純粋ロジック (オンプレ版も借りている) |
+| `logic/src/sql.rs` | 給与大臣に流す SQL 文と DB 名の検証。**オンプレ版の `src/kyuyo/repo.rs` と Worker が同じ文字列を流す** (CAST / CONVERT(…,120) はここ) |
+| `logic/src/service.rs` | SQL Server を開く 5 口の純粋部分: company / month の検証 (400)、失敗の写像 (オンプレ版の `map_repo_err` / `map_db_open_err`)、行の組み立て、store の行の encode / decode |
 | `worker/` | crate `kyuyo-worker` (cdylib)。fetch は認可してから全リクエストを DO へ転送する |
 | `worker/src/state.rs` | Durable Object `KyuyoState` (SQLite)。SQL Server を開く処理はこの中のロックの中だけ |
 | `worker/src/auth.rs` | auth-worker の `KyuyoAuthEntrypoint.authorize(token)` (binding `AUTH_KYUYO`) への RPC |
 | `worker/src/probe.rs` | `POST /probe` の本体 (DO のロックの中で走る) |
+| `worker/src/repo.rs` | 資格情報・TCP・ログイン (`connect`、`/probe` と共用) と、`sql.rs` の文を流して `Raw*Row` に詰める読み取り (型が合わなければ空文字 / 0、オンプレ版と同じ) |
+| `worker/src/routes.rs` | 5 口の本体 (DO のロックの中で走る。1 リクエスト = 1 接続) |
+| `worker/src/store.rs` | DO の SQLite の derived store の読み書き (オンプレ版 `src/kyuyo/store.rs` と同じ表・同じ中身) |
 | `worker/src/tcp.rs` | VPC binding の JS `connect()` を呼ぶ extern |
 | `worker/src/transport.rs` | socket を開いて `tokio_util::compat` で tiberius に渡せる形にする |
 | `scripts/check-exposure.sh` | `worker/wrangler.toml` の公開範囲の検査 (CI で毎回) |
@@ -75,6 +82,33 @@ Service Binding で繋ぐ (下の「ローカル検証」)。
 - DO は await 中に次のリクエストが割り込むので、SQL Server を開く区間は `tokio::sync::Mutex` で直列化する
   (給与大臣 PC への同時接続を増やさない。オンプレ版の `KyuyoLimiter` と同じ役目)。`/probe` と 5 口がこのロックを通る
 - `access` と `synced-months` は SQL Server を開かない (ロックを取らない)
+- 5 口はロックの中で走る (employees / payroll のキャッシュ命中もロックの中なので、sync の保存と読みが交差しない)。
+  保存は await を挟まずに文を続けて流すので、DO の暗黙のトランザクションで一度に確定する。途中の文が失敗したら
+  その scope の `kyuyo_sync_state` を消して、行の欠けたキャッシュを命中させない
+
+## 5 口 (`databases` / `companies` / `employees` / `payroll` / `sync`)
+
+挙動はオンプレ版 `src/routes/kyuyo.rs` の各ハンドラと同じ。応答 JSON は `logic/src/api.rs` の型、SQL は `logic/src/sql.rs`。
+
+| 失敗 | status | 本文 `error` (オンプレ版と同じ文言) |
+|---|---|---|
+| company が `0100/0200/0300/0400` 以外・month が `YYYY-MM` でない | 400 | `company は … のいずれかで指定してください` / `month は YYYY-MM で指定してください` |
+| company / month が無い | 400 | `company と month を指定してください` (オンプレ版は axum の `Query` が返す平文の 400) |
+| 資格情報が読めない | 503 | `給与 DB 接続が未設定です ([kyuyo] config)` |
+| TCP・ログインの失敗 (20 秒) | 503 | `給与 DB に接続できません (給与大臣 PC の稼働を確認してください)` |
+| employees / payroll の本体クエリで SQL Server error **4060** | 404 | `{DB 名} を開けません (…)` |
+| それ以外のクエリの失敗・60 秒の時間切れ | 500 | `給与 DB クエリに失敗しました` |
+| sync の保存の失敗 | 500 | `キャッシュへの保存に失敗しました (payroll)` / `(employees)` |
+
+- 404 の判定はオンプレ版 (文言 "Cannot open database" か "4060") と同じことをエラー番号 4060 で行う。
+  **SQL Server 2022 (docker) では、存在しない年度 DB は 208 (Invalid object name)、権限の無い DB は 916 になり、
+  どちらも 4060 ではない** ので、オンプレ版も Worker も 500 になる (ローカルで両方を叩いて一致を確認済み)
+- `companies` は会社名マスタ (`KYCOMSTD`) が読めなくても warning を付けて一覧を返す (employees の会社名も同じ)
+- 失敗ログは 1 行 `kyuyo payroll: failed at query (6 ms) kind=server:208/16/1` (口の名前・stage・種類・ミリ秒だけ)。
+  成功は `kyuyo payroll: ok cache (0 ms)` / `ok live (22 ms)` — 2 回目の読みが SQL Server を開いていないことはこの行で見える
+- `synced_at` はオンプレ版と同じ RFC3339 (`…+00:00`)。精度はミリ秒 (オンプレ版はナノ秒)
+- 給与大臣の varchar (照合順序 `Japanese_CI_AS` = CP932) と nvarchar の日本語は tiberius がそのまま読む
+  (`encoding_rs` の Shift_JIS。feature の追加は要らない)。ローカルの docker で氏名・所属・会社名・項目名が化けないことを確認済み
 
 ## `POST /probe`
 
@@ -189,11 +223,24 @@ CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build 
    - `GET /kyuyo/access` — `Bearer ok` で 200 `{"allowed":true,…}` (`Cache-Control: no-store`)、`Bearer deny` で 403、無しで 401。
      `x-kyuyo-authorized-email` を外から付けても応答の email は変わらない
    - `GET /kyuyo/synced-months` — 空なら 200 `{"entries":[]}`
-   - `GET /kyuyo/payroll` — 501
+   - 5 口は下の「5 口のローカル検証」
    - `POST /probe` — `{"ok":true}`。陰性対照: pass を誤らせると 502 `stage":"login"`、`LOCAL_SQL_ADDR` を閉じたポートに
      すると `stage":"connect"`、`GET /probe` は 405、`POST /x` は 404
    - `-c stub.toml` を外して起動すると `/kyuyo/*` は 503 `{"error":"server_error"}` (認可に届かなければ通さない)
 5. `docker rm -f mssql-kyuyo`
+
+### 5 口のローカル検証
+
+上の構成に、給与大臣と同じ形の最小のテーブルを作って流す (照合順序は `Japanese_CI_AS`、ダミーデータは実在の人名・社名を使わない):
+
+- DB `KYCOMSTD` (`SELDATA`: `KCODE smallint`, `CONAME1 varchar`) と `KYDATA{会社}_{年度}C` (`KYUYO` (`MONEY00..79` /
+  `KINDATA0000..1600`) / `SHAIN1` / `SHOZOKU` (`NAME1` / `NAME2` は nvarchar) / `SHAIN2` / `SHAIN3` / `KOUMOKU` / `SHUKEI1`)
+- sa ではなく読み取り専用ログイン (`db_datareader`) を作り、年度 DB の 1 つだけ権限を付けない (`companies` の warning を見るため)
+- 見るもの: 5 口が 200、2 回目の employees / payroll が `source:"cache"` (ログ `ok cache`)、コンテナを止めても
+  キャッシュ済みの月は 200 で `databases` は 503、存在しない年度は 500 (上の 404 の注)、不正な company / month は 400、
+  sync の後に `synced-months` に月が出る
+- オンプレ版との一致: 同じ DB に repo ルートの `ichibanboshi --console` を向け (`[database] enabled = false`、`[kyuyo]` の
+  `auth_worker_origin` を `/auth/introspect` のローカルスタブへ)、同じリクエストの応答を `synced_at` を除いて比べる
 
 `.dev.vars` は `.gitignore` 済み。
 
@@ -205,7 +252,11 @@ CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build 
 4. [ ] タグ deploy: `worker-kyuyo-v*` を push (`wrangler deploy --tag`。org secret `CLOUDFLARE_API_TOKEN`)
 5. [ ] 呼び出し側 worker に Service Binding を宣言し、`POST /probe` が `{"ok":true}` を返すことを見る
 6. [x] 認可 (auth-worker の `KyuyoAuthEntrypoint`)・DO `KyuyoState`・`/kyuyo/access`・`/kyuyo/synced-months` を足した
-7. [ ] 残りの 5 口 (`databases` / `companies` / `employees` / `payroll` / `sync`) を DO のロックの中に実装する (#c322-7)
+7. [x] 残りの 5 口 (`databases` / `companies` / `employees` / `payroll` / `sync`) を DO のロックの中に実装した。
+   SQL 文と DB 名の検証はオンプレ版と共有 (`logic/src/sql.rs`)。ローカルでオンプレ版と応答が一致することを確認済み
+8. [ ] 並走: 呼び出し側から両方を叩いて応答を比べ、一致を見てから切り替える。**並走中の給与大臣 PC への同時接続は
+   最大 2 本** (オンプレ版の `KyuyoLimiter` = Semaphore(1) と Worker の DO ロックが独立に 1 本ずつ)。給与大臣 PC の
+   上限 (同時 2 接続) に収まるが、並走中に別の接続元 (手作業の SSMS 等) を足すと超える
 
 ### 到達面の判断
 

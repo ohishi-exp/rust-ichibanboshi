@@ -6,10 +6,14 @@
 //! - [`api`] — `/api/kyuyo/*` の応答型。オンプレ版 (`src/routes/kyuyo.rs`) と Worker が同じ定義を使う
 //! - [`store_keys`] — derived store の DDL と scope の鍵。オンプレ版 (`src/kyuyo/store.rs`) と Worker の DO が共有
 //! - [`auth`] — `/kyuyo/*` の認可 (auth-worker の応答の読み方) と、Worker が返す `/kyuyo/*` の応答
+//! - [`sql`] — 給与大臣に流す SQL 文と DB 名の検証。オンプレ版 (`src/kyuyo/repo.rs`) と Worker が同じ文字列を流す
+//! - [`service`] — SQL Server を開く 5 口の純粋部分 (入力の検証・失敗の写像・行の組み立て・store の行の encode)
 
 pub mod api;
 pub mod auth;
 pub mod payroll;
+pub mod service;
+pub mod sql;
 pub mod store_keys;
 
 use serde::Deserialize;
@@ -140,13 +144,15 @@ impl ErrKind {
     }
 }
 
-/// 失敗ログの 1 行。メッセージ本文を受け取らない (stage・種類・所要ミリ秒だけ)。
+/// probe の失敗ログの 1 行。メッセージ本文を受け取らない (stage・種類・所要ミリ秒だけ)。
 pub fn log_line(stage: Stage, kind: &ErrKind, elapsed_ms: u64) -> String {
-    format!(
-        "kyuyo probe: failed at {} ({elapsed_ms} ms) kind={}",
-        stage.as_str(),
-        kind.label()
-    )
+    log_line_for("probe", stage, kind, elapsed_ms)
+}
+
+/// 失敗ログの 1 行 (`what` は口の名前。`probe` / `payroll` など)。本文は受け取らない。
+pub fn log_line_for(what: &str, stage: Stage, kind: &ErrKind, elapsed_ms: u64) -> String {
+    let (stage, kind) = (stage.as_str(), kind.label());
+    format!("kyuyo {what}: failed at {stage} ({elapsed_ms} ms) kind={kind}")
 }
 
 /// 応答の status と JSON 本文。

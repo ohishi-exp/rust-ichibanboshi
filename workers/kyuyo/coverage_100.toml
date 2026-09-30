@@ -25,3 +25,11 @@ path = "workers/kyuyo/logic/src/auth.rs"
 
 [[files]]
 path = "workers/kyuyo/logic/src/store_keys.rs"
+
+# sql.rs は給与大臣に流す SQL 文と DB 名の検証 (オンプレ版の src/kyuyo/repo.rs と Worker が同じ文字列を流す)、
+# service.rs は SQL Server を開く 5 口の純粋部分 (入力の検証・失敗の写像・行の組み立て・store の行の encode)。
+[[files]]
+path = "workers/kyuyo/logic/src/sql.rs"
+
+[[files]]
+path = "workers/kyuyo/logic/src/service.rs"

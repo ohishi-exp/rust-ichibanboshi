@@ -3,7 +3,7 @@
 //!
 //! - **SQL Server を開く処理はここ (`sql_server` のロックの中) だけ**。DO は await 中に次のリクエストが
 //!   割り込むので明示のロックで直列化し、給与大臣 PC への同時接続を 1 本に保つ (オンプレ版の
-//!   `KyuyoLimiter` と同じ役目)。`POST /probe` と `/kyuyo/*` の 5 口 (#c322-7) がこれを通る
+//!   `KyuyoLimiter` と同じ役目)。`POST /probe` と `/kyuyo/*` の 5 口 ([`crate::routes`]) がこれを通る
 //! - 保存先は `kyuyo_logic::store_keys` の DDL の 3 表 (オンプレ版の derived store と同じ形) +
 //!   自前の `schema_version` 表 (PRAGMA user_version は使わない)。版が違えば 3 表を drop → 再作成
 //!   (derived なので migration しない)
@@ -14,7 +14,7 @@
 use std::cell::Cell;
 
 use kyuyo_logic::auth::{
-    access_reply, not_implemented, server_error, store_error, synced_months_reply, EMAIL_HEADER,
+    access_reply, server_error, store_error, synced_months_reply, EMAIL_HEADER,
 };
 use kyuyo_logic::store_keys::{
     CREATE_TABLES_SQL, DROP_TABLES_SQL, PAYROLL_SYNCED_SQL, SCHEMA_VERSION,
@@ -27,7 +27,7 @@ use worker::{
     Result, SqlStorage, SqlStorageValue, State,
 };
 
-use crate::{probe, respond};
+use crate::{probe, respond, routes};
 
 /// wrangler.toml の `[[durable_objects.bindings]]` の name。
 const STATE_BINDING: &str = "KYUYO_STATE";
@@ -69,7 +69,7 @@ impl DurableObject for KyuyoState {
                 let Some(email) = req.headers().get(EMAIL_HEADER)?.filter(|e| !e.is_empty()) else {
                     return respond(server_error());
                 };
-                self.kyuyo(endpoint, &email).await
+                self.kyuyo(endpoint, &email, &req).await
             }
             _ => {
                 let _one = self.sql_server.lock().await;
@@ -92,7 +92,7 @@ struct SyncedRow {
 }
 
 impl KyuyoState {
-    async fn kyuyo(&self, endpoint: Endpoint, email: &str) -> Result<Response> {
+    async fn kyuyo(&self, endpoint: Endpoint, email: &str, req: &Request) -> Result<Response> {
         match endpoint {
             // SQL Server を開かない 2 口
             Endpoint::Access => {
@@ -107,10 +107,12 @@ impl KyuyoState {
                     respond(store_error())
                 }
             },
-            // 残りの 5 口は #c322-7 で実装する。SQL Server を開くのはこのロックの中だけ
+            // 残りの 5 口 (databases / companies / employees / payroll / sync)。SQL Server を開くのはこのロックの中だけ
+            // (employees / payroll の store 命中もロックの中: sync の put と読みが交差しない)
             _ => {
+                let url = req.url()?;
                 let _one = self.sql_server.lock().await;
-                respond(not_implemented())
+                respond(routes::run(&self.env, &self.sql, endpoint, &url).await)
             }
         }
     }
