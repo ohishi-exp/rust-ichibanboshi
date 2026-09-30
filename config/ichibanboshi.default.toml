@@ -1,6 +1,5 @@
 port = 3100
 bind_addr = "127.0.0.1"
-log_dir = ""
 
 # SQL Server (CAPE#01) を**使うと宣言するか**。既定 true = オンプレ (ohishi-data) の形。
 # 宣言したものに起動時に繋がらなければ**起動失敗**する (静かな degraded を作らない)。
