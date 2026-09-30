@@ -352,6 +352,7 @@ dependencies = [
 name = "kyuyo-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "js-sys",
  "kyuyo-logic",

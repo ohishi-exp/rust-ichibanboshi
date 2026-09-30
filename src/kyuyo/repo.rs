@@ -6,6 +6,9 @@
 //!
 //! SQL Server 2008 R2 は新しい TLS を話せないため `EncryptionLevel::NotSupported`
 //! を明示する (LAN 内 + FW 送信元制限済みの前提、docs/kyuyo-daijin-schema.md)。
+//!
+//! SQL 文と DB 名の検証は `kyuyo_logic::sql` (workers/kyuyo/logic) にあり、Worker と同じ文字列を流す
+//! (Refs #322。並走期間に応答を比べるため 1 か所に置く)。ここは接続と行の詰め方だけ。
 
 use std::sync::Arc;
 
@@ -14,9 +17,14 @@ use bb8::Pool;
 use bb8_tiberius::ConnectionManager;
 use tiberius::{Config as TiberiusConfig, EncryptionLevel};
 
+use kyuyo_logic::sql::{
+    employees_sql, koumoku_sql, payroll_month_sql, shukei_totals_sql, COMPANY_NAMES_SQL,
+    DATABASES_WITH_ACCESS_SQL, DATABASE_NAMES_SQL,
+};
+
 use super::logic::{
     normalize_company_code, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
-    KINDATA_COLUMNS, MAX_MONTH_INDEX, MONEY_COLUMNS,
+    KINDATA_COLUMNS, MONEY_COLUMNS,
 };
 use crate::config::KyuyoConfig;
 
@@ -171,17 +179,6 @@ impl TiberiusKyuyoRepo {
     }
 }
 
-/// DB 名の再検証 (defense in depth)。`KYDATA0100_126C` / `KYCOMSTD` 形式のみ許可。
-fn validate_db_name(db: &str) -> Result<(), KyuyoRepoError> {
-    if db.is_empty() || db.len() > 64 || !db.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(KyuyoRepoError::QueryError(format!(
-            "invalid database name: {db}"
-        )));
-    }
-    Ok(())
-}
-
 fn get_str(row: &tiberius::Row, idx: usize) -> String {
     row.try_get::<&str, _>(idx)
         .ok()
@@ -205,10 +202,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         // HAS_DBACCESS: 1=可 / 0=不可 / NULL=DB名不正等。restore で作られた DB の
         // 権限抜け (model 継承が効かない) をここで検知する
         let stream = conn
-            .simple_query(
-                "SELECT name, HAS_DBACCESS(name) FROM sys.databases \
-                 WHERE name LIKE 'KYDATA%' ORDER BY name",
-            )
+            .simple_query(DATABASES_WITH_ACCESS_SQL)
             .await
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         let rows = stream
@@ -230,7 +224,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         // HAS_DBACCESS 無し = sys.databases のメタデータだけ読む (どの DB も開かず
         // ミリ秒で返る)。消費側 (D1 リスト) の差分更新用
         let stream = conn
-            .simple_query("SELECT name FROM sys.databases WHERE name LIKE 'KYDATA%' ORDER BY name")
+            .simple_query(DATABASE_NAMES_SQL)
             .await
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         let rows = stream
@@ -250,7 +244,7 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         // 素の KCODE を get_str (try_get::<&str>) に渡すと型不一致で Err → 空文字化し、
         // 全社が "" キーに衝突して名前が消える (#86)
         let stream = conn
-            .simple_query("SELECT CAST(KCODE AS varchar(10)), CONAME1 FROM [KYCOMSTD].dbo.SELDATA")
+            .simple_query(COMPANY_NAMES_SQL)
             .await
             .map_err(|e| KyuyoRepoError::QueryError(e.to_string()))?;
         let rows = stream
@@ -269,44 +263,13 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         from: &str,
         to: &str,
     ) -> Result<Vec<RawKyuyoRow>, KyuyoRepoError> {
-        validate_db_name(db)?;
+        // DB 名の再検証 (defense in depth) を含む。MONEY00..79 / KINDATA の列名は SQL 側で生成済み
+        let query = payroll_month_sql(db).map_err(KyuyoRepoError::QueryError)?;
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
-
-        // MONEY00..79 の 80 列は列名を code 側で生成 (T-SQL に動的列は無い)。
-        // 全カラム NOT NULL (Btrieve 由来スキーマ) だが念のため ISNULL する。
-        let money_select: String = (0..MONEY_COLUMNS)
-            .map(|n| format!("CAST(ISNULL(k.MONEY{n:02}, 0) AS int)"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // 勤怠系は別の列 (KINDATA0000, KINDATA0100, .., KINDATA1600 の 17 列・100 刻み)。
-        // 項目番号 001〜017 で、MONEY (018〜097) とは項目帯そのものが違う (Refs #103)
-        let kindata_select: String = (0..KINDATA_COLUMNS)
-            .map(|n| format!("CAST(ISNULL(k.KINDATA{n:02}00, 0) AS int)"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // 日付は CONVERT(varchar(10), _, 120) = "YYYY-MM-DD" (2008 互換) に寄せて
-        // tiberius の型差 (datetime/smalldatetime) を吸収する。月の特定は固定式でなく
-        // CHINGINKIKANST の範囲照合 (#83 レビュー結論: 月内複数支給・欠月に強い)
-        let query = format!(
-            "SELECT CAST(k.SHAIN AS int), CAST(k.[MONTH] AS int), \
-             CONVERT(varchar(10), k.SHIKYUBI, 120), \
-             CONVERT(varchar(10), k.CHINGINKIKANST, 120), \
-             CONVERT(varchar(10), k.CHINGINKIKANEN, 120), \
-             s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
-             ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), \
-             {money_select}, {kindata_select} \
-             FROM [{db}].dbo.KYUYO k \
-             JOIN [{db}].dbo.SHAIN1 s1 ON s1.INCODE = k.SHAIN \
-             LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = k.SHOZOKU \
-             WHERE k.CHINGINKIKANST >= @P1 AND k.CHINGINKIKANST < @P2 \
-             ORDER BY k.SHAIN, k.[MONTH]"
-        );
 
         let stream = conn
             .query(&query, &[&from, &to])
@@ -341,41 +304,13 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
     }
 
     async fn employees(&self, db: &str) -> Result<Vec<RawEmployeeRow>, KyuyoRepoError> {
-        validate_db_name(db)?;
+        // 社員マスタ直読み (KYUYO は経由しない、金額列には触れない)。列の意味は kyuyo_logic::sql
+        let query = employees_sql(db).map_err(KyuyoRepoError::QueryError)?;
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
-
-        // 社員マスタ直読み — 給与明細 (KYUYO) は経由しない。所属は SHAIN1.SHOZOKU が
-        // 持つ (docs/kyuyo-daijin-schema.md の社員マスタ節)。金額列には触れない。
-        // INCODE/TAIKEI は実列型が int とは限らないので CAST する (KAZEI/MEISAI で
-        // 同じ罠を踏み、payments が全件空になった — Refs #95)
-        //
-        // 給与区分 (KKUBUN) は **SHAIN3** にあり、SHOZOKU.TAIKEI とは独立した軸
-        // (Refs #101)。同じ TAIKEI=1 (乗務員) でも月給/日給/時給が混在し、TAIKEI=2
-        // (事務員) にも時給者がいるので、TAIKEI から給与区分を推定してはいけない。
-        //
-        // 入社日/退社日は **SHAIN2** (DAYNYU/DAYTAI、どちらも datetime)。SHAIN1 では
-        // ない — docs/kyuyo-daijin-schema.md が SHAIN1 の 23 列中 6 列しか書いておらず
-        // SHAIN2〜8 を「未調査」としているため、給与大臣に無いと誤読しやすい
-        // (2026-07-26 に実データ 15 件で確定)。日付は他のルートと同じく
-        // CONVERT(varchar(10), _, 120) で "YYYY-MM-DD" に寄せる (SQL 2008 互換)。
-        let query = format!(
-            "SELECT s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
-             ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), \
-             CAST(ISNULL(sz.INCODE, 0) AS int), ISNULL(sz.NAME1, ''), ISNULL(sz.NAME2, ''), \
-             CAST(ISNULL(s3.KKUBUN, 0) AS int), \
-             ISNULL(CONVERT(varchar(10), s2.DAYNYU, 120), ''), \
-             ISNULL(CONVERT(varchar(10), s2.DAYTAI, 120), ''), \
-             CAST(ISNULL(s2.TAIKBN, 0) AS int) \
-             FROM [{db}].dbo.SHAIN1 s1 \
-             LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = s1.SHOZOKU \
-             LEFT JOIN [{db}].dbo.SHAIN3 s3 ON s3.INCODE = s1.INCODE \
-             LEFT JOIN [{db}].dbo.SHAIN2 s2 ON s2.INCODE = s1.INCODE \
-             ORDER BY s1.CODE"
-        );
 
         let stream = conn
             .simple_query(&query)
@@ -406,21 +341,13 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
     }
 
     async fn koumoku(&self, db: &str) -> Result<Vec<RawKoumokuRow>, KyuyoRepoError> {
-        validate_db_name(db)?;
+        // KAZEI/MEISAI/GENGAKU は CAST 済み (素のままだと 0 に化ける、#95)
+        let query = koumoku_sql(db).map_err(KyuyoRepoError::QueryError)?;
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
-        // KAZEI/MEISAI/GENGAKU は実列型が int ではない (smallint 等) ので CAST して渡す。
-        // 素で try_get::<i32> すると型不一致で Err → unwrap_or(0) が効き、全項目が
-        // kazei=0 (控除) / meisai≠1 (単価除外が効かない) に化ける。KCODE (#86) と
-        // 同じ罠で、本番では payments が全件空・単価が deductions に混入していた
-        let query = format!(
-            "SELECT TAIKEIKOUNO, NAME, CAST(ISNULL(KAZEI, 0) AS int), \
-             CAST(ISNULL(MEISAI, 0) AS int), CAST(ISNULL(GENGAKU, 0) AS int) \
-             FROM [{db}].dbo.KOUMOKU"
-        );
         let stream = conn
             .simple_query(&query)
             .await
@@ -446,28 +373,14 @@ impl KyuyoRepo for TiberiusKyuyoRepo {
         db: &str,
         month_index: i32,
     ) -> Result<Vec<RawShukeiRow>, KyuyoRepoError> {
-        validate_db_name(db)?;
-        if !(0..=MAX_MONTH_INDEX).contains(&month_index) {
-            return Err(KyuyoRepoError::QueryError(format!(
-                "invalid month index: {month_index}"
-            )));
-        }
+        // DB 名と支給回インデックス (0..=MAX_MONTH_INDEX) の検証を含む
+        let query = shukei_totals_sql(db, month_index).map_err(KyuyoRepoError::QueryError)?;
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|e| KyuyoRepoError::PoolError(e.to_string()))?;
 
-        // SHUKEI1 は支給回インデックスが列名に埋まっている (SOSHIKYU00..21 等) ため、
-        // 検証済み index から列名を組み立てる
-        let nn = format!("{month_index:02}");
-        let query = format!(
-            "SELECT CAST(SHAIN AS int), \
-             CAST(ISNULL(SOSHIKYU{nn}, 0) AS int), CAST(ISNULL(KAZEI{nn}, 0) AS int), \
-             CAST(ISNULL(HOKEN{nn}, 0) AS int), CAST(ISNULL(ZEI{nn}, 0) AS int), \
-             CAST(ISNULL(SHOKOUJO{nn}, 0) AS int) \
-             FROM [{db}].dbo.SHUKEI1"
-        );
         let stream = conn
             .simple_query(&query)
             .await

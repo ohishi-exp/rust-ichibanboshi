@@ -51,11 +51,6 @@ pub fn server_error() -> Reply {
     error_reply(503, "server_error")
 }
 
-/// 未実装の口 (501)。
-pub fn not_implemented() -> Reply {
-    error_reply(501, "not_implemented")
-}
-
 /// derived store (DO の SQLite) が読めない (500)。文言はオンプレ版の synced-months と同じ。
 pub fn store_error() -> Reply {
     error_reply(500, "キャッシュ一覧の読み出しに失敗しました")
@@ -162,11 +157,6 @@ mod tests {
         assert_eq!(
             (r.status, r.body.as_str()),
             (503, r#"{"error":"server_error"}"#)
-        );
-        let r = not_implemented();
-        assert_eq!(
-            (r.status, r.body.as_str()),
-            (501, r#"{"error":"not_implemented"}"#)
         );
         let r = store_error();
         assert_eq!(r.status, 500);

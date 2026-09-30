@@ -14,7 +14,10 @@
 
 mod auth;
 mod probe;
+mod repo;
+mod routes;
 mod state;
+mod store;
 mod tcp;
 mod transport;
 

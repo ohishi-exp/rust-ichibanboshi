@@ -44,6 +44,55 @@ pub const PAYROLL_SYNCED_SQL: &str = "SELECT scope, synced_at, row_count FROM ky
                      WHERE scope LIKE 'payroll:%'
                      ORDER BY scope ASC";
 
+// ── 行の読み書き (Worker の DO 用。プレースホルダは `?` の位置指定) ─────────────────────────
+// オンプレ版 (`src/kyuyo/store.rs`、rusqlite の `?1`) と同じ文。DO はこれらを await を挟まずに続けて流すので、
+// 1 回の put の書き込みは暗黙のトランザクションで一度に確定する (オンプレ版の明示トランザクションと同じ効果)。
+
+/// sync_state 1 行 (synced_at, company_name, warnings_json)。引数: scope。
+pub const SYNC_STATE_SELECT_SQL: &str =
+    "SELECT synced_at, company_name, warnings_json FROM kyuyo_sync_state WHERE scope = ?";
+
+/// sync_state 1 行を消す。put が途中で失敗したとき、行の欠けた scope を命中させないために流す。引数: scope。
+pub const SYNC_STATE_DELETE_SQL: &str = "DELETE FROM kyuyo_sync_state WHERE scope = ?";
+
+/// 給与明細の row_json (応答配列の順)。引数: company, month。
+pub const PAYROLL_ROWS_SQL: &str =
+    "SELECT row_json FROM kyuyo_payroll WHERE company = ? AND month = ? ORDER BY seq ASC";
+
+/// 給与明細を消す (put の最初)。引数: company, month。
+pub const PAYROLL_DELETE_SQL: &str = "DELETE FROM kyuyo_payroll WHERE company = ? AND month = ?";
+
+/// 給与明細 1 行。引数: company, month, seq, row_json。
+pub const PAYROLL_INSERT_SQL: &str =
+    "INSERT INTO kyuyo_payroll (company, month, seq, row_json) VALUES (?, ?, ?, ?)";
+
+/// 給与明細の sync_state (company_name は使わないので '' のまま)。引数: scope, synced_at, row_count, warnings_json。
+pub const PAYROLL_SYNC_STATE_UPSERT_SQL: &str =
+    "INSERT INTO kyuyo_sync_state (scope, synced_at, row_count, company_name, warnings_json) \
+     VALUES (?, ?, ?, '', ?) \
+     ON CONFLICT (scope) DO UPDATE SET synced_at = excluded.synced_at, \
+     row_count = excluded.row_count, warnings_json = excluded.warnings_json";
+
+/// 社員マスタの row_json (応答配列の順)。引数: company, nendo。
+pub const EMPLOYEES_ROWS_SQL: &str =
+    "SELECT row_json FROM kyuyo_employees WHERE company = ? AND nendo = ? ORDER BY seq ASC";
+
+/// 社員マスタを消す (put の最初)。引数: company, nendo。
+pub const EMPLOYEES_DELETE_SQL: &str =
+    "DELETE FROM kyuyo_employees WHERE company = ? AND nendo = ?";
+
+/// 社員マスタ 1 行。引数: company, nendo, seq, row_json。
+pub const EMPLOYEES_INSERT_SQL: &str =
+    "INSERT INTO kyuyo_employees (company, nendo, seq, row_json) VALUES (?, ?, ?, ?)";
+
+/// 社員マスタの sync_state。引数: scope, synced_at, row_count, company_name, warnings_json。
+pub const EMPLOYEES_SYNC_STATE_UPSERT_SQL: &str =
+    "INSERT INTO kyuyo_sync_state (scope, synced_at, row_count, company_name, warnings_json) \
+     VALUES (?, ?, ?, ?, ?) \
+     ON CONFLICT (scope) DO UPDATE SET synced_at = excluded.synced_at, \
+     row_count = excluded.row_count, company_name = excluded.company_name, \
+     warnings_json = excluded.warnings_json";
+
 /// 給与明細 (会社×月) の sync_state の鍵。
 pub fn payroll_scope(company: &str, month: &str) -> String {
     format!("payroll:{company}:{month}")
@@ -96,6 +145,32 @@ mod tests {
     fn parse_rejects_short() {
         assert_eq!(parse_payroll_scope("payroll"), None);
         assert_eq!(parse_payroll_scope("payroll:0100"), None);
+    }
+
+    #[test]
+    fn row_statements() {
+        let cases = [
+            (SYNC_STATE_SELECT_SQL, "kyuyo_sync_state", 1),
+            (SYNC_STATE_DELETE_SQL, "kyuyo_sync_state", 1),
+            (PAYROLL_ROWS_SQL, "kyuyo_payroll", 2),
+            (PAYROLL_DELETE_SQL, "kyuyo_payroll", 2),
+            (PAYROLL_INSERT_SQL, "kyuyo_payroll", 4),
+            (PAYROLL_SYNC_STATE_UPSERT_SQL, "kyuyo_sync_state", 4),
+            (EMPLOYEES_ROWS_SQL, "kyuyo_employees", 2),
+            (EMPLOYEES_DELETE_SQL, "kyuyo_employees", 2),
+            (EMPLOYEES_INSERT_SQL, "kyuyo_employees", 4),
+            (EMPLOYEES_SYNC_STATE_UPSERT_SQL, "kyuyo_sync_state", 5),
+        ];
+        for (sql, table, params) in cases {
+            assert!(sql.contains(table), "{sql}");
+            assert_eq!(sql.matches('?').count(), params, "{sql}");
+            assert!(!sql.contains("  ") && !sql.contains('\n'), "{sql}");
+        }
+        assert!(PAYROLL_ROWS_SQL.ends_with("ORDER BY seq ASC"));
+        assert!(EMPLOYEES_ROWS_SQL.ends_with("ORDER BY seq ASC"));
+        // payroll の upsert は company_name を触らない。employees は上書きする
+        assert!(!PAYROLL_SYNC_STATE_UPSERT_SQL.contains("company_name = excluded"));
+        assert!(EMPLOYEES_SYNC_STATE_UPSERT_SQL.contains("company_name = excluded.company_name"));
     }
 
     #[test]

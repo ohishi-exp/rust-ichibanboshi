@@ -13,6 +13,8 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+# synced_at (RFC3339) を作るだけ。tiberius の chrono feature と同じ crate
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 js-sys = "0.3"
 kyuyo-logic = { path = "../logic" }
