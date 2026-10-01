@@ -826,7 +826,7 @@ async fn compare_view_keeps_a_non_zero_run_gap() {
 #[tokio::test]
 async fn compare_view_keeps_ferry_on_parts_of_an_overnight_shift() {
     // 日跨ぎ勤務のフェリー控除は parts 側が正 — 突合は parts だけで暦日合算する
-    // (実測 1714 井上 03-15: 14:12→翌00:49 の勤務でフェリー 75 分が落ちていた)
+    // (実測 ある乗務員 03-15: 14:12→翌00:49 の勤務でフェリー 75 分が落ちていた)
     let rows = vec![
         tc_of(1714, "2026-06-15 14:12:00", "始業"),
         tc_of(1714, "2026-06-16 00:49:00", "終業"),
@@ -853,7 +853,7 @@ async fn compare_view_keeps_ferry_on_parts_of_an_overnight_shift() {
 
 #[tokio::test]
 async fn compare_view_carries_the_ferry_map_even_when_no_shift_covers_the_day() {
-    // 1026 一瀬 2026-05-01 の形 (Refs nuxt-dtako-admin#501): 前月に始業した勤務だけが
+    // ある乗務員 2026-05-01 の形 (Refs nuxt-dtako-admin#501): 前月に始業した勤務だけが
     // 覆う日のフェリー控除は、当月応答のどの勤務にも貼れずに落ちる。日別マップを
     // そのまま載せ、突合はマップを優先して読む
     let rows = vec![
@@ -906,7 +906,7 @@ async fn compare_view_carries_the_ferry_map_for_all_drivers_too() {
 
 #[tokio::test]
 async fn compare_view_keeps_a_non_zero_punch_tail() {
-    // 日跨ぎ終業の尻尾 (Refs #501、1708 松江 03-13 の形)。0 の日には載せない。
+    // 日跨ぎ終業の尻尾 (Refs #501、ある乗務員 03-13 の形)。0 の日には載せない。
     // 尻尾が 0 時を跨げば内訳 (parts) にも配られる
     let (status, body) = serve(
         vec![
@@ -927,7 +927,7 @@ async fn compare_view_keeps_a_non_zero_punch_tail() {
 
 #[tokio::test]
 async fn compare_view_keeps_a_non_zero_punch_head() {
-    // 日跨ぎ始業の頭 (Refs #501、1108 福留 03-05 の形)。頭は 0 時を跨ぐので
+    // 日跨ぎ始業の頭 (Refs #501、ある乗務員 03-05 の形)。頭は 0 時を跨ぐので
     // 内訳 (parts) にも配られる。0 の日には載せない
     let (status, body) = serve(
         vec![
@@ -947,7 +947,7 @@ async fn compare_view_keeps_a_non_zero_punch_head() {
 
 #[tokio::test]
 async fn compare_view_keeps_a_non_zero_run_head() {
-    // 始業前の運行の頭 (Refs #501、1026 一瀬の形)。0 の日には載せない
+    // 始業前の運行の頭 (Refs #501、ある乗務員の形)。0 の日には載せない
     let (status, body) = serve(
         vec![
             dtako("2026-06-11 23:50:00", "運行開始", "u1"),
@@ -967,7 +967,7 @@ async fn compare_view_keeps_a_non_zero_run_head() {
 
 #[tokio::test]
 async fn compare_view_keeps_a_non_zero_lunch_overlap() {
-    // 昼休の窓との重なり (Refs #501、1714 井上 03-04 の形)。日跨ぎの対は
+    // 昼休の窓との重なり (Refs #501、ある乗務員 03-04 の形)。日跨ぎの対は
     // 両日の窓が内訳 (parts) に配られる。0 の日には載せない
     let (status, body) = serve(
         vec![
@@ -1153,7 +1153,7 @@ async fn compare_view_carries_the_paper_drift() {
 
 #[tokio::test]
 async fn compare_view_carries_the_paper_outside_map() {
-    // 終業打刻の後の構内ミニ運行 (1018 金原 2026-03-03 の形、Refs #182) は紙だけが
+    // 終業打刻の後の構内ミニ運行 (ある乗務員 2026-03-03 の形、Refs #182) は紙だけが
     // 数える — その実額 (digi 1 分 + 継ぎ目 5 分) を `paper_outside_by_date` として
     // 載せる。単一乗務員と全乗務員の両経路で同じ値になること
     let with_driver = |mut v: serde_json::Value| {
@@ -1247,7 +1247,7 @@ async fn compare_view_carries_the_gap_midnight_map() {
 
 #[tokio::test]
 async fn paper_drift_counts_duplicate_rows_the_way_the_paper_does() {
-    // 取り込み 2 回で全列同一の行が入ると**紙は二重計上する** (実測 1339 渡邊
+    // 取り込み 2 回で全列同一の行が入ると**紙は二重計上する** (実測 ある乗務員
     // 2026-04-04)。再現は重複除去の**前**の行で計算しないと drift が 0 になり
     // 差が unknown に残る。こちらの拘束は除去後 (540) のまま
     let rows = vec![
