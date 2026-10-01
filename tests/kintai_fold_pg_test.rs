@@ -49,7 +49,14 @@ async fn store() -> Option<(KintaiPgStore, sqlx::PgPool)> {
 /// **この harness では飛ばしてよい** — 用意するのは `kintai` スキーマで、資格情報は
 /// スキーマではない。詳細は `kintai_push_pg_test.rs` の同名関数。
 fn needs_psql_variables(sql: &str) -> bool {
-    sql.contains(":'") || sql.contains(":\"")
+    // 引用符の中が識別子のもの (`:'name'` / `:"name"`) だけを変数と見る。009 のコメントに
+    // 在る JSON の例 (`"start":"YYYY-…"`) を変数と読むと、009 が当たらず列が欠ける
+    let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    [":'", ":\""].iter().any(|open| {
+        sql.match_indices(open)
+            .map(|(i, _)| &sql[i + 2..])
+            .any(|rest| rest.find(&open[1..]).is_some_and(|n| ident(&rest[..n])))
+    })
 }
 
 async fn ensure_schema(pool: &sqlx::PgPool) {
@@ -876,6 +883,51 @@ async fn changing_the_input_rewrites_the_folded_rows() {
     );
 }
 
+/// **実働でない区間が `non_working` (009) に入り、畳み直すと入れ替わる**
+/// (Refs ohishi-exp/nuxt-dtako-admin#1133)。区間なしは NULL ではなく `[]`。
+#[tokio::test]
+async fn non_working_is_stored_per_shift_and_replaced_by_a_refold() {
+    let (store, pool) = require_db!();
+    let non_working = || async {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT non_working FROM kintai.day_summaries WHERE tenant_id = $1 \
+              ORDER BY shift_start_at",
+        )
+        .bind(store.tenant_id())
+        .fetch_all(&pool)
+        .await
+        .expect("non_working")
+    };
+    let lunch =
+        |end: &str| json!([{"start": "2026-07-18 12:00:00", "end": end, "kind": "lunch_window"}]);
+    // 1 本目は昼の窓に掛かる (運行なし)。2 本目は 4 時間で昼にも掛からない = 区間なし
+    let stub = std::sync::Arc::new(StubRepo::new(vec![
+        punch("2026-07-18 08:00:00", "始業"),
+        punch("2026-07-18 18:00:00", "終業"),
+        punch("2026-07-19 14:00:00", "始業"),
+        punch("2026-07-19 18:00:00", "終業"),
+    ]));
+    let repo: DynKintaiEventsRepo = stub.clone();
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
+        .await
+        .expect("1st");
+    let want = vec![Some(lunch("2026-07-18 13:00:00")), Some(json!([]))];
+    assert_eq!(non_working().await, want);
+
+    // 1 本目の終業が昼の窓の中へ動く → 区間が勤務で切れた形に入れ替わる
+    *stub.rows.lock().unwrap() = vec![
+        punch("2026-07-18 08:00:00", "始業"),
+        punch("2026-07-18 12:30:00", "終業"),
+        punch("2026-07-19 14:00:00", "始業"),
+        punch("2026-07-19 18:00:00", "終業"),
+    ];
+    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
+        .await
+        .expect("2nd");
+    let want = vec![Some(lunch("2026-07-18 12:30:00")), Some(json!([]))];
+    assert_eq!(non_working().await, want);
+}
+
 /// **勤務を消すと `day_summaries` / `day_parts` も消える** (002 の FK CASCADE)。
 ///
 /// 残ると月合計に二重に載る。
@@ -1050,6 +1102,7 @@ async fn write_unit_survives_crossing_the_insert_chunk() {
             night_minutes: 0,
             overtime_night_minutes: 0,
             legal_holiday_night_minutes: 0,
+            non_working: Vec::new(),
         });
         unit.day_parts.push(DayPartRow {
             driver_cd: DRIVER as i64,

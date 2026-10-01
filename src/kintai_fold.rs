@@ -100,7 +100,9 @@ use crate::kintai_push::{
 use crate::kintai_repo::{
     exact_month_range, lookback_from, month_range, DynKintaiEventsRepo, KintaiRepoError,
 };
-use crate::kosoku::{daily_summary, drop_duplicate_rows, DaySummary, KosokuParams, ShiftSource};
+use crate::kosoku::{
+    daily_summary, drop_duplicate_rows, DaySummary, KosokuParams, NonWorking, ShiftSource,
+};
 
 /// 乗務員CD → 読みの遡り起点 (`YYYY-MM-DD HH:MM:SS`)。
 /// [`crate::kintai_repo::KintaiEventsApi::fetch_month_head_anchors`] の戻り値。
@@ -159,6 +161,8 @@ pub struct DaySummaryRow {
     pub night_minutes: i64,
     pub overtime_night_minutes: i64,
     pub legal_holiday_night_minutes: i64,
+    /// 実働でない区間 (009 の `non_working`)。区間なしは空 = `[]` を書く (NULL は書かない)。
+    pub non_working: Vec<NonWorking>,
 }
 
 /// `day_parts` 1 行。
@@ -288,6 +292,7 @@ pub fn fold_days(driver_cd: i64, days: &[DaySummary]) -> FoldUnit {
             night_minutes: d.night_minutes,
             overtime_night_minutes: d.overtime_night_minutes,
             legal_holiday_night_minutes: d.legal_holiday_night_minutes,
+            non_working: d.non_working.clone(),
         });
         for p in &d.parts {
             let Some(part_date) = parse_date(&p.date) else {
@@ -591,27 +596,28 @@ SELECT $1, d.driver_cd, d.start_at, d.end_at, d.shift_source, $6, $7
 "#;
 
 /// 入れる日別サマリを **1 文で**。分の列は 11 本あるが全部 `int4` の配列。
+/// `non_working` は行ごとに JSON の配列 1 つ (`jsonb[]` の要素 1 つ = 1 行ぶん)。
 const INSERT_DAY_SUMMARIES_SQL: &str = r#"
 INSERT INTO kintai.day_summaries
        (tenant_id, driver_cd, date, shift_start_at, shift_source,
         restraint_minutes, working_minutes, break_minutes, rest_minus_minutes,
         statutory_minutes, within_statutory_overtime_minutes, overtime_minutes,
         legal_holiday_minutes, night_minutes, overtime_night_minutes,
-        legal_holiday_night_minutes, fingerprint, logic_version)
+        legal_holiday_night_minutes, non_working, fingerprint, logic_version)
 SELECT $1, d.driver_cd, d.date, d.shift_start_at, d.shift_source,
        d.restraint_minutes, d.working_minutes, d.break_minutes, d.rest_minus_minutes,
        d.statutory_minutes, d.within_statutory_overtime_minutes, d.overtime_minutes,
        d.legal_holiday_minutes, d.night_minutes, d.overtime_night_minutes,
-       d.legal_holiday_night_minutes, $17, $18
+       d.legal_holiday_night_minutes, d.non_working, $18, $19
   FROM unnest($2::int8[], $3::date[], $4::timestamptz[], $5::text[],
               $6::int4[], $7::int4[], $8::int4[], $9::int4[],
               $10::int4[], $11::int4[], $12::int4[],
-              $13::int4[], $14::int4[], $15::int4[], $16::int4[])
+              $13::int4[], $14::int4[], $15::int4[], $16::int4[], $17::jsonb[])
        AS d(driver_cd, date, shift_start_at, shift_source,
             restraint_minutes, working_minutes, break_minutes, rest_minus_minutes,
             statutory_minutes, within_statutory_overtime_minutes, overtime_minutes,
             legal_holiday_minutes, night_minutes, overtime_night_minutes,
-            legal_holiday_night_minutes)
+            legal_holiday_night_minutes, non_working)
 "#;
 
 /// 入れる暦日ビューを **1 文で**。
@@ -871,6 +877,10 @@ pub async fn write_unit(
         let col = |f: fn(&DaySummaryRow) -> i64| -> Vec<i32> {
             chunk.iter().map(|d| f(d) as i32).collect()
         };
+        let non_working: Vec<sqlx::types::Json<&[NonWorking]>> = chunk
+            .iter()
+            .map(|d| sqlx::types::Json(d.non_working.as_slice()))
+            .collect();
         sqlx::query(INSERT_DAY_SUMMARIES_SQL)
             .bind(tenant)
             .bind(&driver)
@@ -888,6 +898,7 @@ pub async fn write_unit(
             .bind(col(|d| d.night_minutes))
             .bind(col(|d| d.overtime_night_minutes))
             .bind(col(|d| d.legal_holiday_night_minutes))
+            .bind(&non_working)
             .bind(fingerprint)
             .bind(version.as_str())
             .execute(&mut *tx)
@@ -1829,6 +1840,7 @@ mod tests {
             punch_head_minutes: 0,
             run_head_minutes: 0,
             lunch_overlap_minutes: 0,
+            non_working: Vec::new(),
         }
     }
 

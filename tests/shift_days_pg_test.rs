@@ -2,7 +2,7 @@
 //! (Refs ohishi-exp/nuxt-dtako-admin#1133)。
 //!
 //! ここでしか確かめられないのは、**3 表の束ね方** (勤務 1 本 = 1 要素、日別サマリの
-//! 突き合わせと `null`、暦日の按分の昇順と 0 行)、**月の境界** (始業の月に出る)、
+//! 突き合わせと `null`、実働でない区間の配列 / `[]` / `null`、暦日の按分の昇順と 0 行)、**月の境界** (始業の月に出る)、
 //! **テナント/乗務員の分離**。どれも実 DB を往復させないと分からない
 //! (`tests/shift_overlaps_pg_test.rs` と同じ理由)。fixture は架空値だけ。
 //!
@@ -35,7 +35,14 @@ fn database_url() -> Option<String> {
 }
 
 fn needs_psql_variables(sql: &str) -> bool {
-    sql.contains(":'") || sql.contains(":\"")
+    // 引用符の中が識別子のもの (`:'name'` / `:"name"`) だけを変数と見る。009 のコメントに
+    // 在る JSON の例 (`"start":"YYYY-…"`) を変数と読むと、009 が当たらず列が欠ける
+    let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    [":'", ":\""].iter().any(|open| {
+        sql.match_indices(open)
+            .map(|(i, _)| &sql[i + 2..])
+            .any(|rest| rest.find(&open[1..]).is_some_and(|n| ident(&rest[..n])))
+    })
 }
 
 fn sorted_migrations() -> Vec<std::path::PathBuf> {
@@ -244,6 +251,8 @@ fn part(date: &str, minutes: [i32; 3]) -> serde_json::Value {
     })
 }
 
+/// 応答の 1 要素。`non_working` は `null` で置く — `insert_day_summary` はこの列を
+/// 書かない (= 列が出来る前に畳んだ行と同じ NULL)。値を持つ行は `with_non_working` で。
 fn item(
     start_at: &str,
     end_at: &str,
@@ -256,8 +265,36 @@ fn item(
         "end_at": end_at,
         "shift_source": shift_source,
         "summary": summary,
+        "non_working": null,
         "parts": parts,
     })
+}
+
+fn with_non_working(mut item: serde_json::Value, v: serde_json::Value) -> serde_json::Value {
+    item["non_working"] = v;
+    item
+}
+
+/// 既に在る `kintai.day_summaries` の行の `non_working` (009) に値を入れる。
+async fn set_non_working(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    driver_cd: i64,
+    shift_start_at: &str,
+    non_working: serde_json::Value,
+) {
+    let done = sqlx::query(
+        "UPDATE kintai.day_summaries SET non_working = $4 \
+          WHERE tenant_id = $1 AND driver_cd = $2 AND shift_start_at = $3",
+    )
+    .bind(tenant)
+    .bind(driver_cd)
+    .bind(jst_at(shift_start_at).expect("shift_start_at"))
+    .bind(non_working)
+    .execute(pool)
+    .await
+    .expect("set non_working");
+    assert_eq!(done.rows_affected(), 1, "日別サマリの行が先に要る");
 }
 
 // 日をまたぐ勤務 (22:10 → 翌 09:05、拘束 655 = 実働 595 + 休憩 60)
@@ -372,6 +409,61 @@ async fn test_shifts_come_back_in_start_order_with_summary_and_parts() {
         }),
         "got: {got}"
     );
+}
+
+// ── 1b. 実働でない区間: 配列 / `[]` / 列が NULL / 日別サマリが無い ─────────────────
+
+#[tokio::test]
+async fn test_non_working_is_the_stored_column_as_is() {
+    let store = require_db!();
+    let t = store.tenant_id();
+    let pool = store.pool();
+
+    // (a) 区間が在る勤務。列の値 (配列) がそのまま出る
+    let spans = serde_json::json!([
+        {"start": "2026-04-06 10:00:00", "end": "2026-04-06 14:00:00", "kind": "rest"},
+        {"start": "2026-04-06 14:00:00", "end": "2026-04-06 14:30:00", "kind": "break_event"},
+    ]);
+    let start_a = "2026-04-06 06:00:00";
+    insert_shift(pool, t, 9001, start_a, "2026-04-06 20:00:00", "timecard").await;
+    insert_day_summary(pool, t, 9001, start_a, "timecard", DAYTIME).await;
+    set_non_working(pool, t, 9001, start_a, spans.clone()).await;
+    // (b) 畳んだが区間が無い勤務 → `[]`
+    let start_b = "2026-04-07 08:00:00";
+    insert_shift(pool, t, 9001, start_b, "2026-04-07 12:00:00", "timecard").await;
+    insert_day_summary(pool, t, 9001, start_b, "timecard", DAYTIME).await;
+    set_non_working(pool, t, 9001, start_b, serde_json::json!([])).await;
+    // (c) 列が出来る前に畳んだ行 (列は NULL) → `null`
+    let start_c = "2026-04-08 08:00:00";
+    insert_shift(pool, t, 9001, start_c, "2026-04-08 17:00:00", "timecard").await;
+    insert_day_summary(pool, t, 9001, start_c, "timecard", DAYTIME).await;
+    // (d) 日別サマリが無い勤務 → `summary` も `non_working` も `null`
+    let start_d = "2026-04-09 08:00:00";
+    insert_shift(pool, t, 9001, start_d, "2026-04-09 17:00:00", "rest").await;
+
+    let got = get(&store, t, "2026-04", "9001").await;
+    // 応答の実物 (架空値)。`cargo test -- --nocapture` で見える
+    println!("{}", serde_json::to_string_pretty(&got).unwrap());
+
+    let daytime = |start: &str, end: &str| item(start, end, "timecard", summary(DAYTIME), vec![]);
+    let null = serde_json::Value::Null;
+    assert_eq!(
+        got["items"],
+        serde_json::json!([
+            with_non_working(daytime(start_a, "2026-04-06 20:00:00"), spans),
+            with_non_working(
+                daytime(start_b, "2026-04-07 12:00:00"),
+                serde_json::json!([])
+            ),
+            daytime(start_c, "2026-04-08 17:00:00"),
+            item(start_d, "2026-04-09 17:00:00", "rest", null, vec![]),
+        ]),
+        "got: {got}"
+    );
+    // `[]` と `null` を取り違えない (区間なし ≠ まだ畳み直していない)
+    assert!(got["items"][1]["non_working"].is_array());
+    assert!(got["items"][2]["non_working"].is_null());
+    assert!(got["items"][3]["non_working"].is_null());
 }
 
 // ── 2. 月の境界: 勤務は始業 (JST) の月に出る ───────────────────────────────────

@@ -294,6 +294,30 @@ pub struct Punch {
     pub state: String,
 }
 
+/// 実働でない区間の種別 ([`NonWorking::kind`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonWorkingKind {
+    /// 勤務の中に残った休息 ([`DaySummary::rest_minus_minutes`] の区間)。
+    Rest,
+    /// デジタコの休憩イベント ([`breaks_in`])。**実際の時刻**。
+    BreakEvent,
+    /// 運行に出ていない勤務の昼休憩の窓 ([`lunch_windows`])。勤怠の規則による推定。
+    LunchWindow,
+    /// 昼の窓に掛からない勤務のまん中に置く休憩 ([`off_hours_break`])。同じく推定。
+    OffHours,
+}
+
+/// 勤務の中の**実働でない区間** 1 つ (Refs ohishi-exp/nuxt-dtako-admin#1133)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NonWorking {
+    /// 区間の始まり (`YYYY-MM-DD HH:MM:SS`、秒は常に 0)。
+    pub start: String,
+    /// 区間の終わり (同じ書式。この時刻は含まない)。
+    pub end: String,
+    pub kind: NonWorkingKind,
+}
+
 /// 日別サマリ 1 行。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DaySummary {
@@ -418,6 +442,14 @@ pub struct DaySummary {
     /// 数え、紙は拘束から引く。運行のある勤務 ([`has_operation`]) は 0。
     /// 突合が cause `lunch` の実額として使う。拘束は変えない。
     pub lunch_overlap_minutes: i64,
+    /// **実働でない区間** — 始業〜終業のうち実働に数えなかった分 (休息と休憩) を、
+    /// 種別つきで時刻順に並べたもの ([`non_working_spans`]、Refs
+    /// ohishi-exp/nuxt-dtako-admin#1133)。長さの和 = (終業 − 始業) − 実働。
+    ///
+    /// **serde の出力には出さない。** `kosoku-daily` の既定の応答はこの型をそのまま
+    /// 返すので、出すと休憩の時刻の到達面が広がる。保存 (`kintai_fold`) だけが読む。
+    #[serde(skip)]
+    pub non_working: Vec<NonWorking>,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -1539,6 +1571,50 @@ fn add_paper_segment(
     *out.entry(b.date()).or_default() += i64::from(b.hour() * 60 + b.minute());
 }
 
+/// 勤務 (`walk`) のうち、実働の歩きが**通らなかった分**を種別つきの区間にする
+/// (Refs ohishi-exp/nuxt-dtako-admin#1133)。
+///
+/// `intervals` は [`summarize`] が 1 分ずつ歩く区間そのもの。別の区間の列 (休息と
+/// 休憩) から独立に作らない — 休息の終わりが秒つきで直後が休憩のとき、どちらの
+/// 分数にも入らない 1 分が出て、長さの和が (終業 − 始業) − 実働 と合わなくなる。
+///
+/// - 歩きは区間の始まりから 1 分刻みなので、始まり `a` (秒つきになり得る) の区間が
+///   通る分は格子の `[floor_min(a), b)`。終わり `b` は必ず分の格子 — 秒つきの休憩の
+///   始まりは必ず `restraint` の区間の始まりと同じ時刻で、[`subtract_intervals`] の
+///   厳密な不等号が空の区間を出さないため
+/// - 種別は、通らなかった分の**始まりの時刻**が `rests` のどれかに入っていれば
+///   [`NonWorkingKind::Rest`]、入っていなければ `break_kind`。休息の終わりが秒つき
+///   なら、その分は丸ごと休息に入る (終わりが分に切り上がる形)
+/// - `rests` は**捨てた後**のもの (勤務を丸ごと覆う休息は区間に出さない)
+/// - 種別が同じで隣り合う分は 1 つの区間になる (差し引きが割らない)
+fn non_working_spans(
+    walk: &Shift,
+    intervals: &[(NaiveDateTime, NaiveDateTime)],
+    rests: &[(NaiveDateTime, NaiveDateTime)],
+    break_kind: NonWorkingKind,
+) -> Vec<NonWorking> {
+    type Span = (NaiveDateTime, NaiveDateTime);
+    let walked: Vec<Span> = intervals.iter().map(|(s, e)| (floor_min(*s), *e)).collect();
+    let idle = subtract_intervals(&[(walk.start, walk.end)], &walked);
+    let ceil_min = |t: NaiveDateTime| floor_min(t + Duration::seconds(59));
+    let rest_cells: Vec<Span> = rests.iter().map(|(s, e)| (*s, ceil_min(*e))).collect();
+    let breaks = subtract_intervals(&idle, &rest_cells);
+    let rests = subtract_intervals(&idle, &breaks);
+    let tag = |v: Vec<Span>, kind| v.into_iter().map(move |(s, e)| (s, e, kind));
+    let mut out: Vec<(NaiveDateTime, NaiveDateTime, NonWorkingKind)> =
+        tag(rests, NonWorkingKind::Rest)
+            .chain(tag(breaks, break_kind))
+            .collect();
+    out.sort_by_key(|(s, _, _)| *s);
+    out.into_iter()
+        .map(|(s, e, kind)| NonWorking {
+            start: s.format(FMT).to_string(),
+            end: e.format(FMT).to_string(),
+            kind,
+        })
+        .collect()
+}
+
 /// 勤務 1 回を日別サマリへ畳む。
 ///
 /// 実働区間を**時刻順に 1 分ずつ**歩いて、経過実働で所定内 / 法定内残業 / 法定時間外に
@@ -1616,8 +1692,11 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     // 運行に出ていない勤務は昼休憩を引く (ユーザー決定 2026-07-28)。運行中なら
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
     let has_op = has_operation(events, &walk);
-    let breaks = if has_op {
-        breaks_in(events, &walk, p.break_threshold_minutes)
+    let (breaks, break_kind) = if has_op {
+        (
+            breaks_in(events, &walk, p.break_threshold_minutes),
+            NonWorkingKind::BreakEvent,
+        )
     } else {
         // **運行に出ていない勤務にはデジタコの休憩イベントも無い** — 休憩イベントは
         // 運行に紐づいて記録されるので、勤務に重なる休憩が 1 件でもあれば
@@ -1625,9 +1704,9 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
         let lunch = lunch_windows(&walk);
         // 夜勤のように昼の窓へ 1 分も掛からない勤務は、時計の窓では休憩を置けない
         if lunch.is_empty() {
-            off_hours_break(&walk)
+            (off_hours_break(&walk), NonWorkingKind::OffHours)
         } else {
-            lunch
+            (lunch, NonWorkingKind::LunchWindow)
         }
     };
     // 休息の中に入った休憩は二重に引かない (昼休憩の窓が休息に丸ごと重なる場合など)
@@ -1688,6 +1767,7 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
         .map(|(s, e)| (*e - *s).num_minutes())
         .sum();
     let intervals = subtract_intervals(&restraint, &breaks);
+    let non_working = non_working_spans(&walk, &intervals, &rests, break_kind);
     let is_legal_holiday = walk.start.weekday() == Weekday::Sun;
 
     let mut elapsed = 0i64;
@@ -1822,6 +1902,7 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
         night_minutes: night,
         overtime_night_minutes: ot_night,
         legal_holiday_night_minutes: hol_night,
+        non_working,
     }
 }
 
@@ -4746,5 +4827,233 @@ mod tests {
         )[0];
         assert_eq!(d.clone(), *d);
         assert!(format!("{d:?}").contains("2026-06-02"));
+    }
+
+    // --- 実働でない区間 (Refs ohishi-exp/nuxt-dtako-admin#1133) ---
+
+    use NonWorkingKind::{BreakEvent, LunchWindow, OffHours, Rest};
+
+    fn nw(start: &str, end: &str, kind: NonWorkingKind) -> NonWorking {
+        NonWorking {
+            start: start.to_string(),
+            end: end.to_string(),
+            kind,
+        }
+    }
+
+    /// どの入力でも成り立つこと: 分の格子・始まりの昇順・重ならない・勤務の中・
+    /// 長さの和 = (終業 − 始業) − 実働。返すのは (休息の和, 休憩の和)。
+    fn check_non_working(d: &DaySummary) -> (i64, i64) {
+        let (start, end) = (dt(&d.start), dt(&d.end));
+        let (mut prev, mut rest, mut other) = (start, 0, 0);
+        for n in &d.non_working {
+            let (s, e) = (dt(&n.start), dt(&n.end));
+            assert_eq!((s.second(), e.second()), (0, 0), "{n:?}");
+            assert!(prev <= s && s < e && e <= end, "{n:?}");
+            prev = e;
+            if n.kind == Rest {
+                rest += (e - s).num_minutes();
+            } else {
+                other += (e - s).num_minutes();
+            }
+        }
+        assert_eq!(
+            rest + other,
+            (end - start).num_minutes() - d.working_minutes
+        );
+        (rest, other)
+    }
+
+    #[test]
+    fn non_working_spans_follow_the_walk() {
+        // (名前, 行, 期待する区間, どの分数にも入らない分)。日付は架空 (2026-04-06 は月曜)
+        let cases: Vec<(&str, Vec<serde_json::Value>, Vec<NonWorking>, i64)> = vec![
+            (
+                "(1) 運行の在る勤務 — 休憩イベント 2 つ",
+                vec![
+                    tc("2026-04-06 08:00:00", "始業"),
+                    ev("2026-04-06 08:10:00", "2026-04-06 16:50:00", "運転"),
+                    ev("2026-04-06 10:00:00", "2026-04-06 10:30:00", "休憩"),
+                    ev("2026-04-06 14:00:00", "2026-04-06 15:00:00", "休憩"),
+                    tc("2026-04-06 17:00:00", "終業"),
+                ],
+                vec![
+                    nw("2026-04-06 10:00:00", "2026-04-06 10:30:00", BreakEvent),
+                    nw("2026-04-06 14:00:00", "2026-04-06 15:00:00", BreakEvent),
+                ],
+                0,
+            ),
+            (
+                "(2) 打刻の勤務の中に休息が残る + 休憩イベント",
+                vec![
+                    tc("2026-04-06 22:43:00", "始業"),
+                    ev("2026-04-07 00:42:00", "2026-04-07 07:24:00", "休息"),
+                    ev("2026-04-07 07:26:00", "2026-04-07 08:29:00", "休憩"),
+                    ev("2026-04-07 10:33:00", "2026-04-07 11:09:00", "休憩"),
+                    tc("2026-04-07 16:52:00", "終業"),
+                ],
+                vec![
+                    nw("2026-04-07 00:42:00", "2026-04-07 07:24:00", Rest),
+                    nw("2026-04-07 07:26:00", "2026-04-07 08:29:00", BreakEvent),
+                    nw("2026-04-07 10:33:00", "2026-04-07 11:09:00", BreakEvent),
+                ],
+                0,
+            ),
+            (
+                "(3) 運行の無い勤務 — 2 暦日にまたがり昼の窓が 2 つ (端は勤務で切れる)",
+                vec![
+                    tc("2026-04-06 12:30:00", "始業"),
+                    tc("2026-04-07 12:30:00", "終業"),
+                ],
+                vec![
+                    nw("2026-04-06 12:30:00", "2026-04-06 13:00:00", LunchWindow),
+                    nw("2026-04-07 12:00:00", "2026-04-07 12:30:00", LunchWindow),
+                ],
+                0,
+            ),
+            (
+                "(4) 運行の無い夜勤 — まん中に置く 1 時間",
+                vec![
+                    tc("2026-04-06 23:45:00", "始業"),
+                    tc("2026-04-07 08:00:00", "終業"),
+                ],
+                vec![nw("2026-04-07 03:22:00", "2026-04-07 04:22:00", OffHours)],
+                0,
+            ),
+            (
+                "(5) 休憩なし",
+                vec![
+                    tc("2026-04-06 08:00:00", "始業"),
+                    ev("2026-04-06 08:10:00", "2026-04-06 11:00:00", "運転"),
+                    tc("2026-04-06 12:00:00", "終業"),
+                ],
+                vec![],
+                0,
+            ),
+            (
+                "(6) 休息の終わりが運行開始の秒つきの時刻に付け替わり、直後が実働",
+                vec![
+                    tc("2026-04-06 06:00:00", "始業"),
+                    ev("2026-04-06 06:30:00", "2026-04-06 18:00:00", "休息"),
+                    dtako("2026-04-06 09:37:20", "運行開始"),
+                    ev("2026-04-06 09:37:20", "2026-04-06 17:00:00", "運転"),
+                    tc("2026-04-06 20:00:00", "終業"),
+                ],
+                // 歩きは 09:37:20 から始まり 09:37 の分を数える — 休息の区間は 09:37 まで
+                vec![nw("2026-04-06 06:30:00", "2026-04-06 09:37:00", Rest)],
+                0,
+            ),
+            (
+                "(7) 同じく直後が休憩 — 09:37 の 1 分は休息に入る",
+                vec![
+                    tc("2026-04-06 06:00:00", "始業"),
+                    ev("2026-04-06 06:30:00", "2026-04-06 18:00:00", "休息"),
+                    dtako("2026-04-06 09:37:20", "運行開始"),
+                    ev("2026-04-06 09:20:00", "2026-04-06 10:00:00", "休憩"),
+                    tc("2026-04-06 20:00:00", "終業"),
+                ],
+                vec![
+                    nw("2026-04-06 06:30:00", "2026-04-06 09:38:00", Rest),
+                    nw("2026-04-06 09:38:00", "2026-04-06 10:00:00", BreakEvent),
+                ],
+                // 休息 187 分 + 休憩 22 分 (09:37:20 → 10:00 の切り捨て) に対し、歩いて
+                // いないのは 210 分。休息と休憩の列から独立に作ると、この 1 分が合わない
+                1,
+            ),
+            (
+                "(8) 休息が勤務を丸ごと覆う — 捨てた休息は区間に出ない",
+                vec![
+                    tc("2026-04-06 06:00:00", "始業"),
+                    ev("2026-04-06 06:00:00", "2026-04-08 06:00:00", "休息"),
+                    tc("2026-04-08 06:00:00", "終業"),
+                ],
+                vec![
+                    nw("2026-04-06 12:00:00", "2026-04-06 13:00:00", LunchWindow),
+                    nw("2026-04-07 12:00:00", "2026-04-07 13:00:00", LunchWindow),
+                ],
+                0,
+            ),
+            (
+                "(9) 休憩が休息の中に入り差し引かれる — 隣り合っても種別が違えば別の区間",
+                vec![
+                    tc("2026-04-06 06:00:00", "始業"),
+                    ev("2026-04-06 10:00:00", "2026-04-06 14:00:00", "休息"),
+                    ev("2026-04-06 12:00:00", "2026-04-06 13:00:00", "休憩"),
+                    ev("2026-04-06 13:30:00", "2026-04-06 14:30:00", "休憩"),
+                    tc("2026-04-06 20:00:00", "終業"),
+                ],
+                vec![
+                    nw("2026-04-06 10:00:00", "2026-04-06 14:00:00", Rest),
+                    nw("2026-04-06 14:00:00", "2026-04-06 14:30:00", BreakEvent),
+                ],
+                0,
+            ),
+        ];
+        for (name, rows, want, uncounted) in cases {
+            let days = daily_summary(&rows, "2026-04", &KosokuParams::default());
+            assert_eq!(days.len(), 1, "{name}");
+            let d = &days[0];
+            assert_eq!(d.non_working, want, "{name}");
+            let (rest, other) = check_non_working(d);
+            let counted = d.rest_minus_minutes + d.break_minutes;
+            assert_eq!(rest + other - counted, uncounted, "{name}");
+            // どの分数にも入らない分が無ければ、種別ごとの和も既存の分数と一致する
+            if uncounted == 0 {
+                assert_eq!((rest, other), (d.rest_minus_minutes, d.break_minutes));
+            }
+        }
+    }
+
+    #[test]
+    fn non_working_holds_under_every_rounding_mode() {
+        // 丸めのモードは拘束の落とし方だけを変える — 区間は walk から出すので同じ
+        let rows = vec![
+            tc("2026-04-06 08:00:30", "始業"),
+            ev("2026-04-06 08:10:00", "2026-04-06 16:50:00", "運転"),
+            ev("2026-04-06 10:00:10", "2026-04-06 10:30:50", "休憩"),
+            tc("2026-04-06 17:00:20", "終業"),
+        ];
+        let want = vec![nw("2026-04-06 10:00:00", "2026-04-06 10:30:00", BreakEvent)];
+        for restraint_rounding in [
+            RestraintRounding::PaperPerSegment,
+            RestraintRounding::TruncateElapsed,
+            RestraintRounding::FloorEndpoints,
+        ] {
+            let p = KosokuParams {
+                restraint_rounding,
+                ..KosokuParams::default()
+            };
+            let d = &daily_summary(&rows, "2026-04", &p)[0];
+            assert_eq!(d.non_working, want, "{restraint_rounding:?}");
+            check_non_working(d);
+        }
+    }
+
+    #[test]
+    fn non_working_is_kept_out_of_the_serialized_day() {
+        // `kosoku-daily` の既定の応答は `DaySummary` を serde でそのまま返す。
+        // 休憩の時刻をそこへ出さない (出すのは保存値を読む `shift-days` だけ)
+        let rows = vec![
+            tc("2026-04-06 09:00:00", "始業"),
+            tc("2026-04-06 18:00:00", "終業"),
+        ];
+        let d = &daily_summary(&rows, "2026-04", &KosokuParams::default())[0];
+        assert_eq!(d.non_working.len(), 1);
+        let v = serde_json::to_value(d).unwrap();
+        assert!(v.get("non_working").is_none());
+        assert_eq!(v["break_minutes"], 60);
+    }
+
+    #[test]
+    fn non_working_serializes_with_snake_case_kinds() {
+        // 保存 (`kintai.day_summaries.non_working`) と `shift-days` が返す形そのもの
+        let n = nw("2026-04-06 12:00:00", "2026-04-06 13:00:00", LunchWindow);
+        let want = json!({"start": "2026-04-06 12:00:00", "end": "2026-04-06 13:00:00", "kind": "lunch_window"});
+        assert_eq!(serde_json::to_value(&n).unwrap(), want);
+        let kinds = [Rest, BreakEvent, LunchWindow, OffHours];
+        let want = json!(["rest", "break_event", "lunch_window", "off_hours"]);
+        assert_eq!(serde_json::to_value(kinds).unwrap(), want);
+        assert_eq!(n.clone(), n);
+        assert!(format!("{n:?}").contains("LunchWindow"));
     }
 }
