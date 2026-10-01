@@ -91,7 +91,10 @@ async fn ensure_schema(pool: &sqlx::PgPool) {
 fn needs_psql_variables(sql: &str) -> bool {
     // 引用符の中が識別子のもの (`:'name'` / `:"name"`) だけを変数と見る。009 のコメントに
     // 在る JSON の例 (`"start":"YYYY-…"`) を変数と読むと、009 が当たらず列が欠ける
-    let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let ident = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
     [":'", ":\""].iter().any(|open| {
         sql.match_indices(open)
             .map(|(i, _)| &sql[i + 2..])

@@ -37,12 +37,39 @@ fn database_url() -> Option<String> {
 fn needs_psql_variables(sql: &str) -> bool {
     // 引用符の中が識別子のもの (`:'name'` / `:"name"`) だけを変数と見る。009 のコメントに
     // 在る JSON の例 (`"start":"YYYY-…"`) を変数と読むと、009 が当たらず列が欠ける
-    let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let ident = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
     [":'", ":\""].iter().any(|open| {
         sql.match_indices(open)
             .map(|(i, _)| &sql[i + 2..])
             .any(|rest| rest.find(&open[1..]).is_some_and(|n| ident(&rest[..n])))
     })
+}
+
+/// 判定の担保 (DB 不要)。同じ関数が `tests/` の 12 ファイルに同じ形で在り、スキーマは最初に
+/// 走った test binary が作るので、ここが崩れると 009 の列が全部の pg テストから欠ける。
+#[test]
+fn test_only_real_psql_variables_make_a_migration_skip() {
+    let read = |name: &str| std::fs::read_to_string(format!("migrations/{name}")).expect("read");
+    // 003 は本物の psql の変数 (`:'name'`) を使う → 飛ばす
+    assert!(needs_psql_variables("WITH PASSWORD :'some_password';"));
+    assert!(needs_psql_variables("SELECT :\"some_name\""));
+    assert!(needs_psql_variables(&read(
+        "003_kintai_writer_password.sql"
+    )));
+    // 009 はコメントに JSON の例を持つだけ (`:"` の直後が識別子ではない) → 当てる
+    assert!(!needs_psql_variables(
+        "-- [{\"start\":\"YYYY-MM-DD HH24:MI:SS\",\"end\":\"…\"}]"
+    ));
+    assert!(!needs_psql_variables(&read(
+        "009_day_summaries_non_working.sql"
+    )));
+    // 型キャスト・閉じない引用符・空の名前は変数ではない
+    assert!(!needs_psql_variables(
+        "SELECT '[]'::jsonb, 'a:''b', ':\"', :'' , :'9x'"
+    ));
 }
 
 fn sorted_migrations() -> Vec<std::path::PathBuf> {
