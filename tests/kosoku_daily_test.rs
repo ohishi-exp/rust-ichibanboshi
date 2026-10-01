@@ -1649,3 +1649,28 @@ async fn bulk_reads_once_from_the_earliest_anchor() {
         .unwrap_or(json!([]));
     assert_eq!(days, json!([]), "7/1 始業の余分な勤務が無い");
 }
+
+// --- 実働でない区間は出さない (Refs ohishi-exp/nuxt-dtako-admin#1133) ---
+
+/// **既定の応答に `non_working` (休憩・休息の時刻) を出さない** — 1 名の版も全乗務員の
+/// 版も。既定の応答は `DaySummary` を serde でそのまま返すので、欄の `#[serde(skip)]` を
+/// 外すとここが落ちる。区間を返すのは保存値を読む `shift-days` だけ。
+#[tokio::test]
+async fn the_default_view_never_carries_non_working() {
+    // 昼の窓に掛かる勤務 = 区間が 1 つ在る (空だから出ない、ではないことを担保する)
+    let rows = || {
+        vec![
+            tc_of(9001, "2026-04-06 09:00:00", "始業"),
+            tc_of(9001, "2026-04-06 18:00:00", "終業"),
+        ]
+    };
+    let (status, one) = serve(rows(), "/api/kintai/kosoku-daily?month=2026-04&driver=9001").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, all) = serve(rows(), "/api/kintai/kosoku-daily?month=2026-04").await;
+    assert_eq!(status, StatusCode::OK);
+    for day in [&one["days"][0], &all["drivers"][0]["days"][0]] {
+        assert_eq!(day["break_minutes"], 60, "{day}");
+        assert!(day.get("non_working").is_none(), "{day}");
+        assert!(!day.to_string().contains("lunch_window"), "{day}");
+    }
+}

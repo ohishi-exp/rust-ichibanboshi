@@ -65,6 +65,22 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
   前月末に始業した勤務は前月を読む。`parts[].night_minutes` は所定内・法定内残業ぶんの
   深夜だけ。テナントは設定 pin (`shift_overlaps.rs` の `store` / `read_tenant_of` /
   `month_bounds` を共有)。ファイル名を `kintai` / `kosoku` で始めない (`logic_version`)
+  - **`non_working` = 勤務の中の実働でない区間** (`kintai.day_summaries.non_working`、009 の
+    JSONB をそのまま返す)。`[{start, end, kind}]`、分の格子・始まりの昇順・重ならない。
+    **長さの和 = (終業 − 始業) − 実働**。`kind` は `rest` (勤務の中に残った休息) /
+    `break_event` (デジタコの休憩イベント = 実際の時刻) / `lunch_window` (運行に出ていない
+    勤務の昼 12:00-13:00) / `off_hours` (昼に掛からない勤務のまん中の 1 時間)。
+    **後ろ 2 つは勤怠の規則による推定**。`[]` = 区間なし、**`null` = 列が出来る前に畳んだ行**
+    (畳み直すと入る)。`summary` が `null` の勤務も `null`
+  - 作るのは `src/kosoku.rs` の `non_working_spans` — **実働の 1 分ずつの歩きと同じ区間の
+    補集合** (既存の `subtract_intervals` で出す)。休息と休憩の列から独立に作らない: 休息の
+    終わりが `運行開始` の秒つきの時刻に付け替わり直後が休憩のとき、`rest_minus_minutes` にも
+    `break_minutes` にも入らない 1 分が出る (その 1 分は `rest` の区間に入る)。種別は
+    **捨てた後の** `rests` で付ける (勤務を丸ごと覆う休息は区間に出さない)
+  - **`DaySummary.non_working` は `#[serde(skip)]`** — `kosoku-daily` の既定の応答は
+    `DaySummary` を serde でそのまま返す (`"days": days` の 2 か所) ので、外すと全乗務員
+    ぶんの休憩の時刻がそこへ出る。`tests/kosoku_daily_test.rs` が「出ないこと」を固定している。
+    書くのは fold (`DaySummaryRow.non_working` → INSERT の `jsonb[]`) だけ
 - `/api/kintai/version?month=YYYY-MM`: **月別バージョン (ETag)** (#184)。relay の条件付き
   再検証キャッシュ用。下記「月別バージョン」節。
 - `/api/schema/*`: `tables` / `columns` / `sample`
@@ -686,6 +702,12 @@ test job に postgres service があるので毎 PR 走る。`KINTAI_TEST_DATABA
 docker run -d --name kintai-test -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17-alpine
 KINTAI_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres cargo test
 ```
+
+**pg テストの harness (`tests/*_pg_test.rs` の 12 ファイルに同じ写し) は、psql の変数
+(`:'name'` / `:"name"`) を使う migration を飛ばす。** 判定は「引用符の中が識別子」まで見る —
+`:"` を含むだけで飛ばすと、コメントに JSON の例 (`"start":"…"`) を書いた 009 が当たらず
+列が欠ける (Refs ohishi-exp/nuxt-dtako-admin#1133)。スキーマは最初に走った test binary が
+作り、以後は在れば何もしないので、**判定を変えるときは 12 個とも変える**。
 
 この 2 モジュールは `coverage_100.toml` に**登録しない** — 100% に実 Postgres が要り、
 CLAUDE.md の「テストは DB も環境変数も不要」と両立しないため。

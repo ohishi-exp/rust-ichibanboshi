@@ -1,5 +1,5 @@
-//! 乗務員 1 人・1 か月ぶんの**勤務ごとの始業・終業・日別サマリ・暦日の按分**を返す
-//! 読み出し口 (Refs ohishi-exp/nuxt-dtako-admin#1133)。
+//! 乗務員 1 人・1 か月ぶんの**勤務ごとの始業・終業・日別サマリ・実働でない区間・
+//! 暦日の按分**を返す読み出し口 (Refs ohishi-exp/nuxt-dtako-admin#1133)。
 //!
 //! fold が一緒に書く 3 表 — `kintai.shifts` / `kintai.day_summaries` /
 //! `kintai.day_parts` — の保存値を、勤務 1 本 = 1 要素に束ねて返す。
@@ -25,6 +25,8 @@
 //!                  "within_statutory_overtime_minutes": 30, "overtime_minutes": 115,
 //!                  "legal_holiday_minutes": 0, "night_minutes": 350,
 //!                  "overtime_night_minutes": 0, "legal_holiday_night_minutes": 0 },
+//!     "non_working": [ { "start": "2026-04-04 02:00:00", "end": "2026-04-04 03:00:00",
+//!                        "kind": "break_event" } ],
 //!     "parts": [ { "date": "2026-04-03", "restraint_minutes": 110,
 //!                  "working_minutes": 110, "night_minutes": 110 } ]
 //!   } ] }
@@ -33,6 +35,16 @@
 //! - 時刻は JST の `YYYY-MM-DD HH24:MI:SS` (空白区切り。`day-summaries` と同じ表記)
 //! - `summary` は `kintai.day_summaries` の同じ勤務の行 (`shift_start_at` で突き合わせる)
 //!   の 11 個の分数。**行が無ければ `null`**
+//! - `non_working` は同じ行の `non_working` 列を**そのまま** — 始業〜終業のうち実働に
+//!   数えなかった区間 (`[start, end)`、分の格子、始まりの昇順、互いに重ならない)。
+//!   長さの和 = (`end_at` − `start_at`) − `summary.working_minutes`
+//!   - `kind`: `rest` = 勤務の中に残った休息 / `break_event` = デジタコの休憩イベント
+//!     (**実際の時刻**) / `lunch_window` = 運行に出ていない勤務の昼休憩の窓 12:00-13:00 /
+//!     `off_hours` = 昼の窓に掛からない勤務のまん中に置く 1 時間
+//!   - ★ **`lunch_window` と `off_hours` は勤怠の規則による推定で、実際に休んだ時刻では
+//!     ない。** 1 つの勤務に出る休憩の種別は `rest` 以外に 1 つだけ
+//!   - `[]` = 区間なし / **`null` = この列が出来る前に畳んだ行** (畳み直すと入る)。
+//!     `summary` が `null` の勤務も `null`
 //! - `parts` は `kintai.day_parts` のその勤務の行を**表に在るまま、暦日の昇順**で。
 //!   **0 行のことも 1 行以上のことも在る** — 行数から勤務が何暦日にまたがるかを
 //!   決めないこと (それは `start_at` / `end_at` の日付で分かる)
@@ -81,7 +93,8 @@ fn parse_driver_cd(raw: Option<&str>) -> Option<i64> {
     i64::try_from(parse_driver(raw?)?).ok()
 }
 
-/// `kintai.shifts` を起点に、日別サマリを LEFT JOIN、暦日の按分を勤務ごとに束ねる。
+/// `kintai.shifts` を起点に、日別サマリ (と同じ行の `non_working`) を LEFT JOIN、
+/// 暦日の按分を勤務ごとに束ねる。
 /// モジュール docs の「対象」「応答」参照。
 const SELECT_SQL: &str = r#"
 SELECT to_char(s.start_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') AS start_at,
@@ -100,6 +113,7 @@ SELECT to_char(s.start_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') AS
            'overtime_night_minutes', d.overtime_night_minutes,
            'legal_holiday_night_minutes', d.legal_holiday_night_minutes
        ) END AS summary,
+       d.non_working,
        COALESCE((
            SELECT jsonb_agg(jsonb_build_object(
                       'date', to_char(p.date, 'YYYY-MM-DD'),
@@ -137,12 +151,13 @@ fn row_to_item(r: &sqlx::postgres::PgRow) -> Result<serde_json::Value, (StatusCo
         "end_at": r.try_get::<String, _>("end_at").map_err(db_err)?,
         "shift_source": r.try_get::<String, _>("shift_source").map_err(db_err)?,
         "summary": r.try_get::<Option<serde_json::Value>, _>("summary").map_err(db_err)?,
+        "non_working": r.try_get::<Option<serde_json::Value>, _>("non_working").map_err(db_err)?,
         "parts": r.try_get::<serde_json::Value, _>("parts").map_err(db_err)?,
     }))
 }
 
 /// GET /api/kintai/shift-days?month=YYYY-MM&driver=<乗務員CD> — 勤務ごとの始業・終業・
-/// 日別サマリ・暦日の按分 (モジュール docs) を返す。データが 0 件なら **200 + 空の `items`**。
+/// 日別サマリ・実働でない区間・暦日の按分 (モジュール docs) を返す。データが 0 件なら **200 + 空の `items`**。
 pub async fn shift_days(
     Query(params): Query<ShiftDaysQuery>,
     Extension(pg): Extension<DynKintaiPgStore>,
