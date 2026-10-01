@@ -126,6 +126,12 @@ path = "src/routes/sales.rs"
 [[files]]
 path = "src/routes/schema.rs"
 
+# 勤務ごとの始業・終業・日別サマリ・暦日の按分を返す口 (Refs
+# ohishi-exp/nuxt-dtako-admin#1133)。shift_overlaps.rs と同じく pg テストが要る形の
+# まま登録 (CI の Coverage regression check は postgres service 込みで cov-check を回す)
+[[files]]
+path = "src/routes/shift_days.rs"
+
 # 同じ乗務員の勤務の時間帯が重なっている組を返す口 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
 # stale_months.rs / unko_gaps.rs と同じく pg テストが要る形のまま登録 (CI の
 # Coverage regression check は postgres service 込みで cov-check を回す)

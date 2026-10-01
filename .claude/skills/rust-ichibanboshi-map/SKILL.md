@@ -58,6 +58,13 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - `/api/kintai/kosoku-daily?month=YYYY-MM[&driver=N]`: **打刻基準の日別サマリ** (#118、Phase 2)。
   `events` の生行を `src/kosoku.rs` の純粋ロジックで畳む。**金額は含めない**。
   **`driver` 省略で全乗務員** (#125、`{month, drivers:[{driver, days}]}`)。下記「日別サマリ」節。
+- `/api/kintai/shift-days?month=YYYY-MM&driver=N`: **勤務ごとの始業・終業・日別サマリ・
+  暦日の按分** (`src/routes/shift_days.rs`、Refs ohishi-exp/nuxt-dtako-admin#1133)。
+  `kintai.shifts` / `day_summaries` / `day_parts` の保存値を勤務 1 本 = 1 要素で返すだけ
+  (計算しない・金額なし)。`month` も `driver` も必須。**始業 (JST) の月に出る**ので、
+  前月末に始業した勤務は前月を読む。`parts[].night_minutes` は所定内・法定内残業ぶんの
+  深夜だけ。テナントは設定 pin (`shift_overlaps.rs` の `store` / `read_tenant_of` /
+  `month_bounds` を共有)。ファイル名を `kintai` / `kosoku` で始めない (`logic_version`)
 - `/api/kintai/version?month=YYYY-MM`: **月別バージョン (ETag)** (#184)。relay の条件付き
   再検証キャッシュ用。下記「月別バージョン」節。
 - `/api/schema/*`: `tables` / `columns` / `sample`

@@ -402,6 +402,10 @@ pub async fn run(
             "/kintai/shift-overlaps",
             get(routes::shift_overlaps::shift_overlaps),
         )
+        // 勤務ごとの始業・終業・日別サマリ・暦日の按分 (Refs
+        // ohishi-exp/nuxt-dtako-admin#1133)。読むだけ・計算しない (ファイル名は
+        // kintai/kosoku で始めない — shift_days.rs のモジュール doc 参照)
+        .route("/kintai/shift-days", get(routes::shift_days::shift_days))
         .route("/kintai/version", get(routes::kintai_version::version))
         // 月別 stale (畳み直しが要るか) を 1 往復で返す軽い口 (Refs #620 の 1)。
         // 読むだけ・既存の kintai.day_summaries 突合を月単位に割っただけ (ファイル名
