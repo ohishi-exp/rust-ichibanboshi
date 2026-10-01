@@ -587,7 +587,7 @@ SELECT DATE_FORMAT(e.`開始日時`, '%Y-%m-%d %H:%i:%s'),
 /// - **`dtako_events` はイベント名で絞らない** (2026-07-29 に絞りを撤回、
 ///   Refs ohishi-exp/nuxt-dtako-admin#501)。かつて 休息/休憩/運行開始/運行終了 の
 ///   4 種に絞っていた (105,771 行 → 22,092 行) が、**単一乗務員経路と値が割れる**
-///   事故を 2 度起こした — #167 (拾った運行の終わりが経路で変わる) と、1556 林田
+///   事故を 2 度起こした — #167 (拾った運行の終わりが経路で変わる) と、ある乗務員
 ///   03-26 (終業打刻後の運転イベントが見えず `unpunched_ops_shift` が不発、
 ///   紙 979 に対し 864 で +115 の未説明差)。この SQL は in-process 消費
 ///   ([`kosoku_daily_all`](crate::routes::kintai::kosoku_daily)) で Tunnel を
@@ -1362,7 +1362,7 @@ mod tests {
     #[test]
     fn all_events_sql_does_not_filter_event_names() {
         // イベント名の絞りは単一乗務員経路と値が割れる事故を 2 度起こした
-        // (#167 と 1556 林田 03-26、Refs ohishi-exp/nuxt-dtako-admin#501)。
+        // (#167 と ある乗務員 03-26、Refs ohishi-exp/nuxt-dtako-admin#501)。
         // うっかり戻さないよう固定する
         assert!(!ALL_EVENTS_SQL.contains("イベント名` IN"));
     }
