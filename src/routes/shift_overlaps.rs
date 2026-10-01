@@ -64,7 +64,7 @@ pub struct ShiftOverlapsQuery {
 
 /// `[kintai_push]` が無効な instance では挿さらない。`day_parts::store` と同じ文言で
 /// 503 にする。
-fn store(pg: &DynKintaiPgStore) -> Result<&KintaiPgStore, (StatusCode, String)> {
+pub(crate) fn store(pg: &DynKintaiPgStore) -> Result<&KintaiPgStore, (StatusCode, String)> {
     pg.as_deref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "[kintai_push] が無効です (書き先がありません)".to_string(),
@@ -73,7 +73,10 @@ fn store(pg: &DynKintaiPgStore) -> Result<&KintaiPgStore, (StatusCode, String)> 
 
 /// 読み先のテナント。`day_parts::read_tenant_of` と同じ形 (モジュール docs の
 /// 「認可」参照。**`X-Tenant-ID` は読まない**) — **どちらも無ければ 503**。
-fn read_tenant_of(read: ReadTenant, pin: uuid::Uuid) -> Result<uuid::Uuid, (StatusCode, String)> {
+pub(crate) fn read_tenant_of(
+    read: ReadTenant,
+    pin: uuid::Uuid,
+) -> Result<uuid::Uuid, (StatusCode, String)> {
     if let Some(t) = read.0 {
         if !t.is_nil() {
             return Ok(t);
@@ -90,7 +93,7 @@ fn read_tenant_of(read: ReadTenant, pin: uuid::Uuid) -> Result<uuid::Uuid, (Stat
 
 /// 対象月の `[月初, 翌月初)` を JST の `TIMESTAMPTZ` 対で返す。`kintai_timecard::month_bounds`
 /// と同じ形 (向こうは private かつ `src/routes/kintai*` は触らない対象なので写しを持つ)。
-fn month_bounds(month: &str) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+pub(crate) fn month_bounds(month: &str) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     let year: i32 = month.get(..4)?.parse().ok()?;
     let mm: u32 = month.get(5..7)?.parse().ok()?;
     let first = NaiveDate::from_ymd_opt(year, mm, 1)?;
