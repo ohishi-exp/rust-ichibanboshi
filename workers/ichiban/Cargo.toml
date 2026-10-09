@@ -1,0 +1,10 @@
+# 一番星 (CAPE#01) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322) の到達確認 PoC。
+# repo ルートの package (オンプレ / Cloud Run の本体) とも workers/kyuyo とも独立した workspace。
+[workspace]
+members = ["worker"]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -1,0 +1,38 @@
+# ichibanboshi-ichiban: 一番星 (CAPE#01) SQL Server への到達確認 PoC (Refs ohishi-exp/rust-ichibanboshi#322)。
+# Service Binding 専用の POST /probe だけを持つ。本番には出さない (deploy job なし。実接続は wrangler dev --remote)。
+#
+# ★ 外から届く口を持たない:
+#   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。同一アカウントで binding を宣言した worker は誰でも叩ける:
+#       POST /probe  … 認可なし。効果は一番星 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない
+#   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
+#   - SQL Server への口 (vpc_services) はトップレベルにだけ置く
+#   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
+#
+# SQL Server の資格情報は Secrets Store の secret (JSON。キー user/pass。値は repo に書かない)
+name = "ichibanboshi-ichiban"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "worker-build --release"
+
+# Workers Logs (ログは stage・失敗の種類・所要ミリ秒だけ)
+[observability]
+enabled = true
+
+# SQL Server への口。宛先の Tunnel・host:port は VPC Service 側に閉じる (コードの connect() の宛先は名目)。
+# service_id は VPC Service `ichibanboshi-ichiban-sql` (TCP) の id に差し替える (資格情報でも宛先でもない)。
+# いまはプレースホルダ (VPC Service 作成後に入れる)
+[[vpc_services]]
+binding = "ICHIBAN_VPC"
+service_id = "00000000-0000-0000-0000-000000000000"
+remote = true
+
+# SQL Server の資格情報。store_id は Secrets Store の id、secret_name は投入済みの secret 名 (どちらも値そのものではない)
+[[secrets_store_secrets]]
+binding = "ICHIBAN_SQL"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "ICHIBAN_SQL"
