@@ -212,7 +212,6 @@ assert_json "$BODY_A" '.backends.sqlserver' 'disabled'
 # ダミー資格情報でも「使うと宣言した」ところまでは出る (pool は lazy)
 assert_json "$BODY_A" '.backends.mariadb' 'declared'
 # 給与大臣は env を与えていないので disabled
-assert_json "$BODY_A" '.backends.kyuyo' 'disabled'
 # 生イベントの読み先 (Refs #211)。宣言ではなく**実際に注入された実装**が出るので、
 # ここが "mariadb" のままなら GCP の形なのにオンプレの読み先を掴んでいる
 assert_json "$BODY_A" '.backends.kintai_events' 'http'

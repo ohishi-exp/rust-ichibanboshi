@@ -161,74 +161,12 @@ pub struct RawConfig {
     pub dir: String,
 }
 
-/// 給与大臣 (OHKEN) 読み取り configuration (Refs #82)。
-///
-/// ホスト/ポート/パスワード等の実値は repo に置かず、デプロイ先の
-/// `ichibanboshi.toml` で注入する (secrets-inventory 登録)。未設定なら
-/// `/api/kyuyo/*` は fail-closed (503)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct KyuyoConfig {
-    /// 給与大臣 PC のホスト (IP / ホスト名)。空 = 機能無効。
-    #[serde(default)]
-    pub host: String,
-
-    /// OHKEN インスタンスの TCP 固定ポート。
-    #[serde(default = "default_kyuyo_port")]
-    pub port: u16,
-
-    /// 読み取り専用 SQL ログイン。
-    #[serde(default = "default_kyuyo_user")]
-    pub user: String,
-
-    #[serde(default)]
-    pub password: String,
-
-    /// auth-worker origin (introspect 先)。実稼働 AS は auth-staging 側
-    /// (auth.ippoan.org は DCR 503) — デプロイ設定で明示する。
-    #[serde(default)]
-    pub auth_worker_origin: String,
-
-    /// `/auth/introspect` の shared secret (`INTERNAL_SHARED_SECRET_KYUYO` の生値)。
-    #[serde(default)]
-    pub introspect_secret: String,
-
-    /// introspect に渡す呼び出しアプリ origin (APP_TENANT_ACL の per-app 判定)。
-    #[serde(default = "default_kyuyo_app_origin")]
-    pub app_origin: String,
-
-    /// 給与データへのアクセスを許可する email (allowlist)。空 = 全拒否。
-    #[serde(default)]
-    pub allowed_emails: Vec<String>,
-
-    /// introspect HTTP timeout (秒)。
-    #[serde(default = "default_kyuyo_timeout_secs")]
-    pub timeout_secs: u64,
-
-    /// 給与 derived store (SQLite) のパス。空 = 無効 (常に live 読み)。
-    /// キャッシュ扱い — 消して再 sync で全量再構築できる
-    /// (docs/plan-kyuyo-sqlite-store.md)。
-    #[serde(default = "default_kyuyo_sqlite_path")]
-    pub sqlite_path: String,
-}
-
-impl KyuyoConfig {
-    /// DB 接続設定が揃っているか (揃っていなければ給与ルートは 503)。
-    pub fn db_enabled(&self) -> bool {
-        !self.host.is_empty() && !self.user.is_empty() && !self.password.is_empty()
-    }
-
-    /// introspect 認可設定が揃っているか (揃っていなければ給与ルートは 503)。
-    pub fn auth_configured(&self) -> bool {
-        !self.auth_worker_origin.is_empty() && !self.introspect_secret.is_empty()
-    }
-}
-
 /// 社内 MariaDB (勤怠の生イベント) 読み取り configuration (Refs #116)。
 ///
 /// 同一ホストの docker `db` コンテナ (172.18.21.35 をマスタにしたレプリカ) を
 /// loopback で読む。CakePHP が `127.0.0.1:120` で同居しているのと同じ 1 hop で、
 /// **DNS も TLS も経路に入らない**。実値は repo に置かず、デプロイ先の
-/// `ichibanboshi.toml` で注入する (`KyuyoConfig` と同じ作法)。未設定なら
+/// `ichibanboshi.toml` で注入する。未設定なら
 /// `/api/kintai/events` は fail-closed (503)。
 #[derive(Debug, Clone, Deserialize)]
 pub struct MariadbConfig {
@@ -512,9 +450,6 @@ pub struct Config {
     pub raw: RawConfig,
 
     #[serde(default)]
-    pub kyuyo: KyuyoConfig,
-
-    #[serde(default)]
     pub restraint: RestraintConfig,
 
     #[serde(default)]
@@ -628,25 +563,8 @@ fn default_cakephp_timeout_secs() -> u64 {
 fn default_raw_dir() -> String {
     "/opt/ichibanboshi/raw".to_string()
 }
-fn default_kyuyo_port() -> u16 {
-    14330
-}
-fn default_kyuyo_user() -> String {
-    "kyuyo_reader".to_string()
-}
-fn default_kyuyo_app_origin() -> String {
-    "https://dtako.ippoan.org".to_string()
-}
 fn default_kintai_sqlite_path() -> String {
     "/opt/ichibanboshi/kintai_local.sqlite".to_string()
-}
-
-fn default_kyuyo_sqlite_path() -> String {
-    "/opt/ichibanboshi/kyuyo_local.sqlite".to_string()
-}
-
-fn default_kyuyo_timeout_secs() -> u64 {
-    10
 }
 
 fn default_mariadb_host() -> String {
@@ -689,23 +607,6 @@ impl Default for MariadbConfig {
             user: default_mariadb_user(),
             password: String::new(),
             database: String::new(),
-        }
-    }
-}
-
-impl Default for KyuyoConfig {
-    fn default() -> Self {
-        Self {
-            host: String::new(),
-            port: default_kyuyo_port(),
-            user: default_kyuyo_user(),
-            password: String::new(),
-            auth_worker_origin: String::new(),
-            introspect_secret: String::new(),
-            app_origin: default_kyuyo_app_origin(),
-            allowed_emails: Vec::new(),
-            timeout_secs: default_kyuyo_timeout_secs(),
-            sqlite_path: default_kyuyo_sqlite_path(),
         }
     }
 }
@@ -987,32 +888,6 @@ impl Config {
             self.kintai_push.statement_timeout_secs = v;
         }
 
-        // ── 給与大臣 (OHKEN) + introspect 認可 (Refs #82) ──
-        if let Some(v) = env_str(get, "KYUYO_HOST") {
-            self.kyuyo.host = v;
-        }
-        if let Some(v) = env_u16(get, "KYUYO_PORT")? {
-            self.kyuyo.port = v;
-        }
-        if let Some(v) = env_str(get, "KYUYO_USER") {
-            self.kyuyo.user = v;
-        }
-        if let Some(v) = env_str(get, "KYUYO_PASSWORD") {
-            self.kyuyo.password = v;
-        }
-        if let Some(v) = env_str(get, "KYUYO_AUTH_WORKER_ORIGIN") {
-            self.kyuyo.auth_worker_origin = v;
-        }
-        if let Some(v) = env_str(get, "KYUYO_INTROSPECT_SECRET") {
-            self.kyuyo.introspect_secret = v;
-        }
-        if let Some(v) = env_str(get, "KYUYO_APP_ORIGIN") {
-            self.kyuyo.app_origin = v;
-        }
-        if let Some(v) = env_list(get, "KYUYO_ALLOWED_EMAILS") {
-            self.kyuyo.allowed_emails = v;
-        }
-
         // ── その他の秘匿値 / 外部接続先 ──
         // JWT_SECRET は持たない。到達不能だった HS256 自前検証は #207 で撤去済みで、
         // 認可は Cloudflare Access (オンプレ) / Cloud Run IAM (GCP) が担う
@@ -1080,7 +955,6 @@ impl Config {
             sqlite: SqliteConfig::default(),
             cakephp: CakephpConfig::default(),
             raw: RawConfig::default(),
-            kyuyo: KyuyoConfig::default(),
             restraint: RestraintConfig::default(),
             mariadb: MariadbConfig::default(),
             kintai_events: KintaiEventsConfig::default(),

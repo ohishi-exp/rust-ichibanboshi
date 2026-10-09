@@ -17,7 +17,6 @@ pub mod kintai_tail_gap_probe;
 pub mod kintai_version;
 pub mod kosoku;
 pub mod kosoku_paper;
-pub mod kyuyo;
 pub mod rdcleanpath;
 pub mod rdp_defaults;
 pub mod rdp_nego;

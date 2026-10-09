@@ -10,7 +10,6 @@ pub mod kintai_day_summaries;
 pub mod kintai_recalc;
 pub mod kintai_timecard;
 pub mod kintai_version;
-pub mod kyuyo;
 pub mod restraint;
 pub mod sales;
 pub mod schema;

@@ -18,22 +18,6 @@ trust_server_certificate = true
 [cors]
 allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 
-# 給与大臣 (OHKEN) 読み取り (Refs #82)。未設定なら /api/kyuyo/* は 503 (fail-closed)。
-# host / password / introspect_secret の実値は repo に置かず、デプロイ先の
-# ichibanboshi.toml でのみ設定する (secrets-inventory 参照)。
-# [kyuyo]
-# host = "<給与PC-HOST>"
-# port = 14330
-# user = "kyuyo_reader"
-# password = "<kyuyo_reader パスワード>"
-# auth_worker_origin = "<auth-worker origin (実稼働は auth-staging 側)>"
-# introspect_secret = "<INTERNAL_SHARED_SECRET_KYUYO>"
-# app_origin = "https://dtako.ippoan.org"
-# allowed_emails = ["<許可する email>"]
-# 給与 derived store (SQLite、Refs #106)。省略時 /opt/ichibanboshi/kyuyo_local.sqlite、
-# 空文字で無効 (常に live 読み)。キャッシュ扱い — 消して再 sync で全量再構築できる
-# sqlite_path = "/opt/ichibanboshi/kyuyo_local.sqlite"
-
 # 拘束サマリ store (SQLite、Refs #106 Phase 3)。省略時 /opt/ichibanboshi/restraint_local.sqlite、
 # 空文字で無効 (/api/restraint/* が 503)。relay の resummarize (全月) で再構築できる写し
 # [restraint]
