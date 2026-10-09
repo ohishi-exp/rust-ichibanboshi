@@ -12,7 +12,7 @@ method 違いは 405、他の path は 404 (本文 `{"ok":false}`)。
 
 ## binding (`worker/wrangler.toml`)
 
-- `ICHIBAN_VPC` — Workers VPC の VPC Service (TCP)。宛先 host:port は Service 側で固定。`service_id` は作成後に差し替える (いまはプレースホルダ)
+- `ICHIBAN_VPC` — Workers VPC の VPC Service (TCP)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-ichiban-sql` の id
 - `ICHIBAN_SQL` — Secrets Store の secret。JSON `{"user":…,"pass":…}`
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
 
