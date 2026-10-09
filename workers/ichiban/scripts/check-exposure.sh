@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一番星 PoC Worker (ichibanboshi-ichiban) が外から届かないこと・社内への口を本番の外へ漏らさないことを wrangler.toml で検査する
+# 一番星 Worker (ichibanboshi-ichiban) が外から届かないこと・社内への口を本番の外へ漏らさないことを wrangler.toml で検査する
 # (ohishi-exp/smb-watch の `workers/smb-ingest/scripts/check-exposure.sh` を写している)。
 #   (a) トップレベルに workers_dev = false と preview_urls = false が **明示** されている
 #   (b) route / routes が無い (custom_domain も routes の中に書く)

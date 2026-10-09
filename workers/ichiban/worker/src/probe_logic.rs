@@ -1,23 +1,62 @@
-//! `POST /probe` の経路判定・失敗の stage と応答の写像・資格情報 JSON の検証 (純粋ロジック)。
-//! workers/kyuyo の `logic/src/lib.rs` (kyuyo-logic) から probe に要る分だけを写している (path 依存は作らない)。
-//! 到達確認が済むまで捨てる可能性がある PoC なので共通化しない。
+//! 経路判定・失敗の stage と応答の写像・資格情報 JSON の検証 (純粋ロジック)。`POST /probe` と管理画面の GET 6 本で共用する。
+//! workers/kyuyo の `logic/src/lib.rs` (kyuyo-logic) から要る分だけを写している (path 依存は作らない)。
 
 use serde::Deserialize;
 
-/// 経路判定の結果。
-#[derive(Debug, PartialEq, Eq)]
+/// 経路判定の結果。path とクエリはオンプレ版 (repo ルートの `src/routes/`) と同じ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
+    /// `POST /probe` — 到達の切り分け用 (ログインして `SELECT 1`)
     Probe,
+    /// `GET /health`
+    Health,
+    /// `GET /api/employees`
+    Employees,
+    /// `GET /api/vehicles`
+    Vehicles,
+    /// `GET /api/sales/departments`
+    Departments,
+    /// `GET /api/sales/vehicle-daily`
+    VehicleDaily,
+    /// `GET /api/costs/vehicle-daily`
+    CostsDaily,
     NotFound,
     MethodNotAllowed,
 }
 
-/// `POST /probe` だけが口。path が合って method が違えば 405、それ以外は 404。
+/// 口は上の 7 本だけ。path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
-    match (path, method) {
-        ("/probe", "POST") => Route::Probe,
-        ("/probe", _) => Route::MethodNotAllowed,
-        _ => Route::NotFound,
+    let (found, want) = match path {
+        "/probe" => (Route::Probe, "POST"),
+        "/health" => (Route::Health, "GET"),
+        "/api/employees" => (Route::Employees, "GET"),
+        "/api/vehicles" => (Route::Vehicles, "GET"),
+        "/api/sales/departments" => (Route::Departments, "GET"),
+        "/api/sales/vehicle-daily" => (Route::VehicleDaily, "GET"),
+        "/api/costs/vehicle-daily" => (Route::CostsDaily, "GET"),
+        _ => return Route::NotFound,
+    };
+    if method == want {
+        found
+    } else {
+        Route::MethodNotAllowed
+    }
+}
+
+impl Route {
+    /// ログに出す口の名前。
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Route::Probe => "probe",
+            Route::Health => "health",
+            Route::Employees => "employees",
+            Route::Vehicles => "vehicles",
+            Route::Departments => "departments",
+            Route::VehicleDaily => "vehicle-daily",
+            Route::CostsDaily => "costs-daily",
+            Route::NotFound => "not-found",
+            Route::MethodNotAllowed => "method-not-allowed",
+        }
     }
 }
 
@@ -30,7 +69,7 @@ pub(crate) enum Stage {
     Connect,
     /// TDS のログインが拒否された
     Login,
-    /// `SELECT 1` が失敗した・時間切れ・1 が返らない
+    /// クエリが失敗した・時間切れ (`/probe`・`/health` は 1 が返らないときも)
     Query,
 }
 
@@ -92,25 +131,40 @@ pub(crate) struct DbError {
     pub(crate) kind: ErrKind,
 }
 
-/// probe の失敗ログの 1 行。メッセージ本文を受け取らない (stage・種類・所要ミリ秒だけ)。
-pub(crate) fn log_line(stage: Stage, kind: &ErrKind, elapsed_ms: u64) -> String {
-    let (stage, kind) = (stage.as_str(), kind.label());
-    format!("ichiban probe: failed at {stage} ({elapsed_ms} ms) kind={kind}")
+/// 口の失敗。応答にはこの分類だけを写す (エラーの本文は持たない)。
+#[derive(Debug)]
+pub(crate) enum Failure {
+    /// クエリが読めない・絞り込みが 1 つも無い (オンプレ版と同じ 400、本文なし)
+    BadRequest,
+    /// SQL Server までの途中 (資格情報・接続・ログイン・クエリ) で失敗した
+    Db(Stage, ErrKind),
 }
 
-/// 応答の status と JSON 本文。
+impl From<DbError> for Failure {
+    fn from(e: DbError) -> Self {
+        Failure::Db(e.stage, e.kind)
+    }
+}
+
+/// 失敗ログの 1 行。メッセージ本文を受け取らない (口・stage・種類・所要ミリ秒だけ)。
+pub(crate) fn log_line(route: Route, stage: Stage, kind: &ErrKind, elapsed_ms: u64) -> String {
+    let (name, stage, kind) = (route.name(), stage.as_str(), kind.label());
+    format!("ichiban {name}: failed at {stage} ({elapsed_ms} ms) kind={kind}")
+}
+
+/// 応答の status と JSON 本文。本文が空なら content-type を付けない (オンプレ版の 400 と同じ)。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Reply {
     pub(crate) status: u16,
     pub(crate) body: String,
 }
 
-/// 経路判定で弾いた行き先の応答。`Route::Probe` は `None` (先へ進む)。
-pub(crate) fn reply_for_route(route: &Route) -> Option<Reply> {
+/// 経路判定で弾いた行き先の応答。口に当たったら `None` (先へ進む)。
+pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     let status = match route {
-        Route::Probe => return None,
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
+        _ => return None,
     };
     Some(Reply {
         status,
@@ -118,14 +172,16 @@ pub(crate) fn reply_for_route(route: &Route) -> Option<Reply> {
     })
 }
 
-/// probe の結果の応答。成功は 200 `{"ok":true}`、失敗は 502 `{"ok":false,"stage":…}`。
-pub(crate) fn reply_for_probe(outcome: Result<(), (Stage, ErrKind)>) -> Reply {
+/// 口の結果の応答。成功は 200 と JSON 本文、絞り込みの不備は 400 (本文なし)、
+/// SQL Server までの失敗は 502 `{"ok":false,"stage":…,"kind":…}`。
+pub(crate) fn reply_for(outcome: Result<String, Failure>) -> Reply {
     match outcome {
-        Ok(()) => Reply {
-            status: 200,
-            body: r#"{"ok":true}"#.to_string(),
+        Ok(body) => Reply { status: 200, body },
+        Err(Failure::BadRequest) => Reply {
+            status: 400,
+            body: String::new(),
         },
-        Err((stage, kind)) => Reply {
+        Err(Failure::Db(stage, kind)) => Reply {
             status: 502,
             body: format!(
                 r#"{{"ok":false,"stage":"{}","kind":"{}"}}"#,

@@ -1,5 +1,6 @@
-# 一番星 PoC Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く POST /probe で、
-# Workers VPC (binding ICHIBAN_VPC) 経由で一番星 SQL Server に TDS でログインして SELECT 1 を流すだけ。
+# 一番星 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。管理画面が使う GET 6 本
+# (SQL・型・絞り込みの判定・組み立ては ichiban-logic) と到達の切り分け用の POST /probe。
+# Workers VPC (binding ICHIBAN_VPC) 経由で一番星 SQL Server に TDS でログインする (1 リクエスト 1 接続)。
 # tiberius の rustls feature と bb8-tiberius は wasm32 で落ちる (getrandom / mio / rustls-native-certs) ので入れない。
 [package]
 name = "ichiban-worker"
@@ -11,9 +12,14 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+# NaiveDateTime の列を読む (ichiban-logic と同じ chrono)
+chrono = { version = "0.4", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ichiban-logic = { path = "../logic" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# クエリ文字列の読み方はオンプレ版 (axum の Query) と同じ serde_urlencoded
+serde_urlencoded = "0.7"
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
 # tiberius は futures の AsyncRead/Write を要求し、worker::Socket は tokio の AsyncRead/Write を持つので compat で繋ぐ
 tokio = { version = "1", default-features = false, features = ["io-util"] }

@@ -1,10 +1,11 @@
 name: worker-ichiban
 
-# workers/ichiban (一番星 SQL Server への到達確認 PoC Worker、Refs #322)。
+# workers/ichiban (一番星 SQL Server の読み出し Worker、Refs #322)。
 #   - pull_request / main への push → logic の test と 100% gate、Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run
 #     (この経路は secret も token も使わない)
-# 本番へは出さない (deploy job なし。実接続の確認は wrangler dev --remote)。本実装の段で足す。
-# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
+#   - タグ worker-ichiban-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
+# merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。wrangler の出力はファイルに取り、mask してから伏せて出す。
 on:
   pull_request:
     branches: [main]
@@ -13,6 +14,8 @@ on:
       - '.github/workflows/worker-ichiban.yml'
   push:
     branches: [main]
+    # タグの push には paths が効かない (タグは常に走る)
+    tags: ['worker-ichiban-v*']
     paths:
       - 'workers/ichiban/**'
       - '.github/workflows/worker-ichiban.yml'
@@ -90,3 +93,59 @@ jobs:
       - name: wrangler deploy --dry-run
         working-directory: workers/ichiban/worker
         run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
+
+  deploy:
+    name: deploy production
+    needs: [worker]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/worker-ichiban-v')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ichiban-deploy-production
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: workers/ichiban/worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          # 保存は worker の job に任せ、ここは復元だけ
+          shared-key: ichiban-worker
+          workspaces: workers/ichiban -> target
+          save-if: false
+
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す (ログファイルそのものは出さない)。
+      #   - 32 桁の hex (account ID): ::add-mask:: + <account> に置換
+      # token は org の secret CLOUDFLARE_API_TOKEN (repo 単位の secret は作らない)
+      - name: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy \
+            --tag "$GITHUB_REF_NAME" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::本番に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi
