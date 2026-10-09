@@ -6,11 +6,12 @@ use async_trait::async_trait;
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 use chrono::NaiveDate;
+use ichiban_logic::costs_daily::RawCostsDailyRow;
+use ichiban_logic::vehicle_daily::RawVehicleDailyRow;
 use rust_ichibanboshi::cakephp::CakephpClient;
 use rust_ichibanboshi::config::RawConfig;
 use rust_ichibanboshi::repo::{AppRepo, DynRepo, RepoError};
 use rust_ichibanboshi::routes;
-use rust_ichibanboshi::routes::costs_daily::RawCostsDailyRow;
 use rust_ichibanboshi::routes::sales::*;
 use rust_ichibanboshi::routes::schema::{ColumnInfo, SampleRow, TableInfo};
 use rust_ichibanboshi::routes::surcharge::RawSurchargeRow;
@@ -19,7 +20,6 @@ use rust_ichibanboshi::routes::unchin::{
     RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use rust_ichibanboshi::routes::uriage::UriageRow;
-use rust_ichibanboshi::routes::vehicle_daily::RawVehicleDailyRow;
 use rust_ichibanboshi::sqlite::{DynLocalStore, LocalStore};
 use uuid::Uuid;
 

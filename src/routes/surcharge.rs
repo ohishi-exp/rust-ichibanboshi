@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::NaiveDateTime;
+use ichiban_logic::api::{VehicleOption, VEHICLES_SOURCE};
 use serde::{Deserialize, Serialize};
 
 use crate::repo::{DynRepo, RepoError};
@@ -74,13 +75,6 @@ pub struct RawSurchargeRow {
 // ══════════════════════════════════════════════════════════════
 // レスポンス構造体
 // ══════════════════════════════════════════════════════════════
-
-/// 車種ﾏｽﾀ 1 件 (燃費マスタの車種ドロップダウン用)。
-#[derive(Serialize, Debug, PartialEq)]
-pub struct VehicleOption {
-    pub vehicle_code: String,
-    pub vehicle_name: String,
-}
 
 #[derive(Serialize, Debug, PartialEq)]
 pub struct SurchargeRow {
@@ -219,7 +213,7 @@ pub async fn vehicles(
 ) -> Result<Json<ApiResponse<Vec<VehicleOption>>>, StatusCode> {
     let rows = repo.vehicles().await.map_err(map_repo_err)?;
     Ok(Json(ApiResponse {
-        source_table: "車種ﾏｽﾀ".to_string(),
+        source_table: VEHICLES_SOURCE.to_string(),
         data: rows
             .into_iter()
             .map(|(code, name)| VehicleOption {

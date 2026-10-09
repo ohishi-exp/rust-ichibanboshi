@@ -66,6 +66,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # ring 実装なので openssl を引き込まない。先例は rust-alc-api の
 # crates/alc-core/src/auth_google.rs (Google OIDC を同じ形で検証、100% 登録済み)
 jsonwebtoken = "9"
+# 一番星 6 本 (/health・/api/employees・/api/vehicles・/api/sales/departments・
+# /api/sales/vehicle-daily・/api/costs/vehicle-daily) の SQL 文・型・集計 (Refs #322)。
+# Worker (workers/ichiban) と同じ定義を使う。オンプレ版の 6 本を削除するときにこの path 依存も外す
+ichiban-logic = { path = "workers/ichiban/logic" }
 
 [build-dependencies]
 # build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ、Refs #191)

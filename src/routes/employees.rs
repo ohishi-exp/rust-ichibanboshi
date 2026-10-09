@@ -11,7 +11,7 @@
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
-use serde::Serialize;
+use ichiban_logic::api::{EmployeeRow, EMPLOYEES_SOURCE};
 
 use crate::repo::{DynRepo, RepoError};
 use crate::routes::sales::ApiResponse;
@@ -26,24 +26,13 @@ fn map_repo_err(e: RepoError) -> StatusCode {
     }
 }
 
-/// 社員ﾏｽﾀ 1 件。
-#[derive(Serialize, Debug, PartialEq)]
-pub struct EmployeeRow {
-    /// 社員C (コード)。数値型でも varchar に寄せた文字列で返す。
-    pub employee_code: String,
-    /// 社員N (氏名)。
-    pub employee_name: String,
-    /// 社員R (表示名)。nuxt-trouble 側の担当者名はこれを使う。
-    pub employee_r: String,
-}
-
 /// GET /api/employees — 社員ﾏｽﾀ (社員C, 社員N, 社員R) の一覧。
 pub async fn employees(
     Extension(repo): Extension<DynRepo>,
 ) -> Result<Json<ApiResponse<Vec<EmployeeRow>>>, StatusCode> {
     let rows = repo.employees().await.map_err(map_repo_err)?;
     Ok(Json(ApiResponse {
-        source_table: "社員ﾏｽﾀ".to_string(),
+        source_table: EMPLOYEES_SOURCE.to_string(),
         data: rows
             .into_iter()
             .map(|(code, name, r)| EmployeeRow {
