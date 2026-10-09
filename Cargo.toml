@@ -89,5 +89,6 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage)'] }
 
 [profile.release]
 opt-level = 2
-lto = true
+# fat LTO は依存 cache があっても毎回 2 分半かかるため thin (Refs #322)
+lto = "thin"
 strip = true
