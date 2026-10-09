@@ -1,9 +1,12 @@
-# ichibanboshi-ichiban: 一番星 (CAPE#01) SQL Server への到達確認 PoC (Refs ohishi-exp/rust-ichibanboshi#322)。
-# Service Binding 専用の POST /probe だけを持つ。本番には出さない (deploy job なし。実接続は wrangler dev --remote)。
+# ichibanboshi-ichiban: 一番星 (CAPE#01) SQL Server の読み出し Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
+# Service Binding 専用。口は管理画面が使う GET 6 本 (/health・/api/employees・/api/vehicles・/api/sales/departments・
+# /api/sales/vehicle-daily・/api/costs/vehicle-daily) と到達の切り分け用の POST /probe。
+# 本番へはタグ worker-ichiban-v* の push で deploy する (.github/workflows/worker-ichiban.yml)。
 #
 # ★ 外から届く口を持たない:
-#   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。同一アカウントで binding を宣言した worker は誰でも叩ける:
-#       POST /probe  … 認可なし。効果は一番星 SQL Server への 1 回のログインと SELECT 1 だけで、データは返さない
+#   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。
+#   - 認可なし (ユーザー決定 2026-10-09)。Service Binding 専用で、関門は呼び手 (管理画面の proxy) の requireAuth と
+#     path allowlist。同じアカウントで Worker を deploy できる者は binding で読める (社員名・売上・経費) — 承知のうえ
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
 #   - SQL Server への口 (vpc_services) はトップレベルにだけ置く
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
@@ -22,6 +25,10 @@ command = "worker-build --release"
 # Workers Logs (ログは stage・失敗の種類・所要ミリ秒だけ)
 [observability]
 enabled = true
+
+# 版の元 (workers/kyuyo と同じ)
+[version_metadata]
+binding = "CF_VERSION_METADATA"
 
 # SQL Server への口。宛先の Tunnel・host:port は VPC Service 側に閉じる (コードの connect() の宛先は名目)。
 # service_id は VPC Service `ichibanboshi-ichiban-sql` (TCP) の id (資格情報でも宛先でもない)。

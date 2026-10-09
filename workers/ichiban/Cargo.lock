@@ -233,9 +233,12 @@ dependencies = [
 name = "ichiban-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
+ "ichiban-logic",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tiberius",
  "tokio",
  "tokio-util",
