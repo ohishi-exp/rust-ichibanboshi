@@ -1059,16 +1059,21 @@ const RUN_GAP_REST_MINUTES: i64 = 8 * 60;
 /// - **24 時間を超えた勤務だけ**が対象。通常の勤務は運行の継ぎ目で切らない (#123)
 /// - 割るのは空きが [`RUN_GAP_REST_MINUTES`] 以上の所だけ
 /// - 運行終了の後に運行開始が無ければ、そこで勤務を終える (帰宅したまま = #135 の形)
+/// - 勤務の始まりと同じ分の運行終了 (休息の終わり = 運行終了) の後に長い空きがあれば、
+///   勤務の始まりを次の運行開始へ進める。同じ分に運行開始もあるときは進めない
 fn split_by_run_gaps(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     if (shift.end - shift.start).num_minutes() <= MAX_RESTRAINT_MINUTES {
         return vec![shift.clone()];
     }
     let inside = |t: &NaiveDateTime| *t > shift.start && *t < shift.end;
+    // 運行終了は勤務の始まりと同じ分のものも拾う (休息の終わり = 運行終了の形)。
+    // shift.start は秒を持ちうるので、運行終了 (分に揃え済み) とは floor_min で比べる
+    let start_min = floor_min(shift.start);
     let mut run_ends: Vec<NaiveDateTime> = events
         .iter()
         .filter(|e| e.state == "運行終了")
         .map(|e| floor_min(e.start))
-        .filter(inside)
+        .filter(|t| *t >= start_min && *t < shift.end)
         .collect();
     run_ends.sort();
     let mut run_starts: Vec<NaiveDateTime> = events
@@ -1082,12 +1087,26 @@ fn split_by_run_gaps(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     let mut out = Vec::new();
     let mut cur = shift.start;
     for end in run_ends {
-        if end <= cur {
+        if end < floor_min(cur) {
             continue;
         }
         let next_start = run_starts.iter().copied().find(|s| *s > end);
         let gap = next_start.unwrap_or(shift.end) - end;
         if gap.num_minutes() < RUN_GAP_REST_MINUTES {
+            continue;
+        }
+        // 勤務の頭にある運行終了 = 頭に長い空きがある。長さ 0 の勤務は作らず、
+        // 次の運行開始へ勤務の始まりを進める (次の運行が無ければ従来どおり残す)
+        if end <= floor_min(cur) {
+            // 同じ分に運行開始もあるなら頭の空きではなく運行の始まり — 運行を消さない
+            let starts_here = events
+                .iter()
+                .any(|e| e.state == "運行開始" && floor_min(e.start) == end);
+            if !starts_here {
+                if let Some(s) = next_start {
+                    cur = s;
+                }
+            }
             continue;
         }
         out.push(Shift {
@@ -4121,6 +4140,95 @@ mod tests {
         );
         assert!(days.iter().all(|d| !d.over_24h));
         assert_eq!(days[0].restraint_minutes, 6 * 60 + 17);
+    }
+
+    #[test]
+    fn a_long_gap_at_the_head_of_a_shift_is_cut_off() {
+        // 休息の終わり = 運行終了 = 勤務の始まりが同じ分。その運行終了の後の長い空きが
+        // 勤務に入って 1 本の 51 時間になっていた
+        let rows = vec![
+            ev("2026-06-09 20:00:00", "2026-06-10 16:45:00", "休息"),
+            dtako("2026-06-10 16:45:00", "運行終了"),
+            dtako("2026-06-12 09:00:00", "運行開始"),
+            dtako("2026-06-12 15:00:00", "運行終了"),
+            ev("2026-06-12 20:00:00", "2026-06-13 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(
+            days.iter()
+                .map(|d| (d.start.as_str(), d.end.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("2026-06-12 09:00:00", "2026-06-12 20:00:00")],
+        );
+        assert_eq!(days[0].restraint_minutes, 11 * 60);
+        assert!(!days[0].over_24h);
+    }
+
+    fn rest_shift(start: &str, end: &str) -> Shift {
+        Shift {
+            start: dt(start),
+            end: dt(end),
+            source: ShiftSource::Rest,
+        }
+    }
+
+    fn spans(shifts: &[Shift]) -> Vec<(String, String)> {
+        shifts
+            .iter()
+            .map(|s| {
+                (
+                    s.start.format(FMT).to_string(),
+                    s.end.format(FMT).to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_head_run_end_matches_a_shift_start_that_has_seconds() {
+        // 勤務の始まりが秒付き (16:45:30) でも、分に揃えた運行終了 (16:45) を頭として拾う
+        let events = parse_events(&[
+            dtako("2026-06-10 16:45:00", "運行終了"),
+            dtako("2026-06-12 09:00:00", "運行開始"),
+            dtako("2026-06-12 15:00:00", "運行終了"),
+        ]);
+        let shift = rest_shift("2026-06-10 16:45:30", "2026-06-12 20:00:00");
+        assert_eq!(
+            spans(&split_by_run_gaps(&shift, &events)),
+            vec![("2026-06-12 09:00:00".into(), "2026-06-12 20:00:00".into())],
+        );
+    }
+
+    #[test]
+    fn a_head_run_end_without_a_next_start_keeps_the_shift() {
+        // 頭の運行終了の後に運行開始が 1 つも無い形は、勤務を消さず従来どおり残す
+        let events = parse_events(&[dtako("2026-06-10 16:45:00", "運行終了")]);
+        let shift = rest_shift("2026-06-10 16:45:00", "2026-06-11 22:00:00");
+        assert_eq!(
+            spans(&split_by_run_gaps(&shift, &events)),
+            vec![("2026-06-10 16:45:00".into(), "2026-06-11 22:00:00".into())],
+        );
+    }
+
+    #[test]
+    fn a_run_end_and_start_in_the_same_minute_keeps_the_run() {
+        // 勤務の始まり = 前の運行終了 = 次の運行開始が同じ分: 頭の空きではなく運行の始まり。
+        // 16:45 → 21:00 の運行を消さず、修正前と同じ分割になる
+        let events = parse_events(&[
+            dtako("2026-06-10 16:45:00", "運行終了"),
+            dtako("2026-06-10 16:45:00", "運行開始"),
+            dtako("2026-06-10 21:00:00", "運行終了"),
+            dtako("2026-06-12 09:00:00", "運行開始"),
+            dtako("2026-06-12 15:00:00", "運行終了"),
+        ]);
+        let shift = rest_shift("2026-06-10 16:45:00", "2026-06-12 20:00:00");
+        assert_eq!(
+            spans(&split_by_run_gaps(&shift, &events)),
+            vec![
+                ("2026-06-10 16:45:00".into(), "2026-06-10 21:00:00".into()),
+                ("2026-06-12 09:00:00".into(), "2026-06-12 20:00:00".into()),
+            ],
+        );
     }
 
     #[test]
