@@ -7,13 +7,13 @@
 //!
 //! ## なぜ `/api/kintai/*` なのか (金額を返すのに)
 //!
-//! [`crate::routes::kintai_day_summaries`] のモジュール docs は「将来ここに金額を足す
-//! ことになったら `/kyuyo/*` と同じ in-service gate へ移すこと」と指示している。
-//! 一度そのとおり `/kyuyo/*` に置いたが、**本番で 503 になった** (2026-08-05):
+//! [`crate::routes::kintai_day_summaries`] のモジュール docs は、金額を足すなら
+//! in-service gate を持つ側へ移すよう指示していた。一度オンプレ版の給与の口に置いたが、
+//! **本番で 503 になった** (2026-08-05。給与の口はその後 Worker へ移り、オンプレ版は撤去):
 //!
-//! | | Supabase 接続 (`[kintai_push]`) | `/kyuyo/*` の認可 |
+//! | | Supabase 接続 (`[kintai_push]`) | in-service gate |
 //! |---|---|---|
-//! | ohishi-data (`/api/kyuyo/*` の宛先) | 無い | ある |
+//! | オンプレ (ohishi-data) | 無い | あった |
 //! | GCP Cloud Run (`/api/kintai/*` の宛先) | ある | 無い |
 //!
 //! この表が読み書きする `kintai.wage_snapshot` は Supabase にあり、そこへ繋がるのは
@@ -27,7 +27,7 @@
 //! `dtako-scraper-relay` の `restraint-api` が auth-worker JWT + 閲覧者 email で
 //! 認可している。**edge の CF Access だけに寄りかかってはいない。**
 //!
-//! `/kyuyo/*` と同じ in-service gate をここに掛けるには GCP 側に introspect と
+//! in-service gate をここに掛けるには GCP 側に introspect と
 //! allowlist の設定を配る必要があり、それは「資格情報を増やさない」方針と衝突する。
 //!
 //! ## テナントは設定 pin (`X-Tenant-ID` を読まない)

@@ -1172,7 +1172,6 @@ pub fn health_state() -> routes::health::HealthState {
     routes::health::HealthState {
         sqlserver: true,
         mariadb: false,
-        kyuyo: false,
         kintai_events: "disabled",
     }
 }

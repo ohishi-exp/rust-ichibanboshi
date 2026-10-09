@@ -1,7 +1,6 @@
 //! 生イベントの HTTP 読み先 (`rust-alc-api` の `GET /api/dtako/events`) の統合テスト。
 //!
-//! **本番 API は一切叩かない。** 上流は wiremock で stub する (`kintai_test.rs` /
-//! `kyuyo_introspect_test.rs` と同じ方針。base URL を const にせず
+//! **本番 API は一切叩かない。** 上流は wiremock で stub する (`kintai_test.rs` と同じ方針。base URL を const にせず
 //! `KintaiEventsConfig::base_url` で受けるのはこのため)。
 //!
 //! 固定したいのは「生 CSV 行 → `KintaiEventsApi` の戻り値」の写し方 —

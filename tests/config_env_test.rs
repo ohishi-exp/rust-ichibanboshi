@@ -43,10 +43,6 @@ password = "onprem-secret"
 [mariadb]
 password = "maria-secret"
 database = "cake"
-
-[kyuyo]
-host = "10.0.0.9"
-password = "kyuyo-secret"
 "#;
     let mut config: Config = toml::from_str(toml_str).unwrap();
     apply(&mut config, &[]).unwrap();
@@ -58,7 +54,6 @@ password = "kyuyo-secret"
     assert_eq!(config.database.host, "172.18.21.102");
     assert_eq!(config.database.password, "onprem-secret");
     assert_eq!(config.mariadb.password, "maria-secret");
-    assert_eq!(config.kyuyo.password, "kyuyo-secret");
     assert_eq!(config.port, 3100);
     assert_eq!(config.bind_addr, "127.0.0.1");
 }
@@ -85,14 +80,6 @@ fn test_env_overrides_every_supported_key() {
             ("MARIADB_USER", "maria_reader"),
             ("MARIADB_PASSWORD", "maria-pass"),
             ("MARIADB_DATABASE", "cakephp"),
-            ("KYUYO_HOST", "kyuyo.example"),
-            ("KYUYO_PORT", "14331"),
-            ("KYUYO_USER", "kyuyo_reader2"),
-            ("KYUYO_PASSWORD", "kyuyo-pass"),
-            ("KYUYO_AUTH_WORKER_ORIGIN", "https://auth.example"),
-            ("KYUYO_INTROSPECT_SECRET", "introspect-secret"),
-            ("KYUYO_APP_ORIGIN", "https://app.example"),
-            ("KYUYO_ALLOWED_EMAILS", "a@example.com, b@example.com"),
             ("KINTAI_EVENTS_SOURCE", "http"),
             ("KINTAI_EVENTS_BASE_URL", "https://alc.example"),
             (
@@ -141,19 +128,6 @@ fn test_env_overrides_every_supported_key() {
     assert_eq!(config.mariadb.password, "maria-pass");
     assert_eq!(config.mariadb.database, "cakephp");
     assert!(config.mariadb.enabled());
-    assert_eq!(config.kyuyo.host, "kyuyo.example");
-    assert_eq!(config.kyuyo.port, 14331);
-    assert_eq!(config.kyuyo.user, "kyuyo_reader2");
-    assert_eq!(config.kyuyo.password, "kyuyo-pass");
-    assert_eq!(config.kyuyo.auth_worker_origin, "https://auth.example");
-    assert_eq!(config.kyuyo.introspect_secret, "introspect-secret");
-    assert_eq!(config.kyuyo.app_origin, "https://app.example");
-    assert_eq!(
-        config.kyuyo.allowed_emails,
-        vec!["a@example.com", "b@example.com"]
-    );
-    assert!(config.kyuyo.db_enabled());
-    assert!(config.kyuyo.auth_configured());
     assert_eq!(config.cakephp.base_url, "http://127.0.0.1:120");
     assert_eq!(
         config.dtako_day_links.ryohi_base_url,
@@ -505,10 +479,6 @@ fn test_env_number_invalid_is_loud() {
     let mut config = base();
     let err = apply(&mut config, &[("MARIADB_PORT", "-1")]).unwrap_err();
     assert!(err.contains("MARIADB_PORT"), "{err}");
-
-    let mut config = base();
-    let err = apply(&mut config, &[("KYUYO_PORT", "99999999")]).unwrap_err();
-    assert!(err.contains("KYUYO_PORT"), "{err}");
 
     let mut config = base();
     let err = apply(&mut config, &[("DATABASE_PORT", "nope")]).unwrap_err();

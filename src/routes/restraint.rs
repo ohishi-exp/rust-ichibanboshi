@@ -12,7 +12,8 @@
 //!
 //! `/kintai/daily` と同じ扱い。**データの ACL で選んでいる**: サマリは分・日数・
 //! 氏名・所属のみで**金額を含まない**。消費者が Worker DO なのでブラウザ JWT を
-//! 持てない。金額を足すことになったら `/kyuyo/*` の in-service gate へ移すこと。
+//! 持てない。金額を足すことになったら給与大臣 Worker (`workers/kyuyo/`、認可は
+//! auth-worker の `KyuyoAuthEntrypoint`) 側へ置くこと。
 //!
 //! ## サマリ JSON は解釈しない
 //!
@@ -30,7 +31,7 @@ use crate::restraint_store::{
 };
 use crate::routes::kintai::is_valid_month;
 
-/// エラーレスポンス本文 (kyuyo と同形)。
+/// エラーレスポンス本文。
 #[derive(Serialize, Debug)]
 pub struct ErrorBody {
     pub error: String,

@@ -12,7 +12,6 @@ use tower_http::trace::TraceLayer;
 use crate::cakephp::CakephpClient;
 use crate::config::{Config, RawConfig};
 use crate::db;
-use crate::kyuyo;
 use crate::repo::TiberiusRepo;
 use crate::routes;
 use crate::sqlite::{DynLocalStore, LocalStore};
@@ -146,21 +145,6 @@ pub async fn run(
     // fetch はしない — 文字列を組むだけなので到達性チェックは無い
     let dtako_day_links = Arc::new(config.dtako_day_links.clone());
 
-    // 給与大臣 (OHKEN) 読み取り (#82)。未設定なら stub を挿して該当ルートだけ 503。
-    // pool は起動時テストなし — 給与大臣 PC 停止でも本サービス全体は起動する
-    let kyuyo_repo: kyuyo::repo::DynKyuyoRepo = if config.kyuyo.db_enabled() {
-        let pool = kyuyo::repo::create_kyuyo_pool(&config.kyuyo).await?;
-        Arc::new(kyuyo::repo::TiberiusKyuyoRepo::new(pool))
-    } else {
-        tracing::info!("kyuyo database not configured — /api/kyuyo/* returns 503");
-        Arc::new(kyuyo::repo::NotConfiguredKyuyoRepo)
-    };
-    let kyuyo_auth = Arc::new(kyuyo::introspect::KyuyoAuthState::from_config(
-        &config.kyuyo,
-    ));
-    // 給与 DB (OHKEN、非力な PC) を触る区間の同時実行制限 (Refs #369)
-    let kyuyo_limiter = Arc::new(routes::kyuyo::KyuyoLimiter::new());
-
     // タイムカードの SQLite derived store (Refs #106 Phase 2)。open 失敗は Noop に
     // 落として CakePHP 素通し中継を維持する
     let kintai_store: crate::kintai_store::DynKintaiStore = if config.cakephp.sqlite_path.is_empty()
@@ -262,26 +246,10 @@ pub async fn run(
             }
         };
 
-    // 給与の SQLite derived store (Refs #106 Phase 1)。open 失敗は Noop に落として
-    // live 読みへフォールバック — キャッシュの健全性で読み機能を殺さない
-    let kyuyo_store: kyuyo::store::DynKyuyoStore = if config.kyuyo.sqlite_path.is_empty() {
-        tracing::info!("kyuyo sqlite_path is empty — derived store disabled (live reads only)");
-        Arc::new(kyuyo::store::NoopKyuyoStore)
-    } else {
-        match kyuyo::store::KyuyoStore::open(&config.kyuyo.sqlite_path) {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                tracing::warn!("kyuyo store open failed — falling back to live reads: {e}");
-                Arc::new(kyuyo::store::NoopKyuyoStore)
-            }
-        }
-    };
-
     // 宣言したバックエンドの一覧を /health に出す (実行形態を外から判別可能にする)。
     let health_state = crate::routes::health::HealthState {
         sqlserver: config.database.enabled,
         mariadb: config.mariadb.enabled(),
-        kyuyo: config.kyuyo.db_enabled(),
         kintai_events: kintai_events_backend,
     };
 
@@ -473,22 +441,9 @@ pub async fn run(
             "/kintai/recalc",
             get(routes::kintai_recalc::preview).post(routes::kintai_recalc::recalc),
         )
-        .route("/kyuyo/companies", get(routes::kyuyo::companies))
-        .route("/kyuyo/databases", get(routes::kyuyo::databases))
-        .route("/kyuyo/payroll", get(routes::kyuyo::payroll))
-        .route("/kyuyo/employees", get(routes::kyuyo::employees))
-        .route("/kyuyo/sync", post(routes::kyuyo::sync))
-        .route("/kyuyo/synced-months", get(routes::kyuyo::synced_months))
-        // 「この人は給与データを見てよいか」だけを答える口 (Refs
-        // ohishi-exp/nuxt-dtako-admin#951)。下の `/kintai/wage-*` は Supabase の
-        // 都合で GCP 側にしか置けず、そちらには allowlist が無い。呼び出し側
-        // (dtako-scraper-relay) が **allowlist を持つこちらのインスタンス**へ
-        // 1 回聞いてから wage-* を通す、という組み合わせで塞ぐ
-        .route("/kyuyo/access", get(routes::kyuyo::access))
         // 賃金確定値の月次スナップショット (Refs #291)。**`/kintai/*` 側に置く** —
         // 読み書きする `kintai.wage_snapshot` は Supabase にあり、そこへ繋がるのは
-        // GCP のインスタンスだけ。`/kyuyo/*` の宛先 (ohishi-data) には
-        // `[kintai_push]` が無く 503 になる (2026-08-05 本番で判明)
+        // GCP のインスタンスだけ (オンプレには `[kintai_push]` が無く 503 になる)
         .route(
             "/kintai/wage-snapshot",
             post(routes::wage_snapshot::put_wage_snapshot),
@@ -523,10 +478,6 @@ pub async fn run(
         .layer(Extension(local_store))
         .layer(Extension(cakephp_client))
         .layer(Extension(raw_cfg))
-        .layer(Extension(kyuyo_repo))
-        .layer(Extension(kyuyo_auth))
-        .layer(Extension(kyuyo_limiter))
-        .layer(Extension(kyuyo_store))
         .layer(Extension(kintai_store))
         .layer(Extension(kintai_events_repo))
         .layer(Extension(kintai_version_repo))

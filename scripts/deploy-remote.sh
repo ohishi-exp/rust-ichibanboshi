@@ -101,7 +101,7 @@ sleep 6
 
 # remote 側から <addr>/health を叩き、HTTP_CODE / HEALTH_BODY に置く。
 # body は build 情報 ({"status","commit","built_at"})。
-# 起動は 20 秒超かかることがある (kyuyo SQL Server pool 初期化だけで 13 秒の実測、
+# 起動は 20 秒超かかることがある (SQL Server pool 初期化だけで 13 秒の実測、
 # 2026-07-29 に一発チェックで race って赤になった) ので、最長 60 秒までポーリング。
 poll_health() {
   local addr="$1"

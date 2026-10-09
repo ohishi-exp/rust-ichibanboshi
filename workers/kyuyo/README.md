@@ -65,11 +65,10 @@ fetch は `Authorization: Bearer <token>` を取り出し (無ければ空文字
 認可を差し替えるローカル専用の var や分岐はコードに置かない (fail-open になる)。ローカル検証はスタブの auth worker を
 Service Binding で繋ぐ (下の「ローカル検証」)。
 
-### 並走期間の注意
+### 認可の注意
 
-- **allowlist の正本は 2 か所ある**: オンプレの `[kyuyo] allowed_emails` と auth-worker の KV `kyuyo-allowed-emails`。
-  **オンプレ廃止までは両方を同時に直す** (片方だけ直すと、同じ人がオンプレでは通り Worker では弾かれる、またはその逆)。
-  どちらも空なら 503 (オンプレは `allowed_emails が空`、auth-worker は `kyuyo_allowlist_unset`)
+- **allowlist の正本は auth-worker の KV `kyuyo-allowed-emails` だけ** (オンプレ版の口は撤去済み)。
+  空なら 503 (`kyuyo_allowlist_unset`)
 - **認可で弾いた応答の body は auth-worker のもの** (`{"error":"unauthorized"}` 等)。オンプレ版の `ErrorBody` とキー
   (`error`) は同じだが文言は違う。**並走比較では認可で弾いた応答は status だけを比べる**
 
@@ -239,8 +238,7 @@ CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build 
 - 見るもの: 5 口が 200、2 回目の employees / payroll が `source:"cache"` (ログ `ok cache`)、コンテナを止めても
   キャッシュ済みの月は 200 で `databases` は 503、存在しない年度は 500 (上の 404 の注)、不正な company / month は 400、
   sync の後に `synced-months` に月が出る
-- オンプレ版との一致: 同じ DB に repo ルートの `ichibanboshi --console` を向け (`[database] enabled = false`、`[kyuyo]` の
-  `auth_worker_origin` を `/auth/introspect` のローカルスタブへ)、同じリクエストの応答を `synced_at` を除いて比べる
+- オンプレ版との突き合わせ: オンプレ版の口は撤去済みなので、この手順はできない。比べたいときは撤去前の commit (84f0377) をビルドして使う
 
 `.dev.vars` は `.gitignore` 済み。
 

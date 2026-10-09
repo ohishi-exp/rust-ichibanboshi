@@ -1419,14 +1419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kyuyo-logic"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2235,7 +2227,6 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-rdcleanpath",
  "jsonwebtoken",
- "kyuyo-logic",
  "mysql_async",
  "regex",
  "reqwest",

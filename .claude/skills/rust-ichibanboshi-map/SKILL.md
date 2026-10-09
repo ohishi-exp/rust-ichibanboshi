@@ -34,11 +34,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/kintai_version.rs` + `src/routes/kintai_version.rs` | `/api/kintai/version` 月別バージョン (ETag) — `daily`/`kosoku-daily` の全ソーステーブル (11 個) の COUNT+CRC32 マーカーを `VERSION_SQL` 1 本で取り sha256 に畳む (#184、下記) |
 | `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/kosoku_paper.rs` | 紙のタイムカード表 (社内 CakePHP) の日別拘束の**再現** — 突合用に `paper_drift_by_date` (cause `rounding`) / `paper_outside_by_date` (紙だけが数える分: 勤務外・運行行欠けの対二重・イベント重複の二重、cause `paper-outside`) / `ours_outside_by_date` (こちらだけが数える分: 紙の材料に無い拘束、cause `ours-outside`) を `kosoku-daily?view=compare` に載せる (nuxt-dtako-admin#501/#546、#182)。**coverage 100% 対象** |
-| `src/routes/kyuyo.rs` | `/api/kyuyo/*` 給与大臣 DB の読み出し (下記)。**応答型 (`PayrollResponse` 等 9 つ) の定義は `workers/kyuyo/logic/src/api.rs`** (Worker と共有、#322。JSON の形はそちらの unit test が固定) |
-| `src/kyuyo/mod.rs` の `logic` | 給与の純粋ロジック (項目マッピング・行組み立て)。**本体は `workers/kyuyo/logic/src/payroll.rs`** (Worker 側 crate `kyuyo-logic`、#322)。オンプレ版は root `Cargo.toml` の path 依存 + `pub use kyuyo_logic::payroll as logic` で並走期間だけ借りている (オンプレ廃止時に依存を外す)。テストは `workers/kyuyo/logic/tests/payroll_test.rs`、**coverage 100% gate は `workers/kyuyo/coverage_100.toml` (worker-kyuyo.yml が判定)** |
-| `src/kyuyo/repo.rs` | 給与大臣 SQL Server への SELECT (別 pool・別 trait)。DB 層。**SQL 文と DB 名の検証は `workers/kyuyo/logic/src/sql.rs`** (Worker の `workers/kyuyo/worker/src/repo.rs` と同じ文字列を流す、#322。CAST / CONVERT(…,120) はそちらに在る) |
-| `src/kyuyo/store.rs` | 給与の SQLite derived store。**DDL・版・scope の鍵は `workers/kyuyo/logic/src/store_keys.rs`** (Worker の DO `KyuyoState` と共有、#322) |
-| `src/kyuyo/introspect.rs` | `/api/kyuyo/*` の in-service gate (auth-worker introspect + email allowlist) |
+| `workers/kyuyo/` | 給与大臣 `/kyuyo/*` の読み出しは **Cloudflare Worker `ichibanboshi-kyuyo`** に移った (#322)。オンプレ版 (`src/kyuyo/`・`src/routes/kyuyo.rs`・`/api/kyuyo/*`) は撤去済み。純粋ロジック `logic/src/payroll.rs`・SQL 文 `logic/src/sql.rs`・応答型 `logic/src/api.rs`・store の DDL `logic/src/store_keys.rs`、DO `KyuyoState`、認可は auth-worker の `KyuyoAuthEntrypoint`。**coverage 100% gate は `workers/kyuyo/coverage_100.toml` (worker-kyuyo.yml が判定)**。詳細は `workers/kyuyo/README.md` |
 
 ## entrypoint / Axum router (`src/server.rs::run`)
 
@@ -188,8 +184,8 @@ CakePHP は LAN 内にしか居ないので、**同一ホストで動く本サ�
   同一番号体系で、本社事務員も含まれる。受け手がそのまま引き当てる
 - **認可は CF Access Service Token (edge)** で `/employees` と同じ扱い。前例のコピーではなく
   **データの ACL で選んでいる**: 応答は識別情報と時刻だけで金額を含まず、消費者が
-  Cloudflare Worker の DO なのでブラウザ JWT を持てないため。**金額を足すなら `/kyuyo/*` と同じ
-  in-service gate へ移すこと**
+  Cloudflare Worker の DO なのでブラウザ JWT を持てないため。**金額を足すなら給与大臣 Worker
+  (`workers/kyuyo/`、認可は auth-worker の `KyuyoAuthEntrypoint`) へ移すこと**
 - `month` は `YYYY-MM` 必須 (上流の `HolidaysTrait` が月単位 API のため)。不正は 400、
   `base_url` 未設定は 503、上流の非 2xx / 非 JSON / 到達不能は 502
 - **上流が非 JSON (ログイン画面の HTML) を返したら 502 `parse failed`** — CakePHP 側の
@@ -230,7 +226,7 @@ claude.ai/code/artifact/db46b3b2)、規則を決める前に実データで各�
   **こちらは必須のまま**)
 - **キャッシュを持たない**。調査用途で頻度が低く常に最新の打刻が要るため
 - 認可は `daily` と同じ CF Access Service Token (edge)。応答は識別情報と時刻・車番だけで
-  **金額を含まない**。金額を足すなら `/kyuyo/*` の in-service gate へ移すこと
+  **金額を含まない**。金額を足すなら 給与大臣 Worker (`workers/kyuyo/`) へ移すこと
 - テストは `tests/kintai_events_test.rs` — `KintaiEventsApi` の mock を挿して **DB 無し**で
   回す。打刻のみ / 運行のみ / 同日 2 運行 / 日跨ぎ の 4 ケースが「解釈されずそのまま通る」
   ことを固定する (解釈は Phase 2 の `kosoku-daily` 側の担当)
@@ -408,11 +404,12 @@ nuxt-dtako-admin の relay (dtako-scraper-relay) が上流応答キャッシュ 
 - テストは `src/kintai_version.rs` の unit test (畳み込み・SQL guard) と
   `tests/kintai_version_test.rs` (route の配線、mock で DB 無し) の 2 段
 
-## 給与 (給与大臣) の読み出し — `/api/kyuyo/*`
+## 給与 (給与大臣) の読み出し — Worker `workers/kyuyo/` (旧 `/api/kyuyo/*`)
 
-一番星とは**別の SQL Server** (給与大臣、年度ごとに `KYDATA{会社}_{年度}` の DB が分かれる)。
-pool も repo trait も分離してある (`src/kyuyo/repo.rs`)。認可は**ブラウザ JWT の in-service gate**
-(auth-worker introspect + email allowlist) — 金額を返すので `/kintai/*` の Service Token とは扱いが違う。
+読み出しは **Cloudflare Worker `ichibanboshi-kyuyo`** (`workers/kyuyo/`) が担う。オンプレ版の `/api/kyuyo/*`
+は撤去済み (#322)。一番星とは**別の SQL Server** (給与大臣、年度ごとに `KYDATA{会社}_{年度}` の DB が分かれる)。
+認可は**ブラウザ JWT** を auth-worker の `KyuyoAuthEntrypoint.authorize(token)` で判定する — 金額を返すので
+`/kintai/*` の Service Token とは扱いが違う。以下は列と項目番号の知識 (実装は `workers/kyuyo/logic/`)。
 
 **項目マスタ `KOUMOKU.TAIKEIKOUNO` = 体系コード(2桁) + 項目番号(3桁)** で、`KYUYO` の列と
 項目番号帯が対応する。**帯ごとに列がまったく別**なのが要点:

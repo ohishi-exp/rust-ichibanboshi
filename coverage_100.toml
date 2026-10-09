@@ -26,7 +26,7 @@
 # - **計測データに現れないファイルを入れない。** 現れなかったら gate はスキップ
 #   せず fail する (先例はここを WARN で握り潰しており、登録済みなのに一度も
 #   検証されていないファイルが実在した)。
-#   `src/lib.rs` / `src/routes/mod.rs` / `src/kyuyo/mod.rs` は re-export だけで
+#   `src/lib.rs` / `src/routes/mod.rs` は re-export だけで
 #   実行行が 0 なので登録できない。
 # - 100% に到達したファイルは登録漏れさせない (登録漏れ = gate が守っていない)
 #
@@ -86,11 +86,6 @@ path = "src/cf_access.rs"
 [[files]]
 path = "src/change_log.rs"
 
-# --- 給与 (給与大臣) ---
-
-[[files]]
-path = "src/kyuyo/introspect.rs"
-
 # --- routes (全て MockRepo / wiremock でカバー) ---
 
 [[files]]
@@ -113,9 +108,6 @@ path = "src/routes/kintai_day_summaries.rs"
 # 実測 25/25 で 100% だが未登録だった (2026-07-30 の棚卸しで追加)
 [[files]]
 path = "src/routes/kintai_version.rs"
-
-[[files]]
-path = "src/routes/kyuyo.rs"
 
 [[files]]
 path = "src/routes/restraint.rs"
@@ -178,14 +170,12 @@ path = "src/routes/dtako_worktime.rs"
 #
 #   src/cakephp.rs            220/223  98.7%  (miss 3)
 #   src/sqlite.rs            1798/1823 98.6%  (miss 25)
-#   src/kyuyo/store.rs        257/285  90.2%  (miss 28)
 #   src/restraint_store.rs    163/189  86.2%  (miss 26)
 #   src/kintai_version.rs     122/145  84.1%  (miss 23)
 #   src/routes/uriage.rs     1106/1334 82.9%  (miss 228)
 #   src/kintai_repo.rs        134/168  79.8%  (miss 34)
 #   src/kintai_pg_repo.rs      36/43   83.7%  (miss 7)   DB 層 (2026-07-31 実測)
 #   src/kintai_store.rs        67/92   72.8%  (miss 25)
-#   src/kyuyo/repo.rs          20/144  13.9%  (miss 124)  DB 層
 #   src/db.rs                   0/36    0.0%              DB 層
 #   src/main.rs                 0/25    0.0%              entrypoint
 #   src/repo.rs                 0/456   0.0%              DB 層 (tiberius 直叩き)

@@ -6,8 +6,8 @@
 //! wage-report の素材 (当月+前月 × theearth+timecard) を 1 fetch で返すための
 //! 配信キャッシュ — 消えても relay の resummarize (全月) を回せば再構築できる。
 //!
-//! 行は relay のサマリ JSON を **verbatim 保存** (解釈しない — kyuyo/kintai store
-//! と同じ素通し哲学)。`kyuyo/store.rs` と同じ作法 (rusqlite + `Arc<Mutex<_>>` +
+//! 行は relay のサマリ JSON を **verbatim 保存** (解釈しない — kintai store
+//! と同じ素通し哲学)。`kintai_store.rs` と同じ作法 (rusqlite + `Arc<Mutex<_>>` +
 //! `spawn_blocking`)。
 
 use std::sync::Arc;

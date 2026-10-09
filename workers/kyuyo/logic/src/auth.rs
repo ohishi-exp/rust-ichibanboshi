@@ -18,8 +18,7 @@ use crate::Reply;
 /// Worker → DO の内部ヘッダ (認可済みの email)。外から来た同名ヘッダは DO に届かない。
 pub const EMAIL_HEADER: &str = "x-kyuyo-authorized-email";
 
-/// `Authorization` ヘッダから Bearer token を取り出す (オンプレ版 `src/kyuyo/introspect.rs` と同じ
-/// `"Bearer "` 接頭辞)。無ければ空文字 — auth-worker は空の token を 401 にする (allowlist 未設定なら先に 503)。
+/// `Authorization` ヘッダから Bearer token を取り出す (`"Bearer "` 接頭辞)。無ければ空文字 — auth-worker は空の token を 401 にする (allowlist 未設定なら先に 503)。
 pub fn bearer_token(authorization: Option<&str>) -> &str {
     authorization
         .and_then(|v| v.strip_prefix("Bearer "))

@@ -17,7 +17,7 @@ description: 賃金の法定チェック (労基則19条の1時間あたり賃�
 | 暦日按分 | nuxt-dtako-admin `workers/dtako-scraper-relay/src/kosoku-daily.ts` | 上流 (本リポ) は勤務を**始業日へ丸ごと寄せて**返す。暦日へ配るのは下流 |
 | 賃金 (金額) | nuxt-dtako-admin `workers/dtako-scraper-relay/src/restraint-wage.ts` (`computeWageRow`) | **本リポには無い。** R2 の拘束アーカイブを材料に計算する |
 | 支払い実績との突合 | nuxt-dtako-admin `app/utils/salary-compare.ts` (ブラウザ内) | 給与明細 × wage-report |
-| 給与明細の生データ | **本リポ `/api/kyuyo/*`** (`src/kyuyo/`) | 給与大臣 SQL Server (`KYDATA{会社4桁}_{年度3桁}C`) |
+| 給与明細の生データ | **給与大臣 Worker `/kyuyo/*`** (本リポ `workers/kyuyo/`。オンプレ版 `/api/kyuyo/*` は撤去済み) | 給与大臣 SQL Server (`KYDATA{会社4桁}_{年度3桁}C`) |
 
 → `src/kosoku.rs` の丸め・勤務の切り方・24時間の扱いを変えても **賃金額には波及しない**。
 影響が出るのは紙のタイムカード表との突合 (`src/kosoku_paper.rs`)・画面表示・改善基準告示の
@@ -44,7 +44,7 @@ description: 賃金の法定チェック (労基則19条の1時間あたり賃�
 | 区分 | 分母 | 根拠 | 材料 |
 |---|---|---|---|
 | 1 月給 | 月平均所定労働時間 = 年間所定労働日数 × 1日所定 ÷ 12 | 19条4号 (月によって異なる場合は1年平均) | 年間所定労働日数 (**未整備**) + `work_schedules.daily_work_minutes` |
-| 2 日給 | 出勤日数 × 1日所定 | 19条2号 (日給 ÷ 1日の所定労働時間) | 出勤日数 (`KINDATA*` → `/api/kyuyo/payroll` の `attendance`) + `daily_work_minutes` |
+| 2 日給 | 出勤日数 × 1日所定 | 19条2号 (日給 ÷ 1日の所定労働時間) | 出勤日数 (`KINDATA*` → Worker `/kyuyo/payroll` の `attendance`) + `daily_work_minutes` |
 | 3 時給 | 所定内の実働時間 | 19条1号 (時間給はその額) | `wage-report` の `minutes.statutory` |
 | 4 その他 / 0 未設定 | — | — | **null (判定しない)** |
 
@@ -58,9 +58,9 @@ description: 賃金の法定チェック (労基則19条の1時間あたり賃�
 
 | 値 | 出どころ | 状態 |
 |---|---|---|
-| 給与区分 (月給/日給/時給) | **`SHAIN3.KKUBUN`** (`SHAIN1.INCODE` = `SHAIN3.INCODE` で結合) | `/api/kyuyo/employees` の `kkubun` で提供済み (#101) |
-| 支給・控除の金額 | `KYUYO.MONEY00..79` (項目番号 018〜097) | `/api/kyuyo/payroll` で提供済み |
-| **勤怠日数・残業時間** | `KYUYO.KINDATA0000, KINDATA0100, … KINDATA1600` (17列・100刻み、項目番号 001〜017) | `/api/kyuyo/payroll` の `attendance` で提供済み (#103/#104)。項目名 → **`/100` 済みの実数**、0 は含めない・同名は合算 |
+| 給与区分 (月給/日給/時給) | **`SHAIN3.KKUBUN`** (`SHAIN1.INCODE` = `SHAIN3.INCODE` で結合) | Worker `/kyuyo/employees` の `kkubun` で提供済み (#101) |
+| 支給・控除の金額 | `KYUYO.MONEY00..79` (項目番号 018〜097) | Worker `/kyuyo/payroll` で提供済み |
+| **勤怠日数・残業時間** | `KYUYO.KINDATA0000, KINDATA0100, … KINDATA1600` (17列・100刻み、項目番号 001〜017) | Worker `/kyuyo/payroll` の `attendance` で提供済み (#103/#104)。項目名 → **`/100` 済みの実数**、0 は含めない・同名は合算 |
 | 項目名 | `KOUMOKU.TAIKEIKOUNO` = 体系コード2桁 + 項目番号3桁 | `fetch_koumoku` が絞り込みなしで全件読むので**名前だけは既に手元にある** |
 | 所属・職種 | `SHOZOKU.INCODE` / `NAME1` (営業所) / `NAME2` (職種) | `SNAME` から切り出す必要はない |
 | 入社日 | `SHAIN2.DAYNYU` (`SHAIN1` ではない) | 退社日の未設定は **1970-01-02 センチネル** |
@@ -148,7 +148,7 @@ description: 賃金の法定チェック (労基則19条の1時間あたり賃�
 
 ## 参照
 
-- 本リポ: `docs/kyuyo-daijin-schema.md` (給与大臣スキーマの一次情報) / `src/kyuyo/` / `src/kosoku.rs` /
+- 本リポ: `docs/kyuyo-daijin-schema.md` (給与大臣スキーマの一次情報) / `workers/kyuyo/` / `src/kosoku.rs` /
   `rust-ichibanboshi-map` skill (構造ナビゲーション)
 - nuxt-dtako-admin: `docs/wage-calculation-spec.md` (賃金計算の仕様の正) /
   `docs/plan-268-wage-tab-separation.md`

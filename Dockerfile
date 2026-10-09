@@ -34,7 +34,7 @@ COPY ichibanboshi /usr/local/bin/ichibanboshi
 # Config::apply_env_overrides)。優先順位は CLI 引数 > 環境変数 > TOML > 既定値。
 # Cloud Run では secretKeyRef が入れる env var だけで起動できる:
 #   DATABASE_ENABLED=false          … SQL Server (CAPE#01) を使わないと宣言する
-#   MARIADB_* / KYUYO_* / JWT_SECRET … 使うバックエンドの秘匿値
+#   MARIADB_* / JWT_SECRET … 使うバックエンドの秘匿値
 #
 # ⚠️ DATABASE_ENABLED を宣言しないと既定 (= true、オンプレの形) のまま
 #    localhost の SQL Server を探しに行き、起動時接続テストに失敗して終了する。

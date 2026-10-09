@@ -14,9 +14,9 @@ use crate::repo::{DynRepo, RepoError};
 /// - `sqlserver`: `[database] enabled`。**宣言したら起動時に接続を検証済み**
 ///   (繋がらなければそもそも起動していない、`db::create_pool` 参照) なので、
 ///   `/health` では毎回 `health_check()` で継続的な生死だけを見る。
-/// - `mariadb` / `kyuyo`: 設定が揃っているか (`MariadbConfig::enabled()` /
-///   `KyuyoConfig::db_enabled()`)。こちらは pool が lazy で起動時検証をしないため、
-///   `"declared"` は「使うと宣言した」までしか意味しない。
+/// - `mariadb`: 設定が揃っているか (`MariadbConfig::enabled()`)。こちらは pool が
+///   lazy で起動時検証をしないため、`"declared"` は「使うと宣言した」までしか
+///   意味しない。
 /// - `kintai_events`: 生イベントを**どこから読んでいるか** (`"mariadb"` / `"http"` /
 ///   `"disabled"`、Refs #205 実装計画 02)。同じバイナリで読み先が変わるので、
 ///   宣言だけでなく**採用された経路**を出す — 読み先を間違えたときの壊れ方は
@@ -25,7 +25,6 @@ use crate::repo::{DynRepo, RepoError};
 pub struct HealthState {
     pub sqlserver: bool,
     pub mariadb: bool,
-    pub kyuyo: bool,
     /// 生イベントの読み先 (`crate::server` が実際に挿した実装の名前)。
     pub kintai_events: &'static str,
 }
@@ -68,12 +67,11 @@ pub async fn health(
             env!("BUILD_SHA"),
             "\",\"built_at\":\"",
             env!("BUILD_TIME"),
-            "\",\"backends\":{{\"sqlserver\":\"{}\",\"mariadb\":\"{}\",\"kyuyo\":\"{}\",",
+            "\",\"backends\":{{\"sqlserver\":\"{}\",\"mariadb\":\"{}\",",
             "\"kintai_events\":\"{}\"}}}}"
         ),
         sqlserver,
         declared(state.mariadb),
-        declared(state.kyuyo),
         state.kintai_events
     );
     Ok(([(header::CONTENT_TYPE, "application/json")], body))
