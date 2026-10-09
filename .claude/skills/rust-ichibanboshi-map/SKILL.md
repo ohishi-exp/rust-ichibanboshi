@@ -34,14 +34,14 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/kintai_version.rs` + `src/routes/kintai_version.rs` | `/api/kintai/version` 月別バージョン (ETag) — `daily`/`kosoku-daily` の全ソーステーブル (11 個) の COUNT+CRC32 マーカーを `VERSION_SQL` 1 本で取り sha256 に畳む (#184、下記) |
 | `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/kosoku_paper.rs` | 紙のタイムカード表 (社内 CakePHP) の日別拘束の**再現** — 突合用に `paper_drift_by_date` (cause `rounding`) / `paper_outside_by_date` (紙だけが数える分: 勤務外・運行行欠けの対二重・イベント重複の二重、cause `paper-outside`) / `ours_outside_by_date` (こちらだけが数える分: 紙の材料に無い拘束、cause `ours-outside`) を `kosoku-daily?view=compare` に載せる (nuxt-dtako-admin#501/#546、#182)。**coverage 100% 対象** |
-| `workers/ichiban/` | 一番星 (CAPE#01) の読み出しを Worker へ移す途中 (#322)。`logic/` (`ichiban-logic`) に管理画面の 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・`/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) の SQL 文・型・絞り込み判定・`build_*` を置き、**オンプレ版も path 依存で使う** (6 本の SQL を直すのはここ。`src/repo.rs` の `rows_to_*` と列の並びが 1 対 1)。gate は `workers/ichiban/coverage_100.toml` (worker-ichiban.yml)。詳細は `workers/ichiban/README.md` |
+| `workers/ichiban/` | 一番星 (CAPE#01) の管理画面向け 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・`/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) は **Cloudflare Worker `ichibanboshi-ichiban`** に移った (#322)。`logic/` (`ichiban-logic`) に SQL 文・型・絞り込み判定・`build_*` を置く (6 本の SQL を直すのはここ。`worker/src/rows.rs` と列の並びが 1 対 1)。**オンプレ版の 5 本は削除済み。6 本は Worker だけが提供** (オンプレの `/health` は他系統の監視用に残す。`src/repo.rs` は `ichiban-logic` に依存せず、`HEALTH_SQL`・`DEPARTMENTS_SQL` を同じ文字列で持つ)。gate は `workers/ichiban/coverage_100.toml` (worker-ichiban.yml)。詳細は `workers/ichiban/README.md` |
 | `workers/kyuyo/` | 給与大臣 `/kyuyo/*` の読み出しは **Cloudflare Worker `ichibanboshi-kyuyo`** に移った (#322)。オンプレ版 (`src/kyuyo/`・`src/routes/kyuyo.rs`・`/api/kyuyo/*`) は撤去済み。純粋ロジック `logic/src/payroll.rs`・SQL 文 `logic/src/sql.rs`・応答型 `logic/src/api.rs`・store の DDL `logic/src/store_keys.rs`、DO `KyuyoState`、認可は auth-worker の `KyuyoAuthEntrypoint`。**coverage 100% gate は `workers/kyuyo/coverage_100.toml` (worker-kyuyo.yml が判定)**。詳細は `workers/kyuyo/README.md` |
 
 ## entrypoint / Axum router (`src/server.rs::run`)
 
 - `/health`
 - `/api/sales/*`: `monthly` / `by-department` / `by-customer` / `yoy` / `daily` /
-  `customer-trend` / `customer-yoy` / `customer-yoy-by-dept` / `departments` / `customer-detail`
+  `customer-trend` / `customer-yoy` / `customer-yoy-by-dept` / `customer-detail`
 - `/api/surcharge/base`: 燃料サーチャージ基礎データ。`運転日報明細` の請求のみ行 (`請求K`='1'、
   `kind=transport`/`all` で切替) を 得意先 / 積地県 / 卸地県 / 車種 / 売上年月日 / 運賃 / 請求日(入金予定)
   に展開。県正規化 (`地域N` → 都道府県) は `normalize_prefecture` 純粋関数。残マスタ (燃費/距離/軽油価格/
@@ -183,7 +183,7 @@ CakePHP は LAN 内にしか居ないので、**同一ホストで動く本サ�
   未知フィールドも `#[serde(flatten)]` で拾って復元する — 上流が項目を足しても型を触らずに済む
 - **ID 変換・突合はしない** — CakePHP の `drivers.id` は乗務員CD (= 一番星 `社員ﾏｽﾀ.社員C`) と
   同一番号体系で、本社事務員も含まれる。受け手がそのまま引き当てる
-- **認可は CF Access Service Token (edge)** で `/employees` と同じ扱い。前例のコピーではなく
+- **認可は CF Access Service Token (edge)** (旧オンプレ `/employees` と同じ扱いだった)。前例のコピーではなく
   **データの ACL で選んでいる**: 応答は識別情報と時刻だけで金額を含まず、消費者が
   Cloudflare Worker の DO なのでブラウザ JWT を持てないため。**金額を足すなら給与大臣 Worker
   (`workers/kyuyo/`、認可は auth-worker の `KyuyoAuthEntrypoint`) へ移すこと**

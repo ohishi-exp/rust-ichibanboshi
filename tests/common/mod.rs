@@ -6,8 +6,6 @@ use async_trait::async_trait;
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 use chrono::NaiveDate;
-use ichiban_logic::costs_daily::RawCostsDailyRow;
-use ichiban_logic::vehicle_daily::RawVehicleDailyRow;
 use rust_ichibanboshi::cakephp::CakephpClient;
 use rust_ichibanboshi::config::RawConfig;
 use rust_ichibanboshi::repo::{AppRepo, DynRepo, RepoError};
@@ -230,22 +228,6 @@ impl AppRepo for MockRepo {
         ])
     }
 
-    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
-        Ok(vec![
-            ("04".into(), "大型幌".into()),
-            ("07".into(), "ﾄﾚｰﾗｰ".into()),
-            ("00".into(), "".into()), // 未設定 (車種N 空)
-        ])
-    }
-
-    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
-        Ok(vec![
-            ("1001".into(), "田中太郎".into(), "田中".into()),
-            ("1002".into(), "佐藤花子".into(), "佐藤".into()),
-            ("9999".into(), "".into(), "".into()), // 名前未設定行
-        ])
-    }
-
     async fn surcharge_base(
         &self,
         _from: &str,
@@ -296,226 +278,6 @@ impl AppRepo for MockRepo {
                 input_staff_name: "".into(),
             },
         ])
-    }
-
-    async fn vehicle_daily(
-        &self,
-        _from: &str,
-        _to: &str,
-        vehicle: Option<&str>,
-        driver: Option<&str>,
-        customer: Option<&str>,
-        origin: Option<&str>,
-        dest: Option<&str>,
-        _limit: i32,
-    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
-        // 実 SQL の `(@Pn IS NULL OR ...)` 絞り込みを模倣する固定フィクスチャ 3 行
-        // (#79: customer/origin/dest 絞り込み + vehicle 任意化・車輌横断検索のテスト用)。
-        let rows = vec![
-            // 自車 (傭車先C='000000')。origin_area_name は #12 実機調査の例 (市区町村レベル)。
-            RawVehicleDailyRow {
-                sale_date: dt(2026, 6, 21),
-                vehicle_number: "8504".into(),
-                customer_code: "000001".into(),
-                customer_name: "㈱田浦畜産".into(),
-                origin_area_name: "長崎県".into(),
-                dest_area_name: "神奈川県横浜市".into(),
-                origin: "釧路".into(),
-                dest: "福岡県北九州市".into(),
-                subcontractor_code: "000000".into(),
-                self_amount: 65_000,
-                subcontract_amount: 0,
-                item_code: "0001".into(),
-                item_name: "冷凍食品".into(),
-                quantity: 10.5,
-                unit_price: 6190.47,
-                unit: "個".into(),
-                row_id: "20260621-1001".into(),
-                vehicle_branch: "01".into(),
-                driver_code: "1656".into(),
-                driver_name: "西島 健太".into(),
-                request_kind: "0".into(),
-            },
-            // 傭車 (傭車先C!='000000')。得意先名・積地・卸地・品名/数量/単価が未マップ/空文字のエッジ。
-            RawVehicleDailyRow {
-                sale_date: dt(2026, 6, 20),
-                vehicle_number: "8504".into(),
-                customer_code: "000002".into(),
-                customer_name: "".into(),
-                origin_area_name: "".into(),
-                dest_area_name: "".into(),
-                origin: "".into(),
-                dest: "".into(),
-                subcontractor_code: "001234".into(),
-                self_amount: 0,
-                subcontract_amount: 40_000,
-                item_code: "".into(),
-                item_name: "".into(),
-                quantity: 0.0,
-                unit_price: 0.0,
-                unit: "".into(),
-                row_id: "20260620-1002".into(),
-                // 枝番・乗務員CD が空のエッジ (実データにも空行がある)。
-                vehicle_branch: "".into(),
-                driver_code: "".into(),
-                driver_name: "".into(),
-                request_kind: "".into(),
-            },
-            // 別車輌・同得意先。customer/origin/dest だけの車輌横断検索 (#79 の主目的) の
-            // テスト用に、vehicle_number/積地・卸地とも row 1 と異なる値にしてある。
-            RawVehicleDailyRow {
-                sale_date: dt(2026, 6, 22),
-                vehicle_number: "9012".into(),
-                customer_code: "000001".into(),
-                customer_name: "㈱田浦畜産".into(),
-                origin_area_name: "長崎県佐世保市".into(),
-                dest_area_name: "東京都".into(),
-                origin: "".into(),
-                dest: "".into(),
-                subcontractor_code: "000000".into(),
-                self_amount: 80_000,
-                subcontract_amount: 0,
-                item_code: "0002".into(),
-                item_name: "冷蔵食品".into(),
-                quantity: 5.0,
-                unit_price: 16000.0,
-                unit: "個".into(),
-                row_id: "20260622-1003".into(),
-                // 同じ乗務員が別の車番で走った日 (#741 で見つかった形)。
-                vehicle_branch: "00".into(),
-                driver_code: "1656".into(),
-                driver_name: "西島 健太".into(),
-                // 請求のみ (運送を伴わない請求行)。収支に足すと二重計上になる区分。
-                request_kind: "1".into(),
-            },
-        ];
-
-        Ok(rows
-            .into_iter()
-            .filter(|r| vehicle.is_none_or(|v| r.vehicle_number == v))
-            .filter(|r| driver.is_none_or(|d| r.driver_code == d))
-            .filter(|r| customer.is_none_or(|c| r.customer_code == c))
-            .filter(|r| {
-                origin.is_none_or(|o| r.origin_area_name.contains(o) || r.origin.contains(o))
-            })
-            .filter(|r| dest.is_none_or(|d| r.dest_area_name.contains(d) || r.dest.contains(d)))
-            .collect())
-    }
-
-    async fn costs_daily(
-        &self,
-        _from: &str,
-        _to: &str,
-        vehicle: Option<&str>,
-        driver: Option<&str>,
-        kind: Option<&str>,
-        _limit: i32,
-    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
-        // 実 SQL の `(@Pn IS NULL OR ...)` 絞り込みを模倣する固定フィクスチャ 4 行
-        // (nuxt-dtako-admin#760)。**燃料 (経費種別C="01") と通行料 ("04") を必ず
-        // 1 行ずつ**含める — 消費側が種別で分けて粗利の内訳を出すため。
-        let rows = vec![
-            // 燃料 (軽油)。軽油引取税は 税抜金額 に含まれない別立ての税。
-            RawCostsDailyRow {
-                operation_date: dt(2026, 6, 21),
-                vehicle_number: "8504".into(),
-                vehicle_branch: "01".into(),
-                driver_code: "1656".into(),
-                cost_code: "0101".into(),
-                cost_name: "軽油".into(),
-                cost_kind: "01".into(),
-                cost_kind_name: "燃料費".into(),
-                quantity: 150.5,
-                unit_price: 128.5,
-                amount: 19_339,
-                diesel_tax: 4_830,
-                km: 12_345.6,
-                fixed_cost_flag: "0".into(),
-                row_id: "20260621-2001".into(),
-                remarks: "".into(),
-                vendor_code: "001234".into(),
-                vendor_branch: "00".into(),
-                vendor_name: "○○石油".into(),
-                entered_date: Some(dt(2026, 6, 23)),
-            },
-            // 通行料。KM を持たない (0) 種別のエッジ。
-            RawCostsDailyRow {
-                operation_date: dt(2026, 6, 20),
-                vehicle_number: "8504".into(),
-                vehicle_branch: "01".into(),
-                driver_code: "1656".into(),
-                cost_code: "0401".into(),
-                cost_name: "高速道路通行料".into(),
-                cost_kind: "04".into(),
-                cost_kind_name: "通行料".into(),
-                quantity: 1.0,
-                unit_price: 8_400.0,
-                amount: 8_400,
-                diesel_tax: 0,
-                km: 0.0,
-                fixed_cost_flag: "0".into(),
-                row_id: "20260620-2002".into(),
-                remarks: "ETC".into(),
-                vendor_code: "005678".into(),
-                vendor_branch: "00".into(),
-                vendor_name: "".into(),
-                entered_date: Some(dt(2026, 6, 22)),
-            },
-            // 固定経費 (固定経費K="1")。月極めなので乗務員が紐付かない (空文字) エッジ。
-            RawCostsDailyRow {
-                operation_date: dt(2026, 6, 1),
-                vehicle_number: "8504".into(),
-                vehicle_branch: "01".into(),
-                driver_code: "".into(),
-                cost_code: "0901".into(),
-                cost_name: "自動車保険料".into(),
-                cost_kind: "09".into(),
-                cost_kind_name: "保険料".into(),
-                quantity: 0.0,
-                unit_price: 0.0,
-                amount: 45_000,
-                diesel_tax: 0,
-                km: 0.0,
-                fixed_cost_flag: "1".into(),
-                row_id: "20260601-2003".into(),
-                remarks: "".into(),
-                vendor_code: "".into(),
-                vendor_branch: "".into(),
-                vendor_name: "".into(),
-                entered_date: None,
-            },
-            // 同じ乗務員が別の車番で給油した日 (#741 と同じ形)。経費名/種別名が
-            // マスタ未登録で空、固定経費K も空 (ISNULL の既定値) のエッジ。
-            RawCostsDailyRow {
-                operation_date: dt(2026, 6, 22),
-                vehicle_number: "9012".into(),
-                vehicle_branch: "00".into(),
-                driver_code: "1656".into(),
-                cost_code: "0102".into(),
-                cost_name: "".into(),
-                cost_kind: "01".into(),
-                cost_kind_name: "".into(),
-                quantity: 80.0,
-                unit_price: 130.0,
-                amount: 10_400,
-                diesel_tax: 2_568,
-                km: 0.0,
-                fixed_cost_flag: "".into(),
-                row_id: "20260622-2004".into(),
-                remarks: "".into(),
-                vendor_code: "".into(),
-                vendor_branch: "".into(),
-                vendor_name: "".into(),
-                entered_date: None,
-            },
-        ];
-
-        Ok(rows
-            .into_iter()
-            .filter(|r| vehicle.is_none_or(|v| r.vehicle_number == v))
-            .filter(|r| driver.is_none_or(|d| r.driver_code == d))
-            .filter(|r| kind.is_none_or(|k| r.cost_kind == k))
-            .collect())
     }
 
     async fn uriage_rows(
@@ -828,12 +590,6 @@ impl AppRepo for ErrorRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::PoolError)
     }
-    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
-        Err(RepoError::PoolError)
-    }
-    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
-        Err(RepoError::PoolError)
-    }
     async fn surcharge_base(
         &self,
         _: &str,
@@ -841,30 +597,6 @@ impl AppRepo for ErrorRepo {
         _: &str,
         _: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
-        Err(RepoError::PoolError)
-    }
-    async fn vehicle_daily(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: i32,
-    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
-        Err(RepoError::PoolError)
-    }
-    async fn costs_daily(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: i32,
-    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
         Err(RepoError::PoolError)
     }
     async fn uriage_rows(
@@ -1026,12 +758,6 @@ impl AppRepo for QueryErrorRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
-    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
-        Err(RepoError::QueryError("test".into()))
-    }
-    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
-        Err(RepoError::QueryError("test".into()))
-    }
     async fn surcharge_base(
         &self,
         _: &str,
@@ -1039,30 +765,6 @@ impl AppRepo for QueryErrorRepo {
         _: &str,
         _: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError> {
-        Err(RepoError::QueryError("test".into()))
-    }
-    async fn vehicle_daily(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: i32,
-    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
-        Err(RepoError::QueryError("test".into()))
-    }
-    async fn costs_daily(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: Option<&str>,
-        _: i32,
-    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
         Err(RepoError::QueryError("test".into()))
     }
     async fn uriage_rows(
@@ -1203,24 +905,10 @@ pub fn build_app_full(
             get(routes::sales::customer_yoy_by_dept),
         )
         .route(
-            "/sales/departments",
-            get(routes::sales::list_departments_handler),
-        )
-        .route(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
         )
-        .route(
-            "/sales/vehicle-daily",
-            get(routes::vehicle_daily::vehicle_daily),
-        )
-        .route(
-            "/costs/vehicle-daily",
-            get(routes::costs_daily::costs_daily),
-        )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
-        .route("/vehicles", get(routes::surcharge::vehicles))
-        .route("/employees", get(routes::employees::employees))
         .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/unchin/summary", get(routes::unchin::unchin_summary))
         .route(

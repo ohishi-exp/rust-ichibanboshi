@@ -13,7 +13,6 @@ use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::NaiveDateTime;
-use ichiban_logic::api::{VehicleOption, VEHICLES_SOURCE};
 use serde::{Deserialize, Serialize};
 
 use crate::repo::{DynRepo, RepoError};
@@ -204,25 +203,6 @@ pub fn build_surcharge_rows(raw: &[RawSurchargeRow]) -> Vec<SurchargeRow> {
 // ══════════════════════════════════════════════════════════════
 // ハンドラ (薄い — param 解析 → repo → build → JSON)
 // ══════════════════════════════════════════════════════════════
-
-/// GET /api/vehicles — 車種ﾏｽﾀ (車種C, 車種N) の一覧。
-/// 燃料サーチャージ請求側 (nuxt-ichibanboshi-seikyu) の燃費マスタ編集 UI が
-/// 車種ドロップダウンの選択肢として取得する (車種C キーで燃費を登録)。
-pub async fn vehicles(
-    Extension(repo): Extension<DynRepo>,
-) -> Result<Json<ApiResponse<Vec<VehicleOption>>>, StatusCode> {
-    let rows = repo.vehicles().await.map_err(map_repo_err)?;
-    Ok(Json(ApiResponse {
-        source_table: VEHICLES_SOURCE.to_string(),
-        data: rows
-            .into_iter()
-            .map(|(code, name)| VehicleOption {
-                vehicle_code: code,
-                vehicle_name: name,
-            })
-            .collect(),
-    }))
-}
 
 /// GET /api/surcharge/base
 pub async fn surcharge_base(

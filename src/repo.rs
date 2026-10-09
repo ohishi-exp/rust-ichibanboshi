@@ -9,9 +9,6 @@ use crate::routes::unchin::{
     RawUnchinSubcontractorNetDetailRow, RawUnchinSubcontractorNetRow, RawUnchinSummaryRow,
 };
 use crate::routes::uriage::UriageRow;
-use ichiban_logic::costs_daily::RawCostsDailyRow;
-use ichiban_logic::sql as ichiban_sql;
-use ichiban_logic::vehicle_daily::RawVehicleDailyRow;
 
 /// DB 操作の抽象化。本番は TiberiusRepo、テストは MockRepo を使う。
 #[async_trait]
@@ -93,14 +90,6 @@ pub trait AppRepo: Send + Sync {
 
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError>;
 
-    /// 車種ﾏｽﾀ (車種C, 車種N) の一覧。燃費マスタ (車種C キー) の編集 UI 用 (#12)。
-    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError>;
-
-    /// 社員ﾏｽﾀ (社員C, 社員N, 社員R) の一覧。nuxt-trouble の担当者マスタ手動同期用 (#74)。
-    /// 社員ﾏｽﾀ には同一 社員C の複数行があり得る (uriage の TOP 1 スカラサブクエリと
-    /// 同じ事情) ため、社員C で GROUP BY して 1 行に潰す。
-    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError>;
-
     // ── surcharge (燃料サーチャージ基礎データ、#12) ──
     async fn surcharge_base(
         &self,
@@ -109,33 +98,6 @@ pub trait AppRepo: Send + Sync {
         kind_filter: &str,
         limit: i32,
     ) -> Result<Vec<RawSurchargeRow>, RepoError>;
-
-    // ── vehicle_daily (車番×期間の伝票明細、nuxt-dtako-admin#330。customer/origin/dest
-    //    絞り込み + vehicle 任意化は #79、PR5「類似運行検索・比較ページ」依存) ──
-    #[allow(clippy::too_many_arguments)]
-    async fn vehicle_daily(
-        &self,
-        from: &str,
-        to: &str,
-        vehicle: Option<&str>,
-        driver: Option<&str>,
-        customer: Option<&str>,
-        origin: Option<&str>,
-        dest: Option<&str>,
-        limit: i32,
-    ) -> Result<Vec<RawVehicleDailyRow>, RepoError>;
-
-    // ── costs_daily (車番×期間の経費明細、nuxt-dtako-admin#760。粗利 = 売上 − 手当 − 経費
-    //    の「経費」を運ぶ) ──
-    async fn costs_daily(
-        &self,
-        from: &str,
-        to: &str,
-        vehicle: Option<&str>,
-        driver: Option<&str>,
-        kind: Option<&str>,
-        limit: i32,
-    ) -> Result<Vec<RawCostsDailyRow>, RepoError>;
 
     // ── uriage (担当者別売上、#762) ──
     /// `[運転日報明細]` から `compute_person_sum` の入力 1 行を取得する。
@@ -293,26 +255,17 @@ fn get_i32(row: &tiberius::Row, idx: usize) -> i32 {
     row.try_get::<i32, _>(idx).ok().flatten().unwrap_or(0)
 }
 
-/// `get_i64` と同じ decimal/f64/i32 の順で試すが、端数を切り捨てない (`単価`/`数量` 用)。
-fn get_f64(row: &tiberius::Row, idx: usize) -> f64 {
-    row.try_get::<f64, _>(idx)
-        .ok()
-        .flatten()
-        .or_else(|| {
-            row.try_get::<tiberius::numeric::Numeric, _>(idx)
-                .ok()
-                .flatten()
-                .and_then(|d| format!("{}", d).parse::<f64>().ok())
-        })
-        .or_else(|| row.try_get::<i32, _>(idx).ok().flatten().map(|v| v as f64))
-        .unwrap_or(0.0)
-}
+/// `/health` の生死確認。Worker 側 (`workers/ichiban/logic/src/sql.rs`) と同じ文字列。
+const HEALTH_SQL: &str = "SELECT 1";
+
+/// 部門ﾏｽﾀの一覧 (`customer_yoy_by_dept` の部門選択肢)。列: 部門C, 部門N。
+const DEPARTMENTS_SQL: &str = "SELECT [部門C], ISNULL([部門N], '') FROM [部門ﾏｽﾀ] ORDER BY [部門C]";
 
 #[async_trait]
 impl AppRepo for TiberiusRepo {
     async fn health_check(&self) -> Result<(), RepoError> {
         let mut conn = self.conn().await?;
-        conn.simple_query(ichiban_sql::HEALTH_SQL)
+        conn.simple_query(HEALTH_SQL)
             .await
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
         Ok(())
@@ -973,7 +926,7 @@ impl AppRepo for TiberiusRepo {
     async fn list_departments(&self) -> Result<Vec<(String, String)>, RepoError> {
         let mut conn = self.conn().await?;
         let stream = conn
-            .simple_query(ichiban_sql::DEPARTMENTS_SQL)
+            .simple_query(DEPARTMENTS_SQL)
             .await
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
         let rows = stream
@@ -983,45 +936,6 @@ impl AppRepo for TiberiusRepo {
         Ok(rows
             .iter()
             .map(|row| (decode_cp932(row, 0), decode_cp932(row, 1)))
-            .collect())
-    }
-
-    async fn vehicles(&self) -> Result<Vec<(String, String)>, RepoError> {
-        let mut conn = self.conn().await?;
-        let stream = conn
-            .simple_query(ichiban_sql::VEHICLES_SQL)
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream
-            .into_first_result()
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .map(|row| (decode_cp932(row, 0), decode_cp932(row, 1)))
-            .collect())
-    }
-
-    async fn employees(&self) -> Result<Vec<(String, String, String)>, RepoError> {
-        let mut conn = self.conn().await?;
-        // SQL 文と列の並びは ichiban_logic::sql::EMPLOYEES_SQL (Worker と共有)。
-        let stream = conn
-            .simple_query(ichiban_sql::EMPLOYEES_SQL)
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream
-            .into_first_result()
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                (
-                    decode_cp932(row, 0),
-                    decode_cp932(row, 1),
-                    decode_cp932(row, 2),
-                )
-            })
             .collect())
     }
 
@@ -1090,74 +1004,6 @@ impl AppRepo for TiberiusRepo {
             .map_err(|e| RepoError::QueryError(e.to_string()))?;
 
         Ok(Self::rows_to_surcharge(&rows))
-    }
-
-    async fn vehicle_daily(
-        &self,
-        from: &str,
-        to: &str,
-        vehicle: Option<&str>,
-        driver: Option<&str>,
-        customer: Option<&str>,
-        origin: Option<&str>,
-        dest: Option<&str>,
-        limit: i32,
-    ) -> Result<Vec<RawVehicleDailyRow>, RepoError> {
-        let mut conn = self.conn().await?;
-
-        // SQL 文 (列の並び・バインドの順) は ichiban_logic::sql::VEHICLE_DAILY_SQL_BODY (Worker と共有)。
-        let query = ichiban_sql::vehicle_daily_sql(limit);
-
-        let origin_pattern = ichiban_sql::like_pattern(origin);
-        let dest_pattern = ichiban_sql::like_pattern(dest);
-
-        let stream = conn
-            .query(
-                &query,
-                &[
-                    &from,
-                    &to,
-                    &vehicle,
-                    &customer,
-                    &origin_pattern,
-                    &dest_pattern,
-                    &driver,
-                ],
-            )
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream
-            .into_first_result()
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-
-        Ok(Self::rows_to_vehicle_daily(&rows))
-    }
-
-    async fn costs_daily(
-        &self,
-        from: &str,
-        to: &str,
-        vehicle: Option<&str>,
-        driver: Option<&str>,
-        kind: Option<&str>,
-        limit: i32,
-    ) -> Result<Vec<RawCostsDailyRow>, RepoError> {
-        let mut conn = self.conn().await?;
-
-        // SQL 文 (列の並び・バインドの順) は ichiban_logic::sql::COSTS_DAILY_SQL_BODY (Worker と共有)。
-        let query = ichiban_sql::costs_daily_sql(limit);
-
-        let stream = conn
-            .query(&query, &[&from, &to, &vehicle, &driver, &kind])
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-        let rows = stream
-            .into_first_result()
-            .await
-            .map_err(|e| RepoError::QueryError(e.to_string()))?;
-
-        Ok(Self::rows_to_costs_daily(&rows))
     }
 
     async fn uriage_rows(
@@ -1877,66 +1723,6 @@ impl TiberiusRepo {
                 row_id: decode_cp932(r, 15),
                 input_staff_code: decode_cp932(r, 16),
                 input_staff_name: decode_cp932(r, 17),
-            })
-            .collect()
-    }
-
-    fn rows_to_vehicle_daily(rows: &[tiberius::Row]) -> Vec<RawVehicleDailyRow> {
-        rows.iter()
-            .map(|r| RawVehicleDailyRow {
-                sale_date: r.get(0).unwrap_or_default(),
-                vehicle_number: decode_cp932(r, 1),
-                customer_code: decode_cp932(r, 2),
-                customer_name: decode_cp932(r, 3),
-                origin_area_name: decode_cp932(r, 4),
-                dest_area_name: decode_cp932(r, 5),
-                origin: decode_cp932(r, 6),
-                dest: decode_cp932(r, 7),
-                subcontractor_code: decode_cp932(r, 8),
-                self_amount: get_i64(r, 9),
-                subcontract_amount: get_i64(r, 10),
-                item_code: decode_cp932(r, 11),
-                item_name: decode_cp932(r, 12),
-                quantity: get_f64(r, 13),
-                unit_price: get_f64(r, 14),
-                unit: decode_cp932(r, 15),
-                row_id: decode_cp932(r, 16),
-                // **新しい列は末尾に足す。** 途中に挿すと下の index が全部ずれ、
-                // 静かに別の列を読む (金額を取り違える) 事故になりうる。
-                vehicle_branch: decode_cp932(r, 17),
-                driver_code: decode_cp932(r, 18),
-                driver_name: decode_cp932(r, 19),
-                request_kind: decode_cp932(r, 20),
-            })
-            .collect()
-    }
-
-    fn rows_to_costs_daily(rows: &[tiberius::Row]) -> Vec<RawCostsDailyRow> {
-        rows.iter()
-            .map(|r| RawCostsDailyRow {
-                operation_date: r.get(0).unwrap_or_default(),
-                vehicle_number: decode_cp932(r, 1),
-                vehicle_branch: decode_cp932(r, 2),
-                driver_code: decode_cp932(r, 3),
-                cost_code: decode_cp932(r, 4),
-                cost_name: decode_cp932(r, 5),
-                cost_kind: decode_cp932(r, 6),
-                cost_kind_name: decode_cp932(r, 7),
-                quantity: get_f64(r, 8),
-                unit_price: get_f64(r, 9),
-                amount: get_i64(r, 10),
-                diesel_tax: get_i64(r, 11),
-                km: get_f64(r, 12),
-                fixed_cost_flag: decode_cp932(r, 13),
-                // **新しい列は末尾に足す。** 途中に挿すと下の index が全部ずれ、
-                // 静かに別の列を読む (金額を取り違える) 事故になりうる。
-                row_id: decode_cp932(r, 14),
-                remarks: decode_cp932(r, 15),
-                vendor_code: decode_cp932(r, 16),
-                vendor_branch: decode_cp932(r, 17),
-                vendor_name: decode_cp932(r, 18),
-                // NULL も型不一致も None (空文字で返る)。`get` だと型不一致で panic する。
-                entered_date: r.try_get::<chrono::NaiveDateTime, _>(19).ok().flatten(),
             })
             .collect()
     }

@@ -1,7 +1,7 @@
 # workers/ichiban
 
-一番星 (CAPE#01) SQL Server の読み出し Worker (Refs #322)。管理画面が使う 6 本をオンプレ版と同じ path・クエリ・応答で返す
-(並走期間は管理画面の proxy が shadow で両方を叩いて応答を比べる)。Workers VPC (TCP のみ) → 既存の Tunnel → SQL Server に
+一番星 (CAPE#01) SQL Server の読み出し Worker (Refs #322)。管理画面が使う 6 本を、旧オンプレ版と同じ path・クエリ・応答で返す
+(オンプレ版の 5 本は削除済みで、6 本はこの Worker だけが提供する。オンプレの `/health` は他系統の監視用に残っている)。Workers VPC (TCP のみ) → 既存の Tunnel → SQL Server に
 TDS でログインする。1 リクエスト = 1 接続。
 
 | 口 | 中身 |
@@ -37,15 +37,15 @@ tiberius は `EncryptionLevel::NotSupported`・`database("CAPE#01")`。`port` / 
 
 `logic/` (`ichiban-logic`): 管理画面が使う 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・
 `/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) の SQL 文 (`sql.rs`)・応答の型 (`api.rs`)・絞り込みの判定と行の組み立て
-(`vehicle_daily.rs`・`costs_daily.rs`)。tiberius にも worker にも依存しない。**オンプレ版 (repo ルート) も path 依存で同じ定義を使う**
-(並走期間に応答を比べるため。オンプレ版の 6 本を削除するときに path 依存も外す)。`tiberius::Row` から `Raw*Row` を詰める関数は
-オンプレ (`src/repo.rs`) と Worker に別々に持つ — 列の並びは `sql.rs` の定数と 1 対 1 なので、変えるときは両方直す。
+(`vehicle_daily.rs`・`costs_daily.rs`)。tiberius にも worker にも依存しない。使うのは Worker だけ (オンプレ版の 5 本と path 依存は削除済み。
+オンプレの `src/repo.rs` には `/health` の `SELECT 1` と `customer_yoy_by_dept` が使う部門一覧の SQL だけが同じ文字列で残る)。
+`tiberius::Row` から `Raw*Row` を詰める関数は `worker/src/rows.rs` にある — 列の並びは `sql.rs` の定数と 1 対 1 なので、変えるときは両方直す。
 100% 行カバレッジ gate は `coverage_100.toml` (worker-ichiban.yml が判定)。
 
 `worker/src/`: `lib.rs` (fetch) / `routes.rs` (7 本の本体。1 リクエスト 1 接続) / `rows.rs` (`tiberius::Row` → logic の型。
-**オンプレ `src/repo.rs` の `decode_cp932`・`get_i64`・`get_f64`・`rows_to_*` を列番号まで同じに写している**) / `repo.rs` (資格情報・ログイン) /
+旧オンプレ版の `src/repo.rs` の `decode_cp932`・`get_i64`・`get_f64`・`rows_to_*` を列番号まで同じに写したもの) / `repo.rs` (資格情報・ログイン) /
 `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern) / `probe_logic.rs` (経路・stage・応答・資格情報の検証)。
-接続・経路・応答の部品は `workers/kyuyo` から**意図して写している** (特に公開範囲の検査スクリプト 2 本は kyuyo と片方だけ直さないこと)。独立した workspace (repo ルートの package からは `logic` だけを path 依存で借りる)。
+接続・経路・応答の部品は `workers/kyuyo` から**意図して写している** (特に公開範囲の検査スクリプト 2 本は kyuyo と片方だけ直さないこと)。独立した workspace (repo ルートの package からは参照されない)。
 
 ## ローカル検証
 

@@ -92,9 +92,6 @@ path = "src/change_log.rs"
 path = "src/routes/change_log.rs"
 
 [[files]]
-path = "src/routes/employees.rs"
-
-[[files]]
 path = "src/routes/health.rs"
 
 [[files]]
@@ -148,15 +145,6 @@ path = "src/routes/unchin.rs"
 # regression check は postgres service 込みで cov-check を回す)
 [[files]]
 path = "src/routes/unko_gaps.rs"
-
-[[files]]
-path = "src/routes/vehicle_daily.rs"
-
-# 経費明細 (粗利 = 売上 − 手当 − 経費 の「経費」) を返す口
-# (Refs ohishi-exp/nuxt-dtako-admin#760 の 1)。vehicle_daily.rs と同型で、
-# MockRepo / ErrorRepo / QueryErrorRepo だけでカバーできる (DB 不要)
-[[files]]
-path = "src/routes/costs_daily.rs"
 
 # dtako_events の作業区分 (層 A) を 乗務員 × 暦日 × 区分 の秒数で返す口
 # (Refs ohishi-exp/nuxt-dtako-admin#612 の PR-2)。dtako_day.rs と同型で、

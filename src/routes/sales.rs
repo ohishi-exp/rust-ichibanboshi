@@ -960,19 +960,3 @@ pub async fn customer_yoy_by_dept(
         },
     }))
 }
-
-pub async fn list_departments_handler(
-    Extension(repo): Extension<DynRepo>,
-) -> Result<Json<ApiResponse<Vec<DepartmentOption>>>, StatusCode> {
-    let rows = repo.list_departments().await.map_err(map_repo_err)?;
-    Ok(Json(ApiResponse {
-        source_table: ichiban_logic::api::DEPARTMENTS_SOURCE.to_string(),
-        data: rows
-            .into_iter()
-            .map(|(code, name)| DepartmentOption {
-                department_code: code,
-                department_name: name,
-            })
-            .collect(),
-    }))
-}
