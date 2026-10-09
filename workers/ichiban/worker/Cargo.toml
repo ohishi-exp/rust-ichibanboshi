@@ -1,0 +1,23 @@
+# 一番星 PoC Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く POST /probe で、
+# Workers VPC (binding ICHIBAN_VPC) 経由で一番星 SQL Server に TDS でログインして SELECT 1 を流すだけ。
+# tiberius の rustls feature と bb8-tiberius は wasm32 で落ちる (getrandom / mio / rustls-native-certs) ので入れない。
+[package]
+name = "ichiban-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
+# tiberius は futures の AsyncRead/Write を要求し、worker::Socket は tokio の AsyncRead/Write を持つので compat で繋ぐ
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+wasm-bindgen = "0.2"
+worker = "=0.8.7"
+worker-sys = "=0.8.7"

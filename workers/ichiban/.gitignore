@@ -1,0 +1,6 @@
+target/
+worker/build/
+# ローカル検証の secret (LOCAL_SQL_ADDR / LOCAL_ICHIBAN_SQL_JSON)。commit しない
+.dev.vars
+.dev.vars.*
+!.dev.vars.example

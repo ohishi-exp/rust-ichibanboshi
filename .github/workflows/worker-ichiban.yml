@@ -1,0 +1,77 @@
+name: worker-ichiban
+
+# workers/ichiban (一番星 SQL Server への到達確認 PoC Worker、Refs #322)。
+#   - pull_request / main への push → Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run
+#     (この経路は secret も token も使わない)
+# 本番へは出さない (deploy job なし。実接続の確認は wrangler dev --remote)。本実装の段で足す。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'workers/ichiban/**'
+      - '.github/workflows/worker-ichiban.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'workers/ichiban/**'
+      - '.github/workflows/worker-ichiban.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # README と揃える
+  WRANGLER_VERSION: 4.144.0
+
+jobs:
+  worker:
+    name: Worker build + clippy + exposure + wrangler dry-run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/ichiban
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ichiban-worker
+          workspaces: workers/ichiban -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build (wasm32-unknown-unknown)
+        run: cargo build --locked --target wasm32-unknown-unknown
+
+      - name: Clippy (wasm32-unknown-unknown)
+        run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+
+      # wrangler.toml の [build] command と同じ版
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      - name: worker-build --release
+        working-directory: workers/ichiban/worker
+        run: worker-build --release
+
+      - name: Exposure check
+        run: bash scripts/check-exposure.sh worker/wrangler.toml
+
+      - name: Exposure check (negative control)
+        run: bash scripts/check-exposure-test.sh worker/wrangler.toml
+
+      # secret も token も要らない (build と設定の検証だけ)
+      - name: wrangler deploy --dry-run
+        working-directory: workers/ichiban/worker
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
