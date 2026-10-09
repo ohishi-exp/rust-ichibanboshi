@@ -966,7 +966,7 @@ pub async fn list_departments_handler(
 ) -> Result<Json<ApiResponse<Vec<DepartmentOption>>>, StatusCode> {
     let rows = repo.list_departments().await.map_err(map_repo_err)?;
     Ok(Json(ApiResponse {
-        source_table: "部門ﾏｽﾀ".to_string(),
+        source_table: ichiban_logic::api::DEPARTMENTS_SOURCE.to_string(),
         data: rows
             .into_iter()
             .map(|(code, name)| DepartmentOption {

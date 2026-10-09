@@ -1,0 +1,27 @@
+# workers/ichiban の 100% 行カバレッジ登録簿 (Refs #322)。
+#
+# 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
+# coverage_100.toml と同じ)。workers/ichiban は別 workspace なので計測は worker-ichiban.yml が取る:
+#
+#   cargo llvm-cov --manifest-path workers/ichiban/Cargo.toml -p ichiban-logic --text > cov.txt
+#   bash scripts/check_coverage_100.sh --config workers/ichiban/coverage_100.toml --use-cache cov.txt
+#
+# vehicle_daily.rs / costs_daily.rs の build_* と filters は旧 src/routes/{vehicle_daily,costs_daily}.rs
+# (repo ルートの登録簿で 100% だった純粋部分) から移した。絞り込み 0 件の 400 判定は全件スキャン防止の
+# 関門なので、この gate から外さないこと。
+#
+# api.rs は応答の型と source_table の定数だけで実行行が 0 (derive は計測に乗らない) なので登録できない。
+# JSON の形は tests/api_test.rs が固定している。
+
+[[files]]
+path = "workers/ichiban/logic/src/lib.rs"
+
+# 6 本の SQL 文 (オンプレ版の src/repo.rs と Worker が同じ文字列を流す)
+[[files]]
+path = "workers/ichiban/logic/src/sql.rs"
+
+[[files]]
+path = "workers/ichiban/logic/src/vehicle_daily.rs"
+
+[[files]]
+path = "workers/ichiban/logic/src/costs_daily.rs"

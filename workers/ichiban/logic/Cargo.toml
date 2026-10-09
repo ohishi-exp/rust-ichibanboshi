@@ -1,0 +1,16 @@
+# 一番星 (CAPE#01) の読み出し 6 本の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# SQL 文・6 本専用の型・絞り込みの判定・行の組み立て。tiberius にも worker にも依存しないので native で cargo test できる。
+# オンプレ版 (repo ルートの package) も並走期間だけ path 依存で借りている。
+[package]
+name = "ichiban-logic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# alloc: NaiveDateTime::format().to_string() に要る
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
+
+[dev-dependencies]
+serde_json = "1"

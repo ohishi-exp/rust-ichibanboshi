@@ -1,7 +1,7 @@
 name: worker-ichiban
 
 # workers/ichiban (一番星 SQL Server への到達確認 PoC Worker、Refs #322)。
-#   - pull_request / main への push → Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run
+#   - pull_request / main への push → logic の test と 100% gate、Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run
 #     (この経路は secret も token も使わない)
 # 本番へは出さない (deploy job なし。実接続の確認は wrangler dev --remote)。本実装の段で足す。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
@@ -27,7 +27,7 @@ env:
 
 jobs:
   worker:
-    name: Worker build + clippy + exposure + wrangler dry-run
+    name: Logic test + Worker build + clippy + exposure + wrangler dry-run
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -51,6 +51,21 @@ jobs:
           shared-key: ichiban-worker
           workspaces: workers/ichiban -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test (ichiban-logic)
+        working-directory: .
+        run: cargo test --locked --manifest-path workers/ichiban/Cargo.toml -p ichiban-logic
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # 行カバレッジ 100% gate (登録簿 workers/ichiban/coverage_100.toml)。判定は repo ルートの
+      # check_coverage_100.sh を共用する。filters の 400 判定は全件スキャン防止の関門
+      - name: Coverage 100% gate (ichiban-logic)
+        working-directory: .
+        run: |
+          cov="$RUNNER_TEMP/ichiban-logic-cov.txt"
+          cargo llvm-cov --locked --manifest-path workers/ichiban/Cargo.toml -p ichiban-logic --text > "$cov"
+          bash scripts/check_coverage_100.sh --config workers/ichiban/coverage_100.toml --use-cache "$cov"
 
       - name: Build (wasm32-unknown-unknown)
         run: cargo build --locked --target wasm32-unknown-unknown
