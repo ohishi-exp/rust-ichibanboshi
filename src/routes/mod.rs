@@ -1,9 +1,7 @@
 pub mod change_log;
-pub mod costs_daily;
 pub mod dtako_autoload;
 pub mod dtako_day;
 pub mod dtako_worktime;
-pub mod employees;
 pub mod health;
 pub mod kintai;
 pub mod kintai_day_summaries;
@@ -20,5 +18,4 @@ pub mod surcharge;
 pub mod unchin;
 pub mod unko_gaps;
 pub mod uriage;
-pub mod vehicle_daily;
 pub mod wage_snapshot;

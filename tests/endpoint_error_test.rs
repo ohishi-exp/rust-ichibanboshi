@@ -477,7 +477,7 @@ async fn test_sales_customer_detail_ok() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
-// ── customer-yoy-by-dept / departments ──
+// ── customer-yoy-by-dept ──
 
 #[tokio::test]
 async fn test_sales_customer_yoy_by_dept_ok() {
@@ -531,96 +531,6 @@ async fn test_sales_customer_yoy_by_dept_query_error() {
         .oneshot(
             Request::builder()
                 .uri("/api/sales/customer-yoy-by-dept")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn test_sales_departments_ok() {
-    let app = common::build_app(common::mock_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/sales/departments")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_sales_departments_pool_error() {
-    let app = common::build_app(common::error_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/sales/departments")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
-#[tokio::test]
-async fn test_vehicles_pool_error() {
-    let app = common::build_app(common::error_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/vehicles")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
-#[tokio::test]
-async fn test_vehicles_query_error() {
-    let app = common::build_app(common::query_error_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/vehicles")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn test_employees_pool_error() {
-    let app = common::build_app(common::error_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/employees")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
-#[tokio::test]
-async fn test_employees_query_error() {
-    let app = common::build_app(common::query_error_repo());
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/employees")
                 .body(Body::empty())
                 .unwrap(),
         )

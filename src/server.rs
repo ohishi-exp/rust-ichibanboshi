@@ -112,8 +112,8 @@ pub async fn run(
     } else {
         tracing::warn!(
             "[database] enabled = false — this instance does not use SQL Server (CAPE#01). \
-             /api/sales/*, /api/schema/*, /api/surcharge/*, /api/unchin/*, /api/uriage/*, \
-             /api/employees, /api/vehicles return 503. /health reports backends.sqlserver=disabled."
+             /api/sales/*, /api/schema/*, /api/surcharge/*, /api/unchin/*, /api/uriage/* \
+             return 503. /health reports backends.sqlserver=disabled."
         );
         Arc::new(TiberiusRepo::disabled())
     };
@@ -278,24 +278,10 @@ pub async fn run(
             get(routes::sales::customer_yoy_by_dept),
         )
         .route(
-            "/sales/departments",
-            get(routes::sales::list_departments_handler),
-        )
-        .route(
             "/sales/customer-detail",
             get(routes::sales::customer_detail),
         )
-        .route(
-            "/sales/vehicle-daily",
-            get(routes::vehicle_daily::vehicle_daily),
-        )
-        .route(
-            "/costs/vehicle-daily",
-            get(routes::costs_daily::costs_daily),
-        )
         .route("/surcharge/base", get(routes::surcharge::surcharge_base))
-        .route("/vehicles", get(routes::surcharge::vehicles))
-        .route("/employees", get(routes::employees::employees))
         .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
         .route("/unchin/summary", get(routes::unchin::unchin_summary))
         .route(
