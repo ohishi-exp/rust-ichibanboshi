@@ -8,6 +8,9 @@ name: worker-ichiban
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'workers/ichiban/**'
+      - '.github/workflows/worker-ichiban.yml'
   push:
     branches: [main]
     paths:
