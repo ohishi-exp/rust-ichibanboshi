@@ -8,7 +8,9 @@
 #   (e) wrangler.toml のどこにも `LOCAL_` で始まる var (キー) が無い。この Worker はローカルで VPC や Secrets Store を
 #       迂回する var を持たない (ichiban の LOCAL_SQL_ADDR / LOCAL_ICHIBAN_SQL_JSON に当たるものを作らない)
 #   (f) vpc_services の service_id がプレースホルダのままなら warning (fail にはしない)
-# (a)〜(e) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
+#   (g) トップレベルに hyperdrive の KINTAI_HYPERDRIVE (Supabase への口) があり、hyperdrive がトップレベル以外
+#       (env.* を含む表の奥) のどこにも無い (本番の DB へ届く binding をトップレベルの外へ置かない)
+# (a)〜(e)・(g) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/kintai/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/kintai/worker/wrangler.toml)
 set -euo pipefail
@@ -77,7 +79,28 @@ for v in vpcs or []:
     if isinstance(v, dict) and v.get("service_id") == PLACEHOLDER:
         print(f"::warning file={path}::vpc_services {v.get('binding')} の service_id がプレースホルダのまま (VPC Service 作成後に入れる)")
 
+# (g) Supabase への口 KINTAI_HYPERDRIVE はトップレベル。hyperdrive の表はトップレベル以外に置かない
+hds = cfg.get("hyperdrive")
+if not isinstance(hds, list) or not any(isinstance(h, dict) and h.get("binding") == "KINTAI_HYPERDRIVE" for h in hds):
+    err("トップレベルに hyperdrive の KINTAI_HYPERDRIVE が無い (Supabase への口)")
+
+
+def nested_hyperdrive(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            name = f"{prefix}.{k}" if prefix else k
+            if k == "hyperdrive" and prefix:
+                yield name
+            yield from nested_hyperdrive(v, name)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from nested_hyperdrive(v, f"{prefix}[{i}]")
+
+
+for name in nested_hyperdrive(cfg):
+    err(f"{name} がある (hyperdrive はトップレベルにだけ置く。env 等へ置くと本番の DB への口が漏れる)")
+
 if errors:
     sys.exit(1)
-print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services はトップレベル・LOCAL_* 無し")
+print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services と hyperdrive はトップレベル・LOCAL_* 無し")
 PY

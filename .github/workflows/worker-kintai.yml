@@ -1,7 +1,8 @@
 name: worker-kintai
 
-# workers/kintai (勤怠の社内 MariaDB 読み出し Worker と自作の MySQL コーデック、Refs #322)。
-#   - pull_request / main への push → kintai-mysql の test と 100% gate、Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run
+# workers/kintai (勤怠の読み出し Worker・自作の MySQL コーデック・Supabase を読む口の純粋部分、Refs #322)。
+#   - pull_request / main への push → kintai-mysql と kintai-logic の test と 100% gate、Worker の build・clippy・
+#     公開範囲の検査・wrangler deploy --dry-run
 #     (この経路は secret も token も使わない)
 #   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
 # merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。
@@ -30,7 +31,7 @@ env:
 
 jobs:
   worker:
-    name: MySQL codec test + Worker build + clippy + exposure + wrangler dry-run
+    name: MySQL codec + logic test + Worker build + clippy + exposure + wrangler dry-run
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -55,19 +56,20 @@ jobs:
           workspaces: workers/kintai -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Test (kintai-mysql)
+      - name: Test (kintai-mysql, kintai-logic)
         working-directory: .
-        run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql
+        run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       # 行カバレッジ 100% gate (登録簿 workers/kintai/coverage_100.toml)。判定は repo ルートの
-      # check_coverage_100.sh を共用する。コーデックは社内 DB の応答を読む唯一の場所なので全行を通す
-      - name: Coverage 100% gate (kintai-mysql)
+      # check_coverage_100.sh を共用する。コーデックは社内 DB の応答を読む唯一の場所、logic は 5 本の口の
+      # 入力検査・SQL の引数・応答の形を持つ場所なので全行を通す
+      - name: Coverage 100% gate (kintai-mysql, kintai-logic)
         working-directory: .
         run: |
-          cov="$RUNNER_TEMP/kintai-mysql-cov.txt"
-          cargo llvm-cov --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql --text > "$cov"
+          cov="$RUNNER_TEMP/kintai-cov.txt"
+          cargo llvm-cov --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic --text > "$cov"
           bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache "$cov"
 
       - name: Build (wasm32-unknown-unknown)

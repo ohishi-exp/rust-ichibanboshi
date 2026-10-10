@@ -1,6 +1,8 @@
-# 勤怠 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。いまの口は到達の確認用の POST /probe だけ。
+# 勤怠 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。
+# 口は到達の確認用の POST /probe と、Supabase を読むだけの GET /api/kintai/* の 5 本。
 # Workers VPC (binding KINTAI_MARIADB_VPC) 経由で社内 MariaDB に平文の MySQL プロトコルで繋ぐ (1 リクエスト 1 接続)。
 # プロトコルの読み書きは kintai-mysql (I/O 無し)、ここは socket の読み書きと応答だけ。
+# Supabase へは Hyperdrive (binding KINTAI_HYPERDRIVE) + alc-worker-db。SQL・入力検査・応答は kintai-logic。
 [package]
 name = "kintai-worker"
 version = "0.1.0"
@@ -11,12 +13,18 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+# ippoan/alc-worker-kit (rev は workspace の 1 か所)。PgClient::tenant_tx と query_typed だけを出す
+alc-worker-db = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+kintai-logic = { path = "../logic" }
 kintai-mysql = { path = "../mysql" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # worker::Socket は tokio の AsyncRead/Write を持つ (kintai-mysql は I/O を持たないので compat は要らない)
 tokio = { version = "1", default-features = false, features = ["io-util"] }
+# Row と Error の型だけ (接続は alc-worker-db)。jsonb・timestamptz・uuid を読む feature (kit と同じ 0.7 に解決する)
+tokio-postgres = { version = "0.7", default-features = false, features = ["js", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+uuid = "1"
 wasm-bindgen = "0.2"
 worker = "=0.8.7"
 worker-sys = "=0.8.7"
