@@ -39,3 +39,7 @@ path = "workers/ichiban/logic/src/sales_yoy.rs"
 # monthly・by-department・by-customer・yoy (c35)
 [[files]]
 path = "workers/ichiban/logic/src/sales_monthly.rs"
+
+# daily・customer-trend・customer-detail (c36)
+[[files]]
+path = "workers/ichiban/logic/src/sales_daily.rs"
