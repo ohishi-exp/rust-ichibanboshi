@@ -12,11 +12,14 @@
 //! - [`costs_daily`] — `/api/costs/vehicle-daily` の Query・Raw 行・応答行・組み立て
 //! - [`period`] — 期間の計算 (前年同期間・翌月・月数)。sales と surcharge で共用
 //!
+//! 休暇行と社員の 2 本 (rust-leave-worker#1) は [`leave`] に閉じる。
+//!
 //! 移している途中の 15 本 (#322) は領域ごとのファイルに SQL・Raw 型・応答型・Query・組み立てを閉じる:
 //! [`sales_monthly`]・[`sales_daily`]・[`sales_yoy`]・[`unchin`]・[`surcharge`]・[`schema`]。
 
 pub mod api;
 pub mod costs_daily;
+pub mod leave;
 pub mod period;
 pub mod sales_daily;
 pub mod sales_monthly;

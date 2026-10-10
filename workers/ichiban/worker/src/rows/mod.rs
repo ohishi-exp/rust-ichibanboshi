@@ -19,6 +19,7 @@ use ichiban_logic::vehicle_daily::RawVehicleDailyRow;
 use tiberius::numeric::Numeric;
 use tiberius::Row;
 
+pub(crate) mod leave;
 pub(crate) mod sales_daily;
 pub(crate) mod sales_monthly;
 pub(crate) mod sales_yoy;

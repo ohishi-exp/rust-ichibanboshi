@@ -1,6 +1,6 @@
 //! 口の本体。1 リクエスト = 1 接続 (`repo::connect`) で、SQL・クエリの検証・組み立ては ichiban-logic を使う。
-//! 下の 7 本はこのファイル、移した 15 本 (#322) は領域別のモジュール (`handle` 1 本ずつ):
-//! [`sales_monthly`]・[`sales_daily`]・[`sales_yoy`]・[`unchin`]・[`surcharge`]・[`schema`]。
+//! 下の 7 本はこのファイル、移した 15 本 (#322) と休暇 2 本 (rust-leave-worker#1) は領域別のモジュール (`handle` 1 本ずつ):
+//! [`sales_monthly`]・[`sales_daily`]・[`sales_yoy`]・[`unchin`]・[`surcharge`]・[`schema`]・[`leave`]。
 //!
 //! - `POST /probe` — ログインして `SELECT 1`。200 `{"ok":true}`
 //! - `GET /health` — 同じく `SELECT 1`。200 `{"status":"ok"}` (オンプレ版の commit 等は返さない)
@@ -25,6 +25,7 @@ use crate::probe_logic::{log_line, reply_for, ErrKind, Failure, Reply, Route, St
 use crate::repo::{connect, kind_of, timeout};
 use crate::rows;
 
+mod leave;
 mod sales_daily;
 mod sales_monthly;
 mod sales_yoy;
@@ -85,6 +86,7 @@ async fn dispatch(env: &Env, route: Route, query: &str) -> Result<String, Failur
         | Route::UnchinCustomerNetDetail => unchin::handle(env, route, query).await,
         Route::SurchargeBase => surcharge::handle(env, route, query).await,
         Route::SchemaColumns => schema::handle(env, route, query).await,
+        Route::LeaveDays | Route::LeaveEmployees => leave::handle(env, route, query).await,
         // 経路判定 (`reply_for_route`) で先に弾いている
         Route::NotFound | Route::MethodNotAllowed => Err(Failure::BadRequest),
     }

@@ -25,6 +25,7 @@ TDS でログインする。1 リクエスト = 1 接続。
 | `unchin` | `/api/unchin/candidates`・`/api/unchin/summary`・`/api/unchin/customer-net`・`/api/unchin/customer-net-detail` |
 | `surcharge` | `/api/surcharge/base` |
 | `schema` | `/api/schema/columns` |
+| `leave` | `/api/leave/days`・`/api/leave/employees` (rust-leave-worker#1。休暇入力の行と、入社日などに絞った社員) |
 
 - 応答 JSON・400 の判定・limit の丸め (1..=5000、既定 500) はオンプレ版と同じ (`logic/` を共有)
 - SQL Server までの失敗はどの口も 502 `{"ok":false,"stage":"secret|connect|login|query","kind":"…"}`。エラー本文・ホスト・ユーザー名は出さない

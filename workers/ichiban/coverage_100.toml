@@ -53,3 +53,8 @@ path = "workers/ichiban/logic/src/surcharge.rs"
 
 [[files]]
 path = "workers/ichiban/logic/src/schema.rs"
+
+# days・employees (rust-leave-worker#1)。employees の SELECT が列を絞っていること (個人情報の列を入れない) は
+# tests/leave_test.rs が文字列で固定している。
+[[files]]
+path = "workers/ichiban/logic/src/leave.rs"
