@@ -96,9 +96,21 @@ path = "workers/kintai/kosoku/src/kintai_reading_dates.rs"
 [[files]]
 path = "workers/kintai/kosoku/src/kintai_tail_gap_probe.rs"
 
-# 月の窓・月初をまたぐ遡り起点・unko_no の先頭桁の読み方・窓の述語
+# 月の窓・月初をまたぐ遡り起点・unko_no の先頭桁の読み方・窓の述語・読む窓・月の書式
 [[files]]
 path = "workers/kintai/kosoku/src/window.rs"
+
+# kosoku-daily の「取ってきた行から応答を組む」部分 (1 乗務員ぶん・全員版の書き出し)。root の routes/kintai.rs から移した
+[[files]]
+path = "workers/kintai/kosoku/src/kosoku_daily.rs"
+
+# version の範囲と etag の畳み方。root の kintai_version.rs から移した
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_version.rs"
+
+# timecard/drivers のページ・timecard/events の月の検査と窓・2 本の応答。root の kintai_diff.rs と routes/kintai_timecard.rs から移した
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_timecard.rs"
 
 # ── kintai-dtako (day-events と dtako/worktime の純粋部分。repo ルートの package と共有) ──
 # root の src/routes/dtako_day.rs・dtako_worktime.rs から移した (Refs #322)。テストは各ファイルの単体テスト。

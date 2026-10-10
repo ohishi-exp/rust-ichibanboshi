@@ -25,7 +25,7 @@ use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::kintai_version::{fold_etag, DynKintaiVersionRepo};
+use crate::kintai_version::{version_etag, DynKintaiVersionRepo};
 use crate::kosoku::KosokuParams;
 use crate::routes::kintai::{is_valid_month, map_repo_err};
 
@@ -54,12 +54,8 @@ pub async fn version(
     //   kintai と無関係なデプロイでも relay の上流キャッシュが全月無効になる (Refs #191)。
     //   対象の決め方と「取りこぼしたら古い値」の警戒点は build.rs 参照
     // KosokuParams: 再ビルド無しの TOML 変更 (丸め方・閾値) でも応答が変わるため畳む
-    let etag = fold_etag(
-        &month,
-        env!("KINTAI_OUTPUT_SHA"),
-        &format!("{:?}", *params_cfg),
-        &markers,
-    );
+    // (畳み方は共有 crate。版は呼び手が渡す — 勤怠 Worker は自分の build の版を渡す、Refs #322)
+    let etag = version_etag(&month, env!("KINTAI_OUTPUT_SHA"), &params_cfg, &markers);
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let sources = markers.len();
     tracing::info!(month = %month, sources, "kintai version built");

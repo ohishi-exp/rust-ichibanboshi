@@ -95,9 +95,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use sha2::{Digest, Sha256};
 
 use crate::kintai_push::{jst_day_bounds, KintaiPgStore, KintaiPushError, PUSHED_SOURCES};
-use crate::kintai_repo::{
-    exact_month_range, lookback_from, month_range, DynKintaiEventsRepo, KintaiRepoError,
-};
+use crate::kintai_repo::{exact_month_range, month_range, DynKintaiEventsRepo, KintaiRepoError};
 use crate::kosoku::{
     daily_summary, drop_duplicate_rows, DaySummary, KosokuParams, NonWorking, ShiftSource,
 };
@@ -987,7 +985,7 @@ fn push_window_gap_warning(
 // 見え、休息の終わりを始業とする余分な勤務を当月に立てる (乗務員 1194 の 2026-04)。
 // 窓を「月初をまたぐ運行・勤務の開始」まで乗務員ごとに遡らせて直す。
 //
-// - 読みは全員で 1 回: 始端は起点の最小 ([`lookback_from`])。乗務員ごとの窓へは
+// - 読みは全員で 1 回: 始端は起点の最小 ([`kintai_kosoku::window::lookback_from`])。乗務員ごとの窓へは
 //   読んだ後に [`clip_to_anchors`] で切り戻す — 指紋は行まるごとなので、切り戻さ
 //   ないと他人の起点で自分の行 (と指紋) が動き、毎回 stale になる
 // - 当月への絞り込み (`kosoku::daily_summary` の始業日) と DELETE の範囲は変えない。
@@ -1004,19 +1002,15 @@ pub async fn month_anchors(
 }
 
 /// 読む窓 `[from, to)`。`driver` 指定ならその乗務員の起点 (無ければ月初)、
-/// 省略なら全員の最小 ([`lookback_from`])。
+/// 省略なら全員の最小。窓の決め方は共有 crate (`kintai_kosoku::window::read_window`、
+/// 勤怠 Worker と同じもの、Refs #322)。ここは月が読めないときの写しだけ。
 pub fn read_window(
     month: &str,
     anchors: &HeadAnchors,
     driver: Option<u64>,
 ) -> Result<(String, String), KintaiRepoError> {
-    let (from, to) = month_range(month)
-        .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))?;
-    let from = match driver {
-        Some(d) => anchors.get(&d).cloned().unwrap_or(from),
-        None => lookback_from(&from, anchors),
-    };
-    Ok((from, to))
+    kintai_kosoku::window::read_window(month, anchors, driver)
+        .ok_or_else(|| KintaiRepoError::QueryFailed(format!("bad month: {month}")))
 }
 
 /// 遡った乗務員を 1 行ずつ warnings に出す (封は止めない — 診断)。

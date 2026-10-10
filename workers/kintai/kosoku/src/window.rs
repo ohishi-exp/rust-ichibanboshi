@@ -222,6 +222,41 @@ pub fn lookback_from(
         .to_string()
 }
 
+/// 読む窓 `[from, to)` = [`month_range`] の始端を遡り起点まで下げたもの。`driver` 指定ならその乗務員の
+/// 起点 (無ければ月初)、省略なら全員の最小 ([`lookback_from`])。月が読めなければ `None`
+/// (呼び手が自分のエラー型に写す)。
+pub fn read_window(
+    month: &str,
+    anchors: &std::collections::BTreeMap<u64, String>,
+    driver: Option<u64>,
+) -> Option<(String, String)> {
+    let (from, to) = month_range(month)?;
+    let from = match driver {
+        Some(d) => anchors.get(&d).cloned().unwrap_or(from),
+        None => lookback_from(&from, anchors),
+    };
+    Some((from, to))
+}
+
+/// 対象月の書式検証。`YYYY-MM` で月は 01-12。
+///
+/// 上流は月単位 API (`HolidaysTrait` が `first_day_of_month` を受けて「日」の配列を
+/// 返す) なので、任意の日付レンジは受け付けない。
+pub fn is_valid_month(month: &str) -> bool {
+    let bytes = month.as_bytes();
+    if bytes.len() != 7 || bytes[4] != b'-' {
+        return false;
+    }
+    if !bytes[..4].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if !bytes[5..].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mm: u32 = month[5..].parse().unwrap_or(0);
+    (1..=12).contains(&mm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +470,42 @@ mod tests {
         assert!(window_holds(before, inside, from, to), "期間内に終わる区間");
         assert!(window_holds(from, None, from, to), "下端は含む");
         assert!(!window_holds(to, None, from, to), "上端は含まない");
+    }
+
+    /// 指定した乗務員はその起点から (無ければ月初)、省略は全員の最小から。終端は動かない。
+    #[test]
+    fn read_window_starts_at_the_anchor() {
+        let anchors: std::collections::BTreeMap<u64, String> = [
+            (1194, "2026-03-31 21:36:28".to_string()),
+            (1300, "2026-03-30 08:00:00".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let to = "2026-05-02 00:00:00".to_string();
+        let got = read_window("2026-04", &anchors, Some(1194));
+        assert_eq!(got, Some(("2026-03-31 21:36:28".to_string(), to.clone())));
+        let got = read_window("2026-04", &anchors, Some(1500));
+        assert_eq!(got, Some((APRIL.to_string(), to.clone())));
+        let got = read_window("2026-04", &anchors, None);
+        assert_eq!(got, Some(("2026-03-30 08:00:00".to_string(), to)));
+        assert_eq!(read_window("2026-13", &anchors, None), None);
+    }
+
+    #[test]
+    fn valid_months() {
+        assert!(is_valid_month("2026-01"));
+        assert!(is_valid_month("2026-12"));
+    }
+
+    #[test]
+    fn invalid_months() {
+        assert!(!is_valid_month(""));
+        assert!(!is_valid_month("2026-1"));
+        assert!(!is_valid_month("2026-00"));
+        assert!(!is_valid_month("2026-13"));
+        assert!(!is_valid_month("2026/06"));
+        assert!(!is_valid_month("20a6-06"));
+        assert!(!is_valid_month("2026-0a"));
+        assert!(!is_valid_month("2026-006"));
     }
 }
