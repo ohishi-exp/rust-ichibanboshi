@@ -1,4 +1,4 @@
-//! Supabase (勤怠スキーマ `kintai.*`) を Hyperdrive (`KINTAI_HYPERDRIVE`) 経由で読む 5 本の口。
+//! Supabase (勤怠スキーマ `kintai.*`) を Hyperdrive (`KINTAI_HYPERDRIVE`) 経由で読む 6 本の口 (`timecard/signatures` を含む)。
 //!
 //! 入力の検査・SQL・`$n` の型・応答の組み立ては kintai-logic (root の src/ の写し)。ここは DB との往復だけ:
 //! 検査 (400) → binding の有無 (無ければ 503) → テナント (`KINTAI_TENANT_ID`、無ければ 503) → connect (失敗は 502) →
@@ -11,9 +11,12 @@
 
 use alc_worker_db::hyperdrive;
 use alc_worker_db::{kind, PgClient, TxOutput};
-use kintai_logic::common::{db_fail, no_db, preflight, Fail, HYPERDRIVE_BINDING, TENANT_VAR};
-use kintai_logic::wage_snapshot::WageSnapshotRow;
-use kintai_logic::{change_log, day_summaries, shift_days, shift_overlaps, wage_range};
+use kintai_logic::common::{
+    db_fail, no_db, no_write_db, preflight, write_preflight, Fail, HYPERDRIVE_BINDING, TENANT_VAR,
+};
+use kintai_logic::{
+    change_log, day_summaries, shift_days, shift_overlaps, timecard_write, wage_range,
+};
 use tokio_postgres::{Error as PgError, Row};
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
@@ -35,19 +38,30 @@ pub(crate) async fn serve(read: Read, query: &str, env: &Env) -> Result<serde_js
         Read::ShiftDays => shift_days(query, env).await,
         Read::ChangeLog => change_log(query, env).await,
         Read::WageRange => wage_range(query, env).await,
+        Read::Signatures => signatures(query, env).await,
     }
 }
 
 /// binding の有無 → テナント → connect の順 (元の handler と同じく、設定の欠落は DB に繋ぐ前に 503 で決める)。
 /// binding が無い = 503 / テナントが無い = 503 (どちらも connect しない) / 在るのに繋がらない = 502。
 async fn open(env: &Env, what: &str) -> Result<(PgClient, Uuid), Fail> {
+    open_db(env, what, false).await
+}
+
+/// [`open`] の本体。`write` は書き込みの口 (と元が書き先の store を使っていた `timecard/signatures`) で、binding が
+/// 無いときの 503 の文言だけが違う (元の `[kintai_push] が無効です (書き先がありません)` に当たる)。
+pub(crate) async fn open_db(env: &Env, what: &str, write: bool) -> Result<(PgClient, Uuid), Fail> {
     // kit の hyperdrive::connect と同じ判定 (undefined のときだけ「無い」。読めなければ「在る」とし、connect の Err に任せる)
     let has_binding =
         Reflect::get(env, &JsValue::from(HYPERDRIVE_BINDING)).map_or(true, |v| !v.is_undefined());
     let raw = env.var(TENANT_VAR).ok().map(|v| v.to_string());
-    let tenant = preflight(has_binding, raw.as_deref())?;
+    let tenant = match write {
+        true => write_preflight(has_binding, raw.as_deref())?,
+        false => preflight(has_binding, raw.as_deref())?,
+    };
     let pg = match hyperdrive::connect(env, HYPERDRIVE_BINDING).await {
         Ok(Some(pg)) => pg,
+        Ok(None) if write => return Err(no_write_db()),
         Ok(None) => return Err(no_db()),
         // ConnectError の Display は binding 名・段・kind だけ (接続文字列・宛先を含まない)
         Err(e) => return Err(db_fail(what, &e.to_string())),
@@ -178,7 +192,7 @@ async fn change_log(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
 }
 
 async fn wage_range(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
-    use wage_range::{parse, respond, Binds, RangeRow, DB_WHAT, SELECT_RANGE_SQL};
+    use wage_range::{parse, respond, Binds, DB_WHAT, SELECT_RANGE_SQL};
     let req = parse(query)?;
     let (mut pg, tenant) = open(env, DB_WHAT).await?;
     let binds = Binds::new(tenant, &req);
@@ -186,35 +200,8 @@ async fn wage_range(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
         .tenant_tx(tenant, move |tx| {
             Box::pin(async move {
                 let rows = tx.query_typed(SELECT_RANGE_SQL, &binds.params()).await?;
-                let to_row = |r: &Row| -> Result<RangeRow, PgError> {
-                    Ok(RangeRow {
-                        ym: r.try_get("ym")?,
-                        row: WageSnapshotRow {
-                            driver_cd: r.try_get("driver_cd")?,
-                            driver_name: r.try_get("driver_name")?,
-                            company: r.try_get("company")?,
-                            branch_name: r.try_get("branch_name")?,
-                            branch_code: r.try_get("branch_code")?,
-                            job_name: r.try_get("job_name")?,
-                            pay_kubun: r.try_get("pay_kubun")?,
-                            hourly_rate: r.try_get("hourly_rate")?,
-                            calc_base: r.try_get("calc_base")?,
-                            calc_overtime: r.try_get("calc_overtime")?,
-                            calc_total: r.try_get("calc_total")?,
-                            paid_base: r.try_get("paid_base")?,
-                            paid_overtime: r.try_get("paid_overtime")?,
-                            working_minutes: r.try_get("working_minutes")?,
-                            restraint_missing: r.try_get("restraint_missing")?,
-                        },
-                        salary_item_sha: r.try_get("salary_item_sha")?,
-                        payroll_synced_at: r.try_get("payroll_synced_at")?,
-                        wage_logic_version: r.try_get("wage_logic_version")?,
-                        timecard_kosoku: r.try_get("timecard_kosoku")?,
-                        computed_at: r.try_get("computed_at")?,
-                    })
-                };
                 rows.iter()
-                    .map(to_row)
+                    .map(kintai_pg::range_row)
                     .collect::<Result<Vec<_>, _>>()
                     .map(Out)
             })
@@ -222,4 +209,16 @@ async fn wage_range(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
         .await
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
     Ok(respond(&req, rows.0))
+}
+
+/// `GET /api/kintai/timecard/signatures` (元は書き先の store を使っていたので、binding が無いときは書き込みの口と同じ 503)。
+/// 検査 (400) → binding (503) → テナント (503) → connect (502) → `STORED_SIGNATURES_SQL` → 応答。
+async fn signatures(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+    use timecard_write::{parse_signatures, signatures_respond, DB_WHAT};
+    let req = parse_signatures(query)?;
+    let (mut pg, tenant) = open_db(env, DB_WHAT, true).await?;
+    let sigs = kintai_pg::stored_day_signatures(&mut pg, tenant, req.driver_cd, req.from, req.to)
+        .await
+        .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
+    Ok(signatures_respond(&req, &sigs))
 }

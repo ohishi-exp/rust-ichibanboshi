@@ -1,13 +1,14 @@
 # ichibanboshi-kintai: 勤怠 (kintai) の読み出し Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
 # Service Binding 専用。口は到達の確認用の POST /probe (社内 MariaDB、自作の MySQL クライアント kintai-mysql) と、
-# Supabase の勤怠スキーマを読むだけの GET /api/kintai/* の 5 本 (Hyperdrive + alc-worker-db)、
+# Supabase の勤怠スキーマを読む GET /api/kintai/* の 6 本・書く POST の 2 本 (Hyperdrive + alc-worker-db)、
 # 社内 MariaDB を直接読む GET の 10 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime・
 # kosoku-daily・version・timecard/drivers・timecard/events)。
 # 本番へはタグ worker-kintai-v* の push で deploy する (.github/workflows/worker-kintai.yml)。
 #
 # ★ 外から届く口を持たない:
 #   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。
-#   - 認可なし (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手 (relay の共有 secret、kyuyo-mcp の OAuth)
+#   - 読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手 (relay の共有 secret、kyuyo-mcp の OAuth)
+#   - 書き込みの口 (POST の 2 本) だけ Worker が共有 secret KINTAI_WRITE_TOKEN を照合する (ユーザー決定 2026-10-10)
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
 #   - MariaDB への口 (vpc_services) と Supabase への口 (hyperdrive) はトップレベルにだけ置く。
 #     ローカルで迂回する LOCAL_* の var は持たない
@@ -53,8 +54,16 @@ binding = "KINTAI_MARIADB"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "KINTAI_MARIADB"
 
+# 書き込みの口 (POST /api/kintai/timecard・POST /api/kintai/wage-snapshot) の共有 secret。リクエストのヘッダー
+# X-Kintai-Write-Token をこの値と定数時間で照合し、無い・違うなら 403、binding が無い・読めないなら 503。読みの口は照合しない。
+# store は KINTAI_MARIADB と同じ (値は GCP の Secret Manager を正本に同期。repo に書かない)
+[[secrets_store_secrets]]
+binding = "KINTAI_WRITE_TOKEN"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "KINTAI_WRITE_TOKEN"
+
 # Supabase (勤怠スキーマ kintai.*) への口。id は Hyperdrive の設定の id (接続先と資格情報は設定の側に在り、repo には書かない)。
-# 分割 worker と共有の実行用ロールの設定。binding が無ければ GET /api/kintai/* は 503
+# 分割 worker と共有の実行用ロールの設定。binding が無ければ Supabase の口 (読み 6 本・書き 2 本) は 503
 [[hyperdrive]]
 binding = "KINTAI_HYPERDRIVE"
 id = "0110becff61044bb8435c457a69c63a1"

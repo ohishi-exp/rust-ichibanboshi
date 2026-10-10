@@ -126,6 +126,38 @@ mutate 1 "(g) トップレベルに残したまま env.staging にも置く" \
   'cfg["env"] = {"staging": {"hyperdrive": [dict(cfg["hyperdrive"][0])]}}' "env.staging.hyperdrive がある"
 mutate 1 "(g) env 以外の表の奥に hyperdrive" 'cfg["observability"]["hyperdrive"] = [dict(cfg["hyperdrive"][0])]' \
   "observability.hyperdrive がある"
+# (h) 書き込みの口 (worker/src の Route::Write) があるなら KINTAI_WRITE_TOKEN の binding が要る
+mutate 1 "(h) KINTAI_WRITE_TOKEN を消す" \
+  'cfg["secrets_store_secrets"] = [s for s in cfg["secrets_store_secrets"] if s["binding"] != "KINTAI_WRITE_TOKEN"]' \
+  "secrets_store_secrets の KINTAI_WRITE_TOKEN が無い"
+mutate 1 "(h) KINTAI_WRITE_TOKEN の binding 名を変える" \
+  'next(s for s in cfg["secrets_store_secrets"] if s["binding"] == "KINTAI_WRITE_TOKEN")["binding"] = "WRITE_TOKEN"' \
+  "secrets_store_secrets の KINTAI_WRITE_TOKEN が無い"
+mutate 1 "(h) KINTAI_WRITE_TOKEN の secret_name を変える" \
+  'next(s for s in cfg["secrets_store_secrets"] if s["binding"] == "KINTAI_WRITE_TOKEN")["secret_name"] = "OTHER"' \
+  "secret_name が KINTAI_WRITE_TOKEN でない"
+mutate 1 "(h) KINTAI_WRITE_TOKEN の store_id を変える" \
+  'next(s for s in cfg["secrets_store_secrets"] if s["binding"] == "KINTAI_WRITE_TOKEN")["store_id"] = "0" * 32' \
+  "store_id が KINTAI_MARIADB と違う"
+mutate 1 "(h) secrets_store_secrets を env.staging へ動かす" \
+  'cfg["env"] = {"staging": {"secrets_store_secrets": cfg.pop("secrets_store_secrets")}}' \
+  "env.staging.secrets_store_secrets がある"
+# 書き込みの口が無いソース (Route::Write が無い) なら binding が無くても通る (検査が src を見ていることの対照)
+mkdir -p "$tmp/src-no-write"
+echo 'fn main() {}' >"$tmp/src-no-write/lib.rs"
+python3 - "$BASE" "$tmp/no-token.toml" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+# KINTAI_WRITE_TOKEN の表 ([[secrets_store_secrets]] から次の空行まで) を消す
+text, n = re.subn(r"\[\[secrets_store_secrets\]\]\nbinding = \"KINTAI_WRITE_TOKEN\"\n(?:[^\n]+\n)*", "", text)
+assert n == 1, n
+open(sys.argv[2], "w", encoding="utf-8").write(text)
+PY
+KINTAI_WORKER_SRC="$tmp/src-no-write" expect 0 "(h) 書き込みの口が無いなら KINTAI_WRITE_TOKEN が無くても通る" "$tmp/no-token.toml"
+expect 1 "(h) 書き込みの口があるのに KINTAI_WRITE_TOKEN が無い (同じ toml・実物の src)" "$tmp/no-token.toml" \
+  "secrets_store_secrets の KINTAI_WRITE_TOKEN が無い"
 # (f) は warning だけ: service_id を実値らしくしても、プレースホルダのままでも exit 0
 mutate 0 "(f) service_id を入れた (warning 無し)" \
   'cfg["vpc_services"][0]["service_id"] = "11111111-1111-1111-1111-111111111111"'

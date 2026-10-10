@@ -130,3 +130,58 @@ pub fn preflight(has_binding: bool, tenant_raw: Option<&str>) -> Result<Uuid, Fa
     }
     tenant_of(tenant_raw)
 }
+
+/// 書き込みの口の [`preflight`]。binding が無いときの文言だけ違う (元の `[kintai_push] が無効です (書き先がありません)`)。
+pub fn write_preflight(has_binding: bool, tenant_raw: Option<&str>) -> Result<Uuid, Fail> {
+    if !has_binding {
+        return Err(no_write_db());
+    }
+    tenant_of(tenant_raw)
+}
+
+/// 503 (`KINTAI_HYPERDRIVE` の binding が無い、書き込みの口)。
+pub fn no_write_db() -> Fail {
+    Fail::new(503, "[KINTAI_HYPERDRIVE] が無効です (書き先がありません)")
+}
+
+/// axum の `Json` が本文を読む上限 (`DefaultBodyLimit` の既定 2MB)。超えたら元と同じく 413。
+pub const MAX_JSON_BODY_BYTES: usize = 2_097_152;
+
+/// 本文を `T` に読む。axum 0.8 の `Json` と同じ順・同じ status・同じ文言:
+/// Content-Type が `application/json` (か `+json`) でない → 415 / 2MB 超 → 413 /
+/// JSON として読めない・後ろに余計な文字 → 400 / 型に合わない → 422 (本文の頭 + `: ` + serde の理由)。
+pub fn parse_json<T: DeserializeOwned>(content_type: Option<&str>, body: &[u8]) -> Result<T, Fail> {
+    if !json_content_type(content_type) {
+        return Err(Fail::new(415, UNSUPPORTED_JSON));
+    }
+    if body.len() > MAX_JSON_BODY_BYTES {
+        return Err(Fail::new(413, TOO_LARGE));
+    }
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let value: T = serde_path_to_error::deserialize(&mut de).map_err(json_fail)?;
+    de.end()
+        .map_err(|e| Fail::new(400, format!("{JSON_SYNTAX}: {e}")))?;
+    Ok(value)
+}
+
+const UNSUPPORTED_JSON: &str = "Expected request with `Content-Type: application/json`";
+const TOO_LARGE: &str = "Failed to buffer the request body: length limit exceeded";
+const JSON_SYNTAX: &str = "Failed to parse the request body as JSON";
+const JSON_DATA: &str = "Failed to deserialize the JSON body into the target type";
+
+/// serde の失敗を axum と同じく分ける (型に合わない = 422、それ以外 = 400)。
+fn json_fail(e: serde_path_to_error::Error<serde_json::Error>) -> Fail {
+    match e.inner().classify() {
+        serde_json::error::Category::Data => Fail::new(422, format!("{JSON_DATA}: {e}")),
+        _ => Fail::new(400, format!("{JSON_SYNTAX}: {e}")),
+    }
+}
+
+/// axum の `json_content_type` と同じ判定 (mime として読めて `application/json` か `application/*+json`)。
+fn json_content_type(content_type: Option<&str>) -> bool {
+    let Some(mime) = content_type.and_then(|c| c.parse::<mime::Mime>().ok()) else {
+        return false;
+    };
+    let json = mime.subtype() == "json" || mime.suffix().is_some_and(|s| s == "json");
+    mime.type_() == "application" && json
+}

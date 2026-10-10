@@ -10,7 +10,11 @@
 #   (f) vpc_services の service_id がプレースホルダのままなら warning (fail にはしない)
 #   (g) トップレベルに hyperdrive の KINTAI_HYPERDRIVE (Supabase への口) があり、hyperdrive がトップレベル以外
 #       (env.* を含む表の奥) のどこにも無い (本番の DB へ届く binding をトップレベルの外へ置かない)
-# (a)〜(e)・(g) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
+#   (h) Worker のソース (既定 workers/kintai/worker/src、env KINTAI_WORKER_SRC で差し替え) に書き込みの口
+#       (`Route::Write(`) があるなら、トップレベルの secrets_store_secrets に KINTAI_WRITE_TOKEN (secret_name も同名、
+#       store_id は KINTAI_MARIADB と同じ) がある。書き込みの口は共有 secret を照合するので、binding が無いと全部 503 になる
+#       (照合の判定は kintai-logic の write_auth)。secrets_store_secrets もトップレベル以外に置かない
+# (a)〜(e)・(g)・(h) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/kintai/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/kintai/worker/wrangler.toml)
 set -euo pipefail
@@ -20,8 +24,10 @@ if [ "$#" -gt 1 ]; then
   exit 2
 fi
 target="${1:-$(dirname "$0")/../worker/wrangler.toml}"
+src="${KINTAI_WORKER_SRC:-$(dirname "$0")/../worker/src}"
 
-python3 - "$target" <<'PY'
+python3 - "$target" "$src" <<'PY'
+import pathlib
 import sys
 import tomllib
 
@@ -100,7 +106,40 @@ def nested_hyperdrive(node, prefix=""):
 for name in nested_hyperdrive(cfg):
     err(f"{name} がある (hyperdrive はトップレベルにだけ置く。env 等へ置くと本番の DB への口が漏れる)")
 
+# (h) 書き込みの口があるなら、その認可の secret の binding がトップレベルにある
+src = pathlib.Path(sys.argv[2])
+has_write = any("Route::Write(" in f.read_text(encoding="utf-8") for f in src.glob("*.rs"))
+secrets = cfg.get("secrets_store_secrets") or []
+by_binding = {s.get("binding"): s for s in secrets if isinstance(s, dict)}
+if has_write:
+    tok = by_binding.get("KINTAI_WRITE_TOKEN")
+    if tok is None:
+        err("書き込みの口があるのにトップレベルに secrets_store_secrets の KINTAI_WRITE_TOKEN が無い (書き込みの認可)")
+    else:
+        if tok.get("secret_name") != "KINTAI_WRITE_TOKEN":
+            err("KINTAI_WRITE_TOKEN の secret_name が KINTAI_WRITE_TOKEN でない")
+        mariadb = by_binding.get("KINTAI_MARIADB") or {}
+        if tok.get("store_id") != mariadb.get("store_id"):
+            err("KINTAI_WRITE_TOKEN の store_id が KINTAI_MARIADB と違う (同じ Secrets Store に置く)")
+
+
+def nested_secrets(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            name = f"{prefix}.{k}" if prefix else k
+            if k == "secrets_store_secrets" and prefix:
+                yield name
+            yield from nested_secrets(v, name)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from nested_secrets(v, f"{prefix}[{i}]")
+
+
+for name in nested_secrets(cfg):
+    err(f"{name} がある (secrets_store_secrets はトップレベルにだけ置く)")
+
 if errors:
     sys.exit(1)
-print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services と hyperdrive はトップレベル・LOCAL_* 無し")
+write_note = "・書き込みの口の KINTAI_WRITE_TOKEN あり" if has_write else ""
+print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services と hyperdrive はトップレベル・LOCAL_* 無し{write_note}")
 PY

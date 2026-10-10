@@ -1,7 +1,7 @@
-# 勤怠 Worker が Supabase (勤怠スキーマ kintai.*) を読む 5 本の口の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
-# SQL 定数・Query の型と検査・引数の束 ($n と Type の対)・行の型・応答の組み立て・賃金スナップショットの集計。
-# root の src/ (Cloud Run 版) からの写しで、DB も I/O も持たないので native で cargo test できる。
-# 写しの対応表と「撤去までは片方を直したらもう片方も直す」は workers/kintai/README.md。
+# 勤怠 Worker が Supabase (勤怠スキーマ kintai.*) を読み書きする口の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# SQL 定数・Query / 本文の型と検査・引数の束 ($n と Type の対)・行の型・応答の組み立て・賃金スナップショットの集計・
+# 書き込みの口の認可 (共有 secret の照合)。DB も I/O も持たないので native で cargo test できる。
+# root の src/ (Cloud Run 版) との写しの対応表と「撤去までは片方を直したらもう片方も直す」は workers/kintai/README.md。
 [package]
 name = "kintai-logic"
 version = "0.1.0"
@@ -18,15 +18,17 @@ kintai-dtako = { path = "../dtako" }
 kintai-kosoku = { path = "../kosoku" }
 # 名前付き引数の展開とテキストプロトコルの行の型
 kintai-mysql = { path = "../mysql" }
+# 書き込みの口の本文の Content-Type の判定 (axum の Json と同じく mime として読む)
+mime = "0.3"
 # $n の Type と ToSql だけ (tokio-postgres の types は postgres-types の再 export。同じ版に解決される)
 postgres-types = { version = "0.2", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 serde_urlencoded = "0.7"
+# 書き込みの口の共有 secret の照合 (両方を sha256 にしてから定数時間で比べる)。tests/pg_write_snapshot.rs も使う
+sha2 = "0.10"
 uuid = "1"
 
 [dev-dependencies]
 bytes = "1"
-# 書き込みの SQL と bind の束を基点の sha256 で縛る (tests/pg_write_snapshot.rs)
-sha2 = "0.10"

@@ -1,0 +1,34 @@
+# 勤怠 Worker の Supabase (勤怠スキーマ kintai.*) への書き込みの部品 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# alc-worker-db の `PgClient::tenant_tx` の中で、共有 crate (kintai-kosoku・kintai-logic) の SQL と Vec の束を
+# `query_typed` / `execute_typed` に型付きで渡すだけ (名前付き prepared statement は Hyperdrive で接続が切れる)。
+# native でも動く (接続を張るのは呼び手: Worker は Hyperdrive、tests/root_parity.rs は native の tokio-postgres)。
+[package]
+name = "kintai-pg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+alc-worker-db = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+kintai-kosoku = { path = "../kosoku" }
+kintai-logic = { path = "../logic" }
+serde_json = "1"
+# Row・Error・Type だけ (接続は呼び手)。int8[]・timestamptz[]・jsonb[]・uuid の bind に要る feature
+tokio-postgres = { version = "0.7", default-features = false, features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+uuid = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+
+# tests/root_parity.rs: root (Cloud Run 版) の sqlx の経路と、ここの経路に同じ入力を与えて、書いた後の表の中身を比べる
+# (CI の postgres。KINTAI_TEST_DATABASE_URL が無ければ失敗する)。dev-dependency なので wasm のビルドには入らない
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+axum = "0.8"
+rust-ichibanboshi = { path = "../../.." }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+# tests/axum_parity.rs: root の handler を `oneshot` で叩く (DB 不要)
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4"] }

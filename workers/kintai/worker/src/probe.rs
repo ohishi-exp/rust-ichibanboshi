@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Route {
     /// `POST /probe` — 繋いで `SELECT 1, VERSION(), …` を流す
     Probe,
-    /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 5 本
+    /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 6 本 (`timecard/signatures` を含む)
     Read(Read),
+    /// `POST /api/kintai/{timecard,wage-snapshot}` — Supabase に書く 2 本 (共有 secret の照合あり)
+    Write(Write),
     /// `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}` — 社内 MariaDB を直接読む 4 本
     Mariadb(MariadbRead),
     /// `GET /api/kintai/day-events`・`GET /api/dtako/worktime` — 社内 MariaDB を直接読む 2 本
@@ -33,6 +35,7 @@ pub(crate) enum Read {
     ShiftDays,
     ChangeLog,
     WageRange,
+    Signatures,
 }
 
 impl Read {
@@ -44,6 +47,7 @@ impl Read {
             "/api/kintai/shift-days" => Read::ShiftDays,
             "/api/kintai/change-log" => Read::ChangeLog,
             "/api/kintai/wage-range" => Read::WageRange,
+            "/api/kintai/timecard/signatures" => Read::Signatures,
             _ => return None,
         })
     }
@@ -56,13 +60,48 @@ impl Read {
             Read::ShiftDays => "shift-days",
             Read::ChangeLog => "change-log",
             Read::WageRange => "wage-range",
+            Read::Signatures => "timecard/signatures",
         }
     }
 }
 
-/// 口は `POST /probe` と GET の 15 本 (Supabase 5 本・MariaDB 4 本 + day-events・dtako/worktime +
-/// kosoku-daily・version・timecard/drivers・timecard/events)。path が合って method が違えば 405、それ以外の path は 404。
+/// Supabase の勤怠スキーマに書く口 (純粋部分は kintai-logic、DB との往復は kintai-pg)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Write {
+    Timecard,
+    WageSnapshot,
+}
+
+impl Write {
+    /// 口の path。元 (Cloud Run 版) と同じ。
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        Some(match path {
+            "/api/kintai/timecard" => Write::Timecard,
+            "/api/kintai/wage-snapshot" => Write::WageSnapshot,
+            _ => return None,
+        })
+    }
+
+    /// ログに出す名前。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Write::Timecard => "timecard",
+            Write::WageSnapshot => "wage-snapshot",
+        }
+    }
+}
+
+/// 口は `POST /probe`・GET の 16 本 (Supabase 6 本・MariaDB 4 本 + day-events・dtako/worktime +
+/// kosoku-daily・version・timecard/drivers・timecard/events)・POST の 2 本 (Supabase に書く timecard・wage-snapshot)。
+/// path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
+    if let Some(write) = Write::from_path(path) {
+        return if method == "POST" {
+            Route::Write(write)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
     if let Some(read) = KosokuRead::from_path(path) {
         return if method == "GET" {
             Route::Kosoku(read)
@@ -164,9 +203,12 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     let status = match route {
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
-        Route::Probe | Route::Read(_) | Route::Mariadb(_) | Route::Dtako(_) | Route::Kosoku(_) => {
-            return None
-        }
+        Route::Probe
+        | Route::Read(_)
+        | Route::Write(_)
+        | Route::Mariadb(_)
+        | Route::Dtako(_)
+        | Route::Kosoku(_) => return None,
     };
     Some(Reply {
         status,

@@ -23,6 +23,8 @@ pub mod mariadb_reads;
 pub mod mariadb_rows;
 pub mod shift_days;
 pub mod shift_overlaps;
+pub mod timecard_write;
 pub mod wage_range;
 pub mod wage_snapshot;
 pub mod wage_write;
+pub mod write_auth;
