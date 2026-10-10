@@ -1,13 +1,13 @@
 //! **末尾検知 (tail gap) が鳴らしている乗務員を、乗務員別に名指しする** (Refs #205)。
 //!
 //! **直す口ではなく、見える口。** 月ゲートの封の条件・閾値・warning 文言には
-//! 一切触れない — [`crate::kintai_http_repo::InputCoverage`] が実際に見ている量
+//! 一切触れない — `kintai_http_repo::InputCoverage` が実際に見ている量
 //! (最後の運行開始日 → 窓末尾までの空き) を、オンプレの実データで乗務員ごとに
 //! 並べるだけ。
 //!
 //! ## これは alc の tail gap 警告と**同じ量ではない**
 //!
-//! 本物の警告 ([`crate::kintai_http_repo::missing_input_warnings`]) は GCP 側で
+//! 本物の警告 (`kintai_http_repo::missing_input_warnings`) は GCP 側で
 //! **alc の etags** (R2 の CSV の有無) から測っている。この口が読むのは
 //! **オンプレの MariaDB 直読み** (`dtako_events`) — 経路も母集団の取り方も別物。
 //! `/health` の `backends.kintai_events` が `mariadb` のとき、オンプレは alc を
@@ -16,21 +16,21 @@
 //!
 //! ## 母集団はミラーする — 「その月に運行が始まった乗務員」だけ
 //!
-//! [`crate::kintai_http_repo::InputCoverage`] の母集団の絞り方 (Refs #205 の 37)
+//! `kintai_http_repo::InputCoverage` の母集団の絞り方 (Refs #205 の 37)
 //! と同じ理由で、**この月に `dtako_events` の `運行開始` を 1 件も持たない乗務員は
 //! 対象に入れない。** 入れると「そもそも稼働していない」全員が「末尾が欠けた」に
 //! 化ける (本番実測でこの絞りが無かったとき 73 名が 37 日超で鳴った実例がある)。
 //!
 //! **この絞りだけでは「月の途中で退職・長期休暇に入った」形は排除できない** —
 //! その乗務員は月の前半に運行を持つので母集団には入り、末尾の空きは大きいまま
-//! 鳴り続ける。**空き期間に打刻 ([`crate::kintai_repo`] の `time_card_dstate`) が
+//! 鳴り続ける。**空き期間に打刻 (`kintai_repo` の `time_card_dstate`) が
 //! あったかどうか**が、「運行記録だけが欠けている」(本物) と
 //! 「その期間は働いていない」(データの問題ではない) を分ける材料になる ——
 //! かどうかを実データで確かめるのがこの口の目的。
 //!
 //! ## 閾値は複製しない
 //!
-//! [`crate::kintai_http_repo::MAX_TAIL_GAP_DAYS`] をそのまま読む。値をここに
+//! [`crate::window::MAX_TAIL_GAP_DAYS`] をそのまま読む。値をここに
 //! 複製すると、片方だけ変えたときに気付けずに drift する。
 
 use std::collections::HashMap;
@@ -38,14 +38,14 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 use serde::Serialize;
 
-use crate::kintai_http_repo::MAX_TAIL_GAP_DAYS;
+use crate::window::MAX_TAIL_GAP_DAYS;
 
 /// 運行の開始を示す `dtako_events` の `イベント名`。
 /// alc の `unko_no_start_date` に相当する量を、オンプレの実イベントから直接取る。
 const START_EVENT_STATE: &str = "運行開始";
 
 /// 打刻 2 表 (`time_card_dstate` / `time_card_dtako`) の `source`。
-/// [`crate::kintai_repo`] の `EVENTS_SQL` / `ALL_EVENTS_SQL` が付ける値と同じ。
+/// `kintai_repo` の `EVENTS_SQL` / `ALL_EVENTS_SQL` が付ける値と同じ。
 const TIMECARD_SOURCE: &str = "timecard";
 
 /// `dtako_events` の `source` 名。同じく `ALL_EVENTS_SQL` と揃える。
@@ -94,7 +94,7 @@ fn row_date(row: &serde_json::Value, field: &str) -> Option<NaiveDate> {
 }
 
 /// `driver_id` を読む。0 以下は乗務員CD ではないので捨てる
-/// ([`crate::kintai_repo`] の `timecard_driver_cds` と同じ理由)。
+/// (`kintai_repo` の `timecard_driver_cds` と同じ理由)。
 fn row_driver(row: &serde_json::Value) -> Option<u64> {
     row.get("driver_id")
         .and_then(|v| v.as_u64())

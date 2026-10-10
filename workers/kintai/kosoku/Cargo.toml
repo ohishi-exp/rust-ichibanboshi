@@ -1,0 +1,14 @@
+# 勤怠の拘束・休息の純粋ロジックと社内 MariaDB の SQL 文 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# repo ルートの package (オンプレ版・Cloud Run 版) が path 依存で使い、勤怠 Worker も同じものを使う (写さない)。
+# DB も I/O も持たない。依存は serde・serde_json・chrono だけで、wasm32 でも build できること。
+# ここの src/ は全部 repo ルートの build.rs の KINTAI_OUTPUT_SHA (勤怠の版) に入る。
+[package]
+name = "kintai-kosoku"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

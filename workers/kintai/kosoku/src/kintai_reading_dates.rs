@@ -38,7 +38,7 @@
 //!
 //! alc の `dtako_operations` も `reading_date` を持つが、**この口の消費者はオンプレ**で、
 //! オンプレは alc を呼べない (`[kintai_events] source = "mariadb"` なので
-//! [`crate::kintai_http_repo::HttpKintaiEventsRepo`] を構築すらしていない)。
+//! `kintai_http_repo::HttpKintaiEventsRepo` を構築すらしていない)。
 //! そして**勤務の側はオンプレの MariaDB からしか出ない** — 別システムの日付と
 //! 突き合わせる形にすると、#205 の 37 で `運行NO` の正規化に費やしたのと同じ種類の
 //! 問題を自分で作ることになる。
@@ -120,7 +120,7 @@ fn date_of(dt: Option<&str>) -> Option<String> {
 /// `dtako_rows` の行から、運行 → 読取日の引き当てを組む。
 ///
 /// `rows` は
-/// [`crate::kintai_repo::KintaiEventsApi::fetch_operation_reading_dates_between`]
+/// `kintai_repo::KintaiEventsApi::fetch_operation_reading_dates_between`
 /// が返す形 (`driver_cd` / `unko_no` / `reading_date` / `run_date` /
 /// `departure_at` / `return_at`)。
 pub fn reading_dates(rows: &[serde_json::Value]) -> ReadingDates {

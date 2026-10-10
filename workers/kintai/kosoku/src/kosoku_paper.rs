@@ -791,6 +791,23 @@ mod tests {
     }
 
     #[test]
+    fn gap_midnight_looks_only_at_run_end_then_run_start() {
+        // 打刻を挟んだ 1536 の形 (Refs #182)。始業 → 運行終了 等の並びは見ない。
+        // tests/kosoku_daily_test.rs の compare_view_carries_the_gap_midnight_map の写し
+        let rows = vec![
+            tc("2026-03-02 20:00:00", "始業"),
+            ev("2026-03-02 20:00:00", "2026-03-02 23:51:55", "運転"),
+            dtako("2026-03-02 23:51:55", "運行終了"),
+            dtako("2026-03-03 07:03:07", "運行開始"),
+            ev("2026-03-03 07:03:07", "2026-03-03 10:00:00", "運転"),
+            tc("2026-03-03 10:00:00", "終業"),
+        ];
+        let got = gap_midnight_by_date(&rows, "2026-03");
+        assert_eq!(got.get("2026-03-02"), Some(&-8));
+        assert_eq!(got.get("2026-03-03"), Some(&8));
+    }
+
+    #[test]
     fn minus_unko_by_date_reports_the_run_head_the_paper_subtracts() {
         // ある乗務員 2026-01-09 の形。運行開始 → 始業 の 9 分 23 秒を紙は日計から
         // 引く。TC_DC は 運行終了 → 終業 で値を持つので着地する
