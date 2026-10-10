@@ -31,3 +31,7 @@ path = "workers/ichiban/logic/src/costs_daily.rs"
 # 埋めた子が自分の行をこの下に足す
 [[files]]
 path = "workers/ichiban/logic/src/period.rs"
+
+# customer-yoy・customer-yoy-by-dept (c37)
+[[files]]
+path = "workers/ichiban/logic/src/sales_yoy.rs"
