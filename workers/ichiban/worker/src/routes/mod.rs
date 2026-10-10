@@ -146,38 +146,21 @@ async fn ping(env: &Env) -> Result<(), Failure> {
     }
 }
 
-/// 接続して 1 本流し、最初の結果セットを返す。接続は毎回閉じる。
-/// bind が無ければオンプレ版と同じく `simple_query` (SQL batch)、あれば `query` (sp_executesql)。
+/// 接続して 1 本流し、最初の結果セットを返す。接続は毎回閉じる ([`fetch_rows_many`] の 1 本版)。
 pub(crate) async fn fetch_rows(
     env: &Env,
     sql: &str,
     params: &[&dyn ToSql],
     limit: Duration,
 ) -> Result<Vec<Row>, Failure> {
-    let mut client = connect(env).await?;
-    let rows = timeout(limit, async {
-        let stream = if params.is_empty() {
-            client.simple_query(sql).await
-        } else {
-            client.query(sql, params).await
-        }
-        .map_err(|e| kind_of(&e))?;
-        stream.into_first_result().await.map_err(|e| kind_of(&e))
-    })
-    .await;
-    let _ = client.close().await;
-    match rows {
-        None => Err(Failure::Db(Stage::Query, ErrKind::Timeout)),
-        Some(Err(kind)) => Err(Failure::Db(Stage::Query, kind)),
-        Some(Ok(rows)) => Ok(rows),
-    }
+    let mut sets = fetch_rows_many(env, &[(sql, params)], limit).await?;
+    Ok(sets.pop().unwrap_or_default())
 }
 
 /// 1 接続で `queries` (SQL と bind の組) を順に流し、それぞれの最初の結果セットを同じ順で返す。接続は最後に 1 回閉じる。
-/// 1 リクエストで 2〜3 本流す口 (monthly・yoy・daily・customer-trend・customer-detail・customer-yoy・
-/// customer-yoy-by-dept) 用。bind の有無で `simple_query` / `query` を選ぶ規則は [`fetch_rows`] と同じ。
+/// 1 リクエストで 2〜3 本流す口 (monthly・yoy・daily・customer-detail・customer-yoy・customer-yoy-by-dept) 用。
+/// bind が無ければオンプレ版と同じく `simple_query` (SQL batch)、あれば `query` (sp_executesql)。
 /// `limit` は全体 (接続後の全クエリ) の上限。1 本でも失敗すれば残りは流さず `Stage::Query` で返す。
-#[allow(dead_code)] // 領域別のモジュール (#322 の c35〜c39) が使い始めるまで呼び手が無い
 pub(crate) async fn fetch_rows_many(
     env: &Env,
     queries: &[(&str, &[&dyn ToSql])],

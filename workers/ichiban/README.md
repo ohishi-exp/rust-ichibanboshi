@@ -14,7 +14,7 @@ TDS でログインする。1 リクエスト = 1 接続。
 | `GET /api/costs/vehicle-daily` | `?from=&to=&vehicle=&driver=&kind=&limit=`。400 の判定は同上 |
 | `POST /probe` | 到達の切り分け用。ログインして `SELECT 1`。200 `{"ok":true}` |
 
-**オンプレ版に残っていた一番星系の 15 本は、すべて Worker に移った (#322)。** オンプレとの応答の比較と、タグでの本番 deploy はこれから
+**オンプレ版に残っていた一番星系の 15 本は、すべて Worker に移った (#322)。** オンプレとの応答の比較 (#322 のコメント) とタグ `worker-ichiban-v0.2.0` での本番 deploy は済み、呼び手も切り替わった (nuxt-ichibanboshi#134・nuxt-ichibanboshi-seikyu#90)
 (method 違いは 405):
 
 | 領域 | 口 (すべて GET) |

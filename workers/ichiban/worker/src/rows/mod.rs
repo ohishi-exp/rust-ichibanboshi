@@ -68,7 +68,6 @@ fn get_f64(row: &Row, idx: usize) -> f64 {
 }
 
 /// 件数などの int の列 (オンプレ版 `src/repo.rs` の `get_i32` と同じ)。i32 で読めなければ 0。
-#[allow(dead_code)] // 領域別のモジュール (#322 の c35〜c39) が使い始めるまで呼び手が無い
 fn get_i32(row: &Row, idx: usize) -> i32 {
     row.try_get::<i32, _>(idx).ok().flatten().unwrap_or(0)
 }

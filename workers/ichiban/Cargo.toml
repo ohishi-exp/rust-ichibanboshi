@@ -1,4 +1,4 @@
-# 一番星 (CAPE#01) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322)。logic は 6 本の純粋部分 (オンプレ版も path 依存で借りる)。
+# 一番星 (CAPE#01) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322)。logic は Worker の 21 本 (管理画面 6 + 移した 15) の純粋部分。
 # repo ルートの package (オンプレ / Cloud Run の本体) とも workers/kyuyo とも独立した workspace。
 [workspace]
 members = ["logic", "worker"]

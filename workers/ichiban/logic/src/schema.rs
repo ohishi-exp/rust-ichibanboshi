@@ -16,14 +16,6 @@ pub const COLUMNS_SQL: &str =
                  WHERE TABLE_NAME = @P1 \
                  ORDER BY ORDINAL_POSITION";
 
-/// テーブル名のバリデーション (オンプレ版 `is_valid_table_name` と同じ)。
-pub fn is_valid_table_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '#')
-}
-
 /// `COLUMNS_SQL` の 1 行。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawColumnRow {
