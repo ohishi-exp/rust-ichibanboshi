@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::NaiveDateTime;
+use kintai_logic::dtako_autoload::{MaterialQuery, RESET_MATERIAL_SQL};
 use mysql_async::prelude::Queryable;
 use mysql_async::{params, Pool};
 
@@ -89,32 +89,9 @@ impl ResetMaterialApi for DisabledResetMaterialRepo {
     }
 }
 
-/// 材料件数を 1 statement で数える。PHP `_setbyUnkoNo` の絞り込みと完全一致させる
-/// (モジュール doc 参照)。
-///
-/// - **`dtako_events` だけを見る。** `time_card_dtako` は PHP 側が読まない
-///   (`_setbyUnkoNo` は `dtako_events` からしか INSERT し直さない) ので混ぜない
-/// - 2 ブランチに分ける理由 ([`crate::kintai_repo::REST_EVENTS_SQL`] と同じ):
-///   **期間内に始まる区間**と**期間内に終わる区間 (開始は期間より前)** の両方を
-///   拾わないと、日をまたぐ運行の材料を取りこぼす
-/// - `運行NO IN (:v1, :v2)` と `イベント名 IN (...)` は両ブランチに掛ける —
-///   窓は取りこぼし防止の余白であって、絞り込みそのものを緩める理由にはならない
-const RESET_MATERIAL_SQL: &str = r#"
-SELECT CAST(COUNT(*) AS SIGNED) AS n FROM (
-  SELECT e.`運行NO` AS unko_no
-    FROM dtako_events e
-   WHERE e.`開始日時` >= :from AND e.`開始日時` < :to
-     AND e.`運行NO` IN (:v1, :v2)
-     AND e.`イベント名` IN ('休息', '運行開始', '運行終了')
-  UNION ALL
-  SELECT e.`運行NO`
-    FROM dtako_events e
-   WHERE e.`終了日時` >= :from AND e.`終了日時` < :to
-     AND e.`開始日時` < :from
-     AND e.`運行NO` IN (:v1, :v2)
-     AND e.`イベント名` IN ('休息', '運行開始', '運行終了')
-) counted
-"#;
+// 材料件数を 1 statement で数える SQL (`RESET_MATERIAL_SQL`) と、窓・運行NO の 2 パターンの組み立て
+// (`MaterialQuery`) は勤怠 Worker と共有の `kintai-logic` が正本 (Refs #322)。PHP `_setbyUnkoNo` の絞り込みと
+// 完全一致させる理由はそちらの doc。
 
 /// MariaDB 実装。pool は lazy — DB 停止中でも起動は失敗せず、実際に読むときに 502。
 pub struct MariadbResetMaterialRepo {
@@ -168,44 +145,20 @@ impl ResetMaterialApi for MariadbResetMaterialRepo {
     }
 }
 
-/// `unko_no` 先頭 12 桁 (`YYMMDDHHMMSS`) を運行開始日時として読む。
-/// [`crate::routes::dtako_autoload`] / [`crate::routes::dtako_day`] と同じロジックを
-/// 独立して持つ (モジュール doc の「なぜ `kintai_repo.rs` に足さないか」参照)。
-fn unko_no_start_datetime(unko_no: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(unko_no.get(..12)?, "%y%m%d%H%M%S").ok()
-}
-
-/// 材料を数える窓。運行は日をまたぐ (実測: 開始 16:50 → 終了翌日 01:23) ので、
-/// 開始日の前日 0 時から 3 日ぶんという広めの余白を取る (旧実装のまま)。
-fn material_window(start_dt: NaiveDateTime) -> (String, String) {
-    let from = start_dt.date() - chrono::Duration::days(1);
-    let to = from + chrono::Duration::days(4);
-    (format!("{from} 00:00:00"), format!("{to} 00:00:00"))
-}
-
-/// PHP `_setbyUnkoNo` が材料として見る**運行NO の 2 パターン** (対象CD 1/2 両方) を
-/// 組む。`substr($id, 0, 22)` に "1"/"2" を付けるだけの PHP 実装をそのまま写す
-/// (旧実装のまま)。呼び出し側が渡した末尾 1 桁は使わない — PHP 自身が無視して
-/// 両方を見るため。
-fn reset_material_unko_no_variants(unko_no: &str) -> (String, String) {
-    let prefix: String = unko_no.chars().take(22).collect();
-    (format!("{prefix}1"), format!("{prefix}2"))
-}
-
 /// ③ の材料件数を数える ([`crate::routes::dtako_autoload::autoload`] の
 /// `reset_timecard=true` から呼ばれる)。`unko_no` の先頭 12 桁が読めない (壊れた
 /// 入力) 場合は材料無しとして `Ok(0)` (fail-safe — 数えられないなら実行しない側に
-/// 倒す)。
+/// 倒す)。窓 (開始日の前日 0 時から 4 日後の 0 時) と運行NO の 2 パターン (先頭 22 桁 + `1`/`2`) は
+/// [`MaterialQuery`]。
 pub async fn count_reset_material(
     repo: &DynResetMaterialRepo,
     unko_no: &str,
 ) -> Result<i64, KintaiRepoError> {
-    let Some(start_dt) = unko_no_start_datetime(unko_no) else {
+    let Some(q) = MaterialQuery::new(unko_no) else {
         return Ok(0);
     };
-    let (from, to) = material_window(start_dt);
-    let (variant1, variant2) = reset_material_unko_no_variants(unko_no);
-    repo.count_material(&from, &to, &variant1, &variant2).await
+    let (from, to) = q.window_strings();
+    repo.count_material(&from, &to, &q.v1, &q.v2).await
 }
 
 #[cfg(test)]
@@ -287,44 +240,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unko_no_start_datetime_reads_the_leading_12_digits() {
-        let dt = unko_no_start_datetime("26060608220000000041571").unwrap();
-        assert_eq!(dt.to_string(), "2026-06-06 08:22:00");
-        assert_eq!(unko_no_start_datetime("U1"), None, "12桁に満たない");
-    }
-
-    #[test]
-    fn material_window_spans_a_day_before_to_three_days_after_the_start_date() {
-        let start = unko_no_start_datetime("26060608220000000041571").unwrap();
-        let (from, to) = material_window(start);
-        assert_eq!(
-            from, "2026-06-05 00:00:00",
-            "日をまたぐ運行を取りこぼさない余白"
-        );
-        assert_eq!(to, "2026-06-09 00:00:00");
-    }
-
-    #[test]
-    fn reset_material_unko_no_variants_builds_both_crew_suffixes_from_the_leading_22_digits() {
-        assert_eq!(
-            reset_material_unko_no_variants("26060608220000000041571"),
-            (
-                "26060608220000000041571".to_string(),
-                "26060608220000000041572".to_string()
-            ),
-            "呼び出し側の末尾1桁は無視し、両クルーを組む (PHP _setbyUnkoNo と同じ)"
-        );
-        assert_eq!(
-            reset_material_unko_no_variants("2606060822000000004157"),
-            (
-                "26060608220000000041571".to_string(),
-                "26060608220000000041572".to_string()
-            ),
-            "22桁ちょうどの入力でも動く"
-        );
-    }
-
     #[tokio::test]
     async fn count_reset_material_passes_the_window_and_both_crew_variants_through() {
         let repo: DynResetMaterialRepo = Arc::new(AssertingRepo {
@@ -390,17 +305,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KintaiRepoError::NotConfigured));
-    }
-
-    #[test]
-    fn reset_material_sql_covers_rest_start_and_end_events_on_dtako_events_only() {
-        assert!(RESET_MATERIAL_SQL.contains("'休息'"));
-        assert!(RESET_MATERIAL_SQL.contains("'運行開始'"));
-        assert!(RESET_MATERIAL_SQL.contains("'運行終了'"));
-        assert!(RESET_MATERIAL_SQL.contains("FROM dtako_events"));
-        assert!(
-            !RESET_MATERIAL_SQL.contains("time_card_dtako"),
-            "PHP _setbyUnkoNo は dtako_events からしか作り直さない"
-        );
     }
 }

@@ -1,7 +1,8 @@
 //! SQL の名前付き引数 (`:from`・`:driver` 等) をリテラルに展開する (COM_QUERY はテキストプロトコルで、
 //! prepared statement を持たないため)。
 //!
-//! - 受ける値は [`Value`] の 3 種だけ: 整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL。
+//! - 受ける値は [`Value`] の 4 種だけ: 整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL・数字だけの文字列
+//!   ([`Digits`]。`'…'` で囲む。23 桁の運行NO のように `u64` に入らない数字の列のため)。
 //!   **任意の文字列を受ける口は作らない** (自由入力の文字列を SQL に入れる経路を持たない)
 //! - 字句: `'…'`・`"…"`・バッククォートの中は飛ばす (`\` のエスケープと、引用符の 2 連続のエスケープも考慮)。
 //!   `:` の直後が識別子の頭 (英字か `_`) でなければそのまま
@@ -17,6 +18,39 @@ pub enum Value {
     /// `'YYYY-MM-DD HH:MM:SS'` で書く
     DateTime(NaiveDateTime),
     Null,
+    /// `'0123…'` で書く (数字だけなので引用符の中に escape の要る文字は入らない)
+    Digits(Digits),
+}
+
+/// 数字だけの文字列 (1〜32 文字の `0-9`)。[`Digits::new`] を通らなければ作れない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Digits {
+    buf: [u8; Digits::MAX],
+    len: u8,
+}
+
+impl Digits {
+    /// 最大の長さ。
+    pub const MAX: usize = 32;
+
+    /// `^[0-9]{1,32}$` を満たさなければ `None`。
+    pub fn new(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        if b.is_empty() || b.len() > Self::MAX || !b.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut buf = [0u8; Self::MAX];
+        buf[..b.len()].copy_from_slice(b);
+        Some(Self {
+            buf,
+            len: b.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // new が ASCII の数字だけを入れている
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or_default()
+    }
 }
 
 impl Value {
@@ -25,6 +59,7 @@ impl Value {
             Value::UInt(n) => n.to_string(),
             Value::DateTime(dt) => format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S")),
             Value::Null => "NULL".to_string(),
+            Value::Digits(d) => format!("'{}'", d.as_str()),
         }
     }
 }

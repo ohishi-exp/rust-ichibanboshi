@@ -4,43 +4,17 @@
 //! `/editable-months` を社内 LAN HTTP で pull する。token 不要 (社内網)、
 //! base URL は config (空文字なら fetch 系 endpoint は 503 を返す)。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// CakePHP fetch エラー。
-#[derive(Debug)]
-pub enum CakephpError {
-    /// `base_url` 未設定 (= CakePHP fetch 機能が無効化されている)
-    NotConfigured,
-    /// HTTP request 失敗 (DNS / 接続 / timeout 等)
-    RequestFailed(String),
-    /// HTTP non-2xx
-    StatusError { status: u16, body_excerpt: String },
-    /// レスポンス JSON parse 失敗
-    JsonError(String),
-}
-
-impl std::fmt::Display for CakephpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotConfigured => write!(f, "CakePHP base_url is not configured"),
-            Self::RequestFailed(m) => write!(f, "CakePHP request failed: {m}"),
-            Self::StatusError {
-                status,
-                body_excerpt,
-            } => {
-                write!(
-                    f,
-                    "CakePHP returned status {status}, body excerpt: {body_excerpt}"
-                )
-            }
-            Self::JsonError(m) => write!(f, "CakePHP response parse failed: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for CakephpError {}
+// 勤怠の口 (daily・pdf-json・autoload・resetby-unko-no) の URL・multipart・応答の型・エラーの種別は
+// 勤怠 Worker と共有の `kintai-logic` が正本 (Refs #322)。ここは reqwest での送受信だけを持つ
+use kintai_logic::cakephp as wire;
+use kintai_logic::cakephp::urlencode;
+pub use kintai_logic::cakephp::{
+    CakephpError, DtakoAutoloadResponse, ResetTimecardResponse, TimecardDailyResponse,
+};
 
 /// `/uriage-jyuchu-display/masters-json` のレスポンス。
 ///
@@ -111,68 +85,37 @@ pub struct PrintJsonResponse {
     pub sum: serde_json::Value,
 }
 
-/// `/time-card/daily-json?month=YYYY-MM` のレスポンス (Refs
-/// ohishi-exp/nuxt-dtako-admin#424 / yhonda-ohishi/nginx#773, #776)。
-///
-/// **行は `serde_json::Value` のまま持つ** — このサービスは中継であって解釈者では
-/// ないので、上流が項目を足しても型を触らずに素通しできるようにする。同じ理由で
-/// `deny_unknown_fields` は付けず、トップレベルの未知フィールドも `extra` に拾って
-/// 再シリアライズ時に復元する。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TimecardDailyResponse {
-    pub rows: Vec<serde_json::Value>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-/// `POST /dtako-events/autoload` の応答 (Refs #274 / #205 の 58 / #205 の 61)。
-///
-/// HTTP status と PHP が返した本文 (先頭 2000 文字) を**そのまま**保持する。
-/// CakePHP 側は MIME 判定に失敗しても展開もエラー応答も出さず 200 を返す
-/// (親が実物で確認済み) ため、ここで「成功/失敗」に丸めない — 呼び出し側
-/// (route) が status と本文の両方を見て判断できるようにする。
-///
-/// `location` は 3xx 応答の `Location` ヘッダをそのまま持つ (無ければ
-/// `None`)。**通常は空になるはず** — 送信時に `api` フィールドを常に真値で
-/// 付けているため (Refs #205 の 61)。それでも 3xx が返ってきた場合に body が
-/// 空だと何も分からないので、保険として残す。
-#[derive(Debug, Clone, Serialize)]
-pub struct DtakoAutoloadResponse {
-    pub status: u16,
-    pub body_excerpt: String,
-    pub location: Option<String>,
-}
-
-/// `POST /time-card-dtako/resetby-unko-no/<unko_no>` の応答 (③、Refs #205 の 63 /
-/// yhonda-ohishi/nginx#795, #796)。
-///
-/// **応答は空 200 で、成否は PHP 側の Flash (session) にしか出ない**
-/// (yhonda-ohishi/nginx#796 に起票済み)。ここに持つ `status` は「HTTP レベルで
-/// 届いたか」の記録でしかなく、**「勤務時間が実際に再登録されたか」の証明では
-/// ない** — 呼び出し側 (route / 人) は `status` を成功の証拠に使ってはいけない。
-#[derive(Debug, Clone, Serialize)]
-pub struct ResetTimecardResponse {
-    pub status: u16,
-    pub location: Option<String>,
-}
-
 /// CakePHP fetch client。
 ///
 /// `base_url` 空文字なら NotConfigured を返す。
 pub struct CakephpClient {
     base_url: String,
     client: reqwest::Client,
+    /// POST (autoload・resetby-unko-no) 専用。**3xx を追わない** (`redirect::Policy::none()`)。
+    post_client: reqwest::Client,
 }
 
 impl CakephpClient {
     pub fn new(base_url: String, timeout_secs: u64) -> Result<Self, CakephpError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            // 社内 LAN かつ self-signed cert を許容 (PHP dev vhost 想定)
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| CakephpError::RequestFailed(format!("client build: {e}")))?;
-        Ok(Self { base_url, client })
+        let build = |redirect: reqwest::redirect::Policy| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                // 社内 LAN かつ self-signed cert を許容 (PHP dev vhost 想定)
+                .danger_accept_invalid_certs(true)
+                .redirect(redirect)
+                .build()
+                .map_err(|e| CakephpError::RequestFailed(format!("client build: {e}")))
+        };
+        let client = build(reqwest::redirect::Policy::default())?;
+        // 本文を組み立て済みのバイト列で送ると reqwest は 307 / 308 を本文ごと再送して追う
+        // (以前の multipart の stream は再送できず追わなかった)。追うと api の無い分岐の先
+        // (resetby-unko-no なら最大 100 運行ぶんの書き込み) に入りうるので、POST は明示的に追わない
+        let post_client = build(reqwest::redirect::Policy::none())?;
+        Ok(Self {
+            base_url,
+            client,
+            post_client,
+        })
     }
 
     /// `base_url` が空でなければ true (= fetch 可能)
@@ -249,38 +192,21 @@ impl CakephpClient {
         if !self.is_enabled() {
             return Err(CakephpError::NotConfigured);
         }
-        let url = format!(
-            "{}/time-card/daily-json?month={}",
-            self.base_url.trim_end_matches('/'),
-            urlencode(month)
-        );
+        let url = wire::join(&self.base_url, &wire::daily_json_path(month));
         self.get_json(&url).await
     }
 
-    /// `/time-card/pdf-json?month=YYYY-MM[&driver_id=1021]`
+    /// `/time-card/pdf-json?month=YYYY-MM[&driver_id=1021]&recalc=0`
     /// (Refs #143、yhonda-ohishi/nginx#782)
     ///
     /// タイムカード表 **PDF (`TimeCardController::createPdf`) が出す数字**の JSON 版。
     /// [`fetch_timecard_daily`](Self::fetch_timecard_daily) (打刻セッション) とは別物で、
     /// 拘束 (`time_card_kosoku` の日別合計・type 別内訳)・休暇区分・月次集計欄を持つ。
     /// dtako-admin のタイムカード表と 1 vs 1 で突き合わせるための読み出し口。
-    ///
-    /// **`driver_id` 省略で全乗務員。** MCP の一括チェックが月 1 リクエストで済むよう
-    /// 上流がそう作られている。
-    ///
-    /// ## `recalc=0` を必ず付ける (yhonda-ohishi/nginx#786)
-    ///
-    /// 上流は既定 (`recalc=1`) だと拘束時間を**再計算し、値が変われば
-    /// `time_card_kosoku` を DELETE + INSERT する**。この endpoint は突合のための
-    /// **読み取り口**なので、叩くたびに本番データが書き換わってよいはずがない。
-    /// パラメータで選ばせず、ここで固定する — 呼び出し側 (relay / MCP) が付け忘れる
-    /// 余地を残さないため。
+    /// **`recalc=0` の固定** (読み取り口でいられる理由) は `kintai_logic::cakephp::pdf_json_path`。
     ///
     /// 副次的に速い。実測 (2026-04 / 乗務員 1379): **4.18 秒 → 0.31 秒**。
     /// 全乗務員では上流計測で実行時間の約 65% が再計算だった。
-    ///
-    /// 読むのは保存済みの値になるが、突合の相手は**紙のタイムカード表 = 保存済みの値**
-    /// なのでこちらが正しい。再計算が要るなら PDF を出す本来の経路で行う。
     ///
     /// 応答は [`serde_json::Value`] のまま返す — 上流の形が確定しておらず、かつ
     /// このサービスは中継であって解釈者ではないため、型を持たない。
@@ -292,40 +218,9 @@ impl CakephpClient {
         if !self.is_enabled() {
             return Err(CakephpError::NotConfigured);
         }
-        let base = self.base_url.trim_end_matches('/');
-        let url = match driver {
-            Some(d) => format!(
-                "{}/time-card/pdf-json?month={}&driver_id={}&recalc=0",
-                base,
-                urlencode(month),
-                d
-            ),
-            None => format!(
-                "{}/time-card/pdf-json?month={}&recalc=0",
-                base,
-                urlencode(month)
-            ),
-        };
+        let url = wire::join(&self.base_url, &wire::pdf_json_path(month, driver));
         self.get_json(&url).await
     }
-
-    /// PHP (`DtakoEventsController::autoload`) が zip として受け付ける唯一の
-    /// Content-Type。**`$file->getClientMediaType() === "application/x-zip-compressed"`
-    /// でしか判定しない** — OS/ブラウザの一般的な既定 MIME である
-    /// `application/zip` で送ると、展開もエラー応答も無く黙って無視される
-    /// (親が実物で確認済み、Refs #274)。reqwest は拡張子や中身から MIME を
-    /// 推測しないので、ここで固定しないと必ず踏む。
-    const DTAKO_AUTOLOAD_MIME: &'static str = "application/x-zip-compressed";
-
-    /// `post_dtako_autoload` 専用の timeout (秒)。PHP 側は取り込みを
-    /// `for ($i=1;$i<10;$i++)` で最大 18 回叩き直し、`usleep` のビジーウェイトも
-    /// 挟む (親が実物で確認済み、Refs #274) ため応答が遅いことがある。1 回あたりの
-    /// 所要時間は明記されていないので、受け入れ条件の下限 (60 秒) の倍を確保し、
-    /// 「取り込みは進んでいるのにこちらが先に諦めて失敗と誤判定する」方を避ける —
-    /// 待ちすぎるコストより、進行中の書き込みを失敗と誤報するコストの方が高い。
-    /// この client 全体の既定 (`timeout_secs`、他の高速な GET 用) とは別に、この
-    /// 呼び出しだけ `RequestBuilder::timeout()` で上書きする。
-    const DTAKO_AUTOLOAD_TIMEOUT_SECS: u64 = 120;
 
     /// `POST /dtako-events/autoload` — csvdata.zip を社内 nginx の取り込み口へ渡す
     /// (Refs #274 / #205 の 58 / #205 の 61)。**1 回の呼び出しは 1 つの zip だけを
@@ -335,17 +230,10 @@ impl CakephpClient {
     /// `addUnauthenticatedActions` / `Application.php` のホワイトリストに
     /// `DtakoEvents::autoload` が乗っている、親が実物で確認済み)。
     ///
-    /// ## `api` フィールドが必須な理由 (実物で確定済み、Refs #205 の 61)
-    ///
-    /// `DtakoEventsController::autoload()` は末尾で
-    /// `if ($this->request->getData('api')) { $this->autoRender = false; }
-    /// else { $this->redirect(...getQuery('redirect', '/'), 307); }` という分岐を
-    /// 持つ。**POST データに `api` (真値) が無いと必ず 307 で `/` へ redirect
-    /// される** — nginx でも https でもなく PHP アプリが明示的に返す。
-    /// `DtakoIchizipKintai` にも同じ分岐があり、「API 利用者は `api` を付ける」が
-    /// 暗黙の規約になっている。zip の受信・展開・取り込みはこの分岐より**前**
-    /// (1399〜1468 行) で実行されるため、`api` を付け忘れても取り込み自体は走る
-    /// が、応答が 307 になり `location` 以外の情報が失われる。
+    /// 本文 (`api=1` と、MIME 固定の `file[]`) は `kintai_logic::cakephp::autoload_multipart` が組む
+    /// (`api` が必須な理由・MIME を固定する理由もそちら)。timeout は
+    /// `DTAKO_AUTOLOAD_TIMEOUT_SECS` (120 秒) で、この client 全体の既定 (`timeout_secs`、他の高速な
+    /// GET 用) とは別に、この呼び出しだけ `RequestBuilder::timeout()` で上書きする。
     pub async fn post_dtako_autoload(
         &self,
         file_name: &str,
@@ -354,43 +242,14 @@ impl CakephpClient {
         if !self.is_enabled() {
             return Err(CakephpError::NotConfigured);
         }
-        // format! を複数行にしない (フォーマット文字列が独立行だと llvm-cov の行
-        // カバレッジに乗らないことがある、CLAUDE.md / kintai-ops skill §5)
-        let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}/dtako-events/autoload");
-        let part = reqwest::multipart::Part::bytes(zip_bytes)
-            .file_name(file_name.to_string())
-            .mime_str(Self::DTAKO_AUTOLOAD_MIME)
-            .expect("DTAKO_AUTOLOAD_MIME is a constant valid MIME string");
-        let form = reqwest::multipart::Form::new()
-            // ★ 無いと PHP 側が 307 で `/` へ redirect する (上の doc 参照)。
-            // 中身は真値であれば何でもよい (`getData('api')` は真偽判定のみ)。
-            .text("api", "1")
-            .part("file[]", part);
-        let res = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(Self::DTAKO_AUTOLOAD_TIMEOUT_SECS))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| CakephpError::RequestFailed(e.to_string()))?;
+        let url = wire::join(&self.base_url, wire::AUTOLOAD_PATH);
+        let form = wire::autoload_multipart(&gen_boundary(), file_name, &zip_bytes);
+        let timeout = Duration::from_secs(wire::DTAKO_AUTOLOAD_TIMEOUT_SECS);
+        let res = self.post_multipart(&url, form, Some(timeout)).await?;
         let status = res.status().as_u16();
-        // reqwest はこの POST (multipart body) の 3xx を自動追跡しない
-        // (body を再送できないため素通しする、親セッションで実測確認済み) —
-        // 3xx が返ってきたときは Location だけが手がかりなので保険として拾う。
-        let location = res
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let location = location_of(&res);
         let body = res.text().await.unwrap_or_default();
-        let body_excerpt: String = body.chars().take(2000).collect();
-        Ok(DtakoAutoloadResponse {
-            status,
-            body_excerpt,
-            location,
-        })
+        Ok(wire::autoload_response(status, &body, location))
     }
 
     /// `POST /time-card-dtako/resetby-unko-no/<unko_no>` — 勤務時間の再登録
@@ -398,22 +257,13 @@ impl CakephpClient {
     /// 1 つの `unko_no` だけを対象にする** — `dtako_events` と同じく破壊的操作
     /// (`time_card_dtako` への書き戻し) のため一括処理は作らない。
     ///
-    /// ## `api=1` が必須な理由 (実物で確定済み、yhonda-ohishi/nginx#795)
-    ///
-    /// 無いと既定の redirect 先 (`TimeCardDtako::index()` → `_recheck()`) で
-    /// **最大 100 運行ぶんの書き込みが走る**。redirect を追う HTTP client なら
-    /// そこへ丸ごと巻き込まれる — `post_dtako_autoload` の `api` 分岐と同じ罠だが、
-    /// こちらは巻き込まれた場合の被害がより大きい (単一運行のはずが 100 運行)。
-    /// `reqwest` はこの POST の 3xx を自動追跡しないので、万一 `api=1` を送り
-    /// 忘れても実際に巻き込まれることはないが、意図を明示するため常に送る。
+    /// 本文は `api=1` だけ (無いと最大 100 運行ぶんの書き込みに巻き込まれる。
+    /// `kintai_logic::cakephp` の `api_part` の doc)。
     ///
     /// ## 応答は空 200 (yhonda-ohishi/nginx#796)
     ///
     /// 成否は Flash (session) にしか出ないため、`ResetTimecardResponse::status`
     /// を成功の証拠として使ってはいけない (型の doc 参照)。
-    ///
-    /// URL は CakePHP の `postLink` が生成するものと同じ形。**DashedRoute なので
-    /// action は `resetby-unko-no`** (controller は `time-card-dtako`)。
     pub async fn post_reset_timecard(
         &self,
         unko_no: &str,
@@ -421,24 +271,35 @@ impl CakephpClient {
         if !self.is_enabled() {
             return Err(CakephpError::NotConfigured);
         }
-        // format! を複数行にしない (CLAUDE.md / kintai-ops skill §5)
-        let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}/time-card-dtako/resetby-unko-no/{unko_no}");
-        let form = reqwest::multipart::Form::new().text("api", "1");
-        let res = self
-            .client
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| CakephpError::RequestFailed(e.to_string()))?;
+        let url = wire::join(&self.base_url, &wire::reset_timecard_path(unko_no));
+        let form = wire::reset_multipart(&gen_boundary());
+        let res = self.post_multipart(&url, form, None).await?;
         let status = res.status().as_u16();
-        let location = res
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let location = location_of(&res);
         Ok(ResetTimecardResponse { status, location })
+    }
+
+    /// 組み立て済みの multipart を POST する。
+    ///
+    /// **3xx は追わない** (`post_client`) — 3xx が返ってきたときは Location だけが手がかりなので
+    /// 呼び手が保険として拾う。
+    async fn post_multipart(
+        &self,
+        url: &str,
+        form: wire::Multipart,
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::Response, CakephpError> {
+        let mut req = self
+            .post_client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, form.content_type)
+            .body(form.body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        req.send()
+            .await
+            .map_err(|e| CakephpError::RequestFailed(e.to_string()))
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, CakephpError> {
@@ -451,11 +312,7 @@ impl CakephpClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(500).collect();
-            return Err(CakephpError::StatusError {
-                status: status.as_u16(),
-                body_excerpt: excerpt,
-            });
+            return Err(wire::status_error(status.as_u16(), &body));
         }
         res.json::<T>()
             .await
@@ -463,19 +320,23 @@ impl CakephpClient {
     }
 }
 
-/// 最小限の URL encode (date 文字列が `:` `+` 等を含むことは無い想定だが念のため `%` 関連だけ吸収)
-fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => "%20".to_string(),
-            _ => format!("%{:02X}", c as u32),
-        })
-        .collect()
+/// 応答の `Location` ヘッダ (無い・読めなければ `None`)。
+fn location_of(res: &reqwest::Response) -> Option<String> {
+    res.headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// multipart の境界 (reqwest の既定と同じ形・長さ。乱数は uuid v4 から取る)。
+fn gen_boundary() -> String {
+    let (a, b) = uuid::Uuid::new_v4().as_u64_pair();
+    let (c, d) = uuid::Uuid::new_v4().as_u64_pair();
+    wire::boundary([a, b, c, d])
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -770,6 +631,164 @@ mod tests {
             .unwrap();
         assert_eq!(res.status, 307);
         assert_eq!(res.location, Some("/time-card-dtako".to_string()));
+    }
+
+    /// wiremock が受けたリクエストを 1 つの文字列にする (snapshot 用)。host (port が毎回違う) は除き、
+    /// ヘッダーは名前順。本文はバイト単位で escape する (zip・UTF-8 のファイル名も失わない)。
+    /// multipart の境界は毎回違うので `BOUNDARY` に置き換える。
+    pub(crate) fn render_request(req: &wiremock::Request) -> String {
+        let boundary = req
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| c.split("boundary=").nth(1))
+            .map(str::to_string);
+        let mut headers: Vec<String> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.as_str() != "host")
+            .map(|(k, v)| format!("{k}: {}", v.to_str().unwrap()))
+            .collect();
+        headers.sort();
+        let body: String = req
+            .body
+            .iter()
+            .flat_map(|b| std::ascii::escape_default(*b))
+            .map(char::from)
+            .collect();
+        let query = req.url.query().map(|q| format!("?{q}")).unwrap_or_default();
+        let path = req.url.path();
+        let text = format!(
+            "{} {path}{query}\n{}\n\n{body}",
+            req.method,
+            headers.join("\n")
+        );
+        match boundary {
+            Some(b) => text.replace(&b, "BOUNDARY"),
+            None => text,
+        }
+    }
+
+    /// 1 回の呼び出しで受けたリクエストを全部 render する。
+    pub(crate) async fn render_received(server: &wiremock::MockServer) -> String {
+        let reqs = server.received_requests().await.unwrap();
+        reqs.iter()
+            .map(render_request)
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
+
+    /// `name` の snapshot を `tests/fixtures/<file>` の該当節と比べる。
+    /// `UPDATE_CAKEPHP_SNAPSHOT=1` のときは比べずに集めて書き出す (基点で 1 回だけ使う)。
+    pub(crate) fn check_snapshot(file: &str, cases: &[(String, String)]) {
+        let rendered: String = cases
+            .iter()
+            .map(|(name, text)| format!("===== {name}\n{text}\n"))
+            .collect();
+        let path = format!("{}/tests/fixtures/{file}", env!("CARGO_MANIFEST_DIR"));
+        if std::env::var("UPDATE_CAKEPHP_SNAPSHOT").as_deref() == Ok("1") {
+            std::fs::write(&path, &rendered).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(rendered, expected, "snapshot {file} がずれた");
+    }
+
+    /// 移す前 (基点 dd2b9c4) に CakePHP へ送っていたリクエスト (method・URL・ヘッダー・本文) と、
+    /// 応答の読み取り結果を固定する (Refs #322)。純粋部分を kintai-logic へ移した後も同じであること。
+    #[tokio::test]
+    async fn wire_snapshot_matches_the_baseline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut cases: Vec<(String, String)> = Vec::new();
+
+        // daily-json: 未知のトップレベルも素通しで復元する
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/time-card/daily-json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"rows":[{"driver_id":1021,"sessions":[]}],"month":"2026-06","z":null}"#,
+            ))
+            .mount(&server)
+            .await;
+        let c = CakephpClient::new(format!("{}/", server.uri()), 30).unwrap();
+        let res = c.fetch_timecard_daily("2026-06").await.unwrap();
+        let out = serde_json::to_string(&res).unwrap();
+        cases.push((
+            "daily".into(),
+            format!("{}\n=> {out}", render_received(&server).await),
+        ));
+
+        // daily-json: 非 2xx は本文 500 文字までの StatusError
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("あ".repeat(600)))
+            .mount(&server)
+            .await;
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let err = c.fetch_timecard_daily("2026 06").await.unwrap_err();
+        cases.push((
+            "daily_503".into(),
+            format!("{}\n=> {err}", render_received(&server).await),
+        ));
+
+        // pdf-json: driver あり・なし (recalc=0 固定)
+        for driver in [Some(1021), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"drivers":[1]}"#))
+                .mount(&server)
+                .await;
+            let c = CakephpClient::new(server.uri(), 30).unwrap();
+            let res = c.fetch_timecard_pdf_json("2026-04", driver).await.unwrap();
+            let name = format!("pdf_json_{driver:?}");
+            cases.push((
+                name,
+                format!("{}\n=> {res}", render_received(&server).await),
+            ));
+        }
+
+        // autoload: 既定のファイル名・escape が要るファイル名、3xx の location と本文の抜粋
+        let names = ["csvdata.zip", "a\"b\\c\r\n日本.zip"];
+        for (i, file_name) in names.iter().enumerate() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("location", "/")
+                        .set_body_string("x".repeat(2100)),
+                )
+                .mount(&server)
+                .await;
+            let c = CakephpClient::new(server.uri(), 30).unwrap();
+            let zip = b"PK\x03\x04\x00\xff fake-zip \r\n--".to_vec();
+            let res = c.post_dtako_autoload(file_name, zip).await.unwrap();
+            let out = serde_json::to_string(&res).unwrap();
+            cases.push((
+                format!("autoload_{i}"),
+                format!("{}\n=> {out}", render_received(&server).await),
+            ));
+        }
+
+        // resetby-unko-no
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let c = CakephpClient::new(server.uri(), 30).unwrap();
+        let res = c
+            .post_reset_timecard("26060507533000000042861")
+            .await
+            .unwrap();
+        let out = serde_json::to_string(&res).unwrap();
+        cases.push((
+            "reset".into(),
+            format!("{}\n=> {out}", render_received(&server).await),
+        ));
+
+        check_snapshot("cakephp_wire.txt", &cases);
     }
 
     #[tokio::test]
