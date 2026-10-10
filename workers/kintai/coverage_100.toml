@@ -3,7 +3,7 @@
 # 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
 # coverage_100.toml と同じ)。workers/kintai は別 workspace なので計測は worker-kintai.yml が取る:
 #
-#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku --text > cov.txt
+#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako --text > cov.txt
 #   bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache cov.txt
 #
 # kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
@@ -94,3 +94,13 @@ path = "workers/kintai/kosoku/src/kintai_tail_gap_probe.rs"
 # 月の窓・月初をまたぐ遡り起点・unko_no の先頭桁の読み方・窓の述語
 [[files]]
 path = "workers/kintai/kosoku/src/window.rs"
+
+# ── kintai-dtako (day-events と dtako/worktime の純粋部分。repo ルートの package と共有) ──
+# root の src/routes/dtako_day.rs・dtako_worktime.rs から移した (Refs #322)。テストは各ファイルの単体テスト。
+# lib.rs は mod 宣言だけ (実行行 0) なので登録しない
+
+[[files]]
+path = "workers/kintai/dtako/src/day.rs"
+
+[[files]]
+path = "workers/kintai/dtako/src/worktime.rs"

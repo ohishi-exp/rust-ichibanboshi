@@ -55,6 +55,8 @@ mysql_async = { version = "0.37.0", default-features = false, features = ["minim
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
 # 勤怠の拘束・休息の純粋ロジックと社内 MariaDB の SQL (勤怠 Worker と共有、Refs #322)
 kintai-kosoku = { path = "workers/kintai/kosoku" }
+# day-events と dtako/worktime の純粋部分 (勤怠 Worker と共有。build.rs の勤怠の版の glob の外、Refs #322)
+kintai-dtako = { path = "workers/kintai/dtako" }
 
 # RDP 中継用。ironrdp は RDP の PDU 定義をそのまま借りる (自前で組み立て直さない)。
 # rustls は既定の aws-lc-rs ではなく ring を明示する — musl static build を維持するため

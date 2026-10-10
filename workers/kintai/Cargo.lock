@@ -522,6 +522,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kintai-dtako"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kintai-kosoku",
+ "serde_json",
+]
+
+[[package]]
 name = "kintai-kosoku"
 version = "0.1.0"
 dependencies = [
