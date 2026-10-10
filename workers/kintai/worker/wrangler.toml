@@ -1,7 +1,8 @@
 # ichibanboshi-kintai: 勤怠 (kintai) の読み出し Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
 # Service Binding 専用。口は到達の確認用の POST /probe (社内 MariaDB、自作の MySQL クライアント kintai-mysql) と、
 # Supabase の勤怠スキーマを読むだけの GET /api/kintai/* の 5 本 (Hyperdrive + alc-worker-db)、
-# 社内 MariaDB を直接読む GET の 6 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime)。
+# 社内 MariaDB を直接読む GET の 10 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime・
+# kosoku-daily・version・timecard/drivers・timecard/events)。
 # 本番へはタグ worker-kintai-v* の push で deploy する (.github/workflows/worker-kintai.yml)。
 #
 # ★ 外から届く口を持たない:
@@ -26,6 +27,13 @@ command = "worker-build --release"
 # Workers Logs (ログは段・失敗の種類・所要ミリ秒だけ)
 [observability]
 enabled = true
+
+# CPU 時間の上限 (ms、上限は 300000)。既定の 30000 では足りない恐れがあるので上げる:
+# kosoku-daily の全乗務員 (1 か月・view=full) はオンプレ版で約 11 秒 (DB の待ちを含む)、生行 約 6.4 万行を乗務員ごとに
+# 畳んで約 2.2MB を書く。wasm はネイティブより遅いので、畳む部分が 2〜3 倍になっても収まるよう 120 秒にする
+# (DB の待ちは CPU 時間に数えない)。合否は wrangler dev --remote で最大の月を測って決める
+[limits]
+cpu_ms = 120000
 
 # 版の元 (workers/ichiban と同じ)
 [version_metadata]

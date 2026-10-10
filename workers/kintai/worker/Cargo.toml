@@ -1,5 +1,5 @@
 # 勤怠 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。
-# 口は到達の確認用の POST /probe と、Supabase を読むだけの GET /api/kintai/* の 5 本、社内 MariaDB を直接読む GET の 6 本 (/api/kintai/* の 5 本と /api/dtako/worktime)。
+# 口は到達の確認用の POST /probe と、Supabase を読むだけの GET /api/kintai/* の 5 本、社内 MariaDB を直接読む GET の 10 本 (/api/kintai/* の 9 本と /api/dtako/worktime)。
 # Workers VPC (binding KINTAI_MARIADB_VPC) 経由で社内 MariaDB に平文の MySQL プロトコルで繋ぐ (1 リクエスト 1 接続)。
 # プロトコルの読み書きは kintai-mysql (I/O 無し)、ここは socket の読み書きと応答だけ。
 # Supabase へは Hyperdrive (binding KINTAI_HYPERDRIVE) + alc-worker-db。SQL・入力検査・応答は kintai-logic。
@@ -28,3 +28,7 @@ uuid = "1"
 wasm-bindgen = "0.2"
 worker = "=0.8.7"
 worker-sys = "=0.8.7"
+
+[build-dependencies]
+# build.rs の KINTAI_WORKER_OUTPUT_SHA (応答を形づくるコードの版。畳み方は ../output_sha.rs で repo ルートの build.rs と共有)
+sha2 = "0.10"

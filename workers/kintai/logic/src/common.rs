@@ -71,21 +71,9 @@ pub fn parse_query<T: DeserializeOwned>(query: &str) -> Result<T, Fail> {
         .map_err(|e| bad_request(format!("Failed to deserialize query string: {e}")))
 }
 
-/// `YYYY-MM` (年 4 桁・月 01-12) か。root の `routes/kintai.rs` の `is_valid_month` の写し。
-pub fn is_valid_month(month: &str) -> bool {
-    let bytes = month.as_bytes();
-    if bytes.len() != 7 || bytes[4] != b'-' {
-        return false;
-    }
-    if !bytes[..4].iter().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    if !bytes[5..].iter().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let mm: u32 = month[5..].parse().unwrap_or(0);
-    (1..=12).contains(&mm)
-}
+/// `YYYY-MM` (年 4 桁・月 01-12) か。写しではなく共有 crate (`kintai_kosoku::window`) のもの — root の
+/// `routes/kintai.rs` も同じものを使う。
+pub use kintai_kosoku::window::is_valid_month;
 
 /// 乗務員CD のパース。**数字のみ**を受ける (空・非数字・負値・桁溢れは None)。
 /// root の `routes/kintai.rs` の `parse_driver` の写し。

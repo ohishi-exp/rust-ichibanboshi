@@ -73,6 +73,11 @@ path = "workers/kintai/logic/src/mariadb_rows.rs"
 [[files]]
 path = "workers/kintai/logic/src/dtako_reads.rs"
 
+# 社内 MariaDB を読む kosoku-daily・version・timecard/drivers・timecard/events の検査・引数・応答 (応答を組む部分は kintai-kosoku)。
+# テストは workers/kintai/logic/tests/kosoku.rs
+[[files]]
+path = "workers/kintai/logic/src/kosoku_reads.rs"
+
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。
