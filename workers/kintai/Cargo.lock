@@ -546,6 +546,7 @@ dependencies = [
  "bytes",
  "chrono",
  "form_urlencoded",
+ "kintai-dtako",
  "kintai-kosoku",
  "kintai-mysql",
  "postgres-types",
