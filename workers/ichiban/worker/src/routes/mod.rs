@@ -35,7 +35,7 @@ mod unchin;
 /// `/probe`・`/health` の `SELECT 1` の上限。
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一覧のクエリの上限 (vehicle-daily / costs-daily は最大 5000 行)。
-const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 口を 1 回走らせ、結果をログに 1 行出して応答を返す。`route` は経路判定で口に当たったもの。
 pub(crate) async fn run(env: &Env, route: Route, query: &str) -> Reply {
