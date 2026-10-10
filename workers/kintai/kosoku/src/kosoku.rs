@@ -478,8 +478,25 @@ pub fn parse_events(rows: &[serde_json::Value]) -> Vec<Event> {
             state: state.to_string(),
         });
     }
-    out.sort_by_key(|e| e.start);
+    out.sort_by(|a, b| event_order(a).cmp(&event_order(b)));
     out
+}
+
+/// [`parse_events`] の並べ替えの key。**4 列すべてで決まる全順序** — 上流の SQL は
+/// `ORDER BY datetime, source` で同時刻・同 source の並びが実行の仕方で変わる
+/// (Supabase・HTTP 経由も同じ) ので、ここで決めないと同じ行の集合から別の値が出る。
+///
+/// 同時刻では**閉じる状態 (`終業` / `運行終了`) を開く状態 (`始業` / `運行開始`) より前**に置く。
+/// [`shifts_from_timecard`] は前の始業を閉じる終業が先に来ないと勤務を落とし、
+/// [`in_run_at`] は同時刻の境界の後ろ側を「直前」と読む (運行終了 → 次の運行開始の順)。
+/// 残りは状態名・source の文字列順、`end` は `None` が先。
+fn event_order(e: &Event) -> (NaiveDateTime, u8, &str, &str, Option<NaiveDateTime>) {
+    let rank = match e.state.as_str() {
+        "終業" | "運行終了" => 0,
+        "始業" | "運行開始" => 2,
+        _ => 1,
+    };
+    (e.start, rank, &e.state, &e.source, e.end)
 }
 
 /// 秒を切り捨てて分に丸める。拘束・実働は分単位で出すので、境界も分に揃える。
@@ -2371,6 +2388,80 @@ mod tests {
         ];
         let out = parse_events(&rows);
         assert_eq!(out[0].state, "始業");
+    }
+
+    #[test]
+    fn parse_order_does_not_depend_on_the_input_order_of_same_time_rows() {
+        // 上流の ORDER BY datetime, source は同時刻の並びを決めない — 入れる順を逆にしても同じ
+        let rows = vec![
+            ev("2026-06-02 09:25:00", "2026-06-02 09:40:00", "休憩"),
+            dtako("2026-06-02 09:25:00", "運行開始"),
+            ev("2026-06-02 09:25:00", "2026-06-02 10:00:00", "運転"),
+            ev("2026-06-02 09:25:00", "2026-06-02 09:25:00", "運転"),
+            json!({"datetime": "2026-06-02 09:25:00", "source": "dtako_events", "state": "運転"}),
+            tc("2026-06-02 09:25:00", "始業"),
+            dtako("2026-06-02 09:25:00", "運行終了"),
+        ];
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let out = parse_events(&rows);
+        assert_eq!(out, parse_events(&reversed));
+        let got: Vec<(&str, &str, Option<NaiveDateTime>)> = out
+            .iter()
+            .map(|e| (e.source.as_str(), e.state.as_str(), e.end))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("dtako", "運行終了", None),
+                ("dtako_events", "休憩", Some(dt("2026-06-02 09:40:00"))),
+                ("dtako_events", "運転", None),
+                ("dtako_events", "運転", Some(dt("2026-06-02 09:25:00"))),
+                ("dtako_events", "運転", Some(dt("2026-06-02 10:00:00"))),
+                ("timecard", "始業", None),
+                ("dtako", "運行開始", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn same_time_closing_states_come_before_opening_ones() {
+        // 終業 → 始業、運行終了 → 運行開始 (文字列順では 始業 < 終業 になるので順位で決める)
+        let rows = vec![
+            tc("2026-06-02 17:00:00", "始業"),
+            dtako("2026-06-02 17:00:00", "運行開始"),
+            tc("2026-06-02 17:00:00", "終業"),
+            ev("2026-06-02 17:00:00", "2026-06-02 17:00:00", "運行終了"),
+        ];
+        let states: Vec<String> = parse_events(&rows).into_iter().map(|e| e.state).collect();
+        assert_eq!(states, vec!["終業", "運行終了", "始業", "運行開始"]);
+    }
+
+    #[test]
+    fn a_punch_out_and_in_at_the_same_time_give_two_shifts_in_either_order() {
+        // 終業と次の始業が同じ秒: 入れる順に関わらず 08:00→17:00 と 17:00→22:00 の 2 勤務
+        let rows = vec![
+            tc("2026-06-02 08:00:00", "始業"),
+            tc("2026-06-02 17:00:00", "始業"),
+            tc("2026-06-02 17:00:00", "終業"),
+            tc("2026-06-02 22:00:00", "終業"),
+        ];
+        let mut swapped = rows.clone();
+        swapped.swap(1, 2);
+        let p = KosokuParams::default();
+        let days = daily_summary(&rows, "2026-06", &p);
+        assert_eq!(days, daily_summary(&swapped, "2026-06", &p));
+        let got: Vec<(&str, &str, i64)> = days
+            .iter()
+            .map(|d| (d.start.as_str(), d.end.as_str(), d.restraint_minutes))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2026-06-02 08:00:00", "2026-06-02 17:00:00", 540),
+                ("2026-06-02 17:00:00", "2026-06-02 22:00:00", 300),
+            ],
+        );
     }
 
     #[test]
