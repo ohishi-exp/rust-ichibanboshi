@@ -1,9 +1,9 @@
 # workers/kintai
 
-勤怠 (kintai) の読み出し Worker `ichibanboshi-kintai` (Refs #322)。口は 2 系統:
+勤怠 (kintai) の Worker `ichibanboshi-kintai` (Refs #322)。口は 2 系統:
 
 - 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` と、直接読む GET の 10 本 (`/api/kintai/*` の 9 本と `/api/dtako/worktime`。オンプレ版から移した。下記)
-- Supabase の勤怠スキーマ (`kintai.*`) を**読むだけ**の `GET /api/kintai/*` の 5 本 (Cloud Run 版から移した。下記)
+- Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 6 本と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
 
 ## 到達の経路
 
@@ -152,7 +152,7 @@ Service Binding を持つ Worker からだけ呼べる。実機の確認は `wra
 
 - `timecard/diff` (POST)
 
-## `GET /api/kintai/*` (Supabase を読む 5 本)
+## `GET /api/kintai/*` (Supabase を読む 6 本)
 
 Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えていた口を移した。**応答 (JSON の形・キー・数値の型)・
 入力の検査・400 / 502 / 503 の条件は元と同じ**にしてある (呼び手の relay は応答をそのまま返すため)。呼び手の切替はまだ。
@@ -164,6 +164,7 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
 | `shift-days` | `month`・`driver` 必須 | `kintai.shifts` + `day_summaries` + `day_parts` |
 | `change-log` | `from`・`to` 必須 (両端含む・400 日まで)・`driver` 任意 | `kintai.event_changes` |
 | `wage-range` | `comp`・`from`・`to` 必須・`source` (既定 gcp)・任意の現行版 | `kintai.wage_snapshot` |
+| `timecard/signatures` | `month`・`driver_cd` 必須 | `kintai.kintai_events` (日別の署名。下の書き込みの節) |
 
 | 結果 | status | 本文 |
 |---|---|---|
@@ -181,8 +182,49 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
 - DB へは `alc-worker-db` (ippoan/alc-worker-kit、rev は直下の `Cargo.toml` の 1 か所) の `PgClient::tenant_tx` の中で
   `query_typed` / `query_typed_one` だけを流す (名前付き prepared statement は Hyperdrive で接続が切れる)。全 `$n` に型を付ける。
   kit の `SET_TENANT` は `search_path = alc_api` にするが、5 本の SQL は全部 `kintai.` で修飾しているのでそのまま動く
-- 移していないもの: `stale-months` (`logic_version` を Worker で同じ値に作れない)・`unko-gaps` (alc の etags の掃引を含む)・
-  `wage-snapshot` の保存。どれも書き込み側を移す段で一緒に移す
+- 移していないもの: `stale-months` (`logic_version` を Worker で同じ値に作れない)・`unko-gaps` (alc の etags の掃引を含む)。
+  window (`fold` 付きで畳み直す)・fold・recalc と一緒に後の段で移す
+
+## Supabase に書く口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`) と `GET /api/kintai/timecard/signatures`
+
+Cloud Run 版 (root の `src/routes/kintai_timecard.rs` の `receive`・`signatures`、`src/routes/wage_snapshot.rs` の `put_wage_snapshot`) を
+移した。**入力の検査・400 の条件と文言・応答の JSON・書く表の中身は元と同じ** (呼び手の切替はまだ)。
+
+| 口 | 認可 | 入力の検査 (順) | 書く表 (1 transaction) | 応答 |
+|---|---|---|---|---|
+| `POST /api/kintai/timecard` | `X-Kintai-Write-Token` | 本文 (axum の `Json`: 415 / 413 / 400 / 422) → `month` (400) | 旧 events を読む → `kintai.event_changes` (変わった日の前後) → `kintai.kintai_events` の DELETE → INSERT (2000 行ごと) | `TimecardBatchResult` |
+| `POST /api/kintai/wage-snapshot` | `X-Kintai-Write-Token` | 本文 (同上) → `validate_snapshot` (400) → `payroll_synced_at` (400) | 既存を読む → 同じなら書かない (`skipped_unchanged: true`) / 違えば `kintai.wage_snapshot` の DELETE → INSERT | `{saved, skipped_unchanged, …}` |
+| `GET /api/kintai/timecard/signatures` | なし (読みの口) | Query (400) → `month` (400) → `driver_cd` (400) | (読むだけ) `STORED_SIGNATURES_SQL` | `{month, driver_cd, signatures}` |
+
+| 結果 | status | 本文 (平文) |
+|---|---|---|
+| `X-Kintai-Write-Token` が無い・違う (書き込みの 2 本) | 403 | `書き込みの口には正しい X-Kintai-Write-Token が要ります` (固定。元には無い) |
+| `KINTAI_WRITE_TOKEN` の binding が無い・読めない・空 (書き込みの 2 本) | 503 | `書き込みの認可の設定 (KINTAI_WRITE_TOKEN) が読めません` (元には無い) |
+| 本文の Content-Type が JSON でない / 2MB 超 / JSON として読めない / 型に合わない | 415 / 413 / 400 / 422 | axum の `Json` と同じ文言 (`Expected request with …` / `Failed to buffer the request body: length limit exceeded` / `Failed to parse the request body as JSON: …` / `Failed to deserialize the JSON body into the target type: …`) |
+| 入力不正 | 400 | 元と同じ文言 |
+| `KINTAI_HYPERDRIVE` が無い | 503 | `[KINTAI_HYPERDRIVE] が無効です (書き先がありません)` (元の `[kintai_push] が無効です (書き先がありません)` に当たる。signatures も元が書き先の store を使っていたので同じ) |
+| `KINTAI_TENANT_ID` が空・UUID でない・nil | 503 | `読み先のテナントが決まりません (KINTAI_TENANT_ID を設定してください)` |
+| DB・接続の失敗 | 502 | `kintai push db failed: <kind>` (timecard・signatures) / `kintai.wage_snapshot access failed: <kind>` (wage-snapshot)。DB の message は出さない |
+
+検査の順は **認可 → 入力 → binding → テナント → DB** (認可の前に本文を読んで 400 を返さない)。
+
+- **テナントは `KINTAI_TENANT_ID` の設定 pin。`X-Tenant-ID` は読まない。** 元の timecard・signatures は `X-Tenant-ID` を読み、設定の pin と
+  食い違えば 403・どちらも無ければ 400 だった。Worker は pin だけで決めるので、その 403 / 400 は無い (pin が無ければ 503)。
+  呼び手 (relay) が名乗るテナントと pin が違っても pin に書く — 単一テナントの運用が前提
+- 書き込みの部品は `pg/` (`kintai-pg`): kit の `PgClient::tenant_tx` の中で、共有 crate (`kintai_kosoku::kintai_push`・
+  `kintai_logic::{change_log, wage_write}`) の SQL と Vec の束を `query_typed` / `execute_typed` に `Type::*_ARRAY` 付きで渡す。
+  型なしの `ANY($5)` は SQL を書き換えず `Type::TEXT_ARRAY` を渡す。全 SQL の `$1` は pin の UUID (`tenant_id = $1`、
+  `kosoku/tests/pg_write_snapshot.rs`・`logic/tests/pg_write_snapshot.rs` が全 SQL について確かめる)
+- **`statement_timeout`**: 元は接続ごとに `SET statement_timeout = 300000`。Worker は transaction の頭で
+  `set_config('statement_timeout', '300000', true)` (transaction の中だけ効く)。Hyperdrive 越しで効くかは CI では確かめられない
+  (native の postgres では効く)。効かなくても Workers の CPU / 実行時間の上限の方が先に来る
+- **元との一致の確かめ方**: `pg/tests/root_parity.rs` が root の sqlx の経路 (`apply_timecard_batch`・`put_wage_snapshot`・
+  `stored_day_signatures`) と `kintai-pg` に同じ入力を与え、`kintai.kintai_events`・`event_changes`・`wage_snapshot` の中身と応答が
+  一致することを実 postgres で確かめる (worker-kintai.yml の `pg-parity` job)。int8[]・timestamptz[]・text[]・jsonb[] (NULL 入り)・
+  date[]・int2[]・int4[] (NULL 入り)・bool[] がここを通る。入力の検査は `pg/tests/axum_parity.rs` が root の axum の handler と
+  同じ status・本文になることを確かめる (DB 不要)
+- 元の `apply_timecard_batch` の `deduped` の数え方には、misplaced を含む日の後に日が続くと引き算が負になる不具合がある (#361)。
+  Worker も同じ式 (共有 crate) なので一致する
 
 ### 元 (root の src/) と写し (logic/) の対応 — **撤去までは片方を直したらもう片方も直す**
 
@@ -227,7 +269,7 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 handler だけを持つ)。打刻と畳んだ 3 表の書き込みの純粋部分 (生行の写し・重複・署名・差分の計画・SQL・bind の束) は
 `kintai-kosoku` の `kintai_push`・`kintai_fold` (root の `src/kintai_push.rs`・`src/kintai_fold.rs` は再 export と I/O だけ)。
 移す前と SQL の文字列・bind の束が同じことは `kosoku/tests/pg_write_snapshot.rs`・`logic/tests/pg_write_snapshot.rs` が
-基点 (a06a4d0) の sha256 で縛る。Worker はまだ書き込みの口を持たない (後の段)。
+基点 (a06a4d0) の sha256 で縛る。Worker の書き込みの口はこの部品の上に載る (上の節)。
 
 day-events・worktime の純粋部分そのもの (日の窓・畳み方・リンク・層 A の秒数) は写しではなく、オンプレ版と Worker が同じ
 共有 crate `kintai-dtako` を使う。上の 2 行は handler の部分 (検査の順・どの SQL を読むか) だけの対応。
@@ -239,21 +281,29 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 
 ## 到達面と認可
 
-**認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** Service Binding 専用 (route・workers.dev・preview 無し) で、
-関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
+Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
+
+- **読みの口 (GET 全部。`timecard/signatures` を含む) は認可なし** (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手の側
+  (relay の共有 secret、kyuyo-mcp の OAuth)
+- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`) は Worker が共有 secret を照合する** (ユーザー決定
+  2026-10-10)。読みのために binding を持つ呼び手が POST を転送しても書けないようにするため。ヘッダー `X-Kintai-Write-Token` を
+  Secrets Store の `KINTAI_WRITE_TOKEN` と照合し (両方を sha256 にして 32 バイトを定数時間で比べる。`logic/src/write_auth.rs`)、
+  無い・違う = 403 (固定文言)、binding が無い・読めない・空 = 503。値は repo に書かない (GCP の Secret Manager が正本)
 
 ## binding (`worker/wrangler.toml`)
 
 - `KINTAI_MARIADB_VPC` — Workers VPC の VPC Service (TCP 3306)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-kintai-mariadb` の id
 - `KINTAI_MARIADB` — Secrets Store の secret。JSON `{"user":…,"password":…,"database":…}` (どれも空でない文字列)。未投入なら `/probe` と MariaDB の口は 503
   (timecard の 2 本だけは元と同じく 502)
-- `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ `GET /api/kintai/*` は 503
+- `KINTAI_WRITE_TOKEN` — Secrets Store の secret (書き込みの口の共有 secret。store は `KINTAI_MARIADB` と同じ)。無ければ書き込みの 2 本は 503
+- `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ Supabase の口 (読み 6 本・書き 2 本) は 503
 - `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` (`[vars]`) — day-events のリンクの base URL。空 = そのリンクを省く。本番は deploy 時に同名の repo variable を `--var` で渡す (社内ホスト名を repo に書かない)
 - `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
 - `CF_VERSION_METADATA` — 版の元
 - `[limits] cpu_ms = 120000` — kosoku-daily の全員版のため (上記)
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / `LOCAL_*` の var なし /
-  hyperdrive はトップレベル以外に無い。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
+  hyperdrive・secrets_store_secrets はトップレベル以外に無い / 書き込みの口 (`worker/src` の `Route::Write`) があるなら
+  `KINTAI_WRITE_TOKEN` の binding がある。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
 
 ## 構成
 
@@ -264,13 +314,19 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 - `dtako/` (`kintai-dtako`): day-events と dtako/worktime の純粋部分 (`day.rs`・`worktime.rs`)。**repo ルートの package も path 依存で使う共有 crate**
   (root の 2 つの route は handler だけ)。依存は serde_json・chrono・kintai-kosoku だけ。root の `build.rs` の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の外
   (元の route と同じ分類。`kintai-kosoku` に入れると版が変わり、`kintai-logic` に入れると postgres-types 等が root に入るので別 crate)。100% 行カバレッジ gate は `coverage_100.toml`
-- `logic/` (`kintai-logic`): Supabase を読む 5 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
-  部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`)。**repo ルートの package も path 依存で使う** (書き込みの部品と
+- `logic/` (`kintai-logic`): Supabase を読む 6 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
+  部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`・timecard の検査 `timecard_write`・認可 `write_auth`、本文の読み方
+  `common::parse_json`)。**repo ルートの package も path 依存で使う** (書き込みの部品と
   `change_log`・`wage_range`・`wage_snapshot`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 10 本の往復。1 接続を開く `open` とクエリ 1 本の `query`) /
   `build.rs` (version の etag の版 `KINTAI_WORKER_OUTPUT_SHA`) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
-  `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) /
+  `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの 2 本: 認可 → 本文 → `kintai-pg`) /
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
+
+- `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
+  kit の `tenant_tx` の中の `query_typed` / `execute_typed` だけで、native でも動く (Worker は Hyperdrive の接続を、テストは native の
+  tokio-postgres の接続を渡す)。実 DB が要るので 100% gate には入れず、`pg-parity` job が root と突き合わせる。dev-dependency に
+  repo ルートの package (`rust-ichibanboshi`) を持つ (比べる相手。wasm のビルドには入らない)
 
 - `output_sha.rs`: 版の畳み方 (`fold_output_sha`)。repo ルートの build.rs と `worker/build.rs` が `include!` する (crate の src の外 = どちらの版の glob にも入らない)
 
@@ -278,10 +334,12 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 
 ## ローカル検証
 
-`cargo test -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako` (DB 不要)。Worker は `cargo build --target wasm32-unknown-unknown` と clippy まで。
+`cargo test -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako` (DB 不要)。`kintai-pg` は
+`KINTAI_TEST_DATABASE_URL` (使い捨ての postgres) を渡して `cargo test -p kintai-pg` (無ければ `root_parity` は失敗する)。Worker は `cargo build --target wasm32-unknown-unknown` と clippy まで。
 ローカルで VPC や Secrets Store を迂回する var は持たないので、実接続は VPC Service と `KINTAI_MARIADB` を用意してから
 `wrangler dev --remote` で `POST /probe` と MariaDB の 10 本 (day-events のリンクを出すなら `--var "KINTAI_RYOHI_BASE_URL:…"` 等)。Supabase の 5 本も同じく `wrangler dev --remote` (Hyperdrive の経路は CI では通せない)。
-`--var "KINTAI_TENANT_ID:<UUID>"` を渡すと 5 本が 503 ではなく答える。
+`--var "KINTAI_TENANT_ID:<UUID>"` を渡すと Supabase の口が 503 ではなく答える。書き込みの 2 本は `KINTAI_WRITE_TOKEN` の値を
+`X-Kintai-Write-Token` に載せて叩く (Supabase に書くので、書いてよい月・乗務員で)。
 
 ## 本番 deploy
 
