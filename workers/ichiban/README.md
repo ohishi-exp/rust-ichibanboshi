@@ -14,6 +14,18 @@ TDS でログインする。1 リクエスト = 1 接続。
 | `GET /api/costs/vehicle-daily` | `?from=&to=&vehicle=&driver=&kind=&limit=`。400 の判定は同上 |
 | `POST /probe` | 到達の切り分け用。ログインして `SELECT 1`。200 `{"ok":true}` |
 
+**オンプレ版に残る一番星系の 15 本を移している途中 (#322)。** 経路だけ先に受け、中身を移すまでは 501 (本文なし) を返す
+(method 違いは 405)。移し終えたら上の表へ足す:
+
+| 領域 | 口 (すべて GET) |
+|---|---|
+| `sales_monthly` | `/api/sales/monthly`・`/api/sales/by-department`・`/api/sales/by-customer`・`/api/sales/yoy` |
+| `sales_daily` | `/api/sales/daily`・`/api/sales/customer-trend`・`/api/sales/customer-detail` |
+| `sales_yoy` | `/api/sales/customer-yoy`・`/api/sales/customer-yoy-by-dept` |
+| `unchin` | `/api/unchin/candidates`・`/api/unchin/summary`・`/api/unchin/customer-net`・`/api/unchin/customer-net-detail` |
+| `surcharge` | `/api/surcharge/base` |
+| `schema` | `/api/schema/columns` |
+
 - 応答 JSON・400 の判定・limit の丸め (1..=5000、既定 500) はオンプレ版と同じ (`logic/` を共有)
 - SQL Server までの失敗はどの口も 502 `{"ok":false,"stage":"secret|connect|login|query","kind":"…"}`。エラー本文・ホスト・ユーザー名は出さない
 - method 違いは 405、他の path は 404 (本文 `{"ok":false}`)
@@ -39,12 +51,20 @@ tiberius は `EncryptionLevel::NotSupported`・`database("CAPE#01")`。`port` / 
 `/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) の SQL 文 (`sql.rs`)・応答の型 (`api.rs`)・絞り込みの判定と行の組み立て
 (`vehicle_daily.rs`・`costs_daily.rs`)。tiberius にも worker にも依存しない。使うのは Worker だけ (オンプレ版の 5 本と path 依存は削除済み。
 オンプレの `src/repo.rs` には `/health` の `SELECT 1` と `customer_yoy_by_dept` が使う部門一覧の SQL だけが同じ文字列で残る)。
-`tiberius::Row` から `Raw*Row` を詰める関数は `worker/src/rows.rs` にある — 列の並びは `sql.rs` の定数と 1 対 1 なので、変えるときは両方直す。
+`tiberius::Row` から `Raw*Row` を詰める関数は `worker/src/rows/` にある — 列の並びは `sql.rs` の定数と 1 対 1 なので、変えるときは両方直す。
+`period.rs` は期間の計算 (旧オンプレ `src/routes/sales.rs` の `calc_prev_period`・`calc_next_month`・`calc_months` を同じ挙動で写したもの)。
 100% 行カバレッジ gate は `coverage_100.toml` (worker-ichiban.yml が判定)。
 
-`worker/src/`: `lib.rs` (fetch) / `routes.rs` (7 本の本体。1 リクエスト 1 接続) / `rows.rs` (`tiberius::Row` → logic の型。
-旧オンプレ版の `src/repo.rs` の `decode_cp932`・`get_i64`・`get_f64`・`rows_to_*` を列番号まで同じに写したもの) / `repo.rs` (資格情報・ログイン) /
+**移している 15 本は領域ごとに 3 か所のファイルを持つ** (領域名は上の表): `logic/src/<領域>.rs` (SQL・Raw 型・応答型・Query・組み立て) /
+`worker/src/routes/<領域>.rs` (`handle(env, route, query) -> Result<String, Failure>`。まだ 501) / `worker/src/rows/<領域>.rs`
+(`tiberius::Row` → Raw 型。列の読み方は `rows/mod.rs` の `decode_cp932`・`get_i64`・`get_f64`・`get_i32`・`get_datetime`)。
+領域の子はこの 3 つと `logic/tests/`・`coverage_100.toml` の自分の行だけを触る。空の `logic/src/<領域>.rs` は実行行 0 なので、中身が入るまで gate に登録しない。
+
+`worker/src/`: `lib.rs` (fetch) / `routes/mod.rs` (経路の振り分けと 7 本の本体。1 リクエスト 1 接続) / `routes/<領域>.rs` / `rows/mod.rs` (`tiberius::Row` → logic の型。
+旧オンプレ版の `src/repo.rs` の `decode_cp932`・`get_i64`・`get_f64`・`get_i32`・`rows_to_*` を列番号まで同じに写したもの) / `rows/<領域>.rs` / `repo.rs` (資格情報・ログイン) /
 `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern) / `probe_logic.rs` (経路・stage・応答・資格情報の検証)。
+`routes/mod.rs` の `fetch_rows` は 1 本流すごとに接続し直す。`fetch_rows_many` は 1 接続で複数の (SQL, bind) を順に流して結果セットを同じ順で返す
+(1 リクエストで 2〜3 本流す口用。bind が空なら `simple_query`、あれば `query` の規則は同じ)。
 接続・経路・応答の部品は `workers/kyuyo` から**意図して写している** (特に公開範囲の検査スクリプト 2 本は kyuyo と片方だけ直さないこと)。独立した workspace (repo ルートの package からは参照されない)。
 
 ## ローカル検証
