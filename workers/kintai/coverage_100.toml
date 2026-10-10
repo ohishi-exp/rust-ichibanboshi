@@ -8,7 +8,7 @@
 #
 # kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
 # テストは workers/kintai/mysql/tests/codec.rs。
-# kintai-logic は Supabase を読む 5 本と社内 MariaDB を読む 6 本の口の純粋部分 (root の src/ の写し)。テストは workers/kintai/logic/tests/。
+# kintai-logic は Supabase を読む 5 本・書き込み (変更履歴・賃金スナップショット) と社内 MariaDB を読む口の純粋部分。テストは workers/kintai/logic/tests/。
 # worker crate (socket・Hyperdrive・応答) は wasm32 専用なので計測しない。
 
 [[files]]
@@ -59,6 +59,11 @@ path = "workers/kintai/logic/src/wage_range.rs"
 # root の src/wage_snapshot.rs の写し (テスト 39 本も写し)
 [[files]]
 path = "workers/kintai/logic/src/wage_snapshot.rs"
+
+# 賃金スナップショットの保存 (SQL・検査・判定・応答・bind の束)。root の src/routes/wage_snapshot.rs から移した (Refs #322)。
+# テストは workers/kintai/logic/tests/wage_write.rs と pg_write_snapshot.rs
+[[files]]
+path = "workers/kintai/logic/src/wage_write.rs"
 
 # 社内 MariaDB を読む 4 本 (events・rest-diff・reading-dates・tail-gap-probe) の検査・引数・応答と、行 → JSON。
 # テストは workers/kintai/logic/tests/mariadb.rs
@@ -116,6 +121,15 @@ path = "workers/kintai/kosoku/src/kintai_version.rs"
 # timecard/drivers のページ・timecard/events の月の検査と窓・2 本の応答。root の kintai_diff.rs と routes/kintai_timecard.rs から移した
 [[files]]
 path = "workers/kintai/kosoku/src/kintai_timecard.rs"
+
+# 打刻の Supabase への書き込みの純粋部分 (写し・重複・署名・差分の計画・SQL・bind の束)。root の kintai_push.rs から移した。
+# テストは単体テストと workers/kintai/kosoku/tests/pg_write_snapshot.rs (移す前の SQL と束の sha256)
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_push.rs"
+
+# 畳んだ 3 表の行・保存済みの姿・SQL・bind の束。root の kintai_fold.rs から移した
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_fold.rs"
 
 # ── kintai-dtako (day-events と dtako/worktime の純粋部分。repo ルートの package と共有) ──
 # root の src/routes/dtako_day.rs・dtako_worktime.rs から移した (Refs #322)。テストは各ファイルの単体テスト。
