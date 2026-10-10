@@ -25,23 +25,15 @@ use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::NaiveDate;
-use serde::Deserialize;
+// 期間の検査と SQL は勤怠 Worker と共有する (`kintai-logic`、Refs #322。写さない)
+pub use kintai_logic::change_log::{ChangeLogQuery, MAX_CHANGE_LOG_DAYS, SELECT_SQL, SINCE_SQL};
 
 use crate::kintai_push::KintaiPgStore;
 use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
 
-/// 1 回に読める期間の上限 (両端を含む日数)。
-pub const MAX_CHANGE_LOG_DAYS: i64 = 400;
-
-#[derive(Debug, Default, Deserialize)]
-pub struct ChangeLogQuery {
-    pub driver: Option<i64>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-}
-
-fn bad_request(msg: &str) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, msg.to_string())
+/// `from` / `to` を検査して日付の対に (検査は `kintai_logic::change_log::parse_range`。400 の文言も同じ)。
+fn parse_range(q: &ChangeLogQuery) -> Result<(NaiveDate, NaiveDate), (StatusCode, String)> {
+    kintai_logic::change_log::parse_range(q).map_err(|f| (StatusCode::BAD_REQUEST, f.body))
 }
 
 /// `unko_gaps::store` と同じ文言で 503。
@@ -67,42 +59,6 @@ fn read_tenant_of(read: ReadTenant, pin: uuid::Uuid) -> Result<uuid::Uuid, (Stat
         "読み先のテナントが決まりません ([kintai_events] tenant_id を設定してください)".to_string(),
     ))
 }
-
-/// `from` / `to` を検査して日付の対に。
-fn parse_range(q: &ChangeLogQuery) -> Result<(NaiveDate, NaiveDate), (StatusCode, String)> {
-    let day = |s: &Option<String>| {
-        s.as_deref()
-            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-    };
-    let (Some(from), Some(to)) = (day(&q.from), day(&q.to)) else {
-        return Err(bad_request("from / to は YYYY-MM-DD で指定してください"));
-    };
-    if from > to {
-        return Err(bad_request("from は to 以前にしてください"));
-    }
-    if (to - from).num_days() >= MAX_CHANGE_LOG_DAYS {
-        return Err(bad_request("期間は 400 日までです"));
-    }
-    Ok((from, to))
-}
-
-/// 期間 (両端を含む) の記録。`$4` が NULL なら全乗務員。
-const SELECT_SQL: &str = r#"
-SELECT driver_cd,
-       to_char(date, 'YYYY-MM-DD') AS date,
-       to_char(recorded_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') AS recorded_at,
-       before, after
-  FROM kintai.event_changes
- WHERE tenant_id = $1 AND date >= $2 AND date <= $3
-   AND ($4::int8 IS NULL OR driver_cd = $4)
- ORDER BY date, driver_cd, recorded_at
-"#;
-
-const SINCE_SQL: &str = r#"
-SELECT to_char(min(recorded_at) AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS')
-  FROM kintai.event_changes
- WHERE tenant_id = $1
-"#;
 
 fn db_err(e: sqlx::Error) -> (StatusCode, String) {
     (

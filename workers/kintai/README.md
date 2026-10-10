@@ -195,9 +195,6 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/routes/kintai_day_summaries.rs` (SQL・Query・検査・行 → JSON) | `src/day_summaries.rs` |
 | `src/routes/shift_overlaps.rs` | `src/shift_overlaps.rs` |
 | `src/routes/shift_days.rs` | `src/shift_days.rs` |
-| `src/routes/change_log.rs` | `src/change_log.rs` |
-| `src/routes/wage_snapshot.rs` の `wage_range`・`RangeQuery`・`SELECT_RANGE_SQL`・`to_fetched`・`to_buckets` (読み出しだけ) | `src/wage_range.rs` |
-| `src/wage_snapshot.rs` (丸ごと。テスト 39 本も) | `src/wage_snapshot.rs` |
 | `src/routes/kintai.rs` の `parse_driver` | `src/common.rs` (`is_valid_month` は写しをやめ、共有 crate の `kintai_kosoku::window::is_valid_month` を再 export) |
 | 4 つの `read_tenant_of` / `tenant_of` (`[kintai_events]` → `[kintai_push]` の pin) | `src/common.rs` の `tenant_of` 1 つ (`KINTAI_TENANT_ID`) |
 | `month_date_bounds` (DATE) と `month_bounds` (JST の TIMESTAMPTZ。`kintai_push::jst_day_bounds`) | `src/common.rs` の `month_bounds` + `jst_midnight` 1 つずつ |
@@ -222,6 +219,15 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/kintai_version.rs` の `MarkerRow` (`VERSION_SQL` の 3 列、全部 CHAR) | `src/mariadb_rows.rs` の `version_row` |
 | `src/kintai_repo.rs` の `fetch_timecard_driver_cds_between` の `u64` (`TIMECARD_DRIVERS_SQL` の 1 列) | `src/mariadb_rows.rs` の `timecard_driver_row` |
 | `src/kintai_repo.rs` の `fetch_timecard_window` の行 (`TIMECARD_WINDOW_SQL` の 7 列 = `row_to_json`) | `src/mariadb_rows.rs` の `event_row` (events と共有) |
+
+**写しをやめて共有にしたもの** (Refs #322、Supabase への書き込みの部品の段): `change_log` (読みの SQL・期間の検査と、
+書きの `build_changes`・SQL・bind の束)・`wage_range` (SQL・検査・詰め直し・応答)・`wage_snapshot` (丸ごと)・`wage_write`
+(保存の SQL・検査・「前回と同じなら書かない」の判定・応答・bind の束) は `kintai-logic` が正本で、root (`src/change_log.rs`・
+`src/routes/change_log.rs`・`src/wage_snapshot.rs`・`src/routes/wage_snapshot.rs`) は path 依存でそれを使う (sqlx の bind と
+handler だけを持つ)。打刻と畳んだ 3 表の書き込みの純粋部分 (生行の写し・重複・署名・差分の計画・SQL・bind の束) は
+`kintai-kosoku` の `kintai_push`・`kintai_fold` (root の `src/kintai_push.rs`・`src/kintai_fold.rs` は再 export と I/O だけ)。
+移す前と SQL の文字列・bind の束が同じことは `kosoku/tests/pg_write_snapshot.rs`・`logic/tests/pg_write_snapshot.rs` が
+基点 (a06a4d0) の sha256 で縛る。Worker はまだ書き込みの口を持たない (後の段)。
 
 day-events・worktime の純粋部分そのもの (日の窓・畳み方・リンク・層 A の秒数) は写しではなく、オンプレ版と Worker が同じ
 共有 crate `kintai-dtako` を使う。上の 2 行は handler の部分 (検査の順・どの SQL を読むか) だけの対応。
@@ -258,7 +264,9 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 - `dtako/` (`kintai-dtako`): day-events と dtako/worktime の純粋部分 (`day.rs`・`worktime.rs`)。**repo ルートの package も path 依存で使う共有 crate**
   (root の 2 つの route は handler だけ)。依存は serde_json・chrono・kintai-kosoku だけ。root の `build.rs` の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の外
   (元の route と同じ分類。`kintai-kosoku` に入れると版が変わり、`kintai-logic` に入れると postgres-types 等が root に入るので別 crate)。100% 行カバレッジ gate は `coverage_100.toml`
-- `logic/` (`kintai-logic`): Supabase を読む 5 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)。100% 行カバレッジ gate は `coverage_100.toml`
+- `logic/` (`kintai-logic`): Supabase を読む 5 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
+  部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`)。**repo ルートの package も path 依存で使う** (書き込みの部品と
+  `change_log`・`wage_range`・`wage_snapshot`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 10 本の往復。1 接続を開く `open` とクエリ 1 本の `query`) /
   `build.rs` (version の etag の版 `KINTAI_WORKER_OUTPUT_SHA`) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
   `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) /

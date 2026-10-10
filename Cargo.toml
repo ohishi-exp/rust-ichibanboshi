@@ -57,6 +57,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 kintai-kosoku = { path = "workers/kintai/kosoku" }
 # day-events と dtako/worktime の純粋部分 (勤怠 Worker と共有。build.rs の勤怠の版の glob の外、Refs #322)
 kintai-dtako = { path = "workers/kintai/dtako" }
+# Supabase の勤怠スキーマを読み書きする口の純粋部分 (変更履歴・賃金スナップショットの SQL と bind の束。勤怠 Worker と
+# 共有、Refs #322)。build.rs の勤怠の版の glob の外。postgres-types 等がオンプレ版にも入るのは許容
+kintai-logic = { path = "workers/kintai/logic" }
 
 # RDP 中継用。ironrdp は RDP の PDU 定義をそのまま借りる (自前で組み立て直さない)。
 # rustls は既定の aws-lc-rs ではなく ring を明示する — musl static build を維持するため

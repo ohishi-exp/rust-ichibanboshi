@@ -29,6 +29,8 @@ const KINTAI_OUTPUT_REQUIRED: &[&str] = &[
     "src/routes/kintai_version.rs",
     // 共有 crate は全ファイルを列挙する (Refs #322)
     "workers/kintai/kosoku/src/anchors.rs",
+    "workers/kintai/kosoku/src/kintai_fold.rs",
+    "workers/kintai/kosoku/src/kintai_push.rs",
     "workers/kintai/kosoku/src/kintai_reading_dates.rs",
     "workers/kintai/kosoku/src/kintai_rest_diff.rs",
     "workers/kintai/kosoku/src/kintai_tail_gap_probe.rs",

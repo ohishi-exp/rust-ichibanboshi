@@ -25,3 +25,4 @@ pub mod shift_days;
 pub mod shift_overlaps;
 pub mod wage_range;
 pub mod wage_snapshot;
+pub mod wage_write;

@@ -28,3 +28,5 @@ uuid = "1"
 
 [dev-dependencies]
 bytes = "1"
+# 書き込みの SQL と bind の束を基点の sha256 で縛る (tests/pg_write_snapshot.rs)
+sha2 = "0.10"
