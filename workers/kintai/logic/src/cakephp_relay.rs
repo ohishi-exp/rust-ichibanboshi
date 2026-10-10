@@ -19,8 +19,10 @@ use kintai_mysql::response::Row;
 /// CakePHP への口 (Workers VPC の VPC Service、HTTP)。wrangler.toml のトップレベルにだけ置く。
 pub const CAKEPHP_VPC_BINDING: &str = "KINTAI_CAKEPHP_VPC";
 
-/// fetch の URL の origin。**名目** (宛先の host:port は VPC Service の側で決まる)。社内のホスト名は書かない。
-pub const VPC_ORIGIN: &str = "http://kintai-cakephp.internal";
+/// fetch の URL の origin。宛先の host:port は VPC Service の側で決まる (社内のホスト名は書かない) が、**`Host` は CakePHP に届き、
+/// CakePHP は `Host` で応答を変えることがある** — `kintai-cakephp.internal` では 200 の text/html (ErrorHandlerMiddleware の
+/// エラー画面) が返った (dev で実測)。`localhost` (port は VPC Service と同じ 120) は JSON を返す。
+pub const VPC_ORIGIN: &str = "http://localhost:120";
 
 /// binding が無いときの 503 の本文 (オンプレ版の「CakePHP base_url が未設定」に当たる)。
 pub const NOT_CONFIGURED: &str = "CakePHP の VPC binding (KINTAI_CAKEPHP_VPC) が無い";

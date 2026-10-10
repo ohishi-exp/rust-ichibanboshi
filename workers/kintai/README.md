@@ -202,8 +202,9 @@ CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart
 - **① の材料**: オンプレ版と同じ SQL (`dtako_autoload::RESET_MATERIAL_SQL`) を、他の MariaDB の口と同じ接続・資格情報で流す。
   運行NO の 2 パターン (先頭 22 桁 + `1`/`2`) は `Digits` で埋める。資格情報が無ければ `MariaDB 接続設定が未設定`・失敗は
   `MariaDB query failed: <段>:<種別>` を `dtako_events_count_error` / `reset_error` に入れ、③ は打たない (fail-closed)
-- **URL の host は名目** (`http://kintai-cakephp.internal`)。宛先の host:port は VPC Service の側で決まる。CakePHP (nginx) が
-  `Host` で vhost を選ぶ場合はこの名目の host が届くので、`wrangler dev --remote` で daily がオンプレ版と同じ応答になることを確かめる
+- **URL は `http://localhost:120`** (`cakephp_relay::VPC_ORIGIN`)。宛先の host:port は VPC Service の側で決まるが、`Host` は CakePHP に届く。
+  Host 名で CakePHP が応答を変えることがあり、`kintai-cakephp.internal` はエラー画面 (200 の text/html) になった。localhost にした
+  (`localhost`・`127.0.0.1` 等は JSON を返すことをオンプレ機で確認済み)
 - **呼び手の追従が要る**: 今の呼び手 (kyuyo-mcp → auth-worker → オンプレ版) は `X-Kintai-Write-Token` を送っていない。この Worker に
   切り替える段で、autoload を呼ぶ側 (kyuyo-mcp の `run_dtako_reimport` → relay / auth-worker) が token を付ける必要がある
 
