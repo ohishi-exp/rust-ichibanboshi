@@ -42,6 +42,9 @@ const SURCHARGE_SQL_BODY: &str = "t.[請求K], t.[得意先C], \
      FROM [運転日報明細] t \
      WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 ";
 
+/// 並び順 (`kind` の絞り込みの後ろに付ける)。gate 対象で `format!` を 1 行に収めるため定数に出している。
+const SURCHARGE_ORDER_SQL: &str = "ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]";
+
 /// 取得上限件数の既定値と範囲。
 const LIMIT_DEFAULT: i32 = 2000;
 const LIMIT_MIN: i32 = 1;
@@ -51,10 +54,7 @@ const LIMIT_MAX: i32 = 10000;
 /// 受け付け、生の SQL 片は渡せない。`TOP n` は clamp した整数だけを連結する。
 pub fn surcharge_sql(kind_filter: &'static str, limit: i32) -> String {
     let top = limit.clamp(LIMIT_MIN, LIMIT_MAX);
-    format!(
-        "SELECT TOP {top} {SURCHARGE_SQL_BODY}{kind_filter} \
-         ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]"
-    )
+    format!("SELECT TOP {top} {SURCHARGE_SQL_BODY}{kind_filter} {SURCHARGE_ORDER_SQL}")
 }
 
 /// `運転日報明細` 1 行 + マスタ join の生データ。
