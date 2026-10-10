@@ -12,7 +12,7 @@ use bytes::BytesMut;
 use chrono::{NaiveDate, TimeZone, Utc};
 use kintai_logic::common::{
     bad_request, db_fail, is_valid_month, jst_midnight, month_bounds, no_db, parse_driver,
-    parse_query, tenant_of, Fail, Param, HYPERDRIVE_BINDING, TENANT_VAR,
+    parse_query, preflight, tenant_of, Fail, Param, HYPERDRIVE_BINDING, TENANT_VAR,
 };
 use kintai_logic::{change_log, day_summaries, shift_days, shift_overlaps, wage_range};
 use postgres_types::{IsNull, Type};
@@ -160,6 +160,27 @@ fn no_usable_pin_is_service_unavailable() {
             "読み先のテナントが決まりません (KINTAI_TENANT_ID を設定してください)"
         );
         assert!(f.body.contains(TENANT_VAR));
+    }
+}
+
+/// DB に繋ぐ前の検査の順は元と同じ: binding → テナント。どちらも欠けたら binding の 503 が先。
+/// worker は `preflight` が `Ok` を返したときだけ connect する (`KINTAI_TENANT_ID` が空の初期状態では
+/// connect せずに 503 — 接続の 502 が設定欠落を隠さない)。connect を呼ばないこと自体は wasm 側の分岐。
+#[test]
+fn preflight_decides_before_connecting_in_the_original_order() {
+    let t = uuid(9);
+    let raw = t.to_string();
+    assert_eq!(preflight(true, Some(&raw)), Ok(t));
+    assert_eq!(preflight(false, Some(&raw)), Err(no_db()));
+    assert_eq!(
+        preflight(false, None),
+        Err(no_db()),
+        "両方欠けたら binding が先"
+    );
+    for raw in [None, Some(""), Some("00000000-0000-0000-0000-000000000000")] {
+        let f = preflight(true, raw).expect_err("テナントが決まらなければ connect に進まない");
+        assert_eq!(f, tenant_of(raw).unwrap_err(), "{raw:?}");
+        assert_eq!(f.status, 503);
     }
 }
 

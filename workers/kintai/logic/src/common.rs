@@ -121,3 +121,13 @@ pub fn tenant_of(raw: Option<&str>) -> Result<Uuid, Fail> {
         )),
     }
 }
+
+/// DB に繋ぐ**前**の検査。元の handler と同じ順 (binding が無ければ 503 → テナントが決まらなければ 503) で、
+/// どちらかが欠ければ呼び手は connect しない (`KINTAI_TENANT_ID` が空の初期状態で、接続の失敗 (502) が
+/// 設定欠落 (503) を隠さないように)。`has_binding` は `KINTAI_HYPERDRIVE` が env に在るか。
+pub fn preflight(has_binding: bool, tenant_raw: Option<&str>) -> Result<Uuid, Fail> {
+    if !has_binding {
+        return Err(no_db());
+    }
+    tenant_of(tenant_raw)
+}

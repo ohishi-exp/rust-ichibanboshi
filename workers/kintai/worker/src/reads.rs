@@ -1,7 +1,7 @@
 //! Supabase (勤怠スキーマ `kintai.*`) を Hyperdrive (`KINTAI_HYPERDRIVE`) 経由で読む 5 本の口。
 //!
 //! 入力の検査・SQL・`$n` の型・応答の組み立ては kintai-logic (root の src/ の写し)。ここは DB との往復だけ:
-//! 検査 (400) → binding (無ければ 503、繋がらなければ 502) → テナント (`KINTAI_TENANT_ID`、無ければ 503) →
+//! 検査 (400) → binding の有無 (無ければ 503) → テナント (`KINTAI_TENANT_ID`、無ければ 503) → connect (失敗は 502) →
 //! `PgClient::tenant_tx` の中で `query_typed` → 行を owned な型に詰め直す → 応答 (200)。順は元の handler と同じ。
 //!
 //! - **テナントは設定 pin。`X-Tenant-ID` は読まない。** 接続ロールは BYPASSRLS なので、SQL の `WHERE tenant_id = $1`
@@ -11,11 +11,13 @@
 
 use alc_worker_db::hyperdrive;
 use alc_worker_db::{kind, PgClient, TxOutput};
-use kintai_logic::common::{db_fail, no_db, tenant_of, Fail, HYPERDRIVE_BINDING, TENANT_VAR};
+use kintai_logic::common::{db_fail, no_db, preflight, Fail, HYPERDRIVE_BINDING, TENANT_VAR};
 use kintai_logic::wage_snapshot::WageSnapshotRow;
 use kintai_logic::{change_log, day_summaries, shift_days, shift_overlaps, wage_range};
 use tokio_postgres::{Error as PgError, Row};
 use uuid::Uuid;
+use wasm_bindgen::JsValue;
+use worker::js_sys::Reflect;
 use worker::Env;
 
 use crate::probe::Read;
@@ -36,16 +38,20 @@ pub(crate) async fn serve(read: Read, query: &str, env: &Env) -> Result<serde_js
     }
 }
 
-/// binding から繋ぎ、テナントを決める。binding が無い = 503 / 在るのに繋がらない = 502 / テナントが無い = 503。
+/// binding の有無 → テナント → connect の順 (元の handler と同じく、設定の欠落は DB に繋ぐ前に 503 で決める)。
+/// binding が無い = 503 / テナントが無い = 503 (どちらも connect しない) / 在るのに繋がらない = 502。
 async fn open(env: &Env, what: &str) -> Result<(PgClient, Uuid), Fail> {
+    // kit の hyperdrive::connect と同じ判定 (undefined のときだけ「無い」。読めなければ「在る」とし、connect の Err に任せる)
+    let has_binding =
+        Reflect::get(env, &JsValue::from(HYPERDRIVE_BINDING)).map_or(true, |v| !v.is_undefined());
+    let raw = env.var(TENANT_VAR).ok().map(|v| v.to_string());
+    let tenant = preflight(has_binding, raw.as_deref())?;
     let pg = match hyperdrive::connect(env, HYPERDRIVE_BINDING).await {
         Ok(Some(pg)) => pg,
         Ok(None) => return Err(no_db()),
         // ConnectError の Display は binding 名・段・kind だけ (接続文字列・宛先を含まない)
         Err(e) => return Err(db_fail(what, &e.to_string())),
     };
-    let raw = env.var(TENANT_VAR).ok().map(|v| v.to_string());
-    let tenant = tenant_of(raw.as_deref())?;
     Ok((pg, tenant))
 }
 
