@@ -51,11 +51,16 @@ pub(crate) enum Route {
     SurchargeBase,
     /// `GET /api/schema/columns`
     SchemaColumns,
+    // ── rust-leave-worker#1 の 2 本。中身は routes/leave.rs ──
+    /// `GET /api/leave/days`
+    LeaveDays,
+    /// `GET /api/leave/employees`
+    LeaveEmployees,
     NotFound,
     MethodNotAllowed,
 }
 
-/// 口は上の 22 本だけ。path が合って method が違えば 405、それ以外の path は 404。
+/// 口は上の 24 本だけ。path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
     let (found, want) = match path {
         "/probe" => (Route::Probe, "POST"),
@@ -80,6 +85,8 @@ pub(crate) fn route(method: &str, path: &str) -> Route {
         "/api/unchin/customer-net-detail" => (Route::UnchinCustomerNetDetail, "GET"),
         "/api/surcharge/base" => (Route::SurchargeBase, "GET"),
         "/api/schema/columns" => (Route::SchemaColumns, "GET"),
+        "/api/leave/days" => (Route::LeaveDays, "GET"),
+        "/api/leave/employees" => (Route::LeaveEmployees, "GET"),
         _ => return Route::NotFound,
     };
     if method == want {
@@ -115,6 +122,8 @@ impl Route {
             Route::UnchinCustomerNetDetail => "unchin_customer_net_detail",
             Route::SurchargeBase => "surcharge_base",
             Route::SchemaColumns => "schema_columns",
+            Route::LeaveDays => "leave_days",
+            Route::LeaveEmployees => "leave_employees",
             Route::NotFound => "not-found",
             Route::MethodNotAllowed => "method-not-allowed",
         }
