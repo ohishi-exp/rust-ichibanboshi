@@ -1,4 +1,6 @@
-//! 7 本の口の本体。1 リクエスト = 1 接続 (`repo::connect`) で、SQL・クエリの検証・組み立ては ichiban-logic を使う。
+//! 口の本体。1 リクエスト = 1 接続 (`repo::connect`) で、SQL・クエリの検証・組み立ては ichiban-logic を使う。
+//! 下の 7 本はこのファイル、移している途中の 15 本 (#322) は領域別のモジュール (`handle` 1 本ずつ。埋まるまでは 501):
+//! [`sales_monthly`]・[`sales_daily`]・[`sales_yoy`]・[`unchin`]・[`surcharge`]・[`schema`]。
 //!
 //! - `POST /probe` — ログインして `SELECT 1`。200 `{"ok":true}`
 //! - `GET /health` — 同じく `SELECT 1`。200 `{"status":"ok"}` (オンプレ版の commit 等は返さない)
@@ -23,6 +25,13 @@ use crate::probe_logic::{log_line, reply_for, ErrKind, Failure, Reply, Route, St
 use crate::repo::{connect, kind_of, timeout};
 use crate::rows;
 
+mod sales_daily;
+mod sales_monthly;
+mod sales_yoy;
+mod schema;
+mod surcharge;
+mod unchin;
+
 /// `/probe`・`/health` の `SELECT 1` の上限。
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一覧のクエリの上限 (vehicle-daily / costs-daily は最大 5000 行)。
@@ -37,6 +46,7 @@ pub(crate) async fn run(env: &Env, route: Route, query: &str) -> Reply {
     match &outcome {
         Ok(_) => console_log!("ichiban {name}: ok ({ms} ms)"),
         Err(Failure::BadRequest) => console_log!("ichiban {name}: bad request ({ms} ms)"),
+        Err(Failure::NotImplemented) => console_log!("ichiban {name}: not implemented"),
         Err(Failure::Db(stage, kind)) => console_error!("{}", log_line(route, *stage, kind, ms)),
     }
     reply_for(outcome)
@@ -60,6 +70,22 @@ async fn dispatch(env: &Env, route: Route, query: &str) -> Result<String, Failur
         }
         Route::VehicleDaily => vehicle_daily(env, query).await,
         Route::CostsDaily => costs_daily(env, query).await,
+        Route::SalesMonthly
+        | Route::SalesByDepartment
+        | Route::SalesByCustomer
+        | Route::SalesYoy => sales_monthly::handle(env, route, query).await,
+        Route::SalesDaily | Route::SalesCustomerTrend | Route::SalesCustomerDetail => {
+            sales_daily::handle(env, route, query).await
+        }
+        Route::SalesCustomerYoy | Route::SalesCustomerYoyByDept => {
+            sales_yoy::handle(env, route, query).await
+        }
+        Route::UnchinCandidates
+        | Route::UnchinSummary
+        | Route::UnchinCustomerNet
+        | Route::UnchinCustomerNetDetail => unchin::handle(env, route, query).await,
+        Route::SurchargeBase => surcharge::handle(env, route, query).await,
+        Route::SchemaColumns => schema::handle(env, route, query).await,
         // 経路判定 (`reply_for_route`) で先に弾いている
         Route::NotFound | Route::MethodNotAllowed => Err(Failure::BadRequest),
     }
@@ -123,7 +149,7 @@ async fn ping(env: &Env) -> Result<(), Failure> {
 
 /// 接続して 1 本流し、最初の結果セットを返す。接続は毎回閉じる。
 /// bind が無ければオンプレ版と同じく `simple_query` (SQL batch)、あれば `query` (sp_executesql)。
-async fn fetch_rows(
+pub(crate) async fn fetch_rows(
     env: &Env,
     sql: &str,
     params: &[&dyn ToSql],
@@ -148,8 +174,41 @@ async fn fetch_rows(
     }
 }
 
+/// 1 接続で `queries` (SQL と bind の組) を順に流し、それぞれの最初の結果セットを同じ順で返す。接続は最後に 1 回閉じる。
+/// 1 リクエストで 2〜3 本流す口 (monthly・yoy・daily・customer-trend・customer-detail・customer-yoy・
+/// customer-yoy-by-dept) 用。bind の有無で `simple_query` / `query` を選ぶ規則は [`fetch_rows`] と同じ。
+/// `limit` は全体 (接続後の全クエリ) の上限。1 本でも失敗すれば残りは流さず `Stage::Query` で返す。
+#[allow(dead_code)] // 領域別のモジュール (#322 の c35〜c39) が使い始めるまで呼び手が無い
+pub(crate) async fn fetch_rows_many(
+    env: &Env,
+    queries: &[(&str, &[&dyn ToSql])],
+    limit: Duration,
+) -> Result<Vec<Vec<Row>>, Failure> {
+    let mut client = connect(env).await?;
+    let results = timeout(limit, async {
+        let mut out = Vec::with_capacity(queries.len());
+        for (sql, params) in queries {
+            let stream = if params.is_empty() {
+                client.simple_query(*sql).await
+            } else {
+                client.query(*sql, params).await
+            }
+            .map_err(|e| kind_of(&e))?;
+            out.push(stream.into_first_result().await.map_err(|e| kind_of(&e))?);
+        }
+        Ok(out)
+    })
+    .await;
+    let _ = client.close().await;
+    match results {
+        None => Err(Failure::Db(Stage::Query, ErrKind::Timeout)),
+        Some(Err(kind)) => Err(Failure::Db(Stage::Query, kind)),
+        Some(Ok(rows)) => Ok(rows),
+    }
+}
+
 /// `{"source_table":…,"data":[…]}` (オンプレ版の `ApiResponse` と同じ形)。
-fn list<T: Serialize>(source_table: &str, data: T) -> String {
+pub(crate) fn list<T: Serialize>(source_table: &str, data: T) -> String {
     let body = ListResponse {
         source_table: source_table.to_string(),
         data,

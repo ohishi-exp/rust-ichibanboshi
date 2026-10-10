@@ -7,6 +7,10 @@
 //!
 //! 違いは 1 つだけ: 日付の列はオンプレ版の `get` (型が合わなければ panic) ではなく `try_get` で読み、
 //! 型が合わなければ既定値にする (Worker の panic はインスタンスごと落とすため)。型が合う行の値は同じ。
+//!
+//! 移している途中の 15 本 (#322) の詰め直しは領域別のモジュール ([`sales_monthly`]・[`sales_daily`]・
+//! [`sales_yoy`]・[`unchin`]・[`surcharge`]・[`schema`]) に置き、列の読み方 (`decode_cp932`・`get_i64`・
+//! `get_f64`・`get_i32`・`get_datetime`) はここのものを使う。
 
 use chrono::NaiveDateTime;
 use ichiban_logic::api::{Department, EmployeeRow, VehicleOption};
@@ -14,6 +18,13 @@ use ichiban_logic::costs_daily::RawCostsDailyRow;
 use ichiban_logic::vehicle_daily::RawVehicleDailyRow;
 use tiberius::numeric::Numeric;
 use tiberius::Row;
+
+pub(crate) mod sales_daily;
+pub(crate) mod sales_monthly;
+pub(crate) mod sales_yoy;
+pub(crate) mod schema;
+pub(crate) mod surcharge;
+pub(crate) mod unchin;
 
 /// 文字列の列 (varchar の CP932 は tiberius が読む)。NULL・型不一致は空文字、前後の空白は落とす。
 fn decode_cp932(row: &Row, idx: usize) -> String {
@@ -54,6 +65,12 @@ fn get_f64(row: &Row, idx: usize) -> f64 {
         })
         .or_else(|| row.try_get::<i32, _>(idx).ok().flatten().map(|v| v as f64))
         .unwrap_or(0.0)
+}
+
+/// 件数などの int の列 (オンプレ版 `src/repo.rs` の `get_i32` と同じ)。i32 で読めなければ 0。
+#[allow(dead_code)] // 領域別のモジュール (#322 の c35〜c39) が使い始めるまで呼び手が無い
+fn get_i32(row: &Row, idx: usize) -> i32 {
+    row.try_get::<i32, _>(idx).ok().flatten().unwrap_or(0)
 }
 
 /// 日付の列 (オンプレ版は `r.get(0).unwrap_or_default()`)。NULL・型不一致は既定値。
