@@ -99,7 +99,11 @@ async fn push_then_wage_source_round_trips_current_and_prev() {
         .await;
         assert_eq!(status, StatusCode::OK, "push {source} {month}");
         assert_eq!(body["saved"], drivers.len());
-        assert!(body["synced_at"].as_str().unwrap().contains("T"));
+        // RFC3339・ナノ秒 9 桁・+00:00 (書式は kintai-logic の format_synced_at が固定。Worker も同じ)
+        let synced_at = body["synced_at"].as_str().unwrap();
+        let frac = synced_at.split_once('.').unwrap().1;
+        assert_eq!(frac.len(), "123456789+00:00".len(), "{synced_at}");
+        assert!(frac.ends_with("+00:00"), "{synced_at}");
     }
 
     let (status, body) = send(
@@ -446,4 +450,119 @@ async fn synced_months_lists_pushed_scopes_per_comp() {
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ── 移す前 (dd2b9c4) の応答を固定値にしたスナップショット (Refs #322) ──
+// synced_at だけは時刻なので "<synced_at>" に置き換えて比べる (null はそのまま)。
+
+fn normalize_synced_at(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map.iter_mut() {
+                if k == "synced_at" && child.is_string() {
+                    *child = serde_json::json!("<synced_at>");
+                } else {
+                    normalize_synced_at(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(normalize_synced_at),
+        _ => {}
+    }
+}
+
+fn snapshot_app(store: DynRestraintStore) -> Router {
+    Router::new()
+        .route(
+            "/api/restraint/summaries",
+            put(routes::restraint::put_summaries),
+        )
+        .route(
+            "/api/restraint/wage-source",
+            get(routes::restraint::wage_source),
+        )
+        .route(
+            "/api/restraint/synced-months",
+            get(routes::restraint::synced_months),
+        )
+        .layer(Extension(store))
+}
+
+/// 同じ PUT の列を流した後の 3 口の応答 (synced_at は正規化済み)。
+async fn snapshot_responses() -> Vec<serde_json::Value> {
+    let store = memory_store();
+    let puts = [
+        serde_json::json!({"comp_id": "27324455", "source": "theearth", "month": "2026-06",
+            "entries": [summary_entry("100", 600), summary_entry("200", 700)]}),
+        // 100 を上書き・300 を no_data で足す (200 は残る → row_count 3)
+        serde_json::json!({"comp_id": "27324455", "source": "theearth", "month": "2026-06",
+            "entries": [summary_entry("100", 999), {"driver_cd": "300", "no_data": true}]}),
+        serde_json::json!({"comp_id": "27324455", "source": "timecard", "month": "2026-06",
+            "entries": [summary_entry("300", 480)]}),
+        serde_json::json!({"comp_id": "27324455", "source": "theearth", "month": "2026-05",
+            "entries": [summary_entry("100", 500)]}),
+        serde_json::json!({"comp_id": "27324455", "source": "timecard", "month": "2025-12",
+            "entries": [{"driver_cd": "400", "no_data": true, "summary": {"x": 1}}]}),
+        serde_json::json!({"comp_id": "27324455", "source": "theearth", "month": "2026-01",
+            "entries": []}),
+        // LIKE の '_' は 1 文字の wildcard — a_b の一覧に axb が混ざらないこと
+        serde_json::json!({"comp_id": "a_b", "source": "theearth", "month": "2026-06",
+            "entries": [summary_entry("1", 1)]}),
+        serde_json::json!({"comp_id": "axb", "source": "timecard", "month": "2026-06",
+            "entries": [summary_entry("2", 2)]}),
+    ];
+    let mut out = Vec::new();
+    for body in puts {
+        let (status, mut res) = send(
+            snapshot_app(store.clone()),
+            "PUT",
+            "/api/restraint/summaries",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        normalize_synced_at(&mut res);
+        out.push(res);
+    }
+    for uri in [
+        "/api/restraint/wage-source?comp=27324455&month=2026-06",
+        "/api/restraint/wage-source?comp=27324455&month=2026-01",
+        "/api/restraint/synced-months?comp=27324455",
+        "/api/restraint/synced-months?comp=a_b",
+        "/api/restraint/synced-months?comp=nobody",
+    ] {
+        let (status, mut res) = send(snapshot_app(store.clone()), "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        normalize_synced_at(&mut res);
+        out.push(res);
+    }
+    out
+}
+
+/// dd2b9c4 (共有 crate へ移す前・row_count を別の SELECT で数えていた版) で取った応答。
+/// 順は `snapshot_responses` の PUT 8 本 → wage-source 2 本 → synced-months 3 本。
+const SNAPSHOT_BEFORE_MOVE: [&str; 13] = [
+    r#"{"saved":2,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":2,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":1,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":1,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":1,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":0,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":1,"synced_at":"<synced_at>"}"#,
+    r#"{"saved":1,"synced_at":"<synced_at>"}"#,
+    r#"{"comp_id":"27324455","current_theearth":{"no_data_drivers":["300"],"summaries":[{"driver_cd":"100","fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"100","driverName":"乗務員100","restraintMinutes":999}},{"driver_cd":"200","fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"200","driverName":"乗務員200","restraintMinutes":700}}],"synced_at":"<synced_at>"},"current_timecard":{"no_data_drivers":[],"summaries":[{"driver_cd":"300","fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"300","driverName":"乗務員300","restraintMinutes":480}}],"synced_at":"<synced_at>"},"month":"2026-06","prev_month":"2026-05","prev_theearth":{"no_data_drivers":[],"summaries":[{"driver_cd":"100","fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"100","driverName":"乗務員100","restraintMinutes":500}}],"synced_at":"<synced_at>"},"prev_timecard":{"no_data_drivers":[],"summaries":[],"synced_at":null}}"#,
+    r#"{"comp_id":"27324455","current_theearth":{"no_data_drivers":[],"summaries":[],"synced_at":"<synced_at>"},"current_timecard":{"no_data_drivers":[],"summaries":[],"synced_at":null},"month":"2026-01","prev_month":"2025-12","prev_theearth":{"no_data_drivers":[],"summaries":[],"synced_at":null},"prev_timecard":{"no_data_drivers":["400"],"summaries":[],"synced_at":"<synced_at>"}}"#,
+    r#"{"entries":[{"month":"2026-01","row_count":0,"source":"theearth","synced_at":"<synced_at>"},{"month":"2026-05","row_count":1,"source":"theearth","synced_at":"<synced_at>"},{"month":"2026-06","row_count":3,"source":"theearth","synced_at":"<synced_at>"},{"month":"2025-12","row_count":1,"source":"timecard","synced_at":"<synced_at>"},{"month":"2026-06","row_count":1,"source":"timecard","synced_at":"<synced_at>"}]}"#,
+    r#"{"entries":[{"month":"2026-06","row_count":1,"source":"theearth","synced_at":"<synced_at>"}]}"#,
+    r#"{"entries":[]}"#,
+];
+
+#[tokio::test]
+async fn responses_match_snapshot_before_move() {
+    let got = snapshot_responses().await;
+    assert_eq!(got.len(), SNAPSHOT_BEFORE_MOVE.len());
+    for (i, (g, want)) in got.iter().zip(SNAPSHOT_BEFORE_MOVE).enumerate() {
+        let want: serde_json::Value = serde_json::from_str(want).unwrap();
+        assert_eq!(g, &want, "応答 {i} が移す前と違う");
+    }
 }
