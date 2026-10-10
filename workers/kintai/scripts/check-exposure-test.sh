@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # check-exposure.sh の陰性対照。wrangler.toml を tomllib で読んだ dict を 1 か所ずつ崩して TOML に書き戻し、
-# (a)〜(e) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# (a)〜(e)・(g) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# 4 つ目の引数を渡した行は、出力にその文字列 (どの検査が落としたか) があることも確かめる。
 # 文字列の特定の表の直前に行を挿す作りにはしない (表の中身に紛れて別の表のキーになる — rust-alc-api#698)。
 # CI で check-exposure.sh の直後に走る。
 #
@@ -13,17 +14,19 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 fail=0
 
-expect() { # $1 = 期待する exit, $2 = label, $3 = wrangler.toml
+expect() { # $1 = 期待する exit, $2 = label, $3 = wrangler.toml, $4 = 出力に在るべき文字列 (任意)
   local want="$1" label="$2" got
   if bash scripts/check-exposure.sh "$3" >"$tmp/out" 2>&1; then got=0; else got=1; fi
-  if [ "$got" = "$want" ]; then
-    echo "ok   ${label} (exit ${got})"
-  else
+  if [ "$got" != "$want" ]; then
     echo "FAIL ${label}: exit ${got}, want ${want}"; sed 's/^/     /' "$tmp/out"; fail=1
+  elif [ -n "${4:-}" ] && ! grep -qF -- "$4" "$tmp/out"; then
+    echo "FAIL ${label}: 出力に「$4」が無い"; sed 's/^/     /' "$tmp/out"; fail=1
+  else
+    echo "ok   ${label} (exit ${got})"
   fi
 }
 
-# $1 = 期待する exit, $2 = label, $3 = python の式 (cfg を書き換える。空なら書き戻すだけ)
+# $1 = 期待する exit, $2 = label, $3 = python の式 (cfg を書き換える。空なら書き戻すだけ), $4 = expect の $4
 mutate() {
   python3 - "$BASE" "$tmp/w.toml" "$3" <<'PY'
 import copy
@@ -85,7 +88,7 @@ text = dump(cfg) + "\n"
 assert tomllib.loads(text) == cfg, "round trip changed the config"
 open(sys.argv[2], "w").write(text)
 PY
-  expect "$1" "$2" "$tmp/w.toml"
+  expect "$1" "$2" "$tmp/w.toml" "${4:-}"
 }
 
 expect 0 "${BASE} そのまま" "$BASE"
@@ -113,6 +116,16 @@ mutate 1 "(e) vars に LOCAL_ で始まる任意の名前" 'cfg.setdefault("vars
 mutate 1 "(e) 表の配列の奥に LOCAL_" 'cfg["vpc_services"][0]["LOCAL_ADDR"] = "127.0.0.1:3306"'
 # LOCAL_ で始まらないもの (前後の一致ではなく接頭辞の一致であること) は通る
 mutate 0 "(e) vars に NOT_LOCAL_X (接頭辞でない)" 'cfg.setdefault("vars", {})["NOT_LOCAL_X"] = "1"'
+# (g) Supabase への口 KINTAI_HYPERDRIVE はトップレベルにだけ (env 等へ置けば (c) と別に (g) でも落ちる)
+mutate 1 "(g) hyperdrive を消す" 'del cfg["hyperdrive"]' "hyperdrive の KINTAI_HYPERDRIVE が無い"
+mutate 1 "(g) KINTAI_HYPERDRIVE の binding 名を変える" 'cfg["hyperdrive"][0]["binding"] = "OTHER_HD"' \
+  "hyperdrive の KINTAI_HYPERDRIVE が無い"
+mutate 1 "(g) hyperdrive を env.staging へ動かす" \
+  'cfg["env"] = {"staging": {"hyperdrive": cfg.pop("hyperdrive")}}' "env.staging.hyperdrive がある"
+mutate 1 "(g) トップレベルに残したまま env.staging にも置く" \
+  'cfg["env"] = {"staging": {"hyperdrive": [dict(cfg["hyperdrive"][0])]}}' "env.staging.hyperdrive がある"
+mutate 1 "(g) env 以外の表の奥に hyperdrive" 'cfg["observability"]["hyperdrive"] = [dict(cfg["hyperdrive"][0])]' \
+  "observability.hyperdrive がある"
 # (f) は warning だけ: service_id を実値らしくしても、プレースホルダのままでも exit 0
 mutate 0 "(f) service_id を入れた (warning 無し)" \
   'cfg["vpc_services"][0]["service_id"] = "11111111-1111-1111-1111-111111111111"'

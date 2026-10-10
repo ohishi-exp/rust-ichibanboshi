@@ -8,12 +8,56 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Route {
     /// `POST /probe` — 繋いで `SELECT 1, VERSION(), …` を流す
     Probe,
+    /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 5 本
+    Read(Read),
     NotFound,
     MethodNotAllowed,
 }
 
-/// 口は `POST /probe` だけ。path が合って method が違えば 405、それ以外の path は 404。
+/// Supabase の勤怠スキーマを読む口 (純粋部分は kintai-logic)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Read {
+    DaySummaries,
+    ShiftOverlaps,
+    ShiftDays,
+    ChangeLog,
+    WageRange,
+}
+
+impl Read {
+    /// 口の path。元 (Cloud Run 版) と同じ。
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        Some(match path {
+            "/api/kintai/day-summaries" => Read::DaySummaries,
+            "/api/kintai/shift-overlaps" => Read::ShiftOverlaps,
+            "/api/kintai/shift-days" => Read::ShiftDays,
+            "/api/kintai/change-log" => Read::ChangeLog,
+            "/api/kintai/wage-range" => Read::WageRange,
+            _ => return None,
+        })
+    }
+
+    /// ログに出す名前。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Read::DaySummaries => "day-summaries",
+            Read::ShiftOverlaps => "shift-overlaps",
+            Read::ShiftDays => "shift-days",
+            Read::ChangeLog => "change-log",
+            Read::WageRange => "wage-range",
+        }
+    }
+}
+
+/// 口は `POST /probe` と `GET /api/kintai/*` の 5 本。path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
+    if let Some(read) = Read::from_path(path) {
+        return if method == "GET" {
+            Route::Read(read)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
     match (path, method) {
         ("/probe", "POST") => Route::Probe,
         ("/probe", _) => Route::MethodNotAllowed,
@@ -76,7 +120,7 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     let status = match route {
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
-        Route::Probe => return None,
+        Route::Probe | Route::Read(_) => return None,
     };
     Some(Reply {
         status,

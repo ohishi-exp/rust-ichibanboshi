@@ -3,11 +3,13 @@
 # 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
 # coverage_100.toml と同じ)。workers/kintai は別 workspace なので計測は worker-kintai.yml が取る:
 #
-#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql --text > cov.txt
+#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic --text > cov.txt
 #   bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache cov.txt
 #
 # kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
-# テストは workers/kintai/mysql/tests/codec.rs。worker crate (socket・応答) は wasm32 専用なので計測しない。
+# テストは workers/kintai/mysql/tests/codec.rs。
+# kintai-logic は Supabase を読む 5 本の口の純粋部分 (root の src/ の写し)。テストは workers/kintai/logic/tests/。
+# worker crate (socket・Hyperdrive・応答) は wasm32 専用なので計測しない。
 
 [[files]]
 path = "workers/kintai/mysql/src/lib.rs"
@@ -23,3 +25,29 @@ path = "workers/kintai/mysql/src/handshake.rs"
 # OK / ERR / EOF・COM_QUERY・テキストの結果セット
 [[files]]
 path = "workers/kintai/mysql/src/response.rs"
+
+# ── kintai-logic (Supabase を読む 5 本の口の純粋部分) ──
+# lib.rs は mod 宣言だけ (実行行 0) なので登録しない (計測データに現れず gate が落ちる)
+
+# 失敗の形・Query の読み方・月と乗務員CD の検査・月の境界・テナントの解決
+[[files]]
+path = "workers/kintai/logic/src/common.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/day_summaries.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/shift_overlaps.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/shift_days.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/change_log.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/wage_range.rs"
+
+# root の src/wage_snapshot.rs の写し (テスト 39 本も写し)
+[[files]]
+path = "workers/kintai/logic/src/wage_snapshot.rs"
