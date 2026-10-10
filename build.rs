@@ -1,7 +1,7 @@
-use std::path::PathBuf;
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
+// 版の畳み方 (`fold_output_sha`)。勤怠 Worker の build.rs と共有する (Refs #322)。glob の外に置いてある
+include!("workers/kintai/output_sha.rs");
 
 /// `KINTAI_OUTPUT_SHA` の対象 (Refs #191)。
 ///
@@ -48,48 +48,7 @@ const KINTAI_OUTPUT_REQUIRED: &[&str] = &[
 /// `BUILD_SHA` を使っていた頃は、kintai と無関係なデプロイでも relay の上流キャッシュが
 /// 全月無効になっていた (Refs #191 / ohishi-exp/nuxt-dtako-admin#543)。
 fn kintai_output_sha() -> String {
-    let mut files: Vec<PathBuf> = Vec::new();
-    for (dir, prefix) in KINTAI_OUTPUT_GLOBS {
-        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
-        for entry in entries {
-            let path = entry
-                .unwrap_or_else(|e| panic!("read_dir {dir}: {e}"))
-                .path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path.is_file() && name.starts_with(prefix) && name.ends_with(".rs") {
-                files.push(path);
-            }
-        }
-    }
-    // パス区切りは OS で違う (Windows は `\`) ので、比較・畳み込みは `/` に正規化する
-    let mut rels: Vec<String> = files
-        .iter()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .collect();
-    rels.sort();
-
-    for required in KINTAI_OUTPUT_REQUIRED {
-        assert!(
-            rels.iter().any(|r| r == required),
-            "KINTAI_OUTPUT_SHA の対象から {required} が消えています。\
-             移動・リネームしたなら build.rs の KINTAI_OUTPUT_GLOBS / KINTAI_OUTPUT_REQUIRED を\
-             同じ PR で直してください (取りこぼすと relay が古い値を返し続けます、Refs #191)"
-        );
-    }
-
-    let mut hasher = Sha256::new();
-    for rel in &rels {
-        let body = std::fs::read(rel).unwrap_or_else(|e| panic!("read {rel}: {e}"));
-        // パス名も畳む — 中身が同じファイルの入れ替えを別の版として扱うため
-        hasher.update(rel.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(&body);
-        hasher.update([0u8]);
-    }
-    format!("{:x}", hasher.finalize())
-        .chars()
-        .take(16)
-        .collect()
+    fold_output_sha(KINTAI_OUTPUT_GLOBS, KINTAI_OUTPUT_REQUIRED)
 }
 
 // build 時に commit SHA と build 時刻を rustc-env として焼き込む。
@@ -131,4 +90,5 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     // 共有 crate のロジック (Refs #322)。ここは root の src の外なので別に監視する
     println!("cargo:rerun-if-changed=workers/kintai/kosoku/src");
+    println!("cargo:rerun-if-changed=workers/kintai/output_sha.rs");
 }

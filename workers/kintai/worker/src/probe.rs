@@ -2,6 +2,7 @@
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
 use kintai_logic::dtako_reads::DtakoRead;
+use kintai_logic::kosoku_reads::KosokuRead;
 use kintai_logic::mariadb_reads::MariadbRead;
 use kintai_mysql::retry::Phase;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,9 @@ pub(crate) enum Route {
     Mariadb(MariadbRead),
     /// `GET /api/kintai/day-events`・`GET /api/dtako/worktime` — 社内 MariaDB を直接読む 2 本
     Dtako(DtakoRead),
+    /// `GET /api/kintai/{kosoku-daily,version,timecard/drivers,timecard/events}` — 社内 MariaDB を直接読む 4 本
+    /// (1 接続で SQL を何本か流す)
+    Kosoku(KosokuRead),
     NotFound,
     MethodNotAllowed,
 }
@@ -56,9 +60,16 @@ impl Read {
     }
 }
 
-/// 口は `POST /probe` と GET の 11 本 (Supabase 5 本・MariaDB 4 本 + day-events・dtako/worktime)。
-/// path が合って method が違えば 405、それ以外の path は 404。
+/// 口は `POST /probe` と GET の 15 本 (Supabase 5 本・MariaDB 4 本 + day-events・dtako/worktime +
+/// kosoku-daily・version・timecard/drivers・timecard/events)。path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
+    if let Some(read) = KosokuRead::from_path(path) {
+        return if method == "GET" {
+            Route::Kosoku(read)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
     if let Some(read) = DtakoRead::from_path(path) {
         return if method == "GET" {
             Route::Dtako(read)
@@ -153,7 +164,9 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     let status = match route {
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
-        Route::Probe | Route::Read(_) | Route::Mariadb(_) | Route::Dtako(_) => return None,
+        Route::Probe | Route::Read(_) | Route::Mariadb(_) | Route::Dtako(_) | Route::Kosoku(_) => {
+            return None
+        }
     };
     Some(Reply {
         status,
