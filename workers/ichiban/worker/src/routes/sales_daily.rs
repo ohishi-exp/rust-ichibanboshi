@@ -3,7 +3,7 @@
 //! SQL・Raw 型・組み立ては `ichiban_logic::sales_daily`、行の詰め直しは `crate::rows::sales_daily`。
 //!
 //! 400 (本文なし) にするのは: クエリが読めない (オンプレ版の axum の Query と同じ)・customer-detail の `code` 欠落・
-//! daily の `month` に `-` が無い (オンプレ版は panic)・customer-trend の `limit` ≤ 0。
+//! daily の `month` に `-` が無い (オンプレ版は panic)・customer-trend の `limit` < 0 (0 はオンプレ版と同じく `TOP 0` で 200・空)。
 
 use ichiban_logic::sales_daily::{
     build_customer_detail, build_customer_trend, build_daily_sales, CustomerDetailQuery,

@@ -5,7 +5,7 @@
 //! SQL の文字列はオンプレ版と 1 文字も変えない。mode・除外部門で切り替える部分は、オンプレ版が生の SQL 片を
 //! 渡していたところを [`DailyMode`] と bool からの `&'static str` に置き換えた (組み上がる文字列は同じ)。
 //! 400 にする入力はオンプレ版が panic / 500 になるものだけ: daily の `month` に `-` が無い
-//! ([`DailyQuery::plan`])、customer-trend の `limit` ≤ 0 ([`CustomerTrendQuery::plan`])。
+//! ([`DailyQuery::plan`])、customer-trend の `limit` < 0 ([`CustomerTrendQuery::plan`])。
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -271,10 +271,11 @@ pub struct CustomerTrendPlan {
 
 impl CustomerTrendQuery {
     /// オンプレ版と同じ既定値 (2025-04〜2026-03、limit 20) と上限 50。
-    /// `limit` ≤ 0 (オンプレ版は `TOP` に負数・0 をそのまま入れる) は `None` (400)。
+    /// `limit` < 0 (オンプレ版は `TOP` に負数を入れて SQL Server のエラー = 500) は `None` (400)。
+    /// 0 は `TOP 0` のまま流す (オンプレ版は 200・空。TOP が空なので 2 本目は流さない)。
     pub fn plan(&self) -> Option<CustomerTrendPlan> {
         let limit = self.limit.unwrap_or(20);
-        if limit <= 0 {
+        if limit < 0 {
             return None;
         }
         let from = self.from.as_deref().unwrap_or("2025-04");

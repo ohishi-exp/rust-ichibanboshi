@@ -370,14 +370,27 @@ fn test_customer_trend_plan_clamps_to_50() {
 }
 
 #[test]
-fn test_customer_trend_plan_rejects_non_positive_limit() {
-    for limit in [0, -1, i32::MIN] {
+fn test_customer_trend_plan_rejects_negative_limit() {
+    // オンプレ版は TOP に負数が入って SQL Server のエラー (500) → None (400)
+    for limit in [-1, i32::MIN] {
         let q = CustomerTrendQuery {
             limit: Some(limit),
             ..Default::default()
         };
         assert!(q.plan().is_none(), "limit={limit}");
     }
+}
+
+#[test]
+fn test_customer_trend_plan_zero_limit_is_top_0() {
+    // オンプレ版は TOP 0 で 200・空 (TOP が空なので 2 本目は流さない)。Worker も同じ SQL を流す
+    let q = CustomerTrendQuery {
+        limit: Some(0),
+        ..Default::default()
+    };
+    let p = q.plan().unwrap();
+    assert_eq!(p.top_sql, ON_PREM_TREND_TOP.replacen("{}", "0", 1));
+    assert!(build_customer_trend(&[], &[]).is_empty());
 }
 
 #[test]
