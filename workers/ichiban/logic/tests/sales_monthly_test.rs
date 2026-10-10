@@ -299,8 +299,10 @@ fn test_customer_dates_and_top() {
     // 上限 100
     assert_eq!(top(101), Some(100));
     assert_eq!(top(i32::MAX), Some(100));
-    // 0 以下は 400 (オンプレ版は TOP -1 で 500)
-    assert_eq!(top(0), None);
+    // 0 は TOP 0 で 200 + 空配列 (オンプレ版と同じ)
+    assert_eq!(top(0), Some(0));
+    assert!(by_customer_sql(0).starts_with("SELECT TOP 0 "));
+    // 負数は 400 (オンプレ版は TOP -1 で 500)
     assert_eq!(top(-1), None);
 }
 

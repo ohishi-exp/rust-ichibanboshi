@@ -78,7 +78,7 @@ pub const YOY_SQL: &str = "SELECT MONTH([年月度]) as m, \
      GROUP BY MONTH([年月度]) \
      ORDER BY MONTH([年月度])";
 
-/// `/api/sales/by-customer` の SQL。`top` は呼び手が 1..=100 に収めた件数 ([`CustomerQuery::top`])。
+/// `/api/sales/by-customer` の SQL。`top` は呼び手が 0..=100 に収めた件数 ([`CustomerQuery::top`])。
 pub fn by_customer_sql(top: i32) -> String {
     format!("SELECT TOP {top} {BY_CUSTOMER_SQL_BODY}")
 }
@@ -304,10 +304,11 @@ impl CustomerQuery {
         month_start_dates(&self.from, &self.to)
     }
 
-    /// `TOP n` の n (既定 20、上限 100)。0 以下は `None` — オンプレ版は `TOP -1` で 500 になるので Worker は 400 にする。
+    /// `TOP n` の n (既定 20、上限 100)。0 は `TOP 0` で空配列 (オンプレ版と同じ)。
+    /// 負数は `None` — オンプレ版は `TOP -1` で 500 になるので Worker は 400 にする。
     pub fn top(&self) -> Option<i32> {
         let limit = self.limit.unwrap_or(20);
-        (limit > 0).then(|| limit.min(100))
+        (limit >= 0).then(|| limit.min(100))
     }
 }
 

@@ -1,6 +1,6 @@
 //! `/api/sales/monthly`・`/api/sales/by-department`・`/api/sales/by-customer`・`/api/sales/yoy` の本体 (Refs #322)。
 //! SQL・Raw 型・組み立ては `ichiban_logic::sales_monthly`、行の詰め直しは `crate::rows::sales_monthly`。
-//! オンプレ版 `src/routes/sales.rs` の同名ハンドラと同じ既定値・応答。違いは by-customer の limit ≤ 0 を 400 にする点だけ。
+//! オンプレ版 `src/routes/sales.rs` の同名ハンドラと同じ既定値・応答。違いは by-customer の limit < 0 を 400 にする点だけ。
 
 use ichiban_logic::sales_monthly::{
     build_customer_sales, build_department_sales, build_monthly_sales, build_yoy_comparison,
@@ -61,7 +61,7 @@ async fn by_department(env: &Env, query: &str) -> Result<String, Failure> {
     Ok(list(DEPARTMENT_SOURCE, build_department_sales(&raw)))
 }
 
-/// `GET /api/sales/by-customer`。`TOP n` は 1..=100、limit ≤ 0 は 400。bind の順: @P1 from, @P2 to。
+/// `GET /api/sales/by-customer`。`TOP n` は 0..=100、limit < 0 は 400。bind の順: @P1 from, @P2 to。
 async fn by_customer(env: &Env, query: &str) -> Result<String, Failure> {
     let q: CustomerQuery = serde_urlencoded::from_str(query).map_err(|_| Failure::BadRequest)?;
     let top = q.top().ok_or(Failure::BadRequest)?;
