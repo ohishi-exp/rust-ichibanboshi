@@ -266,7 +266,7 @@ pub fn split_and_sort_yoy(
 ) -> (Vec<CustomerYoy>, Vec<CustomerYoy>) {
     let (mut pos, mut neg): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .filter(|e| e.yoy_percent > 0.0 || e.yoy_percent < 0.0)
+        .filter(|e| e.yoy_percent != 0.0 && !e.yoy_percent.is_nan())
         .partition(|e| e.yoy_percent > 0.0);
     pos.sort_by(|a, b| {
         b.prev_total
@@ -326,7 +326,7 @@ pub fn split_and_sort_yoy_with_dept(
 ) -> (Vec<CustomerYoyWithDept>, Vec<CustomerYoyWithDept>) {
     let (mut pos, mut neg): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .filter(|e| e.yoy_percent > 0.0 || e.yoy_percent < 0.0)
+        .filter(|e| e.yoy_percent != 0.0 && !e.yoy_percent.is_nan())
         .partition(|e| e.yoy_percent > 0.0);
     let tie = |a: &CustomerYoyWithDept, b: &CustomerYoyWithDept| {
         a.customer_code

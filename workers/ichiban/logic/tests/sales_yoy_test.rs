@@ -473,6 +473,17 @@ fn test_split_and_sort_yoy_with_dept_neg_sort_by_percent() {
 }
 
 #[test]
+fn test_split_and_sort_yoy_with_dept_zero_and_nan_excluded() {
+    let entries = vec![
+        yoy_dept("01", "X", 100, 100, 0.0),
+        yoy_dept("01", "N", 0, 0, f64::NAN),
+    ];
+    let (pos, neg) = split_and_sort_yoy_with_dept(entries, 10);
+    assert!(pos.is_empty()); // 0% と NaN は positive でも negative でもない
+    assert!(neg.is_empty());
+}
+
+#[test]
 fn test_split_and_sort_yoy_with_dept_ties() {
     // 同じ値どうしは得意先コード → 部門コードの昇順
     let (pos, _) = split_and_sort_yoy_with_dept(
