@@ -26,26 +26,18 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 | `src/repo.rs` | `TiberiusRepo` / `DynRepo` trait — SQL クエリ本体 (DB 層) |
 | `src/auth.rs` | `JwtSecret` / JWT 検証 |
 | `src/routes/health.rs` | `/health` |
-| `src/routes/sales.rs` | `/api/sales/*` 売上集計ハンドラ群 (下記) |
-| `src/routes/schema.rs` | `/api/schema/*` tables/columns/sample (デバッグ用 schema 探索) |
-| `src/routes/surcharge.rs` | `/api/surcharge/base` 燃料サーチャージ基礎データ (請求のみ行 → 県/車種/請求日 展開、#12) |
 | `src/routes/kintai.rs` | `/api/kintai/daily` (CakePHP 中継) / `/api/kintai/events` (MariaDB 直読み) / `/api/kintai/kosoku-daily` (日別サマリ、`driver` 省略で全乗務員) (#99 / #116 / #118 / #125、下記) |
 | `src/kintai_repo.rs` | 勤怠の生イベント読み取り — 社内 MariaDB (mysql_async) の `UNION ALL` 1 本 (#116)。1 名分の `EVENTS_SQL` と全乗務員の `ALL_EVENTS_SQL` (#125) |
 | `src/kintai_version.rs` + `src/routes/kintai_version.rs` | `/api/kintai/version` 月別バージョン (ETag) — `daily`/`kosoku-daily` の全ソーステーブル (11 個) の COUNT+CRC32 マーカーを `VERSION_SQL` 1 本で取り sha256 に畳む (#184、下記) |
 | `src/kosoku.rs` | 拘束時間の日別サマリ**純粋ロジック** (イベント列 → 日別、乗務員ごとの分割)。DB も HTTP も触らない。**coverage 100% 対象** (#118) |
 | `src/kosoku_paper.rs` | 紙のタイムカード表 (社内 CakePHP) の日別拘束の**再現** — 突合用に `paper_drift_by_date` (cause `rounding`) / `paper_outside_by_date` (紙だけが数える分: 勤務外・運行行欠けの対二重・イベント重複の二重、cause `paper-outside`) / `ours_outside_by_date` (こちらだけが数える分: 紙の材料に無い拘束、cause `ours-outside`) を `kosoku-daily?view=compare` に載せる (nuxt-dtako-admin#501/#546、#182)。**coverage 100% 対象** |
-| `workers/ichiban/` | 一番星 (CAPE#01) の管理画面向け 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・`/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) は **Cloudflare Worker `ichibanboshi-ichiban`** に移った (#322)。`logic/` (`ichiban-logic`) に SQL 文・型・絞り込み判定・`build_*` を置く (6 本の SQL を直すのはここ。`worker/src/rows.rs` と列の並びが 1 対 1)。**オンプレ版の 5 本は削除済み。6 本は Worker だけが提供** (オンプレの `/health` は他系統の監視用に残す。`src/repo.rs` は `ichiban-logic` に依存せず、`HEALTH_SQL`・`DEPARTMENTS_SQL` を同じ文字列で持つ)。gate は `workers/ichiban/coverage_100.toml` (worker-ichiban.yml)。詳細は `workers/ichiban/README.md` |
+| `workers/ichiban/` | 一番星 (CAPE#01) の管理画面向け 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・`/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) は **Cloudflare Worker `ichibanboshi-ichiban`** に移った (#322)。`logic/` (`ichiban-logic`) に SQL 文・型・絞り込み判定・`build_*` を置く (6 本の SQL を直すのはここ。`worker/src/rows.rs` と列の並びが 1 対 1)。**オンプレ版の 5 本は削除済み。6 本は Worker だけが提供** (オンプレの `/health` は他系統の監視用に残す。`src/repo.rs` は `ichiban-logic` に依存せず、`HEALTH_SQL` を同じ文字列で持つ)。売上・運賃・燃料サーチャージ・schema の口も Worker に移り、オンプレ版は削除済み (#322)。gate は `workers/ichiban/coverage_100.toml` (worker-ichiban.yml)。詳細は `workers/ichiban/README.md` |
 | `workers/kyuyo/` | 給与大臣 `/kyuyo/*` の読み出しは **Cloudflare Worker `ichibanboshi-kyuyo`** に移った (#322)。オンプレ版 (`src/kyuyo/`・`src/routes/kyuyo.rs`・`/api/kyuyo/*`) は撤去済み。純粋ロジック `logic/src/payroll.rs`・SQL 文 `logic/src/sql.rs`・応答型 `logic/src/api.rs`・store の DDL `logic/src/store_keys.rs`、DO `KyuyoState`、認可は auth-worker の `KyuyoAuthEntrypoint`。**coverage 100% gate は `workers/kyuyo/coverage_100.toml` (worker-kyuyo.yml が判定)**。詳細は `workers/kyuyo/README.md` |
 
 ## entrypoint / Axum router (`src/server.rs::run`)
 
 - `/health`
-- `/api/sales/*`: `monthly` / `by-department` / `by-customer` / `yoy` / `daily` /
-  `customer-trend` / `customer-yoy` / `customer-yoy-by-dept` / `customer-detail`
-- `/api/surcharge/base`: 燃料サーチャージ基礎データ。`運転日報明細` の請求のみ行 (`請求K`='1'、
-  `kind=transport`/`all` で切替) を 得意先 / 積地県 / 卸地県 / 車種 / 売上年月日 / 運賃 / 請求日(入金予定)
-  に展開。県正規化 (`地域N` → 都道府県) は `normalize_prefecture` 純粋関数。残マスタ (燃費/距離/軽油価格/
-  対象得意先) は scope 外 (#12 残課題)。
+- 売上 9 本・運賃 6 本・燃料サーチャージ・schema 3 本は一番星 Worker (`workers/ichiban/`) に移った (#322)。オンプレ版は削除済み
 - `/api/kintai/daily?month=YYYY-MM`: 社内 CakePHP (`yhonda-ohishi/nginx`) のタイムカード日別
   データを Cloudflare Worker (nuxt-dtako-admin の dtako-scraper-relay) へ**中継するだけ**。
   詳細は下記「勤怠の中継」節。
@@ -80,7 +72,6 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
     書くのは fold (`DaySummaryRow.non_working` → INSERT の `jsonb[]`) だけ
 - `/api/kintai/version?month=YYYY-MM`: **月別バージョン (ETag)** (#184)。relay の条件付き
   再検証キャッシュ用。下記「月別バージョン」節。
-- `/api/schema/*`: `tables` / `columns` / `sample`
 - layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` + `Extension(JwtSecret)`
 - repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
 
@@ -101,7 +92,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
   static link) → scp で `/tmp` → `mv` (atomic) で `/opt/ichibanboshi/`。systemd `ichibanboshi-watcher.path`
   (PathModified) がバイナリ変更を検知して自動 restart。実行先 `ohishi-data.tailea945d.ts.net`。
 - `.github/workflows/`: `ci.yml` / `tag-release.yml`。
-- `coverage_100.toml`: `auth.rs` / `config.rs` / `routes/{health,sales,schema}.rs` を 100% 維持
+- `coverage_100.toml`: `auth.rs` / `config.rs` / `routes/health.rs` 等を 100% 維持
   (全て MockRepo / 純粋関数テストで DB 不要)。`scripts/check_coverage_100.sh` で検証。
 - `deploy/` に `ichibanboshi.service` / `.toml`、`config/ichibanboshi.default.toml`。
 
@@ -433,19 +424,6 @@ nuxt-dtako-admin の relay (dtako-scraper-relay) が上流応答キャッシュ 
   `MEISAI=1` は単価項目でどちらにも入れない。`GENGAKU=1` は支給側でも符号反転 (#87)
 - 0 の項目は落とす — 体系によって未定義の項目番号があり、拾うと「項目マスタ未解決」warning が全社で毎回出る
 - スキーマの一次情報は `docs/kyuyo-daijin-schema.md`
-
-## 燃料サーチャージ基礎データ (`/api/surcharge/base`、Refs #12)
-
-調査 #12 で確定した「`運転日報明細` の単一行に完了条件の全項目が揃う」結論に基づく
-基礎データ endpoint。請求のみ行 (`請求K`='1') を中心に、各行を
-**得意先 / 積地県 / 卸地県 / 車種 / 売上年月日 / 運賃 / 請求日(入金予定)** に展開して返す。
-
-- query: `from` / `to` (売上年月 YYYY-MM、半開区間)、`kind` (`billing_only` default / `transport` / `all`)、`limit` (1..=10000、default 2000)
-- 県正規化: `地域ﾏｽﾀ.地域N` の先頭を都道府県へ。`北海道` のみ 4 文字、他は最初の `県`/`府`/`都` まで。
-  未マップ (`発地域C`='000000' 等) は `"?"`。ロジックは `routes/surcharge.rs::normalize_prefecture` (純粋関数)
-- 運賃 = `金額 + 割増 + 実費` (#12 確定式。月計一致用の税抜カラムとは別物なので混同しない)
-- **残課題は scope 外** (新規構築/外部取込が必要): 燃費 km/L マスタ / 県庁間距離マスタ (47×47) /
-  週次全国平均軽油価格の取込 / サーチャージ対象得意先の識別。これらは本 endpoint では扱わない
 
 ## 一番星 売上データ集計ロジック（検証済み）
 

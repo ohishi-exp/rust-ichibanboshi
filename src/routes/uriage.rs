@@ -444,7 +444,7 @@ pub enum PartnerKind {
 
 impl PartnerKind {
     /// SQLite `partner_kind` カラム / HTTP query param の文字列表現。
-    /// `unchin.rs::normalize_partner_type` と同じ語彙 (`"customer"`/`"subcontractor"`)。
+    /// Worker 側 `workers/ichiban/logic/src/unchin.rs` の `PartnerType` と同じ語彙 (`"customer"`/`"subcontractor"`)。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Customer => "customer",

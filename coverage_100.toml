@@ -109,12 +109,6 @@ path = "src/routes/kintai_version.rs"
 [[files]]
 path = "src/routes/restraint.rs"
 
-[[files]]
-path = "src/routes/sales.rs"
-
-[[files]]
-path = "src/routes/schema.rs"
-
 # 勤務ごとの始業・終業・日別サマリ・暦日の按分を返す口 (Refs
 # ohishi-exp/nuxt-dtako-admin#1133)。shift_overlaps.rs と同じく pg テストが要る形の
 # まま登録 (CI の Coverage regression check は postgres service 込みで cov-check を回す)
@@ -132,12 +126,6 @@ path = "src/routes/shift_overlaps.rs"
 # (CI の Coverage regression check は postgres service 込みで cov-check を回す)
 [[files]]
 path = "src/routes/stale_months.rs"
-
-[[files]]
-path = "src/routes/surcharge.rs"
-
-[[files]]
-path = "src/routes/unchin.rs"
 
 # 取り込み漏れ候補 (also_in_month) の GCP にしか無い運行の運行NO を返す口
 # (Refs ohishi-exp/nuxt-dtako-admin#623 の 1)。実測 422/422 で 100%。
@@ -166,5 +154,5 @@ path = "src/routes/dtako_worktime.rs"
 #   src/kintai_store.rs        67/92   72.8%  (miss 25)
 #   src/db.rs                   0/36    0.0%              DB 層
 #   src/main.rs                 0/25    0.0%              entrypoint
-#   src/repo.rs                 0/456   0.0%              DB 層 (tiberius 直叩き)
-#   src/server.rs               0/193   0.0%              pool 生成 + bind
+#   src/repo.rs                          0.0%              DB 層 (tiberius 直叩き)
+#   src/server.rs                        0.0%              pool 生成 + bind
