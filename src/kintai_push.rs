@@ -53,15 +53,15 @@ use sha2::{Digest, Sha256};
 use crate::config::KintaiPushConfig;
 use crate::kintai_repo::{exact_month_range, DynKintaiEventsRepo, KintaiRepoError};
 
+/// 生行 / 署名の日時書式。定義は共有 crate (`kintai_kosoku::window`、Refs #322)。
+pub use kintai_kosoku::window::DATETIME_FORMAT;
+
 /// JST。日本標準時に夏時間は無いので固定オフセットで表せる。
 ///
 /// `chrono-tz` を足さないのは、この 1 か所のためだけに timezone データベースを
 /// 抱えることになるため。`AT TIME ZONE 'Asia/Tokyo'` (Postgres 側) との一致は
 /// オフセットが恒久的に +09:00 であることに依る。
 pub const JST_OFFSET_SECONDS: i32 = 9 * 3600;
-
-/// 生行 / 署名の日時書式。`EVENTS_SQL` の `DATE_FORMAT(..., '%Y-%m-%d %H:%i:%s')` と同じ。
-pub const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// `kintai.kintai_events.state` の CHECK 制約と同じ集合 (001_kintai_schema.sql)。
 ///

@@ -95,6 +95,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::MariadbConfig;
 use crate::kintai_repo::{exact_month_range, month_range, KintaiRepoError};
+use kintai_kosoku::sql::VERSION_SQL;
 
 /// ソーステーブル 1 つぶんの鮮度マーカー。値は SQL 側で `CAST(... AS CHAR)` 済み —
 /// 数値型の推測で駆動側が黙って落ちる事故 (tiberius #86/#95 と同族) を避ける。
@@ -128,100 +129,6 @@ impl KintaiVersionApi for DisabledKintaiVersionRepo {
         Err(KintaiRepoError::NotConfigured)
     }
 }
-
-/// 全ソーステーブルのマーカーを 1 statement で取る。
-///
-/// - 範囲 (`:from`/`:to` = `month_range`、`:mfrom`/`:mto` = `exact_month_range`) と
-///   列は、対応するデータクエリ (`EVENTS_SQL` / `ALL_EVENTS_SQL` / `FERRY_SQL` /
-///   dailyJson) が読むものの**上位集合**に揃える。絞り (dailyJson の state 30/31 等)
-///   は掛けない — 広い分は安全側
-/// - `dtako_events` は CRC を使わない (モジュール docs の「例外」参照)。
-///   `開始日時 >= :efrom` (前月初) の 1 ブランチで `EVENTS_SQL` の 2 ブランチ両方の
-///   行集合を覆う — 第 4 ブランチの「前月開始・当月終了」行も `開始日時` は前月
-///   範囲内にあるため。`COUNT(*)` + `MAX(e.id)` は `開始日時` インデックス
-///   (id を含む) のオンリースキャンで、行本体を読まない (EXPLAIN: `Using index`)
-/// - `dtako_ferry_rows` は `kintai_reader` に**列単位 GRANT** (`運行NO` / `開始日時` /
-///   `終了日時` のみ)。`COUNT(*)` ではなく `COUNT(f.``開始日時``)` を使い、他の列
-///   (`標準料金` 等) には一切触らない
-/// - 日時は `DATE_FORMAT` で文字列化してから CRC に入れる — driver の時刻型と
-///   timezone 解釈を fingerprint に持ち込まない (`EVENTS_SQL` と同じ理由)
-const VERSION_SQL: &str = r#"
-SELECT 'time_card_dstate' AS source,
-       CAST(COUNT(*) AS CHAR) AS cnt,
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|',
-           d.id, DATE_FORMAT(d.datetime, '%Y-%m-%d %H:%i:%s'), d.state,
-           DATE_FORMAT(d.modified, '%Y-%m-%d %H:%i:%s')))), 0) AS CHAR) AS fp
-  FROM time_card_dstate d
- WHERE d.datetime >= :from AND d.datetime < :to
-UNION ALL
-SELECT 'time_card_dtako',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|',
-           t.driver_id, DATE_FORMAT(t.datetime, '%Y-%m-%d %H:%i:%s'), t.state,
-           t.event_name, t.unko_no,
-           DATE_FORMAT(t.modified, '%Y-%m-%d %H:%i:%s')))), 0) AS CHAR)
-  FROM time_card_dtako t
- WHERE t.datetime >= :from AND t.datetime < :to
-UNION ALL
-SELECT 'time_card_dtako_state',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|', s.id, s.name))), 0) AS CHAR)
-  FROM time_card_dtako_state s
-UNION ALL
-SELECT 'dtako_events',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(MAX(e.id), 0) AS CHAR)
-  FROM dtako_events e
- WHERE e.`開始日時` >= :efrom AND e.`開始日時` < :to
-UNION ALL
-SELECT 'dtako_cars',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|', c.`車輌CD`, c.`車輌名`))), 0) AS CHAR)
-  FROM dtako_cars c
-UNION ALL
-SELECT 'dtako_ferry_rows',
-       CAST(COUNT(f.`開始日時`) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|',
-           f.`運行NO`,
-           DATE_FORMAT(f.`開始日時`, '%Y-%m-%d %H:%i:%s'),
-           DATE_FORMAT(f.`終了日時`, '%Y-%m-%d %H:%i:%s')))), 0) AS CHAR)
-  FROM dtako_ferry_rows f
- WHERE f.`開始日時` >= :mfrom AND f.`開始日時` < :mto
-UNION ALL
-SELECT 'dtako_rows',
-       CAST(COUNT(r.`運行NO`) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|',
-           r.`運行NO`, r.`対象乗務員CD`,
-           DATE_FORMAT(r.`出庫日時`, '%Y-%m-%d %H:%i:%s'),
-           DATE_FORMAT(r.`帰庫日時`, '%Y-%m-%d %H:%i:%s')))), 0) AS CHAR)
-  FROM dtako_rows r
- WHERE (r.`出庫日時` >= :mfrom AND r.`出庫日時` < :mto)
-    OR (r.`帰庫日時` >= :mfrom AND r.`帰庫日時` < :mto)
-UNION ALL
-SELECT 'daily_report_other_detail',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|',
-           o.driver_id, o.act_date, o.detail,
-           DATE_FORMAT(o.modified, '%Y-%m-%d %H:%i:%s')))), 0) AS CHAR)
-  FROM daily_report_other_detail o
- WHERE o.report_type = 'kyuka' AND o.act_date >= :mfrom AND o.act_date < :mto
-UNION ALL
-SELECT 'drivers',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|', v.id, v.name, v.bumon))), 0) AS CHAR)
-  FROM drivers v
-UNION ALL
-SELECT 'offices',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CONCAT_WS('|', ofc.id, ofc.name, ofc.bumon_code_id))), 0) AS CHAR)
-  FROM offices ofc
-UNION ALL
-SELECT 'time_card_non_legal_holiday',
-       CAST(COUNT(*) AS CHAR),
-       CAST(IFNULL(SUM(CRC32(CAST(h.p_date AS CHAR))), 0) AS CHAR)
-  FROM time_card_non_legal_holiday h
- WHERE h.p_date >= :mfrom AND h.p_date < :mto
-"#;
 
 /// `VERSION_SQL` の 1 行 (source, cnt, fp — 全列 CHAR)。
 type MarkerRow = (String, String, String);

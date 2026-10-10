@@ -8,10 +8,15 @@ use sha2::{Digest, Sha256};
 /// `/api/kintai/{daily,kosoku-daily,version}` の**応答を形づくるコード**だけを覆う。
 /// ディレクトリと接頭辞で glob するので、同じ接頭辞の新しいモジュールは自動で入る
 /// (列挙漏れ対策 — 個別列挙にすると新設ファイルを黙って取りこぼす)。
+///
+/// 拘束・休息の純粋ロジックと MariaDB の SQL は共有 crate `workers/kintai/kosoku` に
+/// 移した (Refs #322)。**接頭辞は空 = dir の全 .rs** — lib.rs や切り出し先のファイルも
+/// 応答を形づくるので、名前で絞ると版から漏れる。
 const KINTAI_OUTPUT_GLOBS: &[(&str, &str)] = &[
     ("src", "kosoku"),
     ("src", "kintai"),
     ("src/routes", "kintai"),
+    ("workers/kintai/kosoku/src", ""),
 ];
 
 /// 上の glob が必ず拾わなければならないファイル。**1 つでも欠けたらビルドを落とす** —
@@ -20,10 +25,18 @@ const KINTAI_OUTPUT_REQUIRED: &[&str] = &[
     "src/kintai_repo.rs",
     "src/kintai_store.rs",
     "src/kintai_version.rs",
-    "src/kosoku.rs",
-    "src/kosoku_paper.rs",
     "src/routes/kintai.rs",
     "src/routes/kintai_version.rs",
+    // 共有 crate は全ファイルを列挙する (Refs #322)
+    "workers/kintai/kosoku/src/anchors.rs",
+    "workers/kintai/kosoku/src/kintai_reading_dates.rs",
+    "workers/kintai/kosoku/src/kintai_rest_diff.rs",
+    "workers/kintai/kosoku/src/kintai_tail_gap_probe.rs",
+    "workers/kintai/kosoku/src/kosoku.rs",
+    "workers/kintai/kosoku/src/kosoku_paper.rs",
+    "workers/kintai/kosoku/src/lib.rs",
+    "workers/kintai/kosoku/src/sql.rs",
+    "workers/kintai/kosoku/src/window.rs",
 ];
 
 /// 対象ファイルをパス順に畳んだ sha256 (先頭 16 文字)。
@@ -113,4 +126,6 @@ fn main() {
     // 対象ファイルの追加・削除も拾うためディレクトリごと監視する (src はどのみち
     // 変更で再ビルドされるので追加コストは無い)
     println!("cargo:rerun-if-changed=src");
+    // 共有 crate のロジック (Refs #322)。ここは root の src の外なので別に監視する
+    println!("cargo:rerun-if-changed=workers/kintai/kosoku/src");
 }

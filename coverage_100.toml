@@ -50,24 +50,8 @@ path = "src/config.rs"
 path = "src/kintai_http_repo.rs"
 
 # --- 拘束時間の純粋ロジック (DB も HTTP も触らない) ---
-
-[[files]]
-path = "src/kosoku.rs"
-
-[[files]]
-path = "src/kosoku_paper.rs"
-
-# 休息のずれの突合 (Refs #205 の 41)。DB も HTTP も触らない純粋関数
-[[files]]
-path = "src/kintai_rest_diff.rs"
-
-# 運行 → 読取日の引き当て (Refs #205 の 42)。同じく純粋関数
-[[files]]
-path = "src/kintai_reading_dates.rs"
-
-# 末尾検知 (tail gap) が鳴らしている乗務員の名指し (Refs #205)。同じく純粋関数
-[[files]]
-path = "src/kintai_tail_gap_probe.rs"
+# kosoku / kosoku_paper / kintai_rest_diff / kintai_reading_dates / kintai_tail_gap_probe は
+# 共有 crate workers/kintai/kosoku に移した (Refs #322)。登録簿は workers/kintai/coverage_100.toml
 
 [[files]]
 path = "src/rdp_nego.rs"

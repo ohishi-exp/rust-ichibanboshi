@@ -3,7 +3,7 @@
 # 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
 # coverage_100.toml と同じ)。workers/kintai は別 workspace なので計測は worker-kintai.yml が取る:
 #
-#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic --text > cov.txt
+#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku --text > cov.txt
 #   bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache cov.txt
 #
 # kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
@@ -51,3 +51,30 @@ path = "workers/kintai/logic/src/wage_range.rs"
 # root の src/wage_snapshot.rs の写し (テスト 39 本も写し)
 [[files]]
 path = "workers/kintai/logic/src/wage_snapshot.rs"
+
+# ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
+# root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
+# lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。
+# anchors.rs は clip_to_anchors の parse_dt 失敗時の return が到達不能 (month_range の出力は必ず読める) で 100% にならないので登録しない
+
+[[files]]
+path = "workers/kintai/kosoku/src/kosoku.rs"
+
+[[files]]
+path = "workers/kintai/kosoku/src/kosoku_paper.rs"
+
+# 休息のずれの突合 (Refs #205 の 41)
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_rest_diff.rs"
+
+# 運行 → 読取日の引き当て (Refs #205 の 42)
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_reading_dates.rs"
+
+# 末尾検知 (tail gap) が鳴らしている乗務員の名指し (Refs #205)
+[[files]]
+path = "workers/kintai/kosoku/src/kintai_tail_gap_probe.rs"
+
+# 月の窓・月初をまたぐ遡り起点・unko_no の先頭桁の読み方・窓の述語
+[[files]]
+path = "workers/kintai/kosoku/src/window.rs"

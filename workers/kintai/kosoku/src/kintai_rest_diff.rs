@@ -31,11 +31,11 @@
 //! 左辺 `time_card_dtako` (`source = "dtako"`) は**点**の行、右辺 `dtako_events`
 //! (`source = "dtako_events"`) は**区間** (`開始日時` / `終了日時`) で形が違う。
 //! CakePHP は区間の両端をそれぞれ 1 行として書き戻す (開始 = state 20 / 終了 = 21 で
-//! **どちらも名前は「休息」**。[`crate::kintai_push::NOT_CARRIED_STATES`] の docs) ので、
+//! **どちらも名前は「休息」**。`kintai_push::NOT_CARRIED_STATES` の docs) ので、
 //! **両端の時刻の集合**同士なら形を揃えて比べられる。
 //!
 //! **窓の外の端は両側とも数えない。** 月の窓 `[from, to)` は
-//! [`crate::kintai_repo::month_range`] のものをそのまま使い、左辺は行の `datetime`、
+//! [`crate::window::month_range`] のものをそのまま使い、左辺は行の `datetime`、
 //! 右辺は `開始日時` / `終了日時` の**各端**を同じ窓で切る。片側だけ窓に入る端を
 //! 数えると、月末に始まって翌々日に終わる休息が毎月「ずれ」に化ける (窓の縁の作り物)。
 //!
@@ -57,7 +57,7 @@ pub const MAX_REST_DIFF: usize = 500;
 /// 突合の対象にする `state` (両表とも解決後の名前で `休息`)。
 ///
 /// `kosoku.rs` が休息区間を拾う条件 (`e.state == "休息" && e.source == "dtako_events"`)
-/// と同じ文字列。番号ではなく名前で見るのは [`crate::kintai_push::NOT_CARRIED_STATES`]
+/// と同じ文字列。番号ではなく名前で見るのは `kintai_push::NOT_CARRIED_STATES`
 /// と同じ理由 — `event_name` は自由記述なので、番号で見ると「state 20 だが別の名前」の
 /// 行を取り違える。
 pub const REST_STATE: &str = "休息";
@@ -199,9 +199,9 @@ fn only_in(a: &BTreeMap<String, usize>, b: &BTreeMap<String, usize>) -> Vec<Stri
 
 /// 生イベントの行から、休息が食い違っている運行を並べる。
 ///
-/// `rows` は [`crate::kintai_repo::KintaiEventsApi::fetch_rest_events_between`] が
+/// `rows` は `kintai_repo::KintaiEventsApi::fetch_rest_events_between` が
 /// 返す形 (`datetime` / `end_datetime` / `driver_id` / `source` / `state` / `unko_no`)。
-/// `from` / `to` は [`crate::kintai_repo::month_range`] の窓をそのまま渡す。
+/// `from` / `to` は [`crate::window::month_range`] の窓をそのまま渡す。
 pub fn rest_diff(rows: &[serde_json::Value], from: &str, to: &str) -> RestDiff {
     let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut skipped_rows = 0usize;
@@ -310,7 +310,7 @@ fn to_item(unko_no: String, b: Bucket) -> Option<RestDiffUnko> {
     if dtako_only.is_empty() && dtako_events_only.is_empty() {
         return None;
     }
-    let run_date = crate::kintai_http_repo::unko_no_start_date(&unko_no).map(|d| d.to_string());
+    let run_date = crate::window::unko_no_start_date(&unko_no).map(|d| d.to_string());
     // 片側が丸ごと空なら「食い違い」ではなく「片側が無い」— 押しても直る保証が無い
     // ので分ける (`RestDiffKind` の docs、2026-06 の実測で 239/239 がこちらだった)
     let kind = match (b.dtako_rows, b.dtako_intervals) {
