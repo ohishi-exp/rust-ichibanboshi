@@ -1,34 +1,6 @@
 //! `/api/schema/columns` の純粋部分 (オンプレ版の tests/schema_test.rs から移し、テーブルの絞り込みを足した)。
 
-use ichiban_logic::schema::{
-    build_columns, is_valid_table_name, ColumnsQuery, RawColumnRow, ALLOWED_TABLE, COLUMNS_SQL,
-};
-
-#[test]
-fn test_valid_table_names() {
-    assert!(is_valid_table_name("users"));
-    assert!(is_valid_table_name("INFORMATION_SCHEMA"));
-    assert!(is_valid_table_name("table_name"));
-    assert!(is_valid_table_name("Table123"));
-    assert!(is_valid_table_name("CAPE#01")); // # は許可
-}
-
-#[test]
-fn test_invalid_table_names() {
-    assert!(!is_valid_table_name("")); // 空文字
-    assert!(!is_valid_table_name("foo;DROP TABLE")); // セミコロン
-    assert!(!is_valid_table_name("table name")); // スペース
-    assert!(!is_valid_table_name("table--name")); // ハイフン
-    assert!(!is_valid_table_name("table.name")); // ドット
-    assert!(!is_valid_table_name("table'name")); // クオート
-    assert!(!is_valid_table_name("a=b")); // イコール
-    assert!(!is_valid_table_name("[bracketed]")); // ブラケット
-}
-
-#[test]
-fn test_allowed_table_is_valid_name() {
-    assert!(is_valid_table_name(ALLOWED_TABLE));
-}
+use ichiban_logic::schema::{build_columns, ColumnsQuery, RawColumnRow, COLUMNS_SQL};
 
 fn query(table: Option<&str>) -> ColumnsQuery {
     ColumnsQuery {

@@ -26,9 +26,8 @@ path = "workers/ichiban/logic/src/vehicle_daily.rs"
 [[files]]
 path = "workers/ichiban/logic/src/costs_daily.rs"
 
-# 期間の計算 (旧 src/routes/sales.rs の calc_*)。#322 で移している 15 本の領域ファイル
-# (sales_monthly / sales_daily / sales_yoy / unchin / surcharge / schema) は中身が入るまで実行行 0 なので、
-# 埋めた子が自分の行をこの下に足す
+# 期間の計算 (旧 src/routes/sales.rs の calc_*)。#322 で移した 15 本の領域ファイル
+# (sales_monthly / sales_daily / sales_yoy / unchin / surcharge / schema) も、下にすべて登録済み
 [[files]]
 path = "workers/ichiban/logic/src/period.rs"
 
