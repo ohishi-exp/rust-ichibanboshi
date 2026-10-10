@@ -14,7 +14,9 @@
 #       (`Route::Write(`) があるなら、トップレベルの secrets_store_secrets に KINTAI_WRITE_TOKEN (secret_name も同名、
 #       store_id は KINTAI_MARIADB と同じ) がある。書き込みの口は共有 secret を照合するので、binding が無いと全部 503 になる
 #       (照合の判定は kintai-logic の write_auth)。secrets_store_secrets もトップレベル以外に置かない
-# (a)〜(e)・(g)・(h) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
+#   (i) トップレベルに vpc_services の KINTAI_CAKEPHP_VPC (社内 CakePHP への HTTP の口) があり、vpc_services がトップレベル以外
+#       (env.* を含む表の奥) のどこにも無い (社内への口をトップレベルの外へ置かない)
+# (a)〜(e)・(g)・(h)・(i) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/kintai/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/kintai/worker/wrangler.toml)
 set -euo pipefail
@@ -137,6 +139,26 @@ def nested_secrets(node, prefix=""):
 
 for name in nested_secrets(cfg):
     err(f"{name} がある (secrets_store_secrets はトップレベルにだけ置く)")
+
+# (i) 社内 CakePHP への口 KINTAI_CAKEPHP_VPC はトップレベル。vpc_services の表はトップレベル以外に置かない
+if not isinstance(vpcs, list) or not any(isinstance(v, dict) and v.get("binding") == "KINTAI_CAKEPHP_VPC" for v in vpcs):
+    err("トップレベルに vpc_services の KINTAI_CAKEPHP_VPC が無い (社内 CakePHP への口)")
+
+
+def nested_vpc(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            name = f"{prefix}.{k}" if prefix else k
+            if k == "vpc_services" and prefix:
+                yield name
+            yield from nested_vpc(v, name)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from nested_vpc(v, f"{prefix}[{i}]")
+
+
+for name in nested_vpc(cfg):
+    err(f"{name} がある (vpc_services はトップレベルにだけ置く。env 等へ置くと社内への口が漏れる)")
 
 if errors:
     sys.exit(1)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-exposure.sh の陰性対照。wrangler.toml を tomllib で読んだ dict を 1 か所ずつ崩して TOML に書き戻し、
-# (a)〜(e)・(g) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# (a)〜(e)・(g)・(h)・(i) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
 # 4 つ目の引数を渡した行は、出力にその文字列 (どの検査が落としたか) があることも確かめる。
 # 文字列の特定の表の直前に行を挿す作りにはしない (表の中身に紛れて別の表のキーになる — rust-alc-api#698)。
 # CI で check-exposure.sh の直後に走る。
@@ -126,6 +126,21 @@ mutate 1 "(g) トップレベルに残したまま env.staging にも置く" \
   'cfg["env"] = {"staging": {"hyperdrive": [dict(cfg["hyperdrive"][0])]}}' "env.staging.hyperdrive がある"
 mutate 1 "(g) env 以外の表の奥に hyperdrive" 'cfg["observability"]["hyperdrive"] = [dict(cfg["hyperdrive"][0])]' \
   "observability.hyperdrive がある"
+# (i) 社内 CakePHP への口 KINTAI_CAKEPHP_VPC はトップレベルにだけ
+mutate 1 "(i) KINTAI_CAKEPHP_VPC を消す" \
+  'cfg["vpc_services"] = [v for v in cfg["vpc_services"] if v["binding"] != "KINTAI_CAKEPHP_VPC"]' \
+  "vpc_services の KINTAI_CAKEPHP_VPC が無い"
+mutate 1 "(i) KINTAI_CAKEPHP_VPC の binding 名を変える" \
+  'next(v for v in cfg["vpc_services"] if v["binding"] == "KINTAI_CAKEPHP_VPC")["binding"] = "CAKEPHP_VPC"' \
+  "vpc_services の KINTAI_CAKEPHP_VPC が無い"
+mutate 1 "(i) KINTAI_CAKEPHP_VPC を env.staging へ動かす" \
+  'cfg["env"] = {"staging": {"vpc_services": [v for v in cfg["vpc_services"] if v["binding"] == "KINTAI_CAKEPHP_VPC"]}}; cfg["vpc_services"] = [v for v in cfg["vpc_services"] if v["binding"] != "KINTAI_CAKEPHP_VPC"]' \
+  "env.staging.vpc_services がある"
+mutate 1 "(i) トップレベルに残したまま env.staging にも置く" \
+  'cfg["env"] = {"staging": {"vpc_services": [dict(v) for v in cfg["vpc_services"] if v["binding"] == "KINTAI_CAKEPHP_VPC"]}}' \
+  "env.staging.vpc_services がある"
+mutate 1 "(i) env 以外の表の奥に vpc_services" 'cfg["observability"]["vpc_services"] = [dict(cfg["vpc_services"][0])]' \
+  "observability.vpc_services がある"
 # (h) 書き込みの口 (worker/src の Route::Write) があるなら KINTAI_WRITE_TOKEN の binding が要る
 mutate 1 "(h) KINTAI_WRITE_TOKEN を消す" \
   'cfg["secrets_store_secrets"] = [s for s in cfg["secrets_store_secrets"] if s["binding"] != "KINTAI_WRITE_TOKEN"]' \

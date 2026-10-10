@@ -101,6 +101,11 @@ path = "workers/kintai/logic/src/cakephp.rs"
 [[files]]
 path = "workers/kintai/logic/src/dtako_autoload.rs"
 
+# 勤怠 Worker の daily・pdf-json・autoload の口の検査・応答・失敗の写像 (root の routes/kintai.rs の写しを含む)。
+# テストは workers/kintai/logic/tests/cakephp_relay.rs
+[[files]]
+path = "workers/kintai/logic/src/cakephp_relay.rs"
+
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。

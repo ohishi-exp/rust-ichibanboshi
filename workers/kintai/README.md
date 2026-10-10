@@ -1,9 +1,10 @@
 # workers/kintai
 
-勤怠 (kintai) の Worker `ichibanboshi-kintai` (Refs #322)。口は 2 系統:
+勤怠 (kintai) の Worker `ichibanboshi-kintai` (Refs #322)。口は 3 系統:
 
 - 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` と、直接読む GET の 10 本 (`/api/kintai/*` の 9 本と `/api/dtako/worktime`。オンプレ版から移した。下記)
 - Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 6 本と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
+- 社内 CakePHP (nginx) — 中継する `GET /api/kintai/{daily,pdf-json}` と `POST /api/dtako/autoload` (③ resetby-unko-no を含む) の 3 本 (オンプレ版から移した。下記)
 
 ## 到達の経路
 
@@ -65,7 +66,8 @@ Service Binding を持つ Worker からだけ呼べる。実機の確認は `wra
 検査の順は元の handler と同じ (`month` → `driver` → 資格情報 → DB)。
 
 - **値の埋め込み**: 自作コーデックは COM_QUERY (テキストプロトコル) だけなので、SQL の名前付き引数 (`:from`・`:to`・`:driver`) を
-  `kintai_mysql::bind::expand` がリテラルに展開する。受ける値は**整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL の 3 種だけ**で、
+  `kintai_mysql::bind::expand` がリテラルに展開する。受ける値は**整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL・数字だけの文字列
+  (`Digits`。`^[0-9]{1,32}$` を満たさなければ作れない。`'…'` で囲む。autoload の ③ の材料を数える 23 桁の運行NO 用) の 4 種だけ**で、
   任意の文字列を受ける口は無い (`month` も `driver` も検査済みの値から作る)。引用符・バッククォートの中は飛ばし、未知の名前・使われない
   名前・コメントはエラー (502 `bind_*`)。4 本の SQL の名前の集合と渡す名前の集合の一致はテスト (`mysql/tests/bind.rs`・`logic/tests/mariadb.rs`) で固定
 - **行 → JSON**: テキストプロトコルの各列 (バイト列か NULL) を、元の mysql_async のタプルと同じ型で読む。元で `String` の列の NULL・
@@ -151,6 +153,59 @@ Service Binding を持つ Worker からだけ呼べる。実機の確認は `wra
 ### 後の段に残したもの
 
 - `timecard/diff` (POST)
+
+## 社内 CakePHP を中継する 3 本 (`GET /api/kintai/{daily,pdf-json}`・`POST /api/dtako/autoload`)
+
+オンプレ版 (root の `src/routes/kintai.rs` の `daily`・`pdf_json`、`src/routes/dtako_autoload.rs` の `autoload`) の口を移した。CakePHP へは
+Workers VPC の VPC Service (HTTP、binding `KINTAI_CAKEPHP_VPC`) で直接届く (中継の持ち手がオンプレ版の rust から Worker に変わるだけで、
+CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart の本文・応答の型・autoload の段取りは `logic/` の `cakephp`・
+`dtako_autoload` を**オンプレ版と同じものを使う** (写さない)。検査・応答・失敗の写像は `logic/src/cakephp_relay.rs`、fetch は
+`worker/src/cakephp.rs`。
+
+| 口 | 認可 | 入力の検査 (順) | CakePHP へ送るもの | 応答 |
+|---|---|---|---|---|
+| `GET /api/kintai/daily?month=` | なし | Query → `month` | `GET /time-card/daily-json?month=` | CakePHP の JSON + `source: "live"`・`synced_at` (オンプレ版の `with_source_meta` と同じ形) |
+| `GET /api/kintai/pdf-json?month=[&driver=]` | なし | Query → `month` → `driver` (`driver=` の空は 400) | `GET /time-card/pdf-json?month=[&driver_id=]&recalc=0` | CakePHP の JSON をそのまま |
+| `POST /api/dtako/autoload?unko_no=&file_name=&preview=&reset_timecard=` | **`X-Kintai-Write-Token`** (`preview=true` も) | 認可 → Query → 本文の上限 (20 MiB) → `unko_no` (12 桁以上の数字) → 本文が空 | ② `POST /dtako-events/autoload` (multipart: `api=1`・`file[]` (`application/x-zip-compressed` 固定))。② が 2xx で `reset_timecard=true` なら ① 社内 MariaDB で材料を数え、1 件以上なら ③ `POST /time-card-dtako/resetby-unko-no/<unko_no>` (`api=1`) | オンプレ版と同じ JSON (`http_status`・`location`・`response_excerpt`・`reset_*`・`dtako_events_count`) |
+
+| 結果 | status | 本文 (平文) | オンプレ版 |
+|---|---|---|---|
+| `month` が不正 | 400 | `month は YYYY-MM で指定してください` | 同じ |
+| `driver` が不正 (pdf-json) | 400 | `driver は乗務員CD (数字) で指定してください` | 同じ |
+| `unko_no` が無い・不正 / 本文が空 (autoload) | 400 | `unko_no は対象を1件、数字だけで指定してください (一括取り込みは不可)` / `body が空です。csvdata.zip の中身を送ってください` | 同じ |
+| Query として読めない (`preview=1` 等) | 400 | axum と同じ `Failed to deserialize query string: …` | 同じ |
+| 本文が 20 MiB を超えた (autoload) | 413 | `Failed to buffer the request body: length limit exceeded` | 同じ (axum の `DefaultBodyLimit`) |
+| `X-Kintai-Write-Token` が無い・違う (autoload) | 403 | `書き込みの口には正しい X-Kintai-Write-Token が要ります` | **無い** (#362 と同じ部品) |
+| `KINTAI_WRITE_TOKEN` が読めない (autoload) | 503 | `書き込みの認可の設定 (KINTAI_WRITE_TOKEN) が読めません` | **無い** |
+| `KINTAI_CAKEPHP_VPC` が無い | 503 | `CakePHP の VPC binding (KINTAI_CAKEPHP_VPC) が無い` (autoload の `preview` は 200 で `configured: false`) | `CakePHP base_url が未設定` / `… (CAKEPHP_BASE_URL)` |
+| CakePHP に届かない (daily・pdf-json) | 502 | `CakePHP fetch failed: fetch` / `… timeout` | `CakePHP fetch failed: <reqwest の文言>` |
+| CakePHP が非 2xx (daily・pdf-json。**3xx を含む**) | 502 | `CakePHP returned <status>: <本文の先頭 500 文字>` | 同じ (ただしオンプレ版の GET は 3xx を追う) |
+| CakePHP の JSON が読めない | 502 | `CakePHP response parse failed: <serde の文言>` | 同じ頭 (文言は reqwest の) |
+| ② に届かない (autoload) | 502 | `nginx への接続に失敗: fetch` | `nginx への接続に失敗: <reqwest の文言>` |
+| **② の応答待ちの打ち切り** (autoload) | 502 | `nginx の応答待ちを打ち切りました (timeout)。取り込みは応答より前に走るので、取り込まれたかどうかは不明です …` | `nginx への接続に失敗: <reqwest の timeout の文言>` |
+
+- **★ CakePHP への fetch はすべて `redirect: manual`** (`RequestRedirect::Manual`)。Workers の fetch は既定で 3xx を追う。追うと
+  `api` の無い分岐の先 (autoload は `/`、③ は最大 100 運行ぶんの書き込みが走る `TimeCardDtako::index()`) に入りうるうえ、307 の先が
+  200 で返ってオンプレ版では止まる ③ が走る。オンプレ版も POST は 3xx を追わない client で送る。3xx は失敗ではない — ② の 307 は
+  `http_ok: false` (③ は打たない) と `location` を返す (取り込みは redirect の判定より前に走っている)
+- **待ちの上限**: daily・pdf-json と ③ は 30 秒 (オンプレ版の `[cakephp] timeout_secs` の既定)、② は 120 秒
+  (`DTAKO_AUTOLOAD_TIMEOUT_SECS`、オンプレ版と同じ)。Worker は fetch を `Delay` との競争で打ち切る。Service Binding で呼ばれる
+  Worker の実行時間 (wall clock) に上限は無く、待ちは CPU 時間に数えない。Workers VPC の HTTP 側に 120 秒より短い上限がある場合は
+  そちらが先に来て `fetch` (502) になる — `wrangler dev --remote` で 120 秒近い取り込みを測って確かめる
+- **② の打ち切りは「失敗」ではなく「不明」**: 取り込みは応答より前に走るので、打ち切ったときにはもう `dtako_events` が書き換わって
+  いることがある (kintai-ops §4.7 の `uncertain` と同じ考え方)。**同じ zip をすぐ送り直さない。** 打ち切ったら ① ③ は打たない
+  (`kintai_logic::dtako_autoload::run` が `Err` を返して段取りを止める。`logic/tests/dtako_autoload.rs` で固定)。③ の打ち切りは
+  `reset_error: "CakePHP request failed: timeout"` (`reset_attempted: true`) で返る — ③ の成否はもともと応答からは分からない
+- **daily はキャッシュを持たない** (ユーザー決定 2026-10-10。CakePHP 直で 0.4〜1.7 秒、オンプレ版の SQLite キャッシュの利用は 7 日で
+  40 回だった)。`source` は常に `live`、`refresh=1` は受けて無視する。`synced_at` は Worker の時計の RFC 3339 (精度はミリ秒。
+  オンプレ版はナノ秒)。応答のキーの並び (`rows` が先・残りは名前順) はオンプレ版と同じ
+- **① の材料**: オンプレ版と同じ SQL (`dtako_autoload::RESET_MATERIAL_SQL`) を、他の MariaDB の口と同じ接続・資格情報で流す。
+  運行NO の 2 パターン (先頭 22 桁 + `1`/`2`) は `Digits` で埋める。資格情報が無ければ `MariaDB 接続設定が未設定`・失敗は
+  `MariaDB query failed: <段>:<種別>` を `dtako_events_count_error` / `reset_error` に入れ、③ は打たない (fail-closed)
+- **URL の host は名目** (`http://kintai-cakephp.internal`)。宛先の host:port は VPC Service の側で決まる。CakePHP (nginx) が
+  `Host` で vhost を選ぶ場合はこの名目の host が届くので、`wrangler dev --remote` で daily がオンプレ版と同じ応答になることを確かめる
+- **呼び手の追従が要る**: 今の呼び手 (kyuyo-mcp → auth-worker → オンプレ版) は `X-Kintai-Write-Token` を送っていない。この Worker に
+  切り替える段で、autoload を呼ぶ側 (kyuyo-mcp の `run_dtako_reimport` → relay / auth-worker) が token を付ける必要がある
 
 ## `GET /api/kintai/*` (Supabase を読む 6 本)
 
@@ -238,6 +293,9 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/routes/shift_overlaps.rs` | `src/shift_overlaps.rs` |
 | `src/routes/shift_days.rs` | `src/shift_days.rs` |
 | `src/routes/kintai.rs` の `parse_driver` | `src/common.rs` (`is_valid_month` は写しをやめ、共有 crate の `kintai_kosoku::window::is_valid_month` を再 export) |
+| `src/routes/kintai.rs` の `map_cakephp_err` (503 の文言だけ「VPC の binding が無い」に読み替え) | `src/cakephp_relay.rs` の `map_cakephp_err` |
+| `src/routes/kintai.rs` の `with_source_meta` | `src/cakephp_relay.rs` の `with_source_meta` (Worker は `live` だけ) |
+| `src/routes/kintai.rs` の `DailyQuery`・`EventsQuery` と `daily`・`pdf_json` の検査の順・400 の文言 | `src/cakephp_relay.rs` の `DailyQuery`・`EventsQuery`・`CakephpRead::parse`・`MONTH_INVALID`・`DRIVER_INVALID` |
 | 4 つの `read_tenant_of` / `tenant_of` (`[kintai_events]` → `[kintai_push]` の pin) | `src/common.rs` の `tenant_of` 1 つ (`KINTAI_TENANT_ID`) |
 | `month_date_bounds` (DATE) と `month_bounds` (JST の TIMESTAMPTZ。`kintai_push::jst_day_bounds`) | `src/common.rs` の `month_bounds` + `jst_midnight` 1 つずつ |
 | 4 つの `store` (`[kintai_push]` が無効なら 503) | `src/common.rs` の `no_db` (`KINTAI_HYPERDRIVE` が無ければ 503) |
@@ -262,6 +320,12 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/kintai_repo.rs` の `fetch_timecard_driver_cds_between` の `u64` (`TIMECARD_DRIVERS_SQL` の 1 列) | `src/mariadb_rows.rs` の `timecard_driver_row` |
 | `src/kintai_repo.rs` の `fetch_timecard_window` の行 (`TIMECARD_WINDOW_SQL` の 7 列 = `row_to_json`) | `src/mariadb_rows.rs` の `event_row` (events と共有) |
 
+**root の `src/routes/kintai.rs` (勤怠の版の glob の中) は動かせない**ので、daily・pdf-json の上の 3 行はオンプレ版の撤去までの
+期限付きの写し。CakePHP への URL・multipart・応答の型 (`src/cakephp.rs`) と autoload の段取り・材料の SQL
+(`src/dtako_autoload.rs`) は写しではなく共有 (root の `src/cakephp.rs`・`src/routes/dtako_autoload.rs`・`src/dtako_reset_material.rs`
+は reqwest・axum・mysql_async の送受信だけを持つ)。移す前とオンプレ版が CakePHP へ送るリクエスト・autoload の応答が同じことは、
+root の `tests/fixtures/` の snapshot (基点 dd2b9c4 の実物) が縛る。
+
 **写しをやめて共有にしたもの** (Refs #322、Supabase への書き込みの部品の段): `change_log` (読みの SQL・期間の検査と、
 書きの `build_changes`・SQL・bind の束)・`wage_range` (SQL・検査・詰め直し・応答)・`wage_snapshot` (丸ごと)・`wage_write`
 (保存の SQL・検査・「前回と同じなら書かない」の判定・応答・bind の束) は `kintai-logic` が正本で、root (`src/change_log.rs`・
@@ -285,14 +349,16 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 
 - **読みの口 (GET 全部。`timecard/signatures` を含む) は認可なし** (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手の側
   (relay の共有 secret、kyuyo-mcp の OAuth)
-- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`) は Worker が共有 secret を照合する** (ユーザー決定
-  2026-10-10)。読みのために binding を持つ呼び手が POST を転送しても書けないようにするため。ヘッダー `X-Kintai-Write-Token` を
+- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`・`POST /api/dtako/autoload`) は Worker が共有 secret を照合する** (ユーザー決定
+  2026-10-10。autoload は CakePHP を通して `dtako_events`・`time_card_dtako` を書き換えるので書き込みの口として扱い、`preview=true` も照合する)。読みのために binding を持つ呼び手が POST を転送しても書けないようにするため。ヘッダー `X-Kintai-Write-Token` を
   Secrets Store の `KINTAI_WRITE_TOKEN` と照合し (両方を sha256 にして 32 バイトを定数時間で比べる。`logic/src/write_auth.rs`)、
   無い・違う = 403 (固定文言)、binding が無い・読めない・空 = 503。値は repo に書かない (GCP の Secret Manager が正本)
 
 ## binding (`worker/wrangler.toml`)
 
 - `KINTAI_MARIADB_VPC` — Workers VPC の VPC Service (TCP 3306)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-kintai-mariadb` の id
+- `KINTAI_CAKEPHP_VPC` — Workers VPC の VPC Service (HTTP)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-kintai-cakephp` の id。
+  無ければ CakePHP の 3 本は 503 (autoload の `preview` は `configured: false`)。**トップレベルにだけ置く** (check-exposure の (i))
 - `KINTAI_MARIADB` — Secrets Store の secret。JSON `{"user":…,"password":…,"database":…}` (どれも空でない文字列)。未投入なら `/probe` と MariaDB の口は 503
   (timecard の 2 本だけは元と同じく 502)
 - `KINTAI_WRITE_TOKEN` — Secrets Store の secret (書き込みの口の共有 secret。store は `KINTAI_MARIADB` と同じ)。無ければ書き込みの 2 本は 503
@@ -302,25 +368,26 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 - `CF_VERSION_METADATA` — 版の元
 - `[limits] cpu_ms = 120000` — kosoku-daily の全員版のため (上記)
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / `LOCAL_*` の var なし /
-  hyperdrive・secrets_store_secrets はトップレベル以外に無い / 書き込みの口 (`worker/src` の `Route::Write`) があるなら
+  hyperdrive・secrets_store_secrets・vpc_services はトップレベル以外に無い / `KINTAI_CAKEPHP_VPC` がトップレベルにある / 書き込みの口 (`worker/src` の `Route::Write`) があるなら
   `KINTAI_WRITE_TOKEN` の binding がある。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
 
 ## 構成
 
 - `mysql/` (`kintai-mysql`): I/O を持たない純粋なコーデック。`packet.rs` (枠・length-encoded の値) / `handshake.rs` (Initial Handshake v10・
   HandshakeResponse41・mysql_native_password・Auth Switch) / `response.rs` (OK / ERR / EOF・COM_QUERY・テキストの結果セット) /
-  `bind.rs` (名前付き引数を整数・日時・NULL のリテラルに展開) / `retry.rs` (接続のやり直しの判断)。
+  `bind.rs` (名前付き引数を整数・日時・NULL・数字だけの文字列のリテラルに展開) / `retry.rs` (接続のやり直しの判断)。
   CLIENT_DEPRECATE_EOF は立てない (結果セットは EOF で区切られる形に固定)。テストは `mysql/tests/codec.rs`、100% 行カバレッジ gate は `coverage_100.toml`
 - `dtako/` (`kintai-dtako`): day-events と dtako/worktime の純粋部分 (`day.rs`・`worktime.rs`)。**repo ルートの package も path 依存で使う共有 crate**
   (root の 2 つの route は handler だけ)。依存は serde_json・chrono・kintai-kosoku だけ。root の `build.rs` の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の外
   (元の route と同じ分類。`kintai-kosoku` に入れると版が変わり、`kintai-logic` に入れると postgres-types 等が root に入るので別 crate)。100% 行カバレッジ gate は `coverage_100.toml`
 - `logic/` (`kintai-logic`): Supabase を読む 6 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
   部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`・timecard の検査 `timecard_write`・認可 `write_auth`、本文の読み方
-  `common::parse_json`)。**repo ルートの package も path 依存で使う** (書き込みの部品と
-  `change_log`・`wage_range`・`wage_snapshot`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
+  `common::parse_json`)、社内 CakePHP への中継 (`cakephp`・`dtako_autoload`・`cakephp_relay`)。**repo ルートの package も path 依存で使う** (書き込みの部品と
+  `change_log`・`wage_range`・`wage_snapshot`・`cakephp`・`dtako_autoload`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 10 本の往復。1 接続を開く `open` とクエリ 1 本の `query`) /
   `build.rs` (version の etag の版 `KINTAI_WORKER_OUTPUT_SHA`) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
-  `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの 2 本: 認可 → 本文 → `kintai-pg`) /
+  `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの口: 認可 → 本文 → `kintai-pg`。autoload は認可の後 `cakephp.rs`) /
+  `cakephp.rs` (CakePHP への fetch (`redirect: manual`・打ち切り) と autoload の ① ② ③ の送受信) /
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
@@ -340,7 +407,8 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 ローカルで VPC や Secrets Store を迂回する var は持たないので、実接続は VPC Service と `KINTAI_MARIADB` を用意してから
 `wrangler dev --remote` で `POST /probe` と MariaDB の 10 本 (day-events のリンクを出すなら `--var "KINTAI_RYOHI_BASE_URL:…"` 等)。Supabase の 5 本も同じく `wrangler dev --remote` (Hyperdrive の経路は CI では通せない)。
 `--var "KINTAI_TENANT_ID:<UUID>"` を渡すと Supabase の口が 503 ではなく答える。書き込みの 2 本は `KINTAI_WRITE_TOKEN` の値を
-`X-Kintai-Write-Token` に載せて叩く (Supabase に書くので、書いてよい月・乗務員で)。
+`X-Kintai-Write-Token` に載せて叩く (Supabase に書くので、書いてよい月・乗務員で)。CakePHP の daily・pdf-json はそのまま叩ける。
+**autoload は社内の取り込みを実際に走らせる** (preview 以外) — 対象の運行を選んでから 1 回だけ。
 
 ## 本番 deploy
 

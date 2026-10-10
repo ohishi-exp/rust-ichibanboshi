@@ -1,6 +1,7 @@
 //! 経路判定・失敗の段と応答の写像・資格情報 JSON の検証 (純粋ロジック)。
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
+use kintai_logic::cakephp_relay::CakephpRead;
 use kintai_logic::dtako_reads::DtakoRead;
 use kintai_logic::kosoku_reads::KosokuRead;
 use kintai_logic::mariadb_reads::MariadbRead;
@@ -14,8 +15,11 @@ pub(crate) enum Route {
     Probe,
     /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 6 本 (`timecard/signatures` を含む)
     Read(Read),
-    /// `POST /api/kintai/{timecard,wage-snapshot}` — Supabase に書く 2 本 (共有 secret の照合あり)
+    /// `POST /api/kintai/{timecard,wage-snapshot}` — Supabase に書く 2 本、`POST /api/dtako/autoload` — 社内 CakePHP の
+    /// 取り込み口への中継 (どれも共有 secret の照合あり)
     Write(Write),
+    /// `GET /api/kintai/{daily,pdf-json}` — 社内 CakePHP (Workers VPC の HTTP) を中継する 2 本
+    Cakephp(CakephpRead),
     /// `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}` — 社内 MariaDB を直接読む 4 本
     Mariadb(MariadbRead),
     /// `GET /api/kintai/day-events`・`GET /api/dtako/worktime` — 社内 MariaDB を直接読む 2 本
@@ -65,11 +69,13 @@ impl Read {
     }
 }
 
-/// Supabase の勤怠スキーマに書く口 (純粋部分は kintai-logic、DB との往復は kintai-pg)。
+/// 書き込みの口。Supabase の勤怠スキーマに書く 2 本 (純粋部分は kintai-logic、DB との往復は kintai-pg) と、
+/// 社内 CakePHP の取り込み口 (`dtako_events`・③ で `time_card_dtako` を書き換える) への中継。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Write {
     Timecard,
     WageSnapshot,
+    DtakoAutoload,
 }
 
 impl Write {
@@ -78,6 +84,7 @@ impl Write {
         Some(match path {
             "/api/kintai/timecard" => Write::Timecard,
             "/api/kintai/wage-snapshot" => Write::WageSnapshot,
+            "/api/dtako/autoload" => Write::DtakoAutoload,
             _ => return None,
         })
     }
@@ -87,17 +94,26 @@ impl Write {
         match self {
             Write::Timecard => "timecard",
             Write::WageSnapshot => "wage-snapshot",
+            Write::DtakoAutoload => "dtako/autoload",
         }
     }
 }
 
-/// 口は `POST /probe`・GET の 16 本 (Supabase 6 本・MariaDB 4 本 + day-events・dtako/worktime +
-/// kosoku-daily・version・timecard/drivers・timecard/events)・POST の 2 本 (Supabase に書く timecard・wage-snapshot)。
+/// 口は `POST /probe`・GET の 18 本 (Supabase 6 本・MariaDB 4 本 + day-events・dtako/worktime +
+/// kosoku-daily・version・timecard/drivers・timecard/events・CakePHP の daily・pdf-json)・POST の 3 本 (Supabase に書く
+/// timecard・wage-snapshot と CakePHP への autoload)。
 /// path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
     if let Some(write) = Write::from_path(path) {
         return if method == "POST" {
             Route::Write(write)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
+    if let Some(read) = CakephpRead::from_path(path) {
+        return if method == "GET" {
+            Route::Cakephp(read)
         } else {
             Route::MethodNotAllowed
         };
@@ -206,6 +222,7 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
         Route::Probe
         | Route::Read(_)
         | Route::Write(_)
+        | Route::Cakephp(_)
         | Route::Mariadb(_)
         | Route::Dtako(_)
         | Route::Kosoku(_) => return None,
