@@ -10,6 +10,9 @@
 //! - 社内 MariaDB を直接読む `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}`
 //!   (オンプレ版と同じ応答・同じ 400/502/503。検査・SQL の引数・行 → JSON・応答は kintai-logic の `mariadb_reads`)。
 //!   `/probe` と同じ接続・認証・`SET SESSION max_statement_time=60` の上で 1 本のクエリを流す (1 リクエスト 1 接続)。
+//! - 同じく社内 MariaDB を読む `GET /api/kintai/day-events`・`GET /api/dtako/worktime` (オンプレ版と同じ応答・同じ
+//!   400/502/503。検査・SQL の引数・応答は kintai-logic の `dtako_reads`、畳み方は共有 crate kintai-dtako)。
+//!   day-events のリンクの base URL は `[vars]` の `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` (空 = そのリンクを省く)。
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
@@ -28,6 +31,7 @@ use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use kintai_logic::common::{mariadb_fail, mariadb_unconfigured, Fail};
+use kintai_logic::dtako_reads::{DtakoRead, Links, DTAKO_BASE_URL_VAR, RYOHI_BASE_URL_VAR};
 use kintai_logic::mariadb_reads::{jst_today, MariadbRead};
 use kintai_mysql::response::ResultSet;
 use kintai_mysql::retry::{should_retry, RETRY_DELAY_MS};
@@ -61,6 +65,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response
     if let Route::Mariadb(read) = route {
         let url = req.url()?;
         let outcome = mariadb_read(read, url.query().unwrap_or(""), &env);
+        return run_read(read.as_str(), outcome).await;
+    }
+    if let Route::Dtako(read) = route {
+        let url = req.url()?;
+        let outcome = dtako_read(read, url.query().unwrap_or(""), &env);
         return run_read(read.as_str(), outcome).await;
     }
     // reply_for_route で弾かれなかったのは POST /probe だけ
@@ -128,6 +137,27 @@ async fn mariadb_read(
         mariadb_fail(&kind)
     })?;
     req.respond(&set.rows, jst_today(Date::now().as_millis()))
+}
+
+/// day-events・dtako/worktime。順は [`mariadb_read`] と同じ (検査 → 資格情報 → 接続・クエリ → 応答)。
+async fn dtako_read(read: DtakoRead, query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+    let req = read.parse(query)?;
+    let sql = req.sql_text()?;
+    let creds = load_creds(env).await.ok_or_else(mariadb_unconfigured)?;
+    let set = run_sql(env, &creds, &sql).await.map_err(|f| {
+        let kind = format!("{}:{}", f.stage.as_str(), f.kind);
+        mariadb_fail(&kind)
+    })?;
+    let links = Links {
+        ryohi_base_url: var_or_empty(env, RYOHI_BASE_URL_VAR),
+        dtako_base_url: var_or_empty(env, DTAKO_BASE_URL_VAR),
+    };
+    req.respond(&set.rows, &links)
+}
+
+/// `[vars]` の文字列。無ければ空 (= リンクを省く。オンプレ版の設定の既定と同じ)。
+fn var_or_empty(env: &Env, name: &str) -> String {
+    env.var(name).map(|v| v.to_string()).unwrap_or_default()
 }
 
 async fn probe(env: &Env, started: u64) -> Result<ProbeOk, Failure> {

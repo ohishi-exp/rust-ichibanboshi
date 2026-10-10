@@ -8,7 +8,7 @@
 #
 # kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
 # テストは workers/kintai/mysql/tests/codec.rs。
-# kintai-logic は Supabase を読む 5 本と社内 MariaDB を読む 4 本の口の純粋部分 (root の src/ の写し)。テストは workers/kintai/logic/tests/。
+# kintai-logic は Supabase を読む 5 本と社内 MariaDB を読む 6 本の口の純粋部分 (root の src/ の写し)。テストは workers/kintai/logic/tests/。
 # worker crate (socket・Hyperdrive・応答) は wasm32 専用なので計測しない。
 
 [[files]]
@@ -67,6 +67,11 @@ path = "workers/kintai/logic/src/mariadb_reads.rs"
 
 [[files]]
 path = "workers/kintai/logic/src/mariadb_rows.rs"
+
+# 社内 MariaDB を読む day-events・dtako/worktime の検査・引数・応答 (畳み方は kintai-dtako)。
+# テストは workers/kintai/logic/tests/dtako.rs
+[[files]]
+path = "workers/kintai/logic/src/dtako_reads.rs"
 
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。

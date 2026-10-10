@@ -1,6 +1,7 @@
 # ichibanboshi-kintai: 勤怠 (kintai) の読み出し Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
 # Service Binding 専用。口は到達の確認用の POST /probe (社内 MariaDB、自作の MySQL クライアント kintai-mysql) と、
-# Supabase の勤怠スキーマを読むだけの GET /api/kintai/* の 5 本 (Hyperdrive + alc-worker-db)。
+# Supabase の勤怠スキーマを読むだけの GET /api/kintai/* の 5 本 (Hyperdrive + alc-worker-db)、
+# 社内 MariaDB を直接読む GET の 6 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime)。
 # 本番へはタグ worker-kintai-v* の push で deploy する (.github/workflows/worker-kintai.yml)。
 #
 # ★ 外から届く口を持たない:
@@ -53,5 +54,10 @@ id = "0110becff61044bb8435c457a69c63a1"
 # 読み先のテナント (UUID の文字列)。GET /api/kintai/* はこの pin だけでテナントを決め、X-Tenant-ID は読まない。
 # 空・UUID でない・nil UUID なら 503。
 # 本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のまま
+#
+# GET /api/kintai/day-events のリンクの base URL (社内 nginx・dtako-admin)。空 = その項目のリンクを省く (オンプレ版の設定と同じ意味)。
+# 本番は deploy 時に repo variable `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` を `--var` で渡す (社内ホスト名を repo に書かない)。ここは空のまま
 [vars]
 KINTAI_TENANT_ID = ""
+KINTAI_RYOHI_BASE_URL = ""
+KINTAI_DTAKO_BASE_URL = ""
