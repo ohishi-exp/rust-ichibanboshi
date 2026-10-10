@@ -1,0 +1,151 @@
+name: worker-kintai
+
+# workers/kintai (勤怠の社内 MariaDB 読み出し Worker と自作の MySQL コーデック、Refs #322)。
+#   - pull_request / main への push → kintai-mysql の test と 100% gate、Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run
+#     (この経路は secret も token も使わない)
+#   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
+# merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。wrangler の出力はファイルに取り、mask してから伏せて出す。
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'workers/kintai/**'
+      - '.github/workflows/worker-kintai.yml'
+  push:
+    branches: [main]
+    # タグの push には paths が効かない (タグは常に走る)
+    tags: ['worker-kintai-v*']
+    paths:
+      - 'workers/kintai/**'
+      - '.github/workflows/worker-kintai.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # README と揃える
+  WRANGLER_VERSION: 4.144.0
+
+jobs:
+  worker:
+    name: MySQL codec test + Worker build + clippy + exposure + wrangler dry-run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/kintai
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: kintai-worker
+          workspaces: workers/kintai -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test (kintai-mysql)
+        working-directory: .
+        run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # 行カバレッジ 100% gate (登録簿 workers/kintai/coverage_100.toml)。判定は repo ルートの
+      # check_coverage_100.sh を共用する。コーデックは社内 DB の応答を読む唯一の場所なので全行を通す
+      - name: Coverage 100% gate (kintai-mysql)
+        working-directory: .
+        run: |
+          cov="$RUNNER_TEMP/kintai-mysql-cov.txt"
+          cargo llvm-cov --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql --text > "$cov"
+          bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache "$cov"
+
+      - name: Build (wasm32-unknown-unknown)
+        run: cargo build --locked --target wasm32-unknown-unknown
+
+      - name: Clippy (wasm32-unknown-unknown)
+        run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+
+      # wrangler.toml の [build] command と同じ版
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      - name: worker-build --release
+        working-directory: workers/kintai/worker
+        run: worker-build --release
+
+      - name: Exposure check
+        run: bash scripts/check-exposure.sh worker/wrangler.toml
+
+      - name: Exposure check (negative control)
+        run: bash scripts/check-exposure-test.sh worker/wrangler.toml
+
+      # secret も token も要らない (build と設定の検証だけ)
+      - name: wrangler deploy --dry-run
+        working-directory: workers/kintai/worker
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
+
+  deploy:
+    name: deploy production
+    needs: [worker]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/worker-kintai-v')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: kintai-deploy-production
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: workers/kintai/worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          # 保存は worker の job に任せ、ここは復元だけ
+          shared-key: kintai-worker
+          workspaces: workers/kintai -> target
+          save-if: false
+
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す (ログファイルそのものは出さない)。
+      #   - 32 桁の hex (account ID): ::add-mask:: + <account> に置換
+      # token は org の secret CLOUDFLARE_API_TOKEN (repo 単位の secret は作らない)
+      - name: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy \
+            --tag "$GITHUB_REF_NAME" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::本番に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi

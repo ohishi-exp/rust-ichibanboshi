@@ -1,0 +1,25 @@
+# workers/kintai の 100% 行カバレッジ登録簿 (Refs #322)。
+#
+# 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
+# coverage_100.toml と同じ)。workers/kintai は別 workspace なので計測は worker-kintai.yml が取る:
+#
+#   cargo llvm-cov --manifest-path workers/kintai/Cargo.toml -p kintai-mysql --text > cov.txt
+#   bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache cov.txt
+#
+# kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
+# テストは workers/kintai/mysql/tests/codec.rs。worker crate (socket・応答) は wasm32 専用なので計測しない。
+
+[[files]]
+path = "workers/kintai/mysql/src/lib.rs"
+
+# パケットの枠・length-encoded の値
+[[files]]
+path = "workers/kintai/mysql/src/packet.rs"
+
+# Initial Handshake・HandshakeResponse41・mysql_native_password・Auth Switch
+[[files]]
+path = "workers/kintai/mysql/src/handshake.rs"
+
+# OK / ERR / EOF・COM_QUERY・テキストの結果セット
+[[files]]
+path = "workers/kintai/mysql/src/response.rs"

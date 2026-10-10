@@ -1,0 +1,12 @@
+# MySQL / MariaDB のクライアント側プロトコルのうち、勤怠 Worker に要る最小限 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# パケットの枠・length-encoded の値・Initial Handshake (v10)・HandshakeResponse41・mysql_native_password・
+# OK / ERR / EOF・COM_QUERY とテキストの結果セット。I/O を持たない純粋関数だけなので native で cargo test できる。
+# mysql_common (default-features = false) は wasm32 で flate2 の backend 未選択により build が落ちたので使わない。
+[package]
+name = "kintai-mysql"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sha1 = { version = "0.10", default-features = false }

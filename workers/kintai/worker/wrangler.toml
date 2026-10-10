@@ -1,0 +1,43 @@
+# ichibanboshi-kintai: 勤怠 (kintai) の社内 MariaDB 読み出し Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
+# Service Binding 専用。いまの口は到達の確認用の POST /probe だけ (自作の MySQL クライアント kintai-mysql で繋ぐ)。
+# 本番へはタグ worker-kintai-v* の push で deploy する (.github/workflows/worker-kintai.yml)。
+#
+# ★ 外から届く口を持たない:
+#   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。
+#   - 認可なし (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手 (relay の共有 secret、kyuyo-mcp の OAuth)
+#   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
+#   - MariaDB への口 (vpc_services) はトップレベルにだけ置く。ローカルで迂回する LOCAL_* の var は持たない
+#   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。Hyperdrive の binding はまだ入れない。
+#
+# MariaDB の資格情報は Secrets Store の secret (JSON。キー user/password/database。値は repo に書かない)
+name = "ichibanboshi-kintai"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "worker-build --release"
+
+# Workers Logs (ログは段・失敗の種類・所要ミリ秒だけ)
+[observability]
+enabled = true
+
+# 版の元 (workers/ichiban と同じ)
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# MariaDB への口 (tcp 3306)。宛先の Tunnel・host:port は VPC Service 側に閉じる (コードの connect() の宛先は名目)。
+# service_id は VPC Service `ichibanboshi-kintai-mariadb` の id (資格情報でも宛先でもない)。
+[[vpc_services]]
+binding = "KINTAI_MARIADB_VPC"
+service_id = "01a12419-659c-7b21-ac68-945c6f23ccc8"
+remote = true
+
+# MariaDB の資格情報。store_id は Secrets Store の id、secret_name は secret 名 (どちらも値そのものではない)。
+# 未投入なら /probe は 503
+[[secrets_store_secrets]]
+binding = "KINTAI_MARIADB"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "KINTAI_MARIADB"
