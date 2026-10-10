@@ -20,11 +20,42 @@ pub(crate) enum Route {
     VehicleDaily,
     /// `GET /api/costs/vehicle-daily`
     CostsDaily,
+    // ── 移している途中の 15 本 (#322)。中身は領域別の routes/<領域>.rs。埋まるまでは 501 ──
+    /// `GET /api/sales/monthly`
+    SalesMonthly,
+    /// `GET /api/sales/by-department`
+    SalesByDepartment,
+    /// `GET /api/sales/by-customer`
+    SalesByCustomer,
+    /// `GET /api/sales/yoy`
+    SalesYoy,
+    /// `GET /api/sales/daily`
+    SalesDaily,
+    /// `GET /api/sales/customer-trend`
+    SalesCustomerTrend,
+    /// `GET /api/sales/customer-detail`
+    SalesCustomerDetail,
+    /// `GET /api/sales/customer-yoy`
+    SalesCustomerYoy,
+    /// `GET /api/sales/customer-yoy-by-dept`
+    SalesCustomerYoyByDept,
+    /// `GET /api/unchin/candidates`
+    UnchinCandidates,
+    /// `GET /api/unchin/summary`
+    UnchinSummary,
+    /// `GET /api/unchin/customer-net`
+    UnchinCustomerNet,
+    /// `GET /api/unchin/customer-net-detail`
+    UnchinCustomerNetDetail,
+    /// `GET /api/surcharge/base`
+    SurchargeBase,
+    /// `GET /api/schema/columns`
+    SchemaColumns,
     NotFound,
     MethodNotAllowed,
 }
 
-/// 口は上の 7 本だけ。path が合って method が違えば 405、それ以外の path は 404。
+/// 口は上の 22 本だけ。path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
     let (found, want) = match path {
         "/probe" => (Route::Probe, "POST"),
@@ -34,6 +65,21 @@ pub(crate) fn route(method: &str, path: &str) -> Route {
         "/api/sales/departments" => (Route::Departments, "GET"),
         "/api/sales/vehicle-daily" => (Route::VehicleDaily, "GET"),
         "/api/costs/vehicle-daily" => (Route::CostsDaily, "GET"),
+        "/api/sales/monthly" => (Route::SalesMonthly, "GET"),
+        "/api/sales/by-department" => (Route::SalesByDepartment, "GET"),
+        "/api/sales/by-customer" => (Route::SalesByCustomer, "GET"),
+        "/api/sales/yoy" => (Route::SalesYoy, "GET"),
+        "/api/sales/daily" => (Route::SalesDaily, "GET"),
+        "/api/sales/customer-trend" => (Route::SalesCustomerTrend, "GET"),
+        "/api/sales/customer-detail" => (Route::SalesCustomerDetail, "GET"),
+        "/api/sales/customer-yoy" => (Route::SalesCustomerYoy, "GET"),
+        "/api/sales/customer-yoy-by-dept" => (Route::SalesCustomerYoyByDept, "GET"),
+        "/api/unchin/candidates" => (Route::UnchinCandidates, "GET"),
+        "/api/unchin/summary" => (Route::UnchinSummary, "GET"),
+        "/api/unchin/customer-net" => (Route::UnchinCustomerNet, "GET"),
+        "/api/unchin/customer-net-detail" => (Route::UnchinCustomerNetDetail, "GET"),
+        "/api/surcharge/base" => (Route::SurchargeBase, "GET"),
+        "/api/schema/columns" => (Route::SchemaColumns, "GET"),
         _ => return Route::NotFound,
     };
     if method == want {
@@ -54,6 +100,21 @@ impl Route {
             Route::Departments => "departments",
             Route::VehicleDaily => "vehicle-daily",
             Route::CostsDaily => "costs-daily",
+            Route::SalesMonthly => "sales_monthly",
+            Route::SalesByDepartment => "sales_by_department",
+            Route::SalesByCustomer => "sales_by_customer",
+            Route::SalesYoy => "sales_yoy",
+            Route::SalesDaily => "sales_daily",
+            Route::SalesCustomerTrend => "sales_customer_trend",
+            Route::SalesCustomerDetail => "sales_customer_detail",
+            Route::SalesCustomerYoy => "sales_customer_yoy",
+            Route::SalesCustomerYoyByDept => "sales_customer_yoy_by_dept",
+            Route::UnchinCandidates => "unchin_candidates",
+            Route::UnchinSummary => "unchin_summary",
+            Route::UnchinCustomerNet => "unchin_customer_net",
+            Route::UnchinCustomerNetDetail => "unchin_customer_net_detail",
+            Route::SurchargeBase => "surcharge_base",
+            Route::SchemaColumns => "schema_columns",
             Route::NotFound => "not-found",
             Route::MethodNotAllowed => "method-not-allowed",
         }
@@ -138,6 +199,8 @@ pub(crate) enum Failure {
     BadRequest,
     /// SQL Server までの途中 (資格情報・接続・ログイン・クエリ) で失敗した
     Db(Stage, ErrKind),
+    /// 経路はあるが中身を移し終えていない口 (#322 の移行途中)。501、本文なし
+    NotImplemented,
 }
 
 impl From<DbError> for Failure {
@@ -172,13 +235,17 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     })
 }
 
-/// 口の結果の応答。成功は 200 と JSON 本文、絞り込みの不備は 400 (本文なし)、
+/// 口の結果の応答。成功は 200 と JSON 本文、絞り込みの不備は 400 (本文なし)、移し終えていない口は 501 (本文なし)、
 /// SQL Server までの失敗は 502 `{"ok":false,"stage":…,"kind":…}`。
 pub(crate) fn reply_for(outcome: Result<String, Failure>) -> Reply {
     match outcome {
         Ok(body) => Reply { status: 200, body },
         Err(Failure::BadRequest) => Reply {
             status: 400,
+            body: String::new(),
+        },
+        Err(Failure::NotImplemented) => Reply {
+            status: 501,
             body: String::new(),
         },
         Err(Failure::Db(stage, kind)) => Reply {
