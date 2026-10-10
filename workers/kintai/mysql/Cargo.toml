@@ -9,4 +9,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# bind の日時のリテラル (NaiveDateTime) だけ
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha1 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+# bind のテストで、4 本の口が使う SQL 定数の名前の集合を確かめる
+kintai-kosoku = { path = "../kosoku" }

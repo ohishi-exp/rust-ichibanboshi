@@ -1,4 +1,4 @@
-//! 5 本の口が共有する部品 — 失敗の形・Query の読み方・月と乗務員CD の検査・月の境界・テナントの解決。
+//! 口が共有する部品 — 失敗の形・Query の読み方・月と乗務員CD の検査・月の境界・テナントの解決。
 //!
 //! 元 (root の src/) では口ごとに写しを持っていた (`read_tenant_of` が 3 つ + `tenant_of` が 1 つ、
 //! `month_date_bounds` と `month_bounds`)。ここではそれぞれ **1 つだけ**置き、5 本がこれを使う。
@@ -50,6 +50,17 @@ pub fn no_db() -> Fail {
 /// alc-worker-db の `kind` (SQLSTATE か固定の語) か接続の段の label。DB の message は載せない。
 pub fn db_fail(what: &str, kind: &str) -> Fail {
     Fail::new(502, format!("{what} failed: {kind}"))
+}
+
+/// 503 (社内 MariaDB の資格情報 `KINTAI_MARIADB` が無い・読めない)。元の `map_repo_err` の `NotConfigured` と同じ文言。
+pub fn mariadb_unconfigured() -> Fail {
+    Fail::new(503, "MariaDB 接続設定が未設定")
+}
+
+/// 502 (社内 MariaDB までの途中・クエリ・行の読み取りの失敗)。元の `MariaDB query failed: ` の頭 + 種別だけ
+/// (`connect:timeout`・`query:server:1146`・`rows:int` 等)。DB の message・接続先は載せない。
+pub fn mariadb_fail(kind: &str) -> Fail {
+    Fail::new(502, format!("MariaDB query failed: {kind}"))
 }
 
 /// クエリ文字列を `T` に読む。axum 0.8 の `Query` と同じ部品・同じ拒否文言

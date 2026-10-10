@@ -4,12 +4,17 @@
 //! SQL 定数 / `Binds` (`params()` が `query_typed` に渡す `$n` と `Type` の対。**`$1` は必ず UUID のテナント pin**) /
 //! `Row` (owned な行) / `respond` (応答の JSON)。DB との往復は worker crate が持つ。
 //!
-//! root の src/ (Cloud Run 版) からの写しで、対応表は `workers/kintai/README.md`。
+//! 社内 MariaDB を直接読む 4 本 (events・rest-diff・reading-dates・tail-gap-probe) は `mariadb_reads` (検査・引数・応答) と
+//! `mariadb_rows` (テキストプロトコルの行 → JSON)。SQL と突合などの純粋ロジックは共有 crate `kintai-kosoku` を使う。
+//!
+//! root の src/ (Cloud Run 版・オンプレ版) からの写しで、対応表は `workers/kintai/README.md`。
 //! **撤去までは片方を直したらもう片方も直す。**
 
 pub mod change_log;
 pub mod common;
 pub mod day_summaries;
+pub mod mariadb_reads;
+pub mod mariadb_rows;
 pub mod shift_days;
 pub mod shift_overlaps;
 pub mod wage_range;

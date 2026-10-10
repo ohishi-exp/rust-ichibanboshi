@@ -8,7 +8,7 @@
 #
 # kintai-mysql は I/O を持たない MySQL プロトコルのコーデック (社内 MariaDB の応答を読む唯一の場所)。
 # テストは workers/kintai/mysql/tests/codec.rs。
-# kintai-logic は Supabase を読む 5 本の口の純粋部分 (root の src/ の写し)。テストは workers/kintai/logic/tests/。
+# kintai-logic は Supabase を読む 5 本と社内 MariaDB を読む 4 本の口の純粋部分 (root の src/ の写し)。テストは workers/kintai/logic/tests/。
 # worker crate (socket・Hyperdrive・応答) は wasm32 専用なので計測しない。
 
 [[files]]
@@ -25,6 +25,10 @@ path = "workers/kintai/mysql/src/handshake.rs"
 # OK / ERR / EOF・COM_QUERY・テキストの結果セット
 [[files]]
 path = "workers/kintai/mysql/src/response.rs"
+
+# SQL の名前付き引数の展開 (整数・日時・NULL だけ)。テストは workers/kintai/mysql/tests/bind.rs
+[[files]]
+path = "workers/kintai/mysql/src/bind.rs"
 
 # ── kintai-logic (Supabase を読む 5 本の口の純粋部分) ──
 # lib.rs は mod 宣言だけ (実行行 0) なので登録しない (計測データに現れず gate が落ちる)
@@ -51,6 +55,14 @@ path = "workers/kintai/logic/src/wage_range.rs"
 # root の src/wage_snapshot.rs の写し (テスト 39 本も写し)
 [[files]]
 path = "workers/kintai/logic/src/wage_snapshot.rs"
+
+# 社内 MariaDB を読む 4 本 (events・rest-diff・reading-dates・tail-gap-probe) の検査・引数・応答と、行 → JSON。
+# テストは workers/kintai/logic/tests/mariadb.rs
+[[files]]
+path = "workers/kintai/logic/src/mariadb_reads.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/mariadb_rows.rs"
 
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。

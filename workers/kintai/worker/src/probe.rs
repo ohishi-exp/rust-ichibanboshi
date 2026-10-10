@@ -1,6 +1,7 @@
 //! 経路判定・失敗の段と応答の写像・資格情報 JSON の検証 (純粋ロジック)。
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
+use kintai_logic::mariadb_reads::MariadbRead;
 use serde::{Deserialize, Serialize};
 
 /// 経路判定の結果。
@@ -10,6 +11,8 @@ pub(crate) enum Route {
     Probe,
     /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 5 本
     Read(Read),
+    /// `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}` — 社内 MariaDB を直接読む 4 本
+    Mariadb(MariadbRead),
     NotFound,
     MethodNotAllowed,
 }
@@ -49,8 +52,16 @@ impl Read {
     }
 }
 
-/// 口は `POST /probe` と `GET /api/kintai/*` の 5 本。path が合って method が違えば 405、それ以外の path は 404。
+/// 口は `POST /probe` と `GET /api/kintai/*` の 9 本 (Supabase 5 本・MariaDB 4 本)。
+/// path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
+    if let Some(read) = MariadbRead::from_path(path) {
+        return if method == "GET" {
+            Route::Mariadb(read)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
     if let Some(read) = Read::from_path(path) {
         return if method == "GET" {
             Route::Read(read)
@@ -120,7 +131,7 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     let status = match route {
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
-        Route::Probe | Route::Read(_) => return None,
+        Route::Probe | Route::Read(_) | Route::Mariadb(_) => return None,
     };
     Some(Reply {
         status,
