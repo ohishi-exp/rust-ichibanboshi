@@ -20,6 +20,10 @@
 //!   kintai-kosoku)。kosoku-daily と version は 1 接続で遡り起点の 2 本 → 本体 (→ フェリー) を流す。
 //!   version の etag の版は build.rs が焼く `KINTAI_WORKER_OUTPUT_SHA` (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値)。
 //!
+//! - 社内 CakePHP (`yhonda-ohishi/nginx`) を Workers VPC の HTTP (`KINTAI_CAKEPHP_VPC`) で中継する `GET /api/kintai/{daily,pdf-json}`
+//!   (認可なし) と `POST /api/dtako/autoload` (書き込みの口。`preview` も照合する) ([`cakephp`]。オンプレ版と同じ応答・
+//!   同じ 400/502/503。**fetch は 3xx を追わない**)。daily はキャッシュを持たない。
+//!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
 //! **書き込みの口は Worker が共有 secret を照合する** (ユーザー決定 2026-10-10。読みのために binding を持つ呼び手が POST を
@@ -27,6 +31,7 @@
 //! 資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
 //! 社内 MariaDB へは SELECT だけ (SET SESSION はこの接続の打ち切り時間で、データは書かない)。Supabase へは上の 2 本だけが書く。
 
+mod cakephp;
 mod conn;
 mod probe;
 mod reads;
@@ -78,6 +83,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     if let Route::Write(write) = route {
         let outcome = writes::serve(write, &mut req, &env);
         return run_read(write.as_str(), outcome).await;
+    }
+    if let Route::Cakephp(read) = route {
+        let url = req.url()?;
+        let outcome = async { cakephp::read(read.parse(url.query().unwrap_or(""))?, &env).await };
+        return run_bytes(read.as_str(), outcome).await;
     }
     if let Route::Read(read) = route {
         let url = req.url()?;
