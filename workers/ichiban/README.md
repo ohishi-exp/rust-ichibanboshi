@@ -14,8 +14,8 @@ TDS でログインする。1 リクエスト = 1 接続。
 | `GET /api/costs/vehicle-daily` | `?from=&to=&vehicle=&driver=&kind=&limit=`。400 の判定は同上 |
 | `POST /probe` | 到達の切り分け用。ログインして `SELECT 1`。200 `{"ok":true}` |
 
-**オンプレ版に残る一番星系の 15 本を移している途中 (#322)。** 経路だけ先に受け、中身を移すまでは 501 (本文なし) を返す
-(method 違いは 405)。移し終えたら上の表へ足す:
+**オンプレ版に残っていた一番星系の 15 本は、すべて Worker に移った (#322)。** オンプレとの応答の比較と、タグでの本番 deploy はこれから
+(method 違いは 405):
 
 | 領域 | 口 (すべて GET) |
 |---|---|
@@ -55,8 +55,8 @@ tiberius は `EncryptionLevel::NotSupported`・`database("CAPE#01")`。`port` / 
 `period.rs` は期間の計算 (旧オンプレ `src/routes/sales.rs` の `calc_prev_period`・`calc_next_month`・`calc_months` を同じ挙動で写したもの)。
 100% 行カバレッジ gate は `coverage_100.toml` (worker-ichiban.yml が判定)。
 
-**移している 15 本は領域ごとに 3 か所のファイルを持つ** (領域名は上の表): `logic/src/<領域>.rs` (SQL・Raw 型・応答型・Query・組み立て) /
-`worker/src/routes/<領域>.rs` (`handle(env, route, query) -> Result<String, Failure>`。まだ 501) / `worker/src/rows/<領域>.rs`
+**移した 15 本は領域ごとに 3 か所のファイルを持つ** (領域名は上の表): `logic/src/<領域>.rs` (SQL・Raw 型・応答型・Query・組み立て) /
+`worker/src/routes/<領域>.rs` (`handle(env, route, query) -> Result<String, Failure>`) / `worker/src/rows/<領域>.rs`
 (`tiberius::Row` → Raw 型。列の読み方は `rows/mod.rs` の `decode_cp932`・`get_i64`・`get_f64`・`get_i32`・`get_datetime`)。
 領域の子はこの 3 つと `logic/tests/`・`coverage_100.toml` の自分の行だけを触る。空の `logic/src/<領域>.rs` は実行行 0 なので、中身が入るまで gate に登録しない。
 

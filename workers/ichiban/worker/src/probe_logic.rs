@@ -20,7 +20,7 @@ pub(crate) enum Route {
     VehicleDaily,
     /// `GET /api/costs/vehicle-daily`
     CostsDaily,
-    // ── 移している途中の 15 本 (#322)。中身は領域別の routes/<領域>.rs。埋まるまでは 501 ──
+    // ── オンプレ版から移した 15 本 (#322)。中身は領域別の routes/<領域>.rs ──
     /// `GET /api/sales/monthly`
     SalesMonthly,
     /// `GET /api/sales/by-department`
@@ -199,8 +199,6 @@ pub(crate) enum Failure {
     BadRequest,
     /// SQL Server までの途中 (資格情報・接続・ログイン・クエリ) で失敗した
     Db(Stage, ErrKind),
-    /// 経路はあるが中身を移し終えていない口 (#322 の移行途中)。501、本文なし
-    NotImplemented,
 }
 
 impl From<DbError> for Failure {
@@ -235,17 +233,13 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     })
 }
 
-/// 口の結果の応答。成功は 200 と JSON 本文、絞り込みの不備は 400 (本文なし)、移し終えていない口は 501 (本文なし)、
+/// 口の結果の応答。成功は 200 と JSON 本文、絞り込みの不備は 400 (本文なし)、
 /// SQL Server までの失敗は 502 `{"ok":false,"stage":…,"kind":…}`。
 pub(crate) fn reply_for(outcome: Result<String, Failure>) -> Reply {
     match outcome {
         Ok(body) => Reply { status: 200, body },
         Err(Failure::BadRequest) => Reply {
             status: 400,
-            body: String::new(),
-        },
-        Err(Failure::NotImplemented) => Reply {
-            status: 501,
             body: String::new(),
         },
         Err(Failure::Db(stage, kind)) => Reply {

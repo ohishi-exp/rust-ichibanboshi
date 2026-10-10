@@ -1,5 +1,5 @@
 //! 口の本体。1 リクエスト = 1 接続 (`repo::connect`) で、SQL・クエリの検証・組み立ては ichiban-logic を使う。
-//! 下の 7 本はこのファイル、移している途中の 15 本 (#322) は領域別のモジュール (`handle` 1 本ずつ。埋まるまでは 501):
+//! 下の 7 本はこのファイル、移した 15 本 (#322) は領域別のモジュール (`handle` 1 本ずつ):
 //! [`sales_monthly`]・[`sales_daily`]・[`sales_yoy`]・[`unchin`]・[`surcharge`]・[`schema`]。
 //!
 //! - `POST /probe` — ログインして `SELECT 1`。200 `{"ok":true}`
@@ -46,7 +46,6 @@ pub(crate) async fn run(env: &Env, route: Route, query: &str) -> Reply {
     match &outcome {
         Ok(_) => console_log!("ichiban {name}: ok ({ms} ms)"),
         Err(Failure::BadRequest) => console_log!("ichiban {name}: bad request ({ms} ms)"),
-        Err(Failure::NotImplemented) => console_log!("ichiban {name}: not implemented"),
         Err(Failure::Db(stage, kind)) => console_error!("{}", log_line(route, *stage, kind, ms)),
     }
     reply_for(outcome)

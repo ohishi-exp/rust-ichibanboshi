@@ -47,3 +47,10 @@ path = "workers/ichiban/logic/src/sales_daily.rs"
 # candidates・summary・customer-net・customer-net-detail (c38)
 [[files]]
 path = "workers/ichiban/logic/src/unchin.rs"
+
+# surcharge/base・schema/columns (c39)
+[[files]]
+path = "workers/ichiban/logic/src/surcharge.rs"
+
+[[files]]
+path = "workers/ichiban/logic/src/schema.rs"
