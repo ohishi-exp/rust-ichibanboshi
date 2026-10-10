@@ -537,6 +537,8 @@ dependencies = [
  "bytes",
  "chrono",
  "form_urlencoded",
+ "kintai-kosoku",
+ "kintai-mysql",
  "postgres-types",
  "serde",
  "serde_json",
@@ -549,6 +551,8 @@ dependencies = [
 name = "kintai-mysql"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "kintai-kosoku",
  "sha1",
 ]
 

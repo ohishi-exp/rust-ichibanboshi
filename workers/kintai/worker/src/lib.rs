@@ -7,6 +7,9 @@
 //!   `SELECT 1, VERSION(), @@character_set_connection, CURRENT_USER()` → `COM_QUIT`)。1 リクエスト 1 接続。
 //! - Supabase を読むだけの `GET /api/kintai/{day-summaries,shift-overlaps,shift-days,change-log,wage-range}`
 //!   ([`reads`]。Cloud Run 版と同じ応答・同じ 400/502/503。テナントは `KINTAI_TENANT_ID` の設定 pin)。
+//! - 社内 MariaDB を直接読む `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}`
+//!   (オンプレ版と同じ応答・同じ 400/502/503。検査・SQL の引数・行 → JSON・応答は kintai-logic の `mariadb_reads`)。
+//!   `/probe` と同じ接続・認証・`SET SESSION max_statement_time=60` の上で 1 本のクエリを流す (1 リクエスト 1 接続)。
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
@@ -24,11 +27,15 @@ use std::pin::pin;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
+use kintai_logic::common::{mariadb_fail, mariadb_unconfigured, Fail};
+use kintai_logic::mariadb_reads::{jst_today, MariadbRead};
+use kintai_mysql::response::ResultSet;
+use kintai_mysql::retry::{should_retry, RETRY_DELAY_MS};
 use worker::{console_error, console_log, event, Context, Date, Delay, Env, Request, Response};
 
 use conn::Session;
 use probe::{
-    log_line, parse_creds, reply_for, reply_for_route, route, Creds, Failure, ProbeOk, Read, Reply,
+    log_line, parse_creds, reply_for, reply_for_route, route, Creds, Failure, ProbeOk, Reply,
     Route, Stage,
 };
 
@@ -48,7 +55,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response
     let route = route(req.method().as_ref(), &req.path());
     if let Route::Read(read) = route {
         let url = req.url()?;
-        return run_read(read, url.query().unwrap_or(""), &env).await;
+        let outcome = reads::serve(read, url.query().unwrap_or(""), &env);
+        return run_read(read.as_str(), outcome).await;
+    }
+    if let Route::Mariadb(read) = route {
+        let url = req.url()?;
+        let outcome = mariadb_read(read, url.query().unwrap_or(""), &env);
+        return run_read(read.as_str(), outcome).await;
     }
     // reply_for_route で弾かれなかったのは POST /probe だけ
     let reply = match reply_for_route(route) {
@@ -66,12 +79,14 @@ fn respond(reply: Reply) -> worker::Result<Response> {
         .with_headers(headers))
 }
 
-/// Supabase を読む口。成功は JSON (200)、失敗は平文 (元の axum の `(StatusCode, String)` と同じ text/plain)。
-async fn run_read(read: Read, query: &str, env: &Env) -> worker::Result<Response> {
+/// 読む口 (Supabase・MariaDB)。成功は JSON (200)、失敗は平文 (元の axum の `(StatusCode, String)` と同じ text/plain)。
+async fn run_read(
+    name: &str,
+    outcome: impl Future<Output = Result<serde_json::Value, Fail>>,
+) -> worker::Result<Response> {
     let started = Date::now().as_millis();
-    let outcome = reads::serve(read, query, env).await;
+    let outcome = outcome.await;
     let ms = Date::now().as_millis().saturating_sub(started);
-    let name = read.as_str();
     match outcome {
         Ok(body) => {
             console_log!("kintai {name}: ok ({ms} ms)");
@@ -99,20 +114,27 @@ async fn run_probe(env: &Env) -> Reply {
     reply_for(outcome)
 }
 
+/// 社内 MariaDB を直接読む口。検査 (400) → 資格情報 (無ければ 503) → 接続・クエリ (失敗は 502) → 応答 (元の handler と同じ順)。
+async fn mariadb_read(
+    read: MariadbRead,
+    query: &str,
+    env: &Env,
+) -> Result<serde_json::Value, Fail> {
+    let req = read.parse(query)?;
+    let sql = req.sql_text()?;
+    let creds = load_creds(env).await.ok_or_else(mariadb_unconfigured)?;
+    let set = run_sql(env, &creds, &sql).await.map_err(|f| {
+        let kind = format!("{}:{}", f.stage.as_str(), f.kind);
+        mariadb_fail(&kind)
+    })?;
+    req.respond(&set.rows, jst_today(Date::now().as_millis()))
+}
+
 async fn probe(env: &Env, started: u64) -> Result<ProbeOk, Failure> {
     let creds = load_creds(env)
         .await
         .ok_or(Failure::new(Stage::Secret, "missing"))?;
-    let socket = step(Stage::Connect, CONNECT_TIMEOUT, async {
-        transport::open(env)
-            .await
-            .map_err(|_| "transport".to_string())
-    })
-    .await?;
-    let mut session = Session::new(socket);
-    let result = talk(&mut session, &creds).await;
-    session.quit().await;
-    let set = result?;
+    let set = run_sql(env, &creds, PROBE_SQL).await?;
 
     let unexpected = || Failure::new(Stage::Query, "unexpected_result");
     if set.text(0, 0) != Some("1") {
@@ -130,11 +152,44 @@ async fn probe(env: &Env, started: u64) -> Result<ProbeOk, Failure> {
     })
 }
 
-/// handshake → 認証 → 打ち切り時間の設定 → probe のクエリ。
-async fn talk(
-    session: &mut Session,
-    creds: &Creds,
-) -> Result<kintai_mysql::response::ResultSet, Failure> {
+/// 1 接続を開いて `sql` を 1 本流し、COM_QUIT で閉じる。
+///
+/// 認証パケットを送る前 (connect・handshake の段) の失敗だけ、新しい接続で `kintai_mysql::retry` の上限まで
+/// やり直す (間を空けない再接続で handshake の前に閉じられることがあるため)。認証以降の失敗はそのまま返す。
+async fn run_sql(env: &Env, creds: &Creds, sql: &str) -> Result<ResultSet, Failure> {
+    let mut retries = 0;
+    loop {
+        match run_sql_once(env, creds, sql).await {
+            Err(f) if f.stage.phase().is_some_and(|p| should_retry(p, retries)) => {
+                retries += 1;
+                console_log!(
+                    "kintai mariadb: retry {retries} after {}:{}",
+                    f.stage.as_str(),
+                    f.kind
+                );
+                Delay::from(Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// 1 回ぶん: 接続 → handshake → 認証 → `sql` → COM_QUIT を送って閉じる (失敗しても閉じる)。
+async fn run_sql_once(env: &Env, creds: &Creds, sql: &str) -> Result<ResultSet, Failure> {
+    let socket = step(Stage::Connect, CONNECT_TIMEOUT, async {
+        transport::open(env)
+            .await
+            .map_err(|_| "transport".to_string())
+    })
+    .await?;
+    let mut session = Session::new(socket);
+    let result = talk(&mut session, creds, sql).await;
+    session.quit().await;
+    result
+}
+
+/// handshake → 認証 → 打ち切り時間の設定 → `sql`。
+async fn talk(session: &mut Session, creds: &Creds, sql: &str) -> Result<ResultSet, Failure> {
     let (seq, hs) = step(Stage::Handshake, LOGIN_TIMEOUT, session.handshake()).await?;
     step(
         Stage::Auth,
@@ -144,7 +199,7 @@ async fn talk(
     .await?;
     step(Stage::Query, QUERY_TIMEOUT, async {
         session.query(SET_STATEMENT_TIME).await?;
-        session.query(PROBE_SQL).await
+        session.query(sql).await
     })
     .await
 }

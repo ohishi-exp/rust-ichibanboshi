@@ -2,7 +2,7 @@
 
 勤怠 (kintai) の読み出し Worker `ichibanboshi-kintai` (Refs #322)。口は 2 系統:
 
-- 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` だけ
+- 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` と、直接読む `GET /api/kintai/*` の 4 本 (オンプレ版から移した。下記)
 - Supabase の勤怠スキーマ (`kintai.*`) を**読むだけ**の `GET /api/kintai/*` の 5 本 (Cloud Run 版から移した。下記)
 
 ## 到達の経路
@@ -14,6 +14,9 @@ Workers VPC (TCP 3306) → 既存の Tunnel → 社内 MariaDB。MySQL プロト
 - 文字コードは utf8mb4 (charset 45)
 - 1 リクエスト = 1 接続。接続 → handshake → 認証 → `SET SESSION max_statement_time=60` (convoy 対策。オンプレ版と同じ) → クエリ → `COM_QUIT`
 - 社内 MariaDB へは SELECT だけ
+- **connect・handshake の段 (認証パケットを送る前) の失敗だけ、新しい接続で 2 回までやり直す** (200ms 空ける)。間を空けずに再接続を続けると
+  handshake を読む前に閉じられることがある (`handshake:closed`、20 回連続で 2〜3 回)。認証以降・クエリ以降の失敗はやり直さない。
+  判断は `mysql/src/retry.rs` (`should_retry`)。切断は成否によらず COM_QUIT を送ってから閉じる
 
 Hyperdrive の MySQL は JS ドライバ専用で TLS が必須、wasm32 で動く既製の MySQL クライアントも無かった
 (`mysql_common` は `default-features = false` で wasm32 の build が flate2 の backend 未選択で落ちる) ので自作した。
@@ -34,6 +37,44 @@ Hyperdrive の MySQL は JS ドライバ専用で TLS が必須、wasm32 で動�
   `server:<エラー番号>` 等)。パスワード・接続先・サーバーのエラー本文は応答にもログにも出さない
 
 Service Binding を持つ Worker からだけ呼べる。実機の確認は `wrangler dev --remote` (下記)。
+
+## `GET /api/kintai/*` (社内 MariaDB を直接読む 4 本)
+
+オンプレ版 (root の `src/routes/kintai.rs`) が社内 MariaDB を直接読んで答えていた口を移した。**path・応答 (JSON のキー・null 扱い・
+数値の型)・入力の検査の順・400 / 502 / 503 の条件は元と同じ** (呼び手の切替はまだ)。SQL 文と突合・引き当て・末尾検知の純粋ロジックは
+共有 crate `kintai-kosoku` をオンプレ版と同じものを使う (写さない)。`/probe` と同じ接続・認証・`SET SESSION max_statement_time=60` の上で
+1 本のクエリを流す (1 リクエスト 1 接続)。
+
+| 口 | 引数 | 読む SQL (`kintai_kosoku::sql`) | 窓 | 応答 |
+|---|---|---|---|---|
+| `events` | `month` (`is_valid_month`)・`driver` **必須** | `EVENTS_SQL` | `month_range` = `[月初, 翌月 2 日)` | `{rows}` (7 キー) |
+| `rest-diff` | `month`・`driver` 任意 | `REST_EVENTS_SQL` | `month_range` | `kintai_rest_diff::rest_diff` の結果 + `month`・`driver`・`from`・`to`・`max_items` |
+| `reading-dates` | `month`・`driver` 任意 | `OPERATION_READING_DATES_SQL` | `month_range` | `kintai_reading_dates::reading_dates` の結果 + 同上 |
+| `tail-gap-probe` | `month`・`driver` 任意 | `ALL_EVENTS_SQL` (乗務員の絞りは Rust 側) | `exact_month_range` = `[月初, 翌月初)` | `kintai_tail_gap_probe::tail_gap_probe` の結果。`expected` = min(月末, JST の今日 − 1 日)。今日は Worker が `Date.now()` から作って渡す |
+
+| 結果 | status | 本文 (平文) |
+|---|---|---|
+| `month` が不正 (events は `is_valid_month`、他 3 本は窓が作れない) | 400 | `month は YYYY-MM で指定してください` |
+| `driver` が不正 (events は省略も、他 3 本は `driver=` の空も) | 400 | `driver は乗務員CD (数字) で指定してください` |
+| Query として読めない (同じ欄が 2 回等) | 400 | axum と同じ `Failed to deserialize query string: …` |
+| `KINTAI_MARIADB` が無い・読めない・JSON 不正 | 503 | `MariaDB 接続設定が未設定` (元の `NotConfigured` と同じ) |
+| 接続・handshake・認証・クエリ・行の読み取りの失敗 | 502 | `MariaDB query failed: <段>:<種別>` (`connect:timeout`・`query:server:1146`・`rows:int` 等。DB の message・接続先は出さない) |
+
+検査の順は元の handler と同じ (`month` → `driver` → 資格情報 → DB)。
+
+- **値の埋め込み**: 自作コーデックは COM_QUERY (テキストプロトコル) だけなので、SQL の名前付き引数 (`:from`・`:to`・`:driver`) を
+  `kintai_mysql::bind::expand` がリテラルに展開する。受ける値は**整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL の 3 種だけ**で、
+  任意の文字列を受ける口は無い (`month` も `driver` も検査済みの値から作る)。引用符・バッククォートの中は飛ばし、未知の名前・使われない
+  名前・コメントはエラー (502 `bind_*`)。4 本の SQL の名前の集合と渡す名前の集合の一致はテスト (`mysql/tests/bind.rs`・`logic/tests/mariadb.rs`) で固定
+- **行 → JSON**: テキストプロトコルの各列 (バイト列か NULL) を、元の mysql_async のタプルと同じ型で読む。元で `String` の列の NULL・
+  整数の列の読めない値・不正な UTF-8 は 502 (`rows:null`・`rows:int`・`rows:utf8`)。NULL は JSON の null (0 や空文字にしない)
+- オンプレ版の同時実行キャップ (`KOSOKU_DB_PERMITS` の 4) は持たない (Worker はリクエストごとに独立)。`max_statement_time=60` は同じ
+
+### 後の段に残したもの
+
+- `day-events`・`dtako/worktime` — 純粋部分を root から共有 crate へ移す必要がある (次の PR)
+- `kosoku-daily`・`version`・timecard の読み 2 本 — その後
+- `timecard/diff` (POST)
 
 ## `GET /api/kintai/*` (Supabase を読む 5 本)
 
@@ -85,6 +126,13 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | 4 つの `read_tenant_of` / `tenant_of` (`[kintai_events]` → `[kintai_push]` の pin) | `src/common.rs` の `tenant_of` 1 つ (`KINTAI_TENANT_ID`) |
 | `month_date_bounds` (DATE) と `month_bounds` (JST の TIMESTAMPTZ。`kintai_push::jst_day_bounds`) | `src/common.rs` の `month_bounds` + `jst_midnight` 1 つずつ |
 | 4 つの `store` (`[kintai_push]` が無効なら 503) | `src/common.rs` の `no_db` (`KINTAI_HYPERDRIVE` が無ければ 503) |
+| `src/routes/kintai.rs` の `events`・`rest_diff`・`reading_dates`・`tail_gap_probe` (検査・窓・応答の JSON) | `src/mariadb_reads.rs` |
+| `src/routes/kintai.rs` の `map_repo_err` (`MariaDB 接続設定が未設定` / `MariaDB query failed: `) | `src/common.rs` の `mariadb_unconfigured`・`mariadb_fail` |
+| `src/kintai_repo.rs` の `row_to_json` (`EVENTS_SQL` の 7 列) | `src/mariadb_rows.rs` の `event_row` |
+| `src/kintai_repo.rs` の `all_row_to_json` (`ALL_EVENTS_SQL` の 5 列。`unko_no`・`vehicle` はキーごと出さない) | `src/mariadb_rows.rs` の `all_event_row` |
+| `src/kintai_repo.rs` の `rest_row_to_json` (`REST_EVENTS_SQL` の 6 列。`vehicle` 無し) | `src/mariadb_rows.rs` の `rest_row` |
+| `src/kintai_repo.rs` の `reading_date_row_to_json` (`OPERATION_READING_DATES_SQL` の 6 列) | `src/mariadb_rows.rs` の `reading_date_row` |
+| `src/kintai_http_repo.rs` の `today_jst` | `src/mariadb_reads.rs` の `jst_today` (Worker が `Date.now()` を渡す) |
 
 テストは `logic/tests/` (DB 不要)。元の単体テストのうちテナント・月の境界・store の写しは `tests/common.rs` に畳み、
 handler を叩いていたものは同じ入力を `parse` に通す形に書き直した。DB を要する元の `tests/*_pg_test.rs` は写していない。
@@ -97,7 +145,7 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 ## binding (`worker/wrangler.toml`)
 
 - `KINTAI_MARIADB_VPC` — Workers VPC の VPC Service (TCP 3306)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-kintai-mariadb` の id
-- `KINTAI_MARIADB` — Secrets Store の secret。JSON `{"user":…,"password":…,"database":…}` (どれも空でない文字列)。未投入なら `/probe` は 503
+- `KINTAI_MARIADB` — Secrets Store の secret。JSON `{"user":…,"password":…,"database":…}` (どれも空でない文字列)。未投入なら `/probe` と MariaDB の 4 本は 503
 - `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ `GET /api/kintai/*` は 503
 - `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
 - `CF_VERSION_METADATA` — 版の元
@@ -107,10 +155,11 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 ## 構成
 
 - `mysql/` (`kintai-mysql`): I/O を持たない純粋なコーデック。`packet.rs` (枠・length-encoded の値) / `handshake.rs` (Initial Handshake v10・
-  HandshakeResponse41・mysql_native_password・Auth Switch) / `response.rs` (OK / ERR / EOF・COM_QUERY・テキストの結果セット)。
+  HandshakeResponse41・mysql_native_password・Auth Switch) / `response.rs` (OK / ERR / EOF・COM_QUERY・テキストの結果セット) /
+  `bind.rs` (名前付き引数を整数・日時・NULL のリテラルに展開) / `retry.rs` (接続のやり直しの判断)。
   CLIENT_DEPRECATE_EOF は立てない (結果セットは EOF で区切られる形に固定)。テストは `mysql/tests/codec.rs`、100% 行カバレッジ gate は `coverage_100.toml`
-- `logic/` (`kintai-logic`): Supabase を読む 5 本の口の純粋部分 (上の対応表)。100% 行カバレッジ gate は `coverage_100.toml`
-- `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
+- `logic/` (`kintai-logic`): Supabase を読む 5 本と社内 MariaDB を読む 4 本の口の純粋部分 (上の対応表)。100% 行カバレッジ gate は `coverage_100.toml`
+- `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 4 本の往復) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
   `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) /
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
@@ -120,7 +169,7 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 
 `cargo test -p kintai-mysql -p kintai-logic` (DB 不要)。Worker は `cargo build --target wasm32-unknown-unknown` と clippy まで。
 ローカルで VPC や Secrets Store を迂回する var は持たないので、実接続は VPC Service と `KINTAI_MARIADB` を用意してから
-`wrangler dev --remote` で `POST /probe`。Supabase の 5 本も同じく `wrangler dev --remote` (Hyperdrive の経路は CI では通せない)。
+`wrangler dev --remote` で `POST /probe` と MariaDB の 4 本。Supabase の 5 本も同じく `wrangler dev --remote` (Hyperdrive の経路は CI では通せない)。
 `--var "KINTAI_TENANT_ID:<UUID>"` を渡すと 5 本が 503 ではなく答える。
 
 ## 本番 deploy

@@ -1,6 +1,8 @@
 //! 経路判定・失敗の段と応答の写像・資格情報 JSON の検証 (純粋ロジック)。
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
+use kintai_logic::mariadb_reads::MariadbRead;
+use kintai_mysql::retry::Phase;
 use serde::{Deserialize, Serialize};
 
 /// 経路判定の結果。
@@ -10,6 +12,8 @@ pub(crate) enum Route {
     Probe,
     /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 5 本
     Read(Read),
+    /// `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}` — 社内 MariaDB を直接読む 4 本
+    Mariadb(MariadbRead),
     NotFound,
     MethodNotAllowed,
 }
@@ -49,8 +53,16 @@ impl Read {
     }
 }
 
-/// 口は `POST /probe` と `GET /api/kintai/*` の 5 本。path が合って method が違えば 405、それ以外の path は 404。
+/// 口は `POST /probe` と `GET /api/kintai/*` の 9 本 (Supabase 5 本・MariaDB 4 本)。
+/// path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
+    if let Some(read) = MariadbRead::from_path(path) {
+        return if method == "GET" {
+            Route::Mariadb(read)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
     if let Some(read) = Read::from_path(path) {
         return if method == "GET" {
             Route::Read(read)
@@ -90,6 +102,17 @@ impl Stage {
             Stage::Query => "query",
         }
     }
+
+    /// やり直しの判断 (`kintai_mysql::retry`) に渡す段。資格情報の段は接続の外なので `None`。
+    pub(crate) fn phase(self) -> Option<Phase> {
+        match self {
+            Stage::Secret => None,
+            Stage::Connect => Some(Phase::Connect),
+            Stage::Handshake => Some(Phase::Handshake),
+            Stage::Auth => Some(Phase::Auth),
+            Stage::Query => Some(Phase::Query),
+        }
+    }
 }
 
 /// 失敗 (段と種別の名前だけ。サーバーの文言・宛先・ユーザー名は持たない)。
@@ -120,7 +143,7 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
     let status = match route {
         Route::NotFound => 404,
         Route::MethodNotAllowed => 405,
-        Route::Probe | Route::Read(_) => return None,
+        Route::Probe | Route::Read(_) | Route::Mariadb(_) => return None,
     };
     Some(Reply {
         status,
