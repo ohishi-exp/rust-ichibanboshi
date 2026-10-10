@@ -82,6 +82,8 @@ use sha2::{Digest, Sha256};
 
 use crate::config::KintaiEventsConfig;
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
+// `unko_no` の先頭桁の読み方・窓の述語・末尾検知の閾値は共有 crate に置く (Refs #322)。
+pub(crate) use kintai_kosoku::window::{unko_no_start_date, window_holds, MAX_TAIL_GAP_DAYS};
 
 /// 上流の endpoint path。
 const EVENTS_PATH: &str = "/api/dtako/events";
@@ -1337,25 +1339,6 @@ fn in_window(ev: &RawEvent, from: NaiveDateTime, to: NaiveDateTime) -> bool {
     window_holds(ev.start, ev.end, from, to)
 }
 
-/// [`in_window`] の中身。**開始・終了 (区間なら) だけで判定する**ので、fold が
-/// 読んだ行を乗務員ごとの窓へ切り戻すとき (`kintai_fold`、Refs
-/// ohishi-exp/nuxt-dtako-admin#1123) も同じ述語を使う — 絞り方が 2 実装に
-/// ならないように。
-pub(crate) fn window_holds(
-    start: NaiveDateTime,
-    end: Option<NaiveDateTime>,
-    from: NaiveDateTime,
-    to: NaiveDateTime,
-) -> bool {
-    if start >= from && start < to {
-        return true;
-    }
-    match end {
-        Some(end) => start < from && end >= from && end < to,
-        None => false,
-    }
-}
-
 fn fmt_dt(dt: NaiveDateTime) -> String {
     dt.format(OUT_DATETIME_FORMAT).to_string()
 }
@@ -1431,82 +1414,6 @@ fn month_etags_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
 }
 
 // ── 入力 (dtako_events) の欠けの検知 (Refs #205 の 21) ─────────────────────
-
-/// `unko_no` の先頭に埋まっている運行開始日時の桁数 (`YYMMDDHHMMSS`)。
-const UNKO_NO_DATE_DIGITS: usize = 6;
-
-/// etags の窓の末尾がこれより長く空いていたら「入力が欠けている」と見なす (日)。
-///
-/// ## 2 日 → 7 日 (Refs #205 の 37、**暫定値**)
-///
-/// **元の 2 日は「月・全乗務員を通した単一の `last`」向けの値**だった。下の実測は
-/// 「全乗務員のうち誰か 1 人でも走っていれば窓は埋まる」前提で数えたもので、
-/// 誰か 1 人が窓の端まで走っていれば gap は 0 になる。
-///
-/// #205 の 32 が粒度を**乗務員別**に割った際、閾値はこの 2 日のまま据え置かれた。
-/// 乗務員 1 人を見れば**土日を挟むだけで gap は 3〜4 日**になるので、本番 2026-06
-/// では母集団 113 名のうち **72 名**が鳴り続けた。warning が立つと月ゲートが封を
-/// しないため、#205 の主目的 (fold の全量読みを省く) が無効化されたままになる。
-///
-/// **7 日 = 週末 + 1 日。「1 週間以上音沙汰が無い」は業務として異常**と言える位置で、
-/// 実際に欠けている 1078 / 1517 / 1688 (gap 8 前後) は拾える。14 日まで緩めると
-/// この本物を取りこぼす (親の判断、2026-07-31)。
-///
-/// **暫定値なのは、この閾値が見ているのが etags の運行開始日で、閾値を選ぶ根拠に
-/// 使った分布 (`day_summaries` の最終勤務日) とは別の量だから。** 実際に何名鳴るかは
-/// deploy して測るまで分からない。十分下がらなければ再調整する。
-///
-/// ## 元の実測 (単一 `last` 時代、2 日の根拠)
-///
-/// オンプレの生イベント口 (`/api/kintai/events`) から乗務員 47 名 (全 141 名の 1/3)
-/// × 4 か月の 966 運行を引いて、窓 `[月初, 翌月初]` の日ごとの運行開始件数を数えると:
-///
-/// | 月 | 運行開始が 0 件の日 (窓の途中) | 窓の末尾の空き |
-/// |---|---|---|
-/// | 2025-12 (年末) | 無し | 1 日 |
-/// | 2026-01 (年始) | 無し | 0 日 |
-/// | 2026-05 | 2 日 (05-03 / 05-23) | 0 日 |
-/// | 2026-06 | 1 日 (06-13) | 0 日 |
-///
-/// **年末年始でも運行開始は途切れない** (12/27〜12/31 も毎日 4〜10 件、01/01 も
-/// 2 件)。1/3 の抽出でこれなので、全乗務員なら空き日はさらに減る方向にしか動かない
-/// (部分集合のゼロ日 ⊇ 全体のゼロ日)。
-///
-/// `pub(crate)` なのは [`crate::kintai_tail_gap_probe`] が同じ値を読むだけの診断
-/// (Refs #205、鳴っている 12 名を名指しする口) に使うため。**値はここが唯一の
-/// 真実**で、診断側は複製しない — 複製すると drift したときに気付けない。
-pub(crate) const MAX_TAIL_GAP_DAYS: i64 = 7;
-
-/// `unko_no` の先頭 6 桁 (`YYMMDD`) = **運行開始日**。
-///
-/// 定義を書いた場所は alc にも本リポにも無い (`運行NO` はデジタコ由来の不透明な
-/// キーとして通されているだけ) ので、実データで裏を取った値。上記 966 運行で
-/// `unko_no[..12]` を `YYMMDDHHMMSS` として読むと、**不一致 0 / パース不能 0** で、
-/// うち 922 件はその運行の `運行開始` の点イベントと**秒まで一致**した
-/// (例: `26060610055500000023021` → `2026-06-06 10:05:55`)。
-///
-/// 末尾 (車輌コード) の長さは可変 (実データは 23 桁、22 桁の実物も居る) なので、
-/// **先頭だけを見て後ろは一切見ない**。
-///
-/// `pub(crate)` なのは [`crate::kintai_rest_diff`] が休息のずれの一覧に
-/// 運行日を添えるため (Refs #205 の 41)。読み方は 1 か所に置く。
-pub(crate) fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(unko_no.get(..UNKO_NO_DATE_DIGITS)?, "%y%m%d").ok()
-}
-
-/// `unko_no` の先頭 12 桁 (`YYMMDDHHMMSS`) = **運行開始日時** (Refs
-/// ohishi-exp/nuxt-dtako-admin#1123)。裏取りは [`unko_no_start_date`] と同じ実測。
-///
-/// fold の読み窓を月初をまたぐ運行の開始まで遡らせるのに使う
-/// ([`crate::kintai_repo::month_head_anchors`])。日付版は 6 桁しか要らない呼び出し
-/// (短い fixture を含む) のために別に残す。
-///
-/// `routes/dtako_day.rs` にも同じ 1 行があるが、あちらは `build.rs` の glob の外に
-/// 置くために別に持っている。fold の出力を決めるこちらを glob の外から借りると、
-/// 変えても `logic_version` が回らなくなるのでここに置く。
-pub(crate) fn unko_no_start_datetime(unko_no: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(unko_no.get(..12)?, "%y%m%d%H%M%S").ok()
-}
 
 /// etags の一覧から測った「入力がどこまで届いているか」(Refs #205 の 21)。
 ///
@@ -2899,50 +2806,6 @@ mod tests {
     }
 
     // ── 入力欠けの検知 (Refs #205 の 21) ──────────────────────────────────
-
-    /// `unko_no` の実物 (23 桁) / テスト fixture の 22 桁 / 読めない形。
-    #[test]
-    fn unko_no_start_date_reads_the_leading_yymmdd_only() {
-        let real = unko_no_start_date("26060610055500000023021");
-        assert_eq!(real, Some(d(2026, 6, 6)), "実物 23 桁");
-        let short_tail = unko_no_start_date("2602241025060000000272");
-        assert_eq!(short_tail, Some(d(2026, 2, 24)), "車輌コードが短い 22 桁");
-        assert_eq!(unko_no_start_date("U1"), None, "6 桁に満たない");
-        assert_eq!(unko_no_start_date("269999123456"), None, "日付として不正");
-        assert_eq!(unko_no_start_date("26060X10055500"), None, "数字でない");
-    }
-
-    /// 先頭 12 桁 = 運行開始日時 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
-    #[test]
-    fn unko_no_start_datetime_reads_the_leading_12_digits() {
-        let got = unko_no_start_datetime("26033121394700000043241");
-        assert_eq!(got, Some(dt("2026-03-31 21:39:47")), "1194 の実物");
-        let short_tail = unko_no_start_datetime("2602241025060000000272");
-        assert_eq!(short_tail, Some(dt("2026-02-24 10:25:06")), "22 桁");
-        assert_eq!(unko_no_start_datetime("260331"), None, "12 桁に満たない");
-        assert_eq!(
-            unko_no_start_datetime("269999123456"),
-            None,
-            "日付として不正"
-        );
-        assert_eq!(
-            unko_no_start_datetime("260331256000"),
-            None,
-            "時刻として不正"
-        );
-    }
-
-    /// 切り出した述語は区間の 2 ブランチと点をそのまま判定する。
-    #[test]
-    fn window_holds_matches_the_two_sql_branches() {
-        let (from, to) = (dt("2026-04-01 00:00:00"), dt("2026-05-02 00:00:00"));
-        let before = dt("2026-03-31 21:36:28");
-        assert!(!window_holds(before, None, from, to), "点は開始で判定");
-        let inside = Some(dt("2026-04-01 04:38:56"));
-        assert!(window_holds(before, inside, from, to), "期間内に終わる区間");
-        assert!(window_holds(from, None, from, to), "下端は含む");
-        assert!(!window_holds(to, None, from, to), "上端は含まない");
-    }
 
     /// `driver_cds` 無し (alc がまだ返さない現行環境相当)。
     fn pair(unko_no: &str, etag: Option<&str>) -> Pair {

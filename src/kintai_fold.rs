@@ -94,19 +94,17 @@
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use sha2::{Digest, Sha256};
 
-use crate::kintai_push::{
-    jst_day_bounds, KintaiPgStore, KintaiPushError, DATETIME_FORMAT, PUSHED_SOURCES,
-};
+use crate::kintai_push::{jst_day_bounds, KintaiPgStore, KintaiPushError, PUSHED_SOURCES};
 use crate::kintai_repo::{
     exact_month_range, lookback_from, month_range, DynKintaiEventsRepo, KintaiRepoError,
 };
 use crate::kosoku::{
     daily_summary, drop_duplicate_rows, DaySummary, KosokuParams, NonWorking, ShiftSource,
 };
+use kintai_kosoku::window::parse_dt;
 
-/// 乗務員CD → 読みの遡り起点 (`YYYY-MM-DD HH:MM:SS`)。
-/// [`crate::kintai_repo::KintaiEventsApi::fetch_month_head_anchors`] の戻り値。
-pub type HeadAnchors = std::collections::BTreeMap<u64, String>;
+// 乗務員ごとの窓への切り戻しは共有 crate に置く (Refs #322)。
+pub use kintai_kosoku::anchors::{clip_to_anchors, HeadAnchors};
 
 /// `build.rs` が焼き込む「出力に効くコード」の内容ハッシュ (16 桁 hex)。
 ///
@@ -237,10 +235,6 @@ fn shift_source_str(s: ShiftSource) -> &'static str {
         ShiftSource::Timecard => "timecard",
         ShiftSource::Rest => "rest",
     }
-}
-
-fn parse_dt(s: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, DATETIME_FORMAT).ok()
 }
 
 fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -1023,48 +1017,6 @@ pub fn read_window(
         None => lookback_from(&from, anchors),
     };
     Ok((from, to))
-}
-
-/// 乗務員ごとに `[起点 or 月初, to)` へ切り戻す。**切り戻した後に 0 行の乗務員は
-/// 落とす** — 広げた窓のせいで現れただけの乗務員に単位を立てない (今までの母集団を
-/// 保つ)。
-///
-/// 述語は HTTP 実装の読み ([`crate::kintai_http_repo`] の `in_window`) と同じ
-/// [`crate::kintai_http_repo::window_holds`]。起点の無い乗務員は、月初から読んだ
-/// ときと同じ行の集合に戻る。時刻が読めない行は落とさない (読み先が窓で絞って
-/// 返したものなので、今までも入っていた)。
-pub fn clip_to_anchors(
-    by_driver: Vec<(u64, Vec<serde_json::Value>)>,
-    month: &str,
-    anchors: &HeadAnchors,
-) -> Vec<(u64, Vec<serde_json::Value>)> {
-    let Some((month_start, to)) = month_range(month) else {
-        return by_driver;
-    };
-    let (Some(month_start), Some(to)) = (parse_dt(&month_start), parse_dt(&to)) else {
-        return by_driver;
-    };
-    let at = |r: &serde_json::Value, k: &str| r.get(k).and_then(|v| v.as_str()).and_then(parse_dt);
-    by_driver
-        .into_iter()
-        .filter_map(|(cd, rows)| {
-            let from = anchors
-                .get(&cd)
-                .and_then(|a| parse_dt(a))
-                .unwrap_or(month_start);
-            let rows: Vec<serde_json::Value> = rows
-                .into_iter()
-                .filter(|r| match at(r, "datetime") {
-                    Some(start) => {
-                        let end = at(r, "end_datetime");
-                        crate::kintai_http_repo::window_holds(start, end, from, to)
-                    }
-                    None => true,
-                })
-                .collect();
-            (!rows.is_empty()).then_some((cd, rows))
-        })
-        .collect()
 }
 
 /// 遡った乗務員を 1 行ずつ warnings に出す (封は止めない — 診断)。
