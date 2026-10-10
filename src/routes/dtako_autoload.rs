@@ -147,90 +147,72 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
-use serde::Deserialize;
 
-use crate::cakephp::{CakephpClient, CakephpError};
-use crate::dtako_reset_material::{count_reset_material, DynResetMaterialRepo};
-
-/// ③ (`CakephpClient::post_reset_timecard`) の応答に添える注意書き。
-/// **空 200 は成功の証明ではない** (`yhonda-ohishi/nginx#796` に起票済み)。
-/// 受け入れ条件5: `reset_http_status` を成功の証明に使わせない。
-const RESET_TIMECARD_STATUS_NOTE: &str = "reset_http_status は空 200 でも失敗でも同じ値になり得ます。成否は Flash (session) にしか出ないため呼び出し側からは判別できません (yhonda-ohishi/nginx#796)";
-
-/// nginx 側の相対パス。**host は含めない** — 受け入れ条件6 (内部アドレスを
-/// commit / PR / docs に書かない)。実際の到達先は `CakephpClient` の
-/// `base_url` (env `CAKEPHP_BASE_URL`) が持つ。
-const AUTOLOAD_PATH: &str = "/dtako-events/autoload";
-
-/// この route 専用の body size 上限 (20 MiB)。axum の `Bytes` extractor は
-/// 既定 2 MiB までしか受けない — 1 件 (1 unko_no) ぶんの csvdata.zip は
-/// 数 CSV の集合で通常はごく小さいはずだが、上限自体は
-/// `DefaultBodyLimit::max` で個別に緩めておく (他の route の既定 2 MiB には
-/// 影響しない、server.rs でこの route にだけ layer する)。
-pub const MAX_ZIP_BYTES: usize = 20 * 1024 * 1024;
-
-/// `?unko_no=&file_name=&preview=&reset_timecard=`
-#[derive(Debug, Deserialize)]
-pub struct AutoloadQuery {
-    pub unko_no: Option<String>,
-    pub file_name: Option<String>,
-    #[serde(default)]
-    pub preview: bool,
-    /// ③ (勤務時間再登録) まで続けるか。**既定 `false`** (受け入れ条件1、
-    /// モジュール doc 「`reset_timecard`」節参照)。
-    #[serde(default)]
-    pub reset_timecard: bool,
-}
-
-/// ③ の相対パス。**host は含めない** — 受け入れ条件6 と同じ理由
-/// (`AUTOLOAD_PATH` 参照)。`unko_no` は呼び出し前に `parse_unko_no` で
-/// 数字のみと確定済みなので percent-encode は不要。
-fn reset_timecard_path(unko_no: &str) -> String {
-    format!("/time-card-dtako/resetby-unko-no/{unko_no}")
-}
-
-/// `unko_no` の受け入れ判定。**空・非数字は拒否** — 「対象を名指しで受け取る」
-/// (月まるごと等の一括指定を弾く) 歯止め。桁数は固定しない — オンプレ23桁 /
-/// GCP・theearth 側22桁で実物の桁が揺れる (Refs #205 の 57 実機確認、
-/// `dtako_day.rs` のモジュール doc 参照) ため、「全部数字で最低限それらしい
-/// 長さ」だけを見る (12 = `unko_no` 先頭の開始日時 `YYMMDDHHMMSS` の桁数)。
-fn parse_unko_no(raw: &str) -> Option<&str> {
-    if raw.len() < 12 || !raw.as_bytes().iter().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(raw)
-}
+use crate::cakephp::{CakephpClient, CakephpError, DtakoAutoloadResponse, ResetTimecardResponse};
+use crate::dtako_reset_material::DynResetMaterialRepo;
+// クエリの検査・400 の文言・① ② ③ の段取り・応答の組み立ては勤怠 Worker と共有の `kintai-logic` が正本
+// (Refs #322)。ここは axum・reqwest・mysql_async の送受信だけを持つ
+use kintai_logic::dtako_autoload::{self as logic, AutoloadIo, MaterialQuery};
+pub use kintai_logic::dtako_autoload::{AutoloadQuery, MAX_ZIP_BYTES};
 
 /// CakePHP client のエラーを HTTP ステータスへ写す。`routes/kintai.rs` に同じ形の
 /// `map_cakephp_err` があるが、あちらは `build.rs` の glob 対象 (`logic_version` が
 /// 動く) なので import せず独立して持つ (`dtako_day.rs` と同じ方針)。
 fn map_cakephp_err(e: CakephpError) -> (StatusCode, String) {
-    match e {
-        CakephpError::NotConfigured => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "CakePHP base_url が未設定 (CAKEPHP_BASE_URL)".to_string(),
-        ),
-        CakephpError::RequestFailed(m) => (
-            StatusCode::BAD_GATEWAY,
-            format!("nginx への接続に失敗: {m}"),
-        ),
-        // post_dtako_autoload は非2xxも Ok で返すので実際には作らないが、
-        // CakephpError は他の fetch_* と共有の enum なので網羅のために残す
-        CakephpError::StatusError {
-            status,
-            body_excerpt,
-        } => (
-            StatusCode::BAD_GATEWAY,
-            format!("CakePHP returned {status}: {body_excerpt}"),
-        ),
-        CakephpError::JsonError(m) => (
-            StatusCode::BAD_GATEWAY,
-            format!("CakePHP response parse failed: {m}"),
-        ),
+    let (status, body) = logic::map_err(e, logic::NOT_CONFIGURED_ONPREM);
+    // map_err が返すのは 502 / 503 だけ
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        body,
+    )
+}
+
+/// ② ③ は reqwest (`CakephpClient`)、① は mysql_async (`ResetMaterialApi`)。
+struct OnpremIo<'a> {
+    cakephp: &'a CakephpClient,
+    reset_material: &'a DynResetMaterialRepo,
+    unko_no: &'a str,
+    body: Bytes,
+}
+
+impl AutoloadIo for OnpremIo<'_> {
+    fn configured(&self) -> bool {
+        self.cakephp.is_enabled()
+    }
+
+    async fn autoload(&self, file_name: &str) -> Result<DtakoAutoloadResponse, CakephpError> {
+        let res = self
+            .cakephp
+            .post_dtako_autoload(file_name, self.body.to_vec())
+            .await?;
+        let (unko_no, size_bytes, status) = (self.unko_no, self.body.len(), res.status);
+        tracing::info!(unko_no, size_bytes, status, "dtako autoload sent");
+        Ok(res)
+    }
+
+    async fn count_material(&self, q: &MaterialQuery) -> Result<i64, String> {
+        let (from, to) = q.window_strings();
+        let res = self
+            .reset_material
+            .count_material(&from, &to, &q.v1, &q.v2)
+            .await;
+        res.map_err(|e| {
+            tracing::warn!(unko_no = self.unko_no, error = %e, "dtako reset material count failed");
+            e.to_string()
+        })
+    }
+
+    async fn reset(&self, unko_no: &str) -> Result<ResetTimecardResponse, CakephpError> {
+        let res = self.cakephp.post_reset_timecard(unko_no).await;
+        match &res {
+            Ok(r) => tracing::info!(unko_no, status = r.status, "dtako reset_timecard sent"),
+            Err(e) => tracing::warn!(unko_no, error = %e, "dtako reset_timecard failed"),
+        }
+        res
     }
 }
 
-/// POST /api/dtako/autoload?unko_no=&file_name=&preview= — csvdata.zip (body) を
+/// POST /api/dtako/autoload?unko_no=&file_name=&preview=&reset_timecard= — csvdata.zip (body) を
 /// 1 件だけ社内 nginx の取り込み口へ中継する (Refs #205 の 58 / #274)。
 pub async fn autoload(
     Query(params): Query<AutoloadQuery>,
@@ -238,137 +220,23 @@ pub async fn autoload(
     Extension(reset_material): Extension<DynResetMaterialRepo>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let unko_no = match params.unko_no.as_deref().and_then(parse_unko_no) {
-        Some(u) => u.to_string(),
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "unko_no は対象を1件、数字だけで指定してください (一括取り込みは不可)".to_string(),
-            ))
-        }
-    };
-    if body.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "body が空です。csvdata.zip の中身を送ってください".to_string(),
-        ));
-    }
-    let file_name = params
-        .file_name
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "csvdata.zip".to_string());
-    let size_bytes = body.len();
-
-    if params.preview {
+    let req =
+        logic::parse(params, body.len()).map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
+    let (unko_no, size_bytes) = (req.unko_no.as_str(), req.size_bytes);
+    if req.preview {
         tracing::info!(unko_no, size_bytes, "dtako autoload: preview");
-        // preview でも③の材料件数は計算する (受け入れ条件4) — 打つ前に危険が見える。
-        // reset_timecard=false なら計算しない (preview は今までどおり DB を叩かない)。
-        let (dtako_events_count, count_error) = if params.reset_timecard {
-            match count_reset_material(&reset_material, &unko_no).await {
-                Ok(n) => (Some(n), None),
-                Err(e) => {
-                    tracing::warn!(unko_no, error = %e, "dtako reset material count failed (preview)");
-                    (None, Some(e.to_string()))
-                }
-            }
-        } else {
-            (None, None)
-        };
-        return Ok(Json(serde_json::json!({
-            "preview": true,
-            "unko_no": unko_no,
-            "file_name": file_name,
-            "size_bytes": size_bytes,
-            "target_path": AUTOLOAD_PATH,
-            "configured": cakephp.is_enabled(),
-            // ③ は preview でも実行しない (受け入れ条件6) — 予定だけを返す
-            "reset_timecard": params.reset_timecard,
-            "reset_target_path": params.reset_timecard.then(|| reset_timecard_path(&unko_no)),
-            // ③ の材料件数 (受け入れ条件3/4)。数えられなければ null + エラー文言
-            "dtako_events_count": dtako_events_count,
-            "dtako_events_count_error": count_error,
-            "note": "preview=true のため実際には送信していません",
-        })));
     }
-
-    let res = cakephp
-        .post_dtako_autoload(&file_name, body.to_vec())
-        .await
-        .map_err(map_cakephp_err)?;
-    let http_ok = (200..300).contains(&res.status);
-    let status = res.status;
-    tracing::info!(unko_no, size_bytes, status, "dtako autoload sent");
-
-    // ③ (reset_timecard)。②が非2xxなら実行しない (受け入れ条件3)。②の接続自体が
-    // 失敗した場合は上の `?` で既に早期リターンしているのでここには来ない。
-    let mut reset_attempted = false;
-    let mut reset_http_status: Option<u16> = None;
-    let mut reset_location: Option<String> = None;
-    let mut reset_error: Option<String> = None;
-    let mut reset_skip_reason: Option<&str> = None;
-    let mut dtako_events_count: Option<i64> = None;
-    if params.reset_timecard {
-        if http_ok {
-            // ★③の直前 (②のあと) に数える — ②の取り込みで増えた分を取りこぼさない
-            // (モジュール doc 「③は削除してから作り直す」参照)。
-            match count_reset_material(&reset_material, &unko_no).await {
-                Ok(0) => {
-                    tracing::info!(unko_no, "dtako reset_timecard skipped: no dtako_events");
-                    reset_skip_reason = Some("no_dtako_events");
-                    dtako_events_count = Some(0);
-                }
-                Ok(n) => {
-                    dtako_events_count = Some(n);
-                    reset_attempted = true;
-                    match cakephp.post_reset_timecard(&unko_no).await {
-                        Ok(r) => {
-                            let s = r.status;
-                            tracing::info!(unko_no, status = s, "dtako reset_timecard sent");
-                            reset_http_status = Some(r.status);
-                            reset_location = r.location;
-                        }
-                        Err(e) => {
-                            tracing::warn!(unko_no, error = %e, "dtako reset_timecard failed");
-                            reset_error = Some(e.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(unko_no, error = %e, "dtako reset_timecard skipped: count failed");
-                    reset_skip_reason = Some("count_failed");
-                    reset_error = Some(e.to_string());
-                }
-            }
-        } else {
-            tracing::info!(unko_no, "dtako reset_timecard skipped: step2 not http_ok");
-            reset_skip_reason = Some("step2_failed");
-        }
+    let io = OnpremIo {
+        cakephp: &cakephp,
+        reset_material: &reset_material,
+        unko_no,
+        body,
+    };
+    let res = logic::run(&io, &req).await.map_err(map_cakephp_err)?;
+    if let Some(reason) = res["reset_skip_reason"].as_str() {
+        tracing::info!(unko_no, reason, "dtako reset_timecard skipped");
     }
-
-    Ok(Json(serde_json::json!({
-        "preview": false,
-        "unko_no": unko_no,
-        "file_name": file_name,
-        "size_bytes": size_bytes,
-        "target_path": AUTOLOAD_PATH,
-        "http_status": res.status,
-        "http_ok": http_ok,
-        // 3xx でも取り込みは走っている (モジュール doc 参照) — http_status では
-        // 成否を判断できないので、redirect 先だけでも渡しておく (受け入れ条件2)。
-        "location": res.location,
-        "response_excerpt": res.body_excerpt,
-        // ③ の結果は reset_ prefix で分ける (②の http_status/location とは混ぜない、受け入れ条件4)
-        "reset_timecard": params.reset_timecard,
-        "reset_attempted": reset_attempted,
-        "reset_skip_reason": reset_skip_reason,
-        // ③ の材料件数 (受け入れ条件3)。0 件なら reset_skip_reason=no_dtako_events で
-        // reset_attempted=false のまま (モジュール doc 「③は削除してから作り直す」参照)
-        "dtako_events_count": dtako_events_count,
-        "reset_http_status": reset_http_status,
-        "reset_location": reset_location,
-        "reset_error": reset_error,
-        "reset_note": reset_attempted.then_some(RESET_TIMECARD_STATUS_NOTE),
-    })))
+    Ok(Json(res))
 }
 
 #[cfg(test)]
@@ -377,6 +245,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::routing::post;
     use axum::Router;
+    use kintai_logic::dtako_autoload::parse_unko_no;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -925,6 +794,240 @@ mod tests {
         assert_eq!(body["reset_skip_reason"], serde_json::json!("count_failed"));
         assert_eq!(body["dtako_events_count"], serde_json::Value::Null);
         assert!(body["reset_error"].as_str().unwrap().contains("boom"));
+    }
+
+    /// status と本文 (加工しない) を返す。snapshot 用。
+    async fn call_raw(router: Router, uri: &str, body: Vec<u8>) -> String {
+        let res = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let ct = res
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        format!("{status} [{ct}] {}", String::from_utf8_lossy(&bytes))
+    }
+
+    /// 移す前 (基点 dd2b9c4) の autoload の応答 (status・本文) と CakePHP へ送ったリクエストを、
+    /// ① ② ③ の段取りの分岐ごとに固定する (Refs #322)。純粋部分を kintai-logic へ移した後も同じであること。
+    #[tokio::test]
+    async fn autoload_snapshot_matches_the_baseline() {
+        use crate::cakephp::tests::{check_snapshot, render_received};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const U: &str = "26060507533000000042861";
+        let zip = b"PK\x03\x04fake-zip".to_vec();
+        // (名前, クエリ, 本文, ②の status, ③の status, 材料の件数 (None = 数えると失敗))
+        type Case = (&'static str, String, Vec<u8>, u16, u16, Option<i64>);
+        let cases: Vec<Case> = vec![
+            (
+                "no_unko_no",
+                "preview=true".into(),
+                zip.clone(),
+                200,
+                200,
+                Some(1),
+            ),
+            (
+                "bad_unko_no",
+                "unko_no=2026-06".into(),
+                zip.clone(),
+                200,
+                200,
+                Some(1),
+            ),
+            (
+                "short_unko_no",
+                "unko_no=26060507533".into(),
+                zip.clone(),
+                200,
+                200,
+                Some(1),
+            ),
+            (
+                "empty_body",
+                format!("unko_no={U}"),
+                vec![],
+                200,
+                200,
+                Some(1),
+            ),
+            (
+                "preview",
+                format!("unko_no={U}&preview=true&file_name=%20"),
+                zip.clone(),
+                200,
+                200,
+                Some(1),
+            ),
+            (
+                "preview_reset",
+                format!("unko_no={U}&preview=true&reset_timecard=true"),
+                zip.clone(),
+                200,
+                200,
+                Some(3),
+            ),
+            (
+                "preview_reset_fail",
+                format!("unko_no={U}&preview=true&reset_timecard=true"),
+                zip.clone(),
+                200,
+                200,
+                None,
+            ),
+            (
+                "exec",
+                format!("unko_no={U}&file_name=x.zip"),
+                zip.clone(),
+                200,
+                200,
+                Some(1),
+            ),
+            (
+                "exec_307",
+                format!("unko_no={U}"),
+                zip.clone(),
+                307,
+                200,
+                Some(1),
+            ),
+            (
+                "exec_500",
+                format!("unko_no={U}&reset_timecard=false"),
+                zip.clone(),
+                500,
+                200,
+                Some(1),
+            ),
+            (
+                "reset",
+                format!("unko_no={U}&reset_timecard=true"),
+                zip.clone(),
+                200,
+                200,
+                Some(2),
+            ),
+            (
+                "reset_307",
+                format!("unko_no={U}&reset_timecard=true"),
+                zip.clone(),
+                200,
+                307,
+                Some(2),
+            ),
+            (
+                "reset_zero",
+                format!("unko_no={U}&reset_timecard=true"),
+                zip.clone(),
+                200,
+                200,
+                Some(0),
+            ),
+            (
+                "reset_count_fail",
+                format!("unko_no={U}&reset_timecard=true"),
+                zip.clone(),
+                200,
+                200,
+                None,
+            ),
+            (
+                "reset_step2_307",
+                format!("unko_no={U}&reset_timecard=true"),
+                zip.clone(),
+                307,
+                200,
+                Some(2),
+            ),
+            (
+                "reset_step2_500",
+                format!("unko_no={U}&reset_timecard=true"),
+                zip.clone(),
+                500,
+                200,
+                Some(2),
+            ),
+            (
+                "reset_short",
+                "unko_no=123456789012&reset_timecard=true".into(),
+                zip.clone(),
+                200,
+                200,
+                Some(2),
+            ),
+        ];
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (name, query, body, s2, s3, count) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/dtako-events/autoload"))
+                .respond_with(
+                    ResponseTemplate::new(s2)
+                        .insert_header("location", "/")
+                        .set_body_string(format!("step2 {s2}")),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::path_regex("^/time-card-dtako/"))
+                .respond_with(
+                    ResponseTemplate::new(s3).insert_header("location", "/time-card-dtako"),
+                )
+                .mount(&server)
+                .await;
+            let repo: DynResetMaterialRepo = match count {
+                Some(n) => Arc::new(MockResetMaterialRepo { count: n }),
+                None => Arc::new(FailingResetMaterialRepo),
+            };
+            let cakephp = Arc::new(CakephpClient::new(server.uri(), 30).unwrap());
+            let res = call_raw(
+                app(cakephp, repo),
+                &format!("/dtako/autoload?{query}"),
+                body,
+            )
+            .await;
+            let sent = render_received(&server).await;
+            out.push((name.to_string(), format!("{res}\n--- sent\n{sent}")));
+        }
+        // binding (base_url) が無い / nginx に届かない
+        let res = call_raw(
+            app(unconfigured_client(), empty_repo()),
+            &format!("/dtako/autoload?unko_no={U}"),
+            zip.clone(),
+        )
+        .await;
+        out.push(("unconfigured".into(), res));
+        let res = call_raw(
+            app(unconfigured_client(), empty_repo()),
+            &format!("/dtako/autoload?unko_no={U}&preview=1"),
+            zip.clone(),
+        )
+        .await;
+        out.push(("bad_query".into(), res));
+        let down = Arc::new(CakephpClient::new("http://127.0.0.1:0".to_string(), 1).unwrap());
+        let res = call_raw(
+            app(down, empty_repo()),
+            &format!("/dtako/autoload?unko_no={U}"),
+            zip,
+        )
+        .await;
+        // 接続失敗の本文は reqwest のエラー文言 (環境依存) なので頭だけ
+        out.push(("unreachable".into(), res.chars().take(60).collect()));
+        check_snapshot("dtako_autoload_responses.txt", &out);
     }
 
     #[tokio::test]

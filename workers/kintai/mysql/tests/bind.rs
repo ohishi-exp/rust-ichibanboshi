@@ -4,7 +4,7 @@ use chrono::NaiveDate;
 use kintai_kosoku::sql::{
     ALL_EVENTS_SQL, EVENTS_SQL, OPERATION_READING_DATES_SQL, REST_EVENTS_SQL,
 };
-use kintai_mysql::bind::{expand, names, BindError, Value};
+use kintai_mysql::bind::{expand, names, BindError, Digits, Value};
 
 fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> Value {
     let dt = NaiveDate::from_ymd_opt(y, m, d)
@@ -12,6 +12,33 @@ fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> Value {
         .and_hms_opt(h, mi, s)
         .unwrap();
     Value::DateTime(dt)
+}
+
+#[test]
+fn digits_accepts_only_1_to_32_ascii_digits() {
+    let d = Digits::new("26060507533000000042861").unwrap();
+    assert_eq!(d.as_str(), "26060507533000000042861");
+    assert_eq!(Digits::new("0").unwrap().as_str(), "0");
+    assert!(Digits::new(&"9".repeat(32)).is_some(), "32 桁は受ける");
+    assert_eq!(Digits::new(&"9".repeat(33)), None, "33 桁は拒否");
+    assert_eq!(Digits::new(""), None, "空は拒否");
+    for bad in [
+        "1'", "1 ", " 1", "-1", "1a", "１", "1\\", "1;--", "0x1f", "1.5",
+    ] {
+        assert_eq!(Digits::new(bad), None, "{bad:?} は数字以外を含む");
+    }
+}
+
+#[test]
+fn digits_expand_to_a_quoted_literal() {
+    let sql = "WHERE e.`運行NO` IN (:v1, :v2) AND x = ':v1'";
+    let v1 = Value::Digits(Digits::new("26060507533000000042861").unwrap());
+    let v2 = Value::Digits(Digits::new("26060507533000000042862").unwrap());
+    let got = expand(sql, &[("v1", v1), ("v2", v2)]).unwrap();
+    assert_eq!(
+        got,
+        "WHERE e.`運行NO` IN ('26060507533000000042861', '26060507533000000042862') AND x = ':v1'"
+    );
 }
 
 #[test]
