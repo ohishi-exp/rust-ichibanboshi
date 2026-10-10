@@ -65,6 +65,15 @@ path = "workers/kintai/logic/src/wage_snapshot.rs"
 [[files]]
 path = "workers/kintai/logic/src/wage_write.rs"
 
+# 書き込みの口の認可 (X-Kintai-Write-Token と KINTAI_WRITE_TOKEN の照合) と、timecard・signatures の入力の検査と応答。
+# テストは workers/kintai/logic/tests/writes.rs (axum の実物との突き合わせは workers/kintai/pg/tests/axum_parity.rs)。
+# kintai-pg (DB との往復) は実 DB が要るので登録しない (worker-kintai.yml の pg-parity job が root と突き合わせる)
+[[files]]
+path = "workers/kintai/logic/src/write_auth.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/timecard_write.rs"
+
 # 社内 MariaDB を読む 4 本 (events・rest-diff・reading-dates・tail-gap-probe) の検査・引数・応答と、行 → JSON。
 # テストは workers/kintai/logic/tests/mariadb.rs
 [[files]]

@@ -5,8 +5,10 @@
 //! 口:
 //! - 到達の確認用の `POST /probe` (接続 → handshake → 認証 → `SET SESSION max_statement_time=60` →
 //!   `SELECT 1, VERSION(), @@character_set_connection, CURRENT_USER()` → `COM_QUIT`)。1 リクエスト 1 接続。
-//! - Supabase を読むだけの `GET /api/kintai/{day-summaries,shift-overlaps,shift-days,change-log,wage-range}`
+//! - Supabase を読むだけの `GET /api/kintai/{day-summaries,shift-overlaps,shift-days,change-log,wage-range,timecard/signatures}`
 //!   ([`reads`]。Cloud Run 版と同じ応答・同じ 400/502/503。テナントは `KINTAI_TENANT_ID` の設定 pin)。
+//! - Supabase に書く `POST /api/kintai/{timecard,wage-snapshot}` ([`writes`]。Cloud Run 版と同じ応答・同じ 400/502/503。
+//!   **書き込みの口だけ** `X-Kintai-Write-Token` を Secrets Store の `KINTAI_WRITE_TOKEN` と照合する (無い・違う = 403))。
 //! - 社内 MariaDB を直接読む `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}`
 //!   (オンプレ版と同じ応答・同じ 400/502/503。検査・SQL の引数・行 → JSON・応答は kintai-logic の `mariadb_reads`)。
 //!   `/probe` と同じ接続・認証・`SET SESSION max_statement_time=60` の上で 1 本のクエリを流す (1 リクエスト 1 接続)。
@@ -19,15 +21,18 @@
 //!   version の etag の版は build.rs が焼く `KINTAI_WORKER_OUTPUT_SHA` (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値)。
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
-//! **認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
+//! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
+//! **書き込みの口は Worker が共有 secret を照合する** (ユーザー決定 2026-10-10。読みのために binding を持つ呼び手が POST を
+//! 転送しても書けないように)。
 //! 資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
-//! 社内 MariaDB へは SELECT だけ (SET SESSION はこの接続の打ち切り時間で、データは書かない)。Supabase も読むだけ。
+//! 社内 MariaDB へは SELECT だけ (SET SESSION はこの接続の打ち切り時間で、データは書かない)。Supabase へは上の 2 本だけが書く。
 
 mod conn;
 mod probe;
 mod reads;
 mod tcp;
 mod transport;
+mod writes;
 
 use std::future::Future;
 use std::pin::pin;
@@ -68,8 +73,12 @@ const PROBE_SQL: &str = "SELECT 1, VERSION(), @@character_set_connection, CURREN
 const OUTPUT_SHA: &str = env!("KINTAI_WORKER_OUTPUT_SHA");
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
+async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
     let route = route(req.method().as_ref(), &req.path());
+    if let Route::Write(write) = route {
+        let outcome = writes::serve(write, &mut req, &env);
+        return run_read(write.as_str(), outcome).await;
+    }
     if let Route::Read(read) = route {
         let url = req.url()?;
         let outcome = reads::serve(read, url.query().unwrap_or(""), &env);

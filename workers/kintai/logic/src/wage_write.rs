@@ -10,9 +10,14 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::common::{bad_request, Fail};
+use crate::common::{bad_request, parse_json, Fail};
 use crate::wage_range::FetchedRow;
-use crate::wage_snapshot::{rows_equal, ValidSnapshot, WageSnapshotRow};
+use crate::wage_snapshot::{
+    rows_equal, validate_snapshot, SnapshotRequest, ValidSnapshot, WageSnapshotRow,
+};
+
+/// 502 の本文の頭 (元の `kintai.wage_snapshot access failed: …`)。
+pub const DB_WHAT: &str = "kintai.wage_snapshot access";
 
 /// 置き換える月の行を消す。`$1` = テナント (UUID の pin)、`$2` = comp_id、`$3` = ym (DATE)、`$4` = restraint_source。
 pub const DELETE_MONTH_SQL: &str = r#"
@@ -54,6 +59,18 @@ pub fn parse_synced_at(s: Option<&String>) -> Result<Option<DateTime<Utc>>, Fail
             .map(|t| Some(t.with_timezone(&Utc)))
             .map_err(|_| bad_request("masters.payroll_synced_at は RFC3339 で指定してください")),
     }
+}
+
+/// `POST /api/kintai/wage-snapshot` の本文を読んで検査する (元と同じ順: Json の拒否 (415/413/400/422) →
+/// `validate_snapshot` (400) → `payroll_synced_at` (400))。
+pub fn parse_snapshot(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<(ValidSnapshot, Option<DateTime<Utc>>), Fail> {
+    let req: SnapshotRequest = parse_json(content_type, body)?;
+    let valid = validate_snapshot(req).map_err(bad_request)?;
+    let synced_at = parse_synced_at(valid.masters.payroll_synced_at.as_ref())?;
+    Ok((valid, synced_at))
 }
 
 /// 既存 (その月の `SELECT_RANGE_SQL` の行) と同じなら、書かずに返す応答。違えば `None` (= 書く)。

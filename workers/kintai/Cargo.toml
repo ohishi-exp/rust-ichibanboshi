@@ -2,10 +2,12 @@
 # kosoku は拘束・休息の純粋ロジックと社内 MariaDB の SQL (repo ルートの package も path 依存で使う共有 crate)、
 # dtako は day-events と dtako/worktime の純粋部分 (repo ルートの package も path 依存で使う共有 crate。勤怠の版の外)、
 # logic は Supabase の勤怠スキーマを読む口の純粋部分 (SQL・入力検査・応答の組み立て。root の src/ からの写し)、
+# pg は Supabase への書き込み (alc-worker-db の tenant_tx の中の query_typed / execute_typed。native でも動く)、
 # worker は Workers VPC の TCP と Hyperdrive の上でそれを回す Worker。
-# repo ルートの package とも workers/ichiban・workers/kyuyo とも独立した workspace。
+# repo ルートの package とも workers/ichiban・workers/kyuyo とも独立した workspace (pg の dev-dependency だけが、書き込みを
+# 比べる相手として repo ルートの package を引く。wasm のビルドには入らない)。
 [workspace]
-members = ["dtako", "kosoku", "logic", "mysql", "worker"]
+members = ["dtako", "kosoku", "logic", "mysql", "pg", "worker"]
 resolver = "2"
 
 # 分割 worker と同じ DB の部品 (ippoan/alc-worker-kit、public)。rev 固定で、ここの 1 か所にだけ書き、

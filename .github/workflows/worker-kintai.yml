@@ -2,7 +2,8 @@ name: worker-kintai
 
 # workers/kintai (勤怠の読み出し Worker・自作の MySQL コーデック・Supabase を読む口の純粋部分、Refs #322)。
 #   - pull_request / main への push → kintai-mysql・kintai-logic・kintai-kosoku・kintai-dtako の test と 100% gate、Worker の build・clippy・
-#     公開範囲の検査・wrangler deploy --dry-run
+#     公開範囲の検査・wrangler deploy --dry-run。pg-parity job で、Supabase への書き込み部品 (kintai-pg) と root の Cloud Run 版
+#     (sqlx) に同じ入力を与えて書いた後の表を比べる (postgres service。ci.yml の kintai migration + RLS job と同じ形)
 #     (この経路は secret も token も使わない)
 #   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
 # merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。
@@ -15,6 +16,13 @@ on:
     paths:
       - 'workers/kintai/**'
       - '.github/workflows/worker-kintai.yml'
+      # pg-parity が比べる相手 (root の書き込みの経路と、両方が流す migration)
+      - 'src/kintai_push.rs'
+      - 'src/change_log.rs'
+      - 'src/wage_snapshot.rs'
+      - 'src/routes/kintai_timecard.rs'
+      - 'src/routes/wage_snapshot.rs'
+      - 'migrations/**'
   push:
     branches: [main]
     # タグの push には paths が効かない (タグは常に走る)
@@ -22,6 +30,12 @@ on:
     paths:
       - 'workers/kintai/**'
       - '.github/workflows/worker-kintai.yml'
+      - 'src/kintai_push.rs'
+      - 'src/change_log.rs'
+      - 'src/wage_snapshot.rs'
+      - 'src/routes/kintai_timecard.rs'
+      - 'src/routes/wage_snapshot.rs'
+      - 'migrations/**'
 
 permissions:
   contents: read
@@ -99,9 +113,49 @@ jobs:
         working-directory: workers/kintai/worker
         run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
 
+  # Supabase への書き込み: Worker の部品 (kintai-pg、tokio-postgres の query_typed / execute_typed) と root の Cloud Run 版
+  # (sqlx) に同じ入力を与え、kintai.kintai_events・event_changes・wage_snapshot の中身と応答が一致すること
+  # (tests/root_parity.rs。KINTAI_TEST_DATABASE_URL が無ければ失敗する)。入力の検査が root の axum の handler と同じ
+  # status・本文になること (tests/axum_parity.rs、DB 不要)。root の crate を dev-dependency で build するので別 job
+  pg-parity:
+    name: kintai-pg (Worker の書き込み) vs root (sqlx) on postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: kintai-test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: kintai-pg-parity
+          workspaces: workers/kintai -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy (kintai-pg、native・テスト込み)
+        run: cargo clippy --locked --manifest-path workers/kintai/Cargo.toml -p kintai-pg --all-targets -- -D warnings
+
+      - name: Test (kintai-pg)
+        env:
+          KINTAI_TEST_DATABASE_URL: postgres://postgres:kintai-test@127.0.0.1:5432/postgres
+        run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-pg
+
   deploy:
     name: deploy production
-    needs: [worker]
+    needs: [worker, pg-parity]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/worker-kintai-v')
     runs-on: ubuntu-latest
     concurrency:
