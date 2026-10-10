@@ -10,6 +10,8 @@
 //! 層 A の秒数は共有 crate `kintai-dtako` を使う。
 //! kosoku-daily・version・timecard/drivers・timecard/events は `kosoku_reads` (検査・引数・応答)。応答を組む部分は共有 crate
 //! `kintai-kosoku` (`kosoku_daily`・`kintai_version`・`kintai_timecard`) を使う。
+//! 拘束サマリ (restraint) の 3 口は `restraint` (検査・SQL・bind・応答)。写しではなく、オンプレ版 (rusqlite) と
+//! Worker (D1) が同じものを使う。
 //!
 //! root の src/ (Cloud Run 版・オンプレ版) からの写しで、対応表は `workers/kintai/README.md`。
 //! **撤去までは片方を直したらもう片方も直す。**
@@ -21,6 +23,7 @@ pub mod dtako_reads;
 pub mod kosoku_reads;
 pub mod mariadb_reads;
 pub mod mariadb_rows;
+pub mod restraint;
 pub mod shift_days;
 pub mod shift_overlaps;
 pub mod timecard_write;

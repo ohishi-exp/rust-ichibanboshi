@@ -9,12 +9,24 @@
 //! 行は relay のサマリ JSON を **verbatim 保存** (解釈しない — kintai store
 //! と同じ素通し哲学)。`kintai_store.rs` と同じ作法 (rusqlite + `Arc<Mutex<_>>` +
 //! `spawn_blocking`)。
+//!
+//! 表の定義・SQL の文字列・bind の値の並び・一覧の分解は共有 crate `kintai-logic` の `restraint`
+//! (勤怠 Worker の D1 と同じもの、Refs #322)。ここは rusqlite との往復だけを持つ。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension};
+use kintai_logic::restraint::{
+    month_rows_binds, summary_binds, sync_state_binds, synced_at_binds, synced_binds, synced_rows,
+    Bind, MONTH_ROWS_SQL, SCHEMA_SQL, SYNCED_AT_SQL, SYNCED_SQL, UPSERT_SUMMARY_SQL,
+    UPSERT_SYNC_STATE_SQL,
+};
+use rusqlite::types::Value;
+use rusqlite::{params_from_iter, Connection, OptionalExtension};
 use tokio::sync::Mutex;
+
+/// 行・一覧・1 ヶ月分の型は共有 crate のもの (勤怠 Worker の D1 と同じ)。
+pub use kintai_logic::restraint::{RestraintEntry, RestraintMonth, RestraintSyncedRow};
 
 /// schema 版。互換を壊す変更をしたら +1 (旧版は open 時に drop → 再作成)。
 pub const RESTRAINT_STORE_SCHEMA_VERSION: i32 = 1;
@@ -37,34 +49,6 @@ impl std::fmt::Display for RestraintStoreError {
 }
 
 impl std::error::Error for RestraintStoreError {}
-
-/// push される 1 乗務員分。`summary_json` は relay のサマリ JSON verbatim
-/// (noData マーカーの時は None)。
-#[derive(Debug, Clone)]
-pub struct RestraintEntry {
-    pub driver_cd: String,
-    pub no_data: bool,
-    pub summary_json: Option<String>,
-    pub fetched_at: Option<String>,
-    pub last_verified_at: Option<String>,
-}
-
-/// sync 済み 1 件 (メタのみ)。
-#[derive(Debug, Clone)]
-pub struct RestraintSyncedRow {
-    pub source: String,
-    pub month: String,
-    pub synced_at: String,
-    pub row_count: i64,
-}
-
-/// 読み出し結果 1 ヶ月分 (source 単位)。
-#[derive(Debug, Clone, Default)]
-pub struct RestraintMonth {
-    pub entries: Vec<RestraintEntry>,
-    /// 最後に push を受けた時刻 (RFC3339)。一度も受けていなければ None。
-    pub synced_at: Option<String>,
-}
 
 #[async_trait]
 pub trait RestraintStoreApi: Send + Sync {
@@ -151,6 +135,18 @@ fn q(e: rusqlite::Error) -> RestraintStoreError {
     RestraintStoreError::QueryError(e.to_string())
 }
 
+/// 共有 crate の bind の値を rusqlite の値へ。
+fn values(binds: &[Bind]) -> Vec<Value> {
+    binds
+        .iter()
+        .map(|b| match b {
+            Bind::Text(s) => Value::Text(s.clone()),
+            Bind::Int(i) => Value::Integer(*i),
+            Bind::Null => Value::Null,
+        })
+        .collect()
+}
+
 impl RestraintStore {
     /// 指定パス (or `:memory:`) を open し、schema を保証する。
     pub fn open(path: &str) -> Result<Self, RestraintStoreError> {
@@ -185,31 +181,11 @@ impl RestraintStore {
             )
             .map_err(q)?;
         }
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS restraint_summary (
-               comp_id TEXT NOT NULL,
-               source  TEXT NOT NULL,      -- 'theearth' | 'timecard'
-               ym      TEXT NOT NULL,      -- 'YYYY-MM'
-               driver_cd TEXT NOT NULL,
-               no_data INTEGER NOT NULL DEFAULT 0,
-               summary_json TEXT,          -- relay のサマリ JSON verbatim (noData は NULL)
-               fetched_at TEXT,
-               last_verified_at TEXT,
-               PRIMARY KEY (comp_id, source, ym, driver_cd)
-             );
-             CREATE TABLE IF NOT EXISTS restraint_sync_state (
-               scope TEXT NOT NULL PRIMARY KEY,  -- comp:source:ym
-               synced_at TEXT NOT NULL,
-               row_count INTEGER NOT NULL
-             );
-             PRAGMA user_version = {RESTRAINT_STORE_SCHEMA_VERSION};",
-        ))
-        .map_err(q)
+        // 表の定義は共有 crate の SCHEMA_SQL (D1 の migration と同じファイル)。版はここだけが持つ
+        conn.execute_batch(SCHEMA_SQL).map_err(q)?;
+        let pragma = format!("PRAGMA user_version = {RESTRAINT_STORE_SCHEMA_VERSION};");
+        conn.execute_batch(&pragma).map_err(q)
     }
-}
-
-fn scope(comp_id: &str, source: &str, ym: &str) -> String {
-    format!("{comp_id}:{source}:{ym}")
 }
 
 #[async_trait]
@@ -234,45 +210,14 @@ impl RestraintStoreApi for RestraintStore {
             let mut guard = futures_lock(&conn);
             let tx = guard.transaction().map_err(q)?;
             for e in &entries {
-                tx.execute(
-                    "INSERT INTO restraint_summary
-                       (comp_id, source, ym, driver_cd, no_data, summary_json, fetched_at, last_verified_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT (comp_id, source, ym, driver_cd) DO UPDATE SET
-                       no_data = excluded.no_data,
-                       summary_json = excluded.summary_json,
-                       fetched_at = excluded.fetched_at,
-                       last_verified_at = excluded.last_verified_at",
-                    params![
-                        comp_id,
-                        source,
-                        ym,
-                        e.driver_cd,
-                        e.no_data as i64,
-                        e.summary_json,
-                        e.fetched_at,
-                        e.last_verified_at
-                    ],
-                )
-                .map_err(q)?;
+                let binds = summary_binds(&comp_id, &source, &ym, e);
+                tx.execute(UPSERT_SUMMARY_SQL, params_from_iter(values(&binds)))
+                    .map_err(q)?;
             }
-            let count: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM restraint_summary
-                     WHERE comp_id = ?1 AND source = ?2 AND ym = ?3",
-                    params![comp_id, source, ym],
-                    |r| r.get(0),
-                )
+            // row_count は同じ transaction の中の副問い合わせで数える (D1 の batch と同じ SQL)
+            let binds = sync_state_binds(&comp_id, &source, &ym, &synced_at);
+            tx.execute(UPSERT_SYNC_STATE_SQL, params_from_iter(values(&binds)))
                 .map_err(q)?;
-            tx.execute(
-                "INSERT INTO restraint_sync_state (scope, synced_at, row_count)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (scope) DO UPDATE SET
-                   synced_at = excluded.synced_at,
-                   row_count = excluded.row_count",
-                params![scope(&comp_id, &source, &ym), synced_at, count],
-            )
-            .map_err(q)?;
             tx.commit().map_err(q)
         })
         .await
@@ -291,22 +236,16 @@ impl RestraintStoreApi for RestraintStore {
             let guard = futures_lock(&conn);
             let synced_at = guard
                 .query_row(
-                    "SELECT synced_at FROM restraint_sync_state WHERE scope = ?1",
-                    params![scope(&comp_id, &source, &ym)],
+                    SYNCED_AT_SQL,
+                    params_from_iter(values(&synced_at_binds(&comp_id, &source, &ym))),
                     |r| r.get::<_, String>(0),
                 )
                 .optional()
                 .map_err(q)?;
-            let mut stmt = guard
-                .prepare(
-                    "SELECT driver_cd, no_data, summary_json, fetched_at, last_verified_at
-                     FROM restraint_summary
-                     WHERE comp_id = ?1 AND source = ?2 AND ym = ?3
-                     ORDER BY driver_cd ASC",
-                )
-                .map_err(q)?;
+            let mut stmt = guard.prepare(MONTH_ROWS_SQL).map_err(q)?;
+            let binds = month_rows_binds(&comp_id, &source, &ym);
             let entries = stmt
-                .query_map(params![comp_id, source, ym], |r| {
+                .query_map(params_from_iter(values(&binds)), |r| {
                     Ok(RestraintEntry {
                         driver_cd: r.get(0)?,
                         no_data: r.get::<_, i64>(1)? != 0,
@@ -325,19 +264,13 @@ impl RestraintStoreApi for RestraintStore {
     }
 
     async fn synced(&self, comp_id: &str) -> Result<Vec<RestraintSyncedRow>, RestraintStoreError> {
-        let prefix = format!("{comp_id}:");
+        let comp_id = comp_id.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let guard = futures_lock(&conn);
-            let mut stmt = guard
-                .prepare(
-                    "SELECT scope, synced_at, row_count FROM restraint_sync_state
-                     WHERE scope LIKE ?1 || '%'
-                     ORDER BY scope ASC",
-                )
-                .map_err(q)?;
+            let mut stmt = guard.prepare(SYNCED_SQL).map_err(q)?;
             let rows = stmt
-                .query_map(params![prefix], |r| {
+                .query_map(params_from_iter(values(&synced_binds(&comp_id))), |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
@@ -347,20 +280,8 @@ impl RestraintStoreApi for RestraintStore {
                 .map_err(q)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(q)?;
-            // scope = '{comp}:{source}:{ym}'。comp_id に ':' は入らない (route 検証済み)
-            Ok(rows
-                .into_iter()
-                .filter_map(|(scope, synced_at, row_count)| {
-                    let rest = scope.strip_prefix(&prefix)?;
-                    let (source, month) = rest.split_once(':')?;
-                    Some(RestraintSyncedRow {
-                        source: source.to_string(),
-                        month: month.to_string(),
-                        synced_at,
-                        row_count,
-                    })
-                })
-                .collect())
+            // scope = '{comp}:{source}:{ym}' を分ける (LIKE の wildcard で当たった別 comp は落とす)
+            Ok(synced_rows(&comp_id, rows))
         })
         .await
         .map_err(|e| RestraintStoreError::JoinError(e.to_string()))?

@@ -92,6 +92,11 @@ path = "workers/kintai/logic/src/dtako_reads.rs"
 [[files]]
 path = "workers/kintai/logic/src/kosoku_reads.rs"
 
+# 拘束サマリ (restraint) の 3 口の検査・SQL・bind・応答。root の src/routes/restraint.rs・src/restraint_store.rs から移した
+# (オンプレ版と Worker の D1 版が同じものを使う)。テストは workers/kintai/logic/tests/restraint.rs
+[[files]]
+path = "workers/kintai/logic/src/restraint.rs"
+
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。
