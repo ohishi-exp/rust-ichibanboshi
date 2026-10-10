@@ -30,6 +30,7 @@ use futures_util::future::{select, Either};
 use kintai_logic::common::{mariadb_fail, mariadb_unconfigured, Fail};
 use kintai_logic::mariadb_reads::{jst_today, MariadbRead};
 use kintai_mysql::response::ResultSet;
+use kintai_mysql::retry::{should_retry, RETRY_DELAY_MS};
 use worker::{console_error, console_log, event, Context, Date, Delay, Env, Request, Response};
 
 use conn::Session;
@@ -152,7 +153,29 @@ async fn probe(env: &Env, started: u64) -> Result<ProbeOk, Failure> {
 }
 
 /// 1 接続を開いて `sql` を 1 本流し、COM_QUIT で閉じる。
+///
+/// 認証パケットを送る前 (connect・handshake の段) の失敗だけ、新しい接続で `kintai_mysql::retry` の上限まで
+/// やり直す (間を空けない再接続で handshake の前に閉じられることがあるため)。認証以降の失敗はそのまま返す。
 async fn run_sql(env: &Env, creds: &Creds, sql: &str) -> Result<ResultSet, Failure> {
+    let mut retries = 0;
+    loop {
+        match run_sql_once(env, creds, sql).await {
+            Err(f) if f.stage.phase().is_some_and(|p| should_retry(p, retries)) => {
+                retries += 1;
+                console_log!(
+                    "kintai mariadb: retry {retries} after {}:{}",
+                    f.stage.as_str(),
+                    f.kind
+                );
+                Delay::from(Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// 1 回ぶん: 接続 → handshake → 認証 → `sql` → COM_QUIT を送って閉じる (失敗しても閉じる)。
+async fn run_sql_once(env: &Env, creds: &Creds, sql: &str) -> Result<ResultSet, Failure> {
     let socket = step(Stage::Connect, CONNECT_TIMEOUT, async {
         transport::open(env)
             .await

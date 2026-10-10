@@ -14,6 +14,9 @@ Workers VPC (TCP 3306) → 既存の Tunnel → 社内 MariaDB。MySQL プロト
 - 文字コードは utf8mb4 (charset 45)
 - 1 リクエスト = 1 接続。接続 → handshake → 認証 → `SET SESSION max_statement_time=60` (convoy 対策。オンプレ版と同じ) → クエリ → `COM_QUIT`
 - 社内 MariaDB へは SELECT だけ
+- **connect・handshake の段 (認証パケットを送る前) の失敗だけ、新しい接続で 2 回までやり直す** (200ms 空ける)。間を空けずに再接続を続けると
+  handshake を読む前に閉じられることがある (`handshake:closed`、20 回連続で 2〜3 回)。認証以降・クエリ以降の失敗はやり直さない。
+  判断は `mysql/src/retry.rs` (`should_retry`)。切断は成否によらず COM_QUIT を送ってから閉じる
 
 Hyperdrive の MySQL は JS ドライバ専用で TLS が必須、wasm32 で動く既製の MySQL クライアントも無かった
 (`mysql_common` は `default-features = false` で wasm32 の build が flate2 の backend 未選択で落ちる) ので自作した。
@@ -153,7 +156,7 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 
 - `mysql/` (`kintai-mysql`): I/O を持たない純粋なコーデック。`packet.rs` (枠・length-encoded の値) / `handshake.rs` (Initial Handshake v10・
   HandshakeResponse41・mysql_native_password・Auth Switch) / `response.rs` (OK / ERR / EOF・COM_QUERY・テキストの結果セット) /
-  `bind.rs` (名前付き引数を整数・日時・NULL のリテラルに展開)。
+  `bind.rs` (名前付き引数を整数・日時・NULL のリテラルに展開) / `retry.rs` (接続のやり直しの判断)。
   CLIENT_DEPRECATE_EOF は立てない (結果セットは EOF で区切られる形に固定)。テストは `mysql/tests/codec.rs`、100% 行カバレッジ gate は `coverage_100.toml`
 - `logic/` (`kintai-logic`): Supabase を読む 5 本と社内 MariaDB を読む 4 本の口の純粋部分 (上の対応表)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 4 本の往復) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /

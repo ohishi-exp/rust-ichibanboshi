@@ -6,6 +6,7 @@
 //! - [`packet`]: パケットの枠 (3 byte 長 + 1 byte seq)、length-encoded integer / string
 //! - [`handshake`]: Initial Handshake (protocol v10)、HandshakeResponse41、mysql_native_password、Auth Switch
 //! - [`response`]: OK / ERR / EOF、COM_QUERY・COM_QUIT、テキストプロトコルの結果セット
+//! - [`retry`]: 接続のやり直しの判断 (やり直すのは認証パケットを送る前の失敗だけ) の純粋関数
 //! - [`bind`]: SQL の名前付き引数 (`:from` 等) を整数・日時・NULL のリテラルに展開する (COM_QUERY に prepared statement が無いため)
 //!
 //! 立てる capability は CLIENT_PROTOCOL_41・CLIENT_SECURE_CONNECTION・CLIENT_PLUGIN_AUTH・CLIENT_CONNECT_WITH_DB
@@ -15,6 +16,7 @@ pub mod bind;
 pub mod handshake;
 pub mod packet;
 pub mod response;
+pub mod retry;
 
 pub use response::ErrPacket;
 

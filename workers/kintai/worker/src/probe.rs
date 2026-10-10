@@ -2,6 +2,7 @@
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
 use kintai_logic::mariadb_reads::MariadbRead;
+use kintai_mysql::retry::Phase;
 use serde::{Deserialize, Serialize};
 
 /// 経路判定の結果。
@@ -99,6 +100,17 @@ impl Stage {
             Stage::Handshake => "handshake",
             Stage::Auth => "auth",
             Stage::Query => "query",
+        }
+    }
+
+    /// やり直しの判断 (`kintai_mysql::retry`) に渡す段。資格情報の段は接続の外なので `None`。
+    pub(crate) fn phase(self) -> Option<Phase> {
+        match self {
+            Stage::Secret => None,
+            Stage::Connect => Some(Phase::Connect),
+            Stage::Handshake => Some(Phase::Handshake),
+            Stage::Auth => Some(Phase::Auth),
+            Stage::Query => Some(Phase::Query),
         }
     }
 }

@@ -614,3 +614,21 @@ fn error_kinds_carry_no_identifiers() {
         assert_eq!(e.kind(), want);
     }
 }
+
+// ── retry ──
+
+#[test]
+fn retry_only_before_auth_and_at_most_twice() {
+    use kintai_mysql::retry::{should_retry, Phase, MAX_RETRIES, RETRY_DELAY_MS};
+    assert_eq!(MAX_RETRIES, 2);
+    assert!((100..=300).contains(&RETRY_DELAY_MS));
+    for phase in [Phase::Connect, Phase::Handshake] {
+        assert!(should_retry(phase, 0));
+        assert!(should_retry(phase, 1));
+        assert!(!should_retry(phase, 2));
+    }
+    // 認証以降・クエリ以降はやり直さない
+    for phase in [Phase::Auth, Phase::Query] {
+        assert!(!should_retry(phase, 0));
+    }
+}

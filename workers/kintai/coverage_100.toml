@@ -30,6 +30,10 @@ path = "workers/kintai/mysql/src/response.rs"
 [[files]]
 path = "workers/kintai/mysql/src/bind.rs"
 
+# 接続のやり直しの判断 (認証パケットを送る前の失敗だけ)。テストは workers/kintai/mysql/tests/codec.rs
+[[files]]
+path = "workers/kintai/mysql/src/retry.rs"
+
 # ── kintai-logic (Supabase を読む 5 本の口の純粋部分) ──
 # lib.rs は mod 宣言だけ (実行行 0) なので登録しない (計測データに現れず gate が落ちる)
 
