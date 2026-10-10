@@ -26,7 +26,7 @@ path = "workers/kintai/mysql/src/handshake.rs"
 [[files]]
 path = "workers/kintai/mysql/src/response.rs"
 
-# SQL の名前付き引数の展開 (整数・日時・NULL だけ)。テストは workers/kintai/mysql/tests/bind.rs
+# SQL の名前付き引数の展開 (整数・日時・NULL・数字だけの文字列)。テストは workers/kintai/mysql/tests/bind.rs
 [[files]]
 path = "workers/kintai/mysql/src/bind.rs"
 
@@ -91,6 +91,15 @@ path = "workers/kintai/logic/src/dtako_reads.rs"
 # テストは workers/kintai/logic/tests/kosoku.rs
 [[files]]
 path = "workers/kintai/logic/src/kosoku_reads.rs"
+
+# 社内 CakePHP への中継 (daily・pdf-json・autoload・resetby-unko-no) の URL・multipart・応答の型と、autoload の検査・
+# ① ② ③ の段取り・応答・③ の材料の SQL。root の src/cakephp.rs・routes/dtako_autoload.rs・dtako_reset_material.rs から移した
+# (root も path 依存で使う)。テストは workers/kintai/logic/tests/cakephp.rs・dtako_autoload.rs
+[[files]]
+path = "workers/kintai/logic/src/cakephp.rs"
+
+[[files]]
+path = "workers/kintai/logic/src/dtako_autoload.rs"
 
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。

@@ -1,0 +1,150 @@
+===== no_unko_no
+400 Bad Request [text/plain; charset=utf-8] unko_no は対象を1件、数字だけで指定してください (一括取り込みは不可)
+--- sent
+
+===== bad_unko_no
+400 Bad Request [text/plain; charset=utf-8] unko_no は対象を1件、数字だけで指定してください (一括取り込みは不可)
+--- sent
+
+===== short_unko_no
+400 Bad Request [text/plain; charset=utf-8] unko_no は対象を1件、数字だけで指定してください (一括取り込みは不可)
+--- sent
+
+===== empty_body
+400 Bad Request [text/plain; charset=utf-8] body が空です。csvdata.zip の中身を送ってください
+--- sent
+
+===== preview
+200 OK [application/json] {"configured":true,"dtako_events_count":null,"dtako_events_count_error":null,"file_name":"csvdata.zip","note":"preview=true のため実際には送信していません","preview":true,"reset_target_path":null,"reset_timecard":false,"size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+
+===== preview_reset
+200 OK [application/json] {"configured":true,"dtako_events_count":3,"dtako_events_count_error":null,"file_name":"csvdata.zip","note":"preview=true のため実際には送信していません","preview":true,"reset_target_path":"/time-card-dtako/resetby-unko-no/26060507533000000042861","reset_timecard":true,"size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+
+===== preview_reset_fail
+200 OK [application/json] {"configured":true,"dtako_events_count":null,"dtako_events_count_error":"MariaDB query failed: boom","file_name":"csvdata.zip","note":"preview=true のため実際には送信していません","preview":true,"reset_target_path":"/time-card-dtako/resetby-unko-no/26060507533000000042861","reset_timecard":true,"size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+
+===== exec
+200 OK [application/json] {"dtako_events_count":null,"file_name":"x.zip","http_ok":true,"http_status":200,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":null,"reset_timecard":false,"response_excerpt":"step2 200","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 389
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"x.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== exec_307
+200 OK [application/json] {"dtako_events_count":null,"file_name":"csvdata.zip","http_ok":false,"http_status":307,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":null,"reset_timecard":false,"response_excerpt":"step2 307","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== exec_500
+200 OK [application/json] {"dtako_events_count":null,"file_name":"csvdata.zip","http_ok":false,"http_status":500,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":null,"reset_timecard":false,"response_excerpt":"step2 500","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== reset
+200 OK [application/json] {"dtako_events_count":2,"file_name":"csvdata.zip","http_ok":true,"http_status":200,"location":"/","preview":false,"reset_attempted":true,"reset_error":null,"reset_http_status":200,"reset_location":"/time-card-dtako","reset_note":"reset_http_status は空 200 でも失敗でも同じ値になり得ます。成否は Flash (session) にしか出ないため呼び出し側からは判別できません (yhonda-ohishi/nginx#796)","reset_skip_reason":null,"reset_timecard":true,"response_excerpt":"step2 200","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+---
+POST /time-card-dtako/resetby-unko-no/26060507533000000042861
+accept-encoding: gzip
+accept: */*
+content-length: 193
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY--\r\n
+===== reset_307
+200 OK [application/json] {"dtako_events_count":2,"file_name":"csvdata.zip","http_ok":true,"http_status":200,"location":"/","preview":false,"reset_attempted":true,"reset_error":null,"reset_http_status":307,"reset_location":"/time-card-dtako","reset_note":"reset_http_status は空 200 でも失敗でも同じ値になり得ます。成否は Flash (session) にしか出ないため呼び出し側からは判別できません (yhonda-ohishi/nginx#796)","reset_skip_reason":null,"reset_timecard":true,"response_excerpt":"step2 200","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+---
+POST /time-card-dtako/resetby-unko-no/26060507533000000042861
+accept-encoding: gzip
+accept: */*
+content-length: 193
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY--\r\n
+===== reset_zero
+200 OK [application/json] {"dtako_events_count":0,"file_name":"csvdata.zip","http_ok":true,"http_status":200,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":"no_dtako_events","reset_timecard":true,"response_excerpt":"step2 200","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== reset_count_fail
+200 OK [application/json] {"dtako_events_count":null,"file_name":"csvdata.zip","http_ok":true,"http_status":200,"location":"/","preview":false,"reset_attempted":false,"reset_error":"MariaDB query failed: boom","reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":"count_failed","reset_timecard":true,"response_excerpt":"step2 200","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== reset_step2_307
+200 OK [application/json] {"dtako_events_count":null,"file_name":"csvdata.zip","http_ok":false,"http_status":307,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":"step2_failed","reset_timecard":true,"response_excerpt":"step2 307","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== reset_step2_500
+200 OK [application/json] {"dtako_events_count":null,"file_name":"csvdata.zip","http_ok":false,"http_status":500,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":"step2_failed","reset_timecard":true,"response_excerpt":"step2 500","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"26060507533000000042861"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== reset_short
+200 OK [application/json] {"dtako_events_count":0,"file_name":"csvdata.zip","http_ok":true,"http_status":200,"location":"/","preview":false,"reset_attempted":false,"reset_error":null,"reset_http_status":null,"reset_location":null,"reset_note":null,"reset_skip_reason":"no_dtako_events","reset_timecard":true,"response_excerpt":"step2 200","size_bytes":12,"target_path":"/dtako-events/autoload","unko_no":"123456789012"}
+--- sent
+POST /dtako-events/autoload
+accept-encoding: gzip
+accept: */*
+content-length: 395
+content-type: multipart/form-data; boundary=BOUNDARY
+
+--BOUNDARY\r\nContent-Disposition: form-data; name=\"api\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"file[]\"; filename=\"csvdata.zip\"\r\nContent-Type: application/x-zip-compressed\r\n\r\nPK\x03\x04fake-zip\r\n--BOUNDARY--\r\n
+===== unconfigured
+503 Service Unavailable [text/plain; charset=utf-8] CakePHP base_url が未設定 (CAKEPHP_BASE_URL)
+===== bad_query
+400 Bad Request [text/plain; charset=utf-8] Failed to deserialize query string: preview: provided string was not `true` or `false`
+===== unreachable
+502 Bad Gateway [text/plain; charset=utf-8] nginx への接続に失敗: e
