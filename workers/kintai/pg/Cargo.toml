@@ -29,6 +29,8 @@ rust-ichibanboshi = { path = "../../.." }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+# tests/restraint_d1_parity.rs: D1 と同じ SQL の束を native の SQLite で流す (root のオンプレ版と同じ版)
+rusqlite = "0.32"
 # tests/axum_parity.rs: root の handler を `oneshot` で叩く (DB 不要)
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4"] }

@@ -3,15 +3,16 @@
 # Supabase の勤怠スキーマを読む GET /api/kintai/* の 6 本・書く POST の 2 本 (Hyperdrive + alc-worker-db)、
 # 社内 MariaDB を直接読む GET の 10 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime・
 # kosoku-daily・version・timecard/drivers・timecard/events)、社内 CakePHP (Workers VPC の HTTP) を中継する GET の 2 本
-# (daily・pdf-json) と POST /api/dtako/autoload (書き込みの口)。
+# (daily・pdf-json) と POST /api/dtako/autoload (書き込みの口)、拘束サマリの PUT /api/restraint/summaries・
+# GET /api/restraint/{wage-source,synced-months} (D1 KINTAI_RESTRAINT_DB)。
 # 本番へはタグ worker-kintai-v* の push で deploy する (.github/workflows/worker-kintai.yml)。
 #
 # ★ 外から届く口を持たない:
 #   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。
 #   - 読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手 (relay の共有 secret、kyuyo-mcp の OAuth)
-#   - 書き込みの口 (POST の 3 本。CakePHP への autoload を含む) だけ Worker が共有 secret KINTAI_WRITE_TOKEN を照合する (ユーザー決定 2026-10-10)
+#   - 書き込みの口 (POST の 3 本 = CakePHP への autoload を含む・拘束サマリの PUT) だけ Worker が共有 secret KINTAI_WRITE_TOKEN を照合する (ユーザー決定 2026-10-10)
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
-#   - MariaDB・CakePHP への口 (vpc_services) と Supabase への口 (hyperdrive) はトップレベルにだけ置く。
+#   - MariaDB・CakePHP への口 (vpc_services)・Supabase への口 (hyperdrive)・拘束サマリの D1 (d1_databases) はトップレベルにだけ置く。
 #     ローカルで迂回する LOCAL_* の var は持たない
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
@@ -76,6 +77,18 @@ secret_name = "KINTAI_WRITE_TOKEN"
 [[hyperdrive]]
 binding = "KINTAI_HYPERDRIVE"
 id = "0110becff61044bb8435c457a69c63a1"
+
+# 拘束サマリ (restraint) の写しの D1 (PUT /api/restraint/summaries・GET /api/restraint/{wage-source,synced-months})。
+# オンプレ版の SQLite (restraint_local.sqlite) から移した。中身は relay が push する写しで、消えても relay の resummarize (全月) で
+# 作り直せる。表の定義は migrations/0001_restraint.sql (共有 crate kintai-logic が include_str! で読む正本)。
+# 本番 D1 への migration は人が 1 回だけ手で当てる (wrangler d1 migrations apply --remote)。CI の deploy は当てず、未適用が
+# 0 件であることだけを確かめる (org の token に D1:Edit が無くてもタグ deploy が止まらないように)。トップレベルにだけ置く。
+# binding が無ければ restraint の 3 口は 503
+[[d1_databases]]
+binding = "KINTAI_RESTRAINT_DB"
+database_name = "ichibanboshi-kintai-restraint"
+database_id = "9a70d878-604e-402f-a06a-b07696d99f9f"
+migrations_dir = "migrations"
 
 # 読み先のテナント (UUID の文字列)。GET /api/kintai/* はこの pin だけでテナントを決め、X-Tenant-ID は読まない。
 # 空・UUID でない・nil UUID なら 503。

@@ -23,6 +23,9 @@
 //! - 社内 CakePHP (`yhonda-ohishi/nginx`) を Workers VPC の HTTP (`KINTAI_CAKEPHP_VPC`) で中継する `GET /api/kintai/{daily,pdf-json}`
 //!   (認可なし) と `POST /api/dtako/autoload` (書き込みの口。`preview` も照合する) ([`cakephp`]。オンプレ版と同じ応答・
 //!   同じ 400/502/503。**fetch は 3xx を追わない**)。daily はキャッシュを持たない。
+//! - 拘束サマリ (restraint) の `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` ([`restraint`]。
+//!   オンプレ版 (SQLite) から D1 (`KINTAI_RESTRAINT_DB`) へ移した。検査・SQL・応答はオンプレ版と同じ kintai-logic の `restraint`。
+//!   **PUT は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**)。
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
@@ -35,6 +38,7 @@ mod cakephp;
 mod conn;
 mod probe;
 mod reads;
+mod restraint;
 mod tcp;
 mod transport;
 mod writes;
@@ -80,6 +84,9 @@ const OUTPUT_SHA: &str = env!("KINTAI_WORKER_OUTPUT_SHA");
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
     let route = route(req.method().as_ref(), &req.path());
+    if let Route::Restraint(r) = route {
+        return restraint::serve(r, &mut req, &env).await;
+    }
     if let Route::Write(write) = route {
         let outcome = writes::serve(write, &mut req, &env);
         return run_read(write.as_str(), outcome).await;

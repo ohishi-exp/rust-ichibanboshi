@@ -111,6 +111,10 @@ path = "workers/kintai/logic/src/cakephp_relay.rs"
 [[files]]
 path = "workers/kintai/logic/src/restraint.rs"
 
+# 拘束サマリの D1 用 (batch に流す文の束・結果の行の読み取り・D1 だけの 503 / 502 / 400)。テストは workers/kintai/logic/tests/restraint_d1.rs
+[[files]]
+path = "workers/kintai/logic/src/restraint_d1.rs"
+
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。

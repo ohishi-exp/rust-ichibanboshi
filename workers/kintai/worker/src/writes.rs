@@ -57,7 +57,7 @@ async fn read_body(req: &mut Request) -> Result<(Option<String>, Vec<u8>), Fail>
 }
 
 /// 共有 secret を読む。binding が無い・secret が未投入は `None` (中身はどこにも出さない)。
-async fn load_token(env: &Env) -> Option<String> {
+pub(crate) async fn load_token(env: &Env) -> Option<String> {
     let store = env.secret_store(WRITE_TOKEN_BINDING).ok()?;
     store.get().await.ok().flatten()
 }
