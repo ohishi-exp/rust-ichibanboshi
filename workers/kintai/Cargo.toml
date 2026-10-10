@@ -1,10 +1,11 @@
 # 勤怠 (kintai) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322)。mysql は I/O を持たない MySQL プロトコルのコーデック、
 # kosoku は拘束・休息の純粋ロジックと社内 MariaDB の SQL (repo ルートの package も path 依存で使う共有 crate)、
+# dtako は day-events と dtako/worktime の純粋部分 (repo ルートの package も path 依存で使う共有 crate。勤怠の版の外)、
 # logic は Supabase の勤怠スキーマを読む口の純粋部分 (SQL・入力検査・応答の組み立て。root の src/ からの写し)、
 # worker は Workers VPC の TCP と Hyperdrive の上でそれを回す Worker。
 # repo ルートの package とも workers/ichiban・workers/kyuyo とも独立した workspace。
 [workspace]
-members = ["kosoku", "logic", "mysql", "worker"]
+members = ["dtako", "kosoku", "logic", "mysql", "worker"]
 resolver = "2"
 
 # 分割 worker と同じ DB の部品 (ippoan/alc-worker-kit、public)。rev 固定で、ここの 1 か所にだけ書き、

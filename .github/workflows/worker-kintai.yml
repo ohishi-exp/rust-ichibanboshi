@@ -1,7 +1,7 @@
 name: worker-kintai
 
 # workers/kintai (勤怠の読み出し Worker・自作の MySQL コーデック・Supabase を読む口の純粋部分、Refs #322)。
-#   - pull_request / main への push → kintai-mysql・kintai-logic・kintai-kosoku の test と 100% gate、Worker の build・clippy・
+#   - pull_request / main への push → kintai-mysql・kintai-logic・kintai-kosoku・kintai-dtako の test と 100% gate、Worker の build・clippy・
 #     公開範囲の検査・wrangler deploy --dry-run
 #     (この経路は secret も token も使わない)
 #   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
@@ -57,20 +57,21 @@ jobs:
           workspaces: workers/kintai -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Test (kintai-mysql, kintai-logic, kintai-kosoku)
+      - name: Test (kintai-mysql, kintai-logic, kintai-kosoku, kintai-dtako)
         working-directory: .
-        run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku
+        run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       # 行カバレッジ 100% gate (登録簿 workers/kintai/coverage_100.toml)。判定は repo ルートの
       # check_coverage_100.sh を共用する。コーデックは社内 DB の応答を読む唯一の場所、logic は 5 本の口の
-      # 入力検査・SQL の引数・応答の形を持つ場所、kosoku は拘束・休息の計算そのものなので全行を通す
-      - name: Coverage 100% gate (kintai-mysql, kintai-logic, kintai-kosoku)
+      # 入力検査・SQL の引数・応答の形を持つ場所、kosoku は拘束・休息の計算そのもの、dtako は day-events と worktime の
+      # 畳み方なので全行を通す
+      - name: Coverage 100% gate (kintai-mysql, kintai-logic, kintai-kosoku, kintai-dtako)
         working-directory: .
         run: |
           cov="$RUNNER_TEMP/kintai-cov.txt"
-          cargo llvm-cov --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku --text > "$cov"
+          cargo llvm-cov --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako --text > "$cov"
           bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache "$cov"
 
       - name: Build (wasm32-unknown-unknown)
