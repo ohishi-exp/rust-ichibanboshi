@@ -6,7 +6,7 @@
 
 ```
 ブラウザ → https://nuxt-ichibanboshi.m-tama-ramu.workers.dev (CF Workers)
-         → /api/sales/* (server route, CF Access Service Token 付き)
+         → /api/uriage/* 等 (CF Access Service Token 付き。売上・運賃は Worker `workers/ichiban/`)
          → https://rust-ichiban.mtamaramu.com (Cloudflare Tunnel)
          → ohishi-data:3100 (systemd)
          → 172.18.21.102\softec (SQL Server, CAPE#01)

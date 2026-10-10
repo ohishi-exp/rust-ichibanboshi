@@ -4,10 +4,10 @@
 # 検証するのは「同じイメージが設定だけで 2 つの実行形態になる」こと。#208 で実機
 # 確認した挙動を CI に固定する:
 #
-#   | 形態              | 与える設定                        | 期待                                    |
-#   |-------------------|-----------------------------------|-----------------------------------------|
-#   | GCP (Cloud Run)   | DATABASE_ENABLED=false + PORT 注入 | 起動成功 / /health 200 / sales 503      |
-#   | オンプレ          | 既定 (DATABASE_ENABLED 未設定)     | **起動失敗** (exit 非 0、listener 無し) |
+#   | 形態              | 与える設定                        | 期待                                              |
+#   |-------------------|-----------------------------------|---------------------------------------------------|
+#   | GCP (Cloud Run)   | DATABASE_ENABLED=false + PORT 注入 | 起動成功 / /health 200 / uriage/by-person 503     |
+#   | オンプレ          | 既定 (DATABASE_ENABLED 未設定)     | **起動失敗** (exit 非 0、listener 無し)           |
 #
 # ── なぜ `cargo run` ではなくコンテナなのか ─────────────────────────────────
 # #208 で見つかった実バグは **Dockerfile 層**にあった (CMD に --port を書いていた
@@ -107,6 +107,14 @@ http_code() {
   # curl は接続できなくても %{http_code} に 000 を書くが、終了 status が非 0 に
   # なるので `|| true` で set -e から守る (ここで死ぬと「起動待ち中」が失敗になる)。
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)" || true
+  echo "${code:-000}"
+}
+
+# JSON を POST して HTTP status code を stdout に出す (http_code の POST 版)。
+http_code_post_json() {
+  local url="$1" body="$2" code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
+    -H 'Content-Type: application/json' -d "$body" "$url" 2>/dev/null)" || true
   echo "${code:-000}"
 }
 
@@ -217,10 +225,12 @@ assert_json "$BODY_A" '.backends.mariadb' 'declared'
 assert_json "$BODY_A" '.backends.kintai_events' 'http'
 
 # SQL Server 依存ルートは fail-closed。空配列を返して「0 件」に見せない。
-CODE_A_SALES="$(http_code "${BASE_A}/api/sales/monthly")"
-[ "$CODE_A_SALES" = "503" ] \
-  || fail "case A: /api/sales/monthly expected 503, got ${CODE_A_SALES}"
-note "ok: /api/sales/monthly == 503 (fail-closed)"
+# from・to・bumon が空だと入力検証の 400 で先に返るので、検証を通る body を渡す。
+URIAGE_BODY='{"from":"2026-09-01","to":"2026-09-30","bumon":["010"],"persons":{},"other":{}}'
+CODE_A_URIAGE="$(http_code_post_json "${BASE_A}/api/uriage/by-person" "$URIAGE_BODY")"
+[ "$CODE_A_URIAGE" = "503" ] \
+  || fail "case A: POST /api/uriage/by-person expected 503, got ${CODE_A_URIAGE}"
+note "ok: POST /api/uriage/by-person == 503 (fail-closed)"
 
 docker rm -f "$C_A" >/dev/null
 
@@ -437,7 +447,7 @@ docker network rm "$NET_E" >/dev/null
 
 echo
 echo "SMOKE OK — both forms behave as declared:"
-echo "  GCP form     : starts, /health 200, sqlserver=disabled, mariadb=declared, kintai_events=http, sales 503, injected PORT honored"
+echo "  GCP form     : starts, /health 200, sqlserver=disabled, mariadb=declared, kintai_events=http, uriage/by-person 503, injected PORT honored"
 echo "  ENV defaults : reachable on 8080 from outside the container (ENV PORT / BIND_ADDR in effect)"
 echo "  on-prem form : refuses to start without SQL Server (exit ${EXIT_CODE}, no listener)"
 echo "  misconfig    : refuses to start when a declared backend is missing its settings (exit ${EXIT_D})"

@@ -112,7 +112,7 @@ pub async fn run(
     } else {
         tracing::warn!(
             "[database] enabled = false — this instance does not use SQL Server (CAPE#01). \
-             /api/sales/*, /api/schema/*, /api/surcharge/*, /api/unchin/*, /api/uriage/* \
+             /api/uriage/* \
              return 503. /health reports backends.sqlserver=disabled."
         );
         Arc::new(TiberiusRepo::disabled())
@@ -266,40 +266,6 @@ pub async fn run(
         .allow_headers(AllowHeaders::any());
 
     let api_routes = Router::new()
-        .route("/sales/monthly", get(routes::sales::monthly))
-        .route("/sales/by-department", get(routes::sales::by_department))
-        .route("/sales/by-customer", get(routes::sales::by_customer))
-        .route("/sales/yoy", get(routes::sales::yoy))
-        .route("/sales/daily", get(routes::sales::daily))
-        .route("/sales/customer-trend", get(routes::sales::customer_trend))
-        .route("/sales/customer-yoy", get(routes::sales::customer_yoy))
-        .route(
-            "/sales/customer-yoy-by-dept",
-            get(routes::sales::customer_yoy_by_dept),
-        )
-        .route(
-            "/sales/customer-detail",
-            get(routes::sales::customer_detail),
-        )
-        .route("/surcharge/base", get(routes::surcharge::surcharge_base))
-        .route("/unchin/candidates", get(routes::unchin::unchin_candidates))
-        .route("/unchin/summary", get(routes::unchin::unchin_summary))
-        .route(
-            "/unchin/subcontractor-net",
-            get(routes::unchin::unchin_subcontractor_net),
-        )
-        .route(
-            "/unchin/subcontractor-net-detail",
-            get(routes::unchin::unchin_subcontractor_net_detail),
-        )
-        .route(
-            "/unchin/customer-net",
-            get(routes::unchin::unchin_customer_net),
-        )
-        .route(
-            "/unchin/customer-net-detail",
-            get(routes::unchin::unchin_customer_net_detail),
-        )
         .route("/uriage/by-person", post(routes::uriage::by_person))
         .route("/uriage/recalc", post(routes::uriage::recalc))
         .route("/uriage/daily", get(routes::uriage::daily))
@@ -448,15 +414,9 @@ pub async fn run(
             get(routes::restraint::synced_months),
         );
 
-    let schema_routes = Router::new()
-        .route("/schema/tables", get(routes::schema::list_tables))
-        .route("/schema/columns", get(routes::schema::list_columns))
-        .route("/schema/sample", get(routes::schema::sample_data));
-
     let app = Router::new()
         .route("/health", get(routes::health::health))
         .nest("/api", api_routes)
-        .nest("/api", schema_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(repo))
