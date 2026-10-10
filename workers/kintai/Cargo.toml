@@ -1,0 +1,11 @@
+# 勤怠 (kintai) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322)。mysql は I/O を持たない MySQL プロトコルのコーデック、
+# worker は Workers VPC の TCP の上でそれを回す Worker。
+# repo ルートの package とも workers/ichiban・workers/kyuyo とも独立した workspace。
+[workspace]
+members = ["mysql", "worker"]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

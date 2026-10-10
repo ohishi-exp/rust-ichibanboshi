@@ -1,0 +1,22 @@
+# 勤怠 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。いまの口は到達の確認用の POST /probe だけ。
+# Workers VPC (binding KINTAI_MARIADB_VPC) 経由で社内 MariaDB に平文の MySQL プロトコルで繋ぐ (1 リクエスト 1 接続)。
+# プロトコルの読み書きは kintai-mysql (I/O 無し)、ここは socket の読み書きと応答だけ。
+[package]
+name = "kintai-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+kintai-mysql = { path = "../mysql" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# worker::Socket は tokio の AsyncRead/Write を持つ (kintai-mysql は I/O を持たないので compat は要らない)
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+wasm-bindgen = "0.2"
+worker = "=0.8.7"
+worker-sys = "=0.8.7"
