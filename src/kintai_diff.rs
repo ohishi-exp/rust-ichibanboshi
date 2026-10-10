@@ -46,29 +46,9 @@ use crate::kintai_push::{
 };
 use crate::kintai_repo::{exact_month_range, DynKintaiEventsRepo, KintaiRepoError};
 
-/// 1 回の呼び出しで返す乗務員数の既定。
-///
-/// 経緯 — かつての根拠「1 乗務員あたり 0.2 秒」は本番で成立していなかった。
-/// 2026-07-30 の初回 dry-run では 10 人ぶんの `POST /api/kintai/timecard/diff` が
-/// Cloudflare の 524 (100 秒) を超え、1 人なら通った。原因は乗務員ごとの読み出しが
-/// `dtako_events` と `dtako_cars` まで引いていたこと (#225) — 押し出さない行だった。
-///
-/// 打刻 2 表に絞ったあとの実測 (2026-07-31、2026-06 = 94 名):
-///
-/// | 1 回の人数 | 結果 |
-/// |---|---|
-/// | 10 | 通る (524 が消えた) |
-/// | 50 | 通る |
-///
-/// **50 は実測済みなので既定に上げる。** 94 名なら 2 回で終わる。
-pub const DEFAULT_MAX_DRIVERS: usize = 50;
-
-/// `max_drivers` の上限。呼び出し側が大きな値を入れて Tunnel を殺すのを防ぐ。
-///
-/// **100 は未実測。** 50 が通ったこと・上限に当たっても 524 で落ちるだけで
-/// **1 件も書かれない** (この経路は読むだけ、呼び直せば同じ状態に収束する) ことから、
-/// 現在の頭数 (94 名) が 1 回で終わる値まで開ける。踏んだら下げればよい。
-pub const MAX_MAX_DRIVERS: usize = 100;
+// ページの大きさ (既定 50・上限 100) と 1 ページの切り方は共有 crate (勤怠 Worker と同じもの、
+// Refs #322)。根拠の実測は `kintai_kosoku::kintai_timecard` の docs。
+pub use kintai_kosoku::kintai_timecard::{DriversPage, DEFAULT_MAX_DRIVERS, MAX_MAX_DRIVERS};
 
 /// 差分の取り出しに失敗した。
 ///
@@ -106,16 +86,6 @@ impl From<crate::kintai_push::KintaiPushError> for KintaiDiffError {
             other => Self::BadRequest(other.to_string()),
         }
     }
-}
-
-/// `GET /api/kintai/timecard/drivers` の応答。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-pub struct DriversPage {
-    pub drivers: Vec<u64>,
-    /// 続きの位置。`None` なら回りきった。
-    pub next_after_driver_cd: Option<u64>,
-    /// 洗い出しにかかった時間 (ms)。ページごとに毎回払う費用なので出す。
-    pub elapsed_ms: u64,
 }
 
 /// `POST /api/kintai/timecard/diff` の応答。
@@ -161,19 +131,11 @@ pub async fn drivers_page(
 ) -> Result<DriversPage, KintaiDiffError> {
     let (from, to) = exact_month_range(month)
         .ok_or_else(|| KintaiDiffError::BadRequest(format!("bad month: {month}")))?;
-    let max = max.clamp(1, MAX_MAX_DRIVERS);
     let started = std::time::Instant::now();
     let all = repo.fetch_timecard_driver_cds_between(&from, &to).await?;
-    let rest: Vec<u64> = match after {
-        Some(a) => all.into_iter().filter(|d| *d > a).collect(),
-        None => all,
-    };
-    let next = rest.get(max).map(|_| rest[max - 1]);
-    Ok(DriversPage {
-        drivers: rest.into_iter().take(max).collect(),
-        next_after_driver_cd: next,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-    })
+    let mut page = kintai_kosoku::kintai_timecard::page_drivers(all, after, max);
+    page.elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(page)
 }
 
 /// 相手が持っている署名と突き合わせ、**渡すべき差分だけ**を返す。

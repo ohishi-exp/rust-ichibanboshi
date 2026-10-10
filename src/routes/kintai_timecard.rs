@@ -59,6 +59,10 @@ use crate::kintai_push::{
 };
 use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai::is_valid_month;
+// 検査・窓・応答の形は共有 crate (勤怠 Worker と同じもの、Refs #322)
+use kintai_kosoku::kintai_timecard::{
+    drivers_json, parse_months, window_bounds, window_events_json,
+};
 
 /// `[kintai_push]` が無効な instance では挿さらない。
 pub type DynKintaiPgStore = Option<std::sync::Arc<KintaiPgStore>>;
@@ -244,12 +248,7 @@ pub async fn drivers(
     )
     .await
     .map_err(map_diff_err)?;
-    Ok(Json(serde_json::json!({
-        "month": month,
-        "drivers": page.drivers,
-        "next_after_driver_cd": page.next_after_driver_cd,
-        "elapsed_ms": page.elapsed_ms,
-    })))
+    Ok(Json(drivers_json(&month, &page)))
 }
 
 /// POST /api/kintai/timecard/diff — 相手の署名と突き合わせて**渡すべき差分を返す**。
@@ -319,56 +318,18 @@ pub async fn window_events(
     Query(params): Query<WindowQuery>,
     Extension(repo): Extension<DynKintaiEventsRepo>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let months = parse_months(params.months.as_deref().unwrap_or_default())?;
+    let months = parse_months(params.months.as_deref().unwrap_or_default())
+        .map_err(|e| bad_request(&e.to_string()))?;
     let started = std::time::Instant::now();
     let (from, to) = window_bounds(&months).ok_or_else(|| bad_request("months が不正です"))?;
     let events = repo
         .fetch_timecard_window(&from, &to)
         .await
         .map_err(|e| map_diff_err(KintaiDiffError::Read(e)))?;
-    let drivers: Vec<u64> = events
-        .iter()
-        .filter_map(|r| r.get("driver_id").and_then(|v| v.as_u64()))
-        .collect::<std::collections::BTreeSet<u64>>()
-        .into_iter()
-        .collect();
     let n = events.len();
     tracing::info!(n, "timecard window read");
-    Ok(Json(serde_json::json!({
-        "months": months,
-        "drivers": drivers,
-        "events": events,
-        "elapsed_ms": started.elapsed().as_millis() as u64,
-    })))
-}
-
-/// `months=YYYY-MM,YYYY-MM` を検証して返す。**重複は潰し、昇順に揃える。**
-fn parse_months(raw: &str) -> Result<Vec<String>, (StatusCode, String)> {
-    let months: std::collections::BTreeSet<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if months.is_empty() {
-        return Err(bad_request(
-            "months は YYYY-MM をカンマ区切りで指定してください",
-        ));
-    }
-    if let Some(bad) = months.iter().find(|m| !is_valid_month(m)) {
-        return Err(bad_request(&format!("month は YYYY-MM です: {bad}")));
-    }
-    Ok(months.into_iter().collect())
-}
-
-/// 窓ぜんたいの `[最初の月初, 最後の翌月初)` を MariaDB 用の文字列で返す。
-///
-/// 月が飛んでいても 1 クエリで読む — 隙間ぶんが混ざっても受け側が窓の外として
-/// 落とすので、往復を増やすより安い。
-fn window_bounds(months: &[String]) -> Option<(String, String)> {
-    let first = crate::kintai_repo::exact_month_range(months.first()?)?;
-    let last = crate::kintai_repo::exact_month_range(months.last()?)?;
-    Some((first.0, last.1))
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(Json(window_events_json(&months, events, elapsed_ms)))
 }
 
 /// POST /api/kintai/timecard/window — **窓ぶんをまるごと**受けて、変わった日だけ書き、

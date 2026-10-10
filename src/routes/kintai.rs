@@ -23,7 +23,6 @@
 //! 将来この endpoint に金額を足すことになったら、その時点で `/kyuyo/*` と同じ
 //! in-service gate へ移すこと。
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::Query;
@@ -33,17 +32,11 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::cakephp::{CakephpClient, CakephpError, TimecardDailyResponse};
-use crate::kintai_fold::{clip_to_anchors, month_anchors, read_window};
+use crate::kintai_fold::{month_anchors, read_window};
 use crate::kintai_repo::{DynKintaiEventsRepo, KintaiRepoError};
 use crate::kintai_store::DynKintaiStore;
-use crate::kosoku::{
-    apply_ferry_minus, daily_summary, drop_duplicate_rows, ferry_minus_by_date, month_punches,
-    split_by_driver, split_ferry_by_driver, DayPart, DaySummary, KosokuParams, ShiftSource,
-};
-use crate::kosoku_paper::{
-    gap_midnight_by_date, minus_unko_by_date, ours_outside_by_date, paper_daily_minutes,
-    paper_drift_by_date, paper_outside_by_date,
-};
+use crate::kosoku::KosokuParams;
+use kintai_kosoku::kosoku_daily::{build_driver, for_each_driver, parse_view, ResponseView};
 
 /// `?month=YYYY-MM&refresh=1`。`refresh=1` はキャッシュを飛ばして CakePHP から
 /// 引き直す (Refs #106 Phase 2 — 当月の打刻は日々変わるため、relay の取り込みは
@@ -70,236 +63,8 @@ pub struct EventsQuery {
     pub view: Option<String>,
 }
 
-/// 突合用に日別を絞る (Refs #157)。
-///
-/// 全項目だと 1 日 516 B・19 キーあり、2026-05 の全乗務員で **1.71 MB**。突合
-/// (`timecard-compare` / `get_timecard_diff`) が使うのは**日付・拘束・フェリー控除**と、
-/// 暦日按分のための `parts` の日付・拘束だけで、残り 15 キーは受け取って捨てられていた。
-/// 絞ると **108 KB (16 分の 1)**。
-///
-/// この経路は社内から Cloudflare Tunnel を通って出ていくので、応答サイズがそのまま
-/// 応答時間になる (実測: DB 0.48 秒 / rust 0.46 秒 なのにブラウザで 14〜57 秒)。
-///
-/// **キー名は元のまま**にする。短縮すると消費側 (relay / kyuyo-mcp) のパーサを
-/// 2 通り持つことになり、削れるのは数 % しかない。
-fn compare_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
-    days.iter()
-        .map(|d| {
-            let parts: Vec<serde_json::Value> = d
-                .parts
-                .iter()
-                .map(|p| {
-                    let mut o = serde_json::json!({
-                        "date": p.date,
-                        "restraint_minutes": p.restraint_minutes,
-                    });
-                    if p.run_gap_minutes != 0 {
-                        o["run_gap_minutes"] = serde_json::json!(p.run_gap_minutes);
-                    }
-                    if p.punch_tail_minutes != 0 {
-                        o["punch_tail_minutes"] = serde_json::json!(p.punch_tail_minutes);
-                    }
-                    if p.punch_head_minutes != 0 {
-                        o["punch_head_minutes"] = serde_json::json!(p.punch_head_minutes);
-                    }
-                    if p.run_head_minutes != 0 {
-                        o["run_head_minutes"] = serde_json::json!(p.run_head_minutes);
-                    }
-                    if p.lunch_overlap_minutes != 0 {
-                        o["lunch_overlap_minutes"] = serde_json::json!(p.lunch_overlap_minutes);
-                    }
-                    // 日跨ぎ勤務のフェリー控除は**内訳側が正** — 突合 (relay の
-                    // kosokuPartsByDate) は parts がある勤務を parts だけで暦日合算
-                    // するので、ここに載せないと控除が丸ごと落ちて unknown になる
-                    // (実測 ある乗務員: 単日勤務の 03-08 だけ ferry が付き、日跨ぎの
-                    // 03-05/06/15/22/29 は 71〜75 分がそのまま残差になっていた)
-                    if p.ferry_minus_minutes != 0 {
-                        o["ferry_minus_minutes"] = serde_json::json!(p.ferry_minus_minutes);
-                    }
-                    o
-                })
-                .collect();
-            let mut o = serde_json::json!({
-                "date": d.date,
-                "restraint_minutes": d.restraint_minutes,
-            });
-            // **0 は載せない** (Refs #157)。フェリー控除がある日は月に数十日しか無いのに
-            // `"ferry_minus_minutes":0,` が全日に付くと 3,128 日で約 75 KB (応答の 29%)
-            // を食う。消費側は欠けを 0 として読む
-            if d.ferry_minus_minutes != 0 {
-                o["ferry_minus_minutes"] = serde_json::json!(d.ferry_minus_minutes);
-            }
-            // 休息控除も同じ扱い。拘束からは既に外してあるので突合の値は動かないが、
-            // 「この日は休息を何分外したか」が無いと残差の説明が付かない
-            if d.rest_minus_minutes != 0 {
-                o["rest_minus_minutes"] = serde_json::json!(d.rest_minus_minutes);
-            }
-            // 運行の継ぎ目 (cause "run-gap" の実額) も 0 は載せない
-            if d.run_gap_minutes != 0 {
-                o["run_gap_minutes"] = serde_json::json!(d.run_gap_minutes);
-            }
-            // 日跨ぎ終業の尻尾 (cause "punch-tail" の実額) も同じ規則
-            if d.punch_tail_minutes != 0 {
-                o["punch_tail_minutes"] = serde_json::json!(d.punch_tail_minutes);
-            }
-            // 日跨ぎ始業の頭 (cause "punch-head" の実額) も同じ規則
-            if d.punch_head_minutes != 0 {
-                o["punch_head_minutes"] = serde_json::json!(d.punch_head_minutes);
-            }
-            // 始業前の運行の頭 (cause "run-head" の実額、紙が大きくなる向き) も同じ規則
-            if d.run_head_minutes != 0 {
-                o["run_head_minutes"] = serde_json::json!(d.run_head_minutes);
-            }
-            // 昼休の窓との重なり (cause "lunch" の実額) も同じ規則
-            if d.lunch_overlap_minutes != 0 {
-                o["lunch_overlap_minutes"] = serde_json::json!(d.lunch_overlap_minutes);
-            }
-            // 1 日で終わる勤務は内訳が本体と同じなので載せない (元の応答と同じ規則)
-            if !parts.is_empty() {
-                o["parts"] = serde_json::Value::Array(parts);
-            }
-            o
-        })
-        .collect()
-}
-
-/// 画面のタイムカード表用に日別を絞る (Refs #164)。
-///
-/// [`compare_days`] (突合用) と同じ発想の**画面経路**版。全項目だと全乗務員で
-/// 月 ~1.7 MB あり、それが社内から Cloudflare Tunnel を通って毎回出ていく
-/// (方針は「圧縮より先にデータを減らす」— #156 revert 時のユーザー決定)。
-///
-/// 消費側は 2 つ — nuxt-dtako-admin front の `app/utils/kosoku-daily.ts`
-/// (`toKosokuDay`) と relay の `workers/dtako-scraper-relay/src/kosoku-daily.ts`
-/// (`parseKosokuDaily`)。残す/落とすはどちらの実コードにも合わせてある:
-///
-/// - **常に残す**: `date` / `start` / `end` — 消費側はどれかが欠けた日を捨てる
-/// - **既定と違うときだけ載せる**: `source` は `rest` のみ (消費側は `=== 'rest'`
-///   判定)、`is_legal_holiday` / `over_24h` は `true` のみ (`=== true` 判定)、
-///   分数は非 0 のみ (欠けは 0 に落ちる)
-/// - `punches` (勤務の中の打刻 = 表の出勤/退社列の原本) と `parts` (暦日按分)
-///   は**空でなければ**残す。part 側も `date` + 非 0 分数だけ
-/// - **落とす**: `rest_minus_minutes` (compare の診断専用で画面は読まない)
-///
-/// **キー名は元のまま** (compare_days と同じ理由 — 消費側のパーサを 2 通りに
-/// しない)。
-fn timecard_days(days: &[DaySummary]) -> Vec<serde_json::Value> {
-    days.iter()
-        .map(|d| {
-            let mut o = serde_json::json!({
-                "date": d.date,
-                "start": d.start,
-                "end": d.end,
-            });
-            // 消費側は `=== 'rest'` で見るので、既定の `timecard` は書かない
-            if d.source == ShiftSource::Rest {
-                o["source"] = serde_json::json!(d.source);
-            }
-            // `=== true` 判定なので false は書かない
-            if d.is_legal_holiday {
-                o["is_legal_holiday"] = serde_json::json!(true);
-            }
-            if d.over_24h {
-                o["over_24h"] = serde_json::json!(true);
-            }
-            // **0 は載せない** (Refs #157 と同じ規則)。日別 13 個の分数の過半は 0 で、
-            // 消費側は欠けを 0 として読む
-            for (key, v) in [
-                ("restraint_minutes", d.restraint_minutes),
-                ("break_minutes", d.break_minutes),
-                ("working_minutes", d.working_minutes),
-                ("statutory_minutes", d.statutory_minutes),
-                (
-                    "within_statutory_overtime_minutes",
-                    d.within_statutory_overtime_minutes,
-                ),
-                ("overtime_minutes", d.overtime_minutes),
-                ("legal_holiday_minutes", d.legal_holiday_minutes),
-                ("night_minutes", d.night_minutes),
-                ("overtime_night_minutes", d.overtime_night_minutes),
-                ("legal_holiday_night_minutes", d.legal_holiday_night_minutes),
-                ("ferry_minus_minutes", d.ferry_minus_minutes),
-            ] {
-                if v != 0 {
-                    o[key] = serde_json::json!(v);
-                }
-            }
-            // 休息由来の勤務は空 — 空配列を全日ぶら下げない
-            if !d.punches.is_empty() {
-                o["punches"] = serde_json::json!(d.punches);
-            }
-            // 1 日で終わる勤務は空 (元の応答と同じ規則)
-            if !d.parts.is_empty() {
-                o["parts"] = serde_json::Value::Array(timecard_parts(&d.parts));
-            }
-            o
-        })
-        .collect()
-}
-
-/// [`timecard_days`] の暦日按分 — `date` + 非 0 分数だけ (Refs #164)。
-fn timecard_parts(parts: &[DayPart]) -> Vec<serde_json::Value> {
-    parts
-        .iter()
-        .map(|p| {
-            let mut o = serde_json::json!({ "date": p.date });
-            for (key, v) in [
-                ("restraint_minutes", p.restraint_minutes),
-                ("working_minutes", p.working_minutes),
-                ("overtime_minutes", p.overtime_minutes),
-                ("legal_holiday_minutes", p.legal_holiday_minutes),
-                ("night_minutes", p.night_minutes),
-                ("overtime_night_minutes", p.overtime_night_minutes),
-                ("legal_holiday_night_minutes", p.legal_holiday_night_minutes),
-                ("ferry_minus_minutes", p.ferry_minus_minutes),
-            ] {
-                if v != 0 {
-                    o[key] = serde_json::json!(v);
-                }
-            }
-            o
-        })
-        .collect()
-}
-
-/// 応答の絞り方。**未知の値は [`Full`](ResponseView::Full)** — 綴り間違いで黙って
-/// 情報が減らないように、従来どおり全項目へ倒す (壊さない方に倒す)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponseView {
-    /// 従来どおり全項目。
-    Full,
-    /// 突合に要る項目だけ (Refs #157)。
-    Compare,
-    /// 画面のタイムカード表に要る項目だけ (Refs #164)。
-    Timecard,
-}
-
-fn parse_view(view: Option<&str>) -> ResponseView {
-    match view {
-        Some("compare") => ResponseView::Compare,
-        Some("timecard") => ResponseView::Timecard,
-        _ => ResponseView::Full,
-    }
-}
-
-/// 対象月の書式検証。`YYYY-MM` で月は 01-12。
-///
-/// 上流は月単位 API (`HolidaysTrait` が `first_day_of_month` を受けて「日」の配列を
-/// 返す) なので、任意の日付レンジは受け付けない。
-pub fn is_valid_month(month: &str) -> bool {
-    let bytes = month.as_bytes();
-    if bytes.len() != 7 || bytes[4] != b'-' {
-        return false;
-    }
-    if !bytes[..4].iter().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    if !bytes[5..].iter().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let mm: u32 = month[5..].parse().unwrap_or(0);
-    (1..=12).contains(&mm)
-}
+/// 対象月の書式検証 (`YYYY-MM` で月は 01-12)。定義は共有 crate (`kintai_kosoku::window`、Refs #322)。
+pub use kintai_kosoku::window::is_valid_month;
 
 /// 乗務員CD のパース。**数字のみ**を受ける (空・非数字・負値・桁溢れは None)。
 ///
@@ -765,14 +530,9 @@ pub async fn kosoku_daily(
     }
     // DB 読みと kosoku 計算全体をキャップ内で行う (convoy 防止)
     let _permit = KOSOKU_DB_PERMITS.acquire().await.expect("semaphore open");
+    let view = parse_view(params.view.as_deref());
     let Some(raw_driver) = params.driver else {
-        return kosoku_daily_all(
-            &month,
-            repo,
-            &params_cfg,
-            parse_view(params.view.as_deref()),
-        )
-        .await;
+        return kosoku_daily_all(&month, repo, &params_cfg, view).await;
     };
     let driver = match parse_driver(&raw_driver) {
         Some(d) => d,
@@ -792,255 +552,55 @@ pub async fn kosoku_daily(
         .fetch_events_between(&from, &to, driver)
         .await
         .map_err(map_repo_err)?;
-    let view = parse_view(params.view.as_deref());
-    // 紙の再現は**重複除去の前**の行で計算する — 紙は重複行を二重計上するので、
-    // 除去後の行では再現にならない (実測 ある乗務員 2026-04-04: 二重登録の運行 11 分を
-    // 紙は数え、除去後の再現では drift 0 になって差が unknown に残った)。
-    // 単一乗務員経路の行は `運行NO` を持ち全列同一にならないことがあるため、
-    // ここで計算しないと全乗務員経路と値が割れる (Refs nuxt-dtako-admin#501)
-    let paper = (view == ResponseView::Compare).then(|| paper_daily_minutes(&rows, &month));
-    // 紙が勤務の外で数えている分 (cause `paper-outside` の実額、Refs #182)。
-    // 紙の再現と同じく重複除去の前の行で測る
-    let outside = (view == ResponseView::Compare).then(|| paper_outside_by_date(&rows, &month));
-    // こちらだけが数える時間 (cause `ours-outside` の実額、鏡像)
-    let ours_only = (view == ResponseView::Compare).then(|| ours_outside_by_date(&rows, &month));
-    // 紙が引く 運行開始 → 始業 (cause `minus-unko` の実額、Refs #546)
-    let minus_unko = (view == ResponseView::Compare).then(|| minus_unko_by_date(&rows, &month));
-    // 深夜を跨ぐ継ぎ目の暦日配分の差 (cause `gap-midnight` の実額、Refs #546)
-    let gap_midnight = (view == ResponseView::Compare).then(|| gap_midnight_by_date(&rows, &month));
-    // 取り込みが 2 回走ると全列同一の行が入る。**紙は二重計上する**ので件数を返す
-    let (rows, duplicate_rows) = drop_duplicate_rows(rows);
-    let mut days = daily_summary(&rows, &month, &params_cfg);
-    // 紙のタイムカード表がこの月に引いているフェリー控除を載せる (Refs #146)。
-    // **拘束の計算には入れない** — 突合で差の原因を説明するためだけ。
-    // 取れなくても日別サマリは返す (控除が 0 になるだけ) — 突合の付帯情報のために
-    // 本体を落とさない
-    let mut ferry_map: BTreeMap<String, i64> = BTreeMap::new();
-    match repo.fetch_ferry(&month, Some(driver)).await {
-        Ok(ferry) => {
-            ferry_map = ferry_minus_by_date(&ferry);
-            apply_ferry_minus(&mut days, &ferry_map);
-        }
-        Err(e) => tracing::warn!("ferry fetch failed — ferry_minus stays 0: {e}"),
-    }
+    let ferry = ferry_or_empty(&repo, &month, Some(driver)).await;
+    // 組み立ては共有 crate (勤怠 Worker と同じもの、Refs #322)
+    let built = build_driver(rows, &ferry, &month, &params_cfg, view);
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
-    let count = days.len();
+    let count = built.days.len();
     tracing::info!(month = %month, driver, days = count, "kintai kosoku-daily built");
-    match view {
-        ResponseView::Compare => {
-            // 突合は打刻を見ない
-            let mut o = serde_json::json!({
-                "month": month,
-                "driver": driver,
-                "days": compare_days(&days),
-            });
-            // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
-            if !duplicate_rows.is_empty() {
-                o["duplicate_rows"] = serde_json::json!(duplicate_rows);
-            }
-            // 紙の再現値との日別の差 (cause `rounding` の実額、Refs
-            // ohishi-exp/nuxt-dtako-admin#501)。突合しか使わないので compare だけに載せる
-            let drift = paper
-                .map(|p| paper_drift_by_date(&days, &p))
-                .unwrap_or_default();
-            if !drift.is_empty() {
-                o["paper_drift_by_date"] = serde_json::json!(drift);
-            }
-            // フェリー控除の**日別マップそのもの**も載せる — 勤務への貼り付け
-            // (`apply_ferry_minus`) は「その日に始まる勤務か、その日に掛かる parts」
-            // が応答に居ることが前提で、**前月に始業した勤務だけが覆う日**の控除は
-            // どの勤務にも貼れずに落ちる (実測 ある乗務員 2026-05-01: 出庫 04-30 の
-            // 運行のフェリー 76 分。5 月応答に勤務が無く、4 月応答のフェリー窓は
-            // 4 月分だけ)。突合はこのマップを優先して読む
-            if !ferry_map.is_empty() {
-                o["ferry_minus_by_date"] = serde_json::json!(ferry_map);
-            }
-            // 紙が勤務の外で数えている分 — 突合が cause `paper-outside` に使う
-            let outside = outside.unwrap_or_default();
-            if !outside.is_empty() {
-                o["paper_outside_by_date"] = serde_json::json!(outside);
-            }
-            // こちらだけが数える時間 — 突合が cause `ours-outside` に使う
-            let ours_only = ours_only.unwrap_or_default();
-            if !ours_only.is_empty() {
-                o["ours_outside_by_date"] = serde_json::json!(ours_only);
-            }
-            // 紙が引く 運行開始 → 始業 — 突合が cause `minus-unko` に使う
-            let minus_unko = minus_unko.unwrap_or_default();
-            if !minus_unko.is_empty() {
-                o["minus_unko_by_date"] = serde_json::json!(minus_unko);
-            }
-            // 深夜を跨ぐ継ぎ目の暦日配分の差 — 突合が cause `gap-midnight` に使う
-            let gap_midnight = gap_midnight.unwrap_or_default();
-            if !gap_midnight.is_empty() {
-                o["gap_midnight_by_date"] = serde_json::json!(gap_midnight);
-            }
-            Ok(Json(o))
+    Ok(Json(built.into_single(&month, driver, view)))
+}
+
+/// 紙のタイムカード表がこの月に引いているフェリー控除の行 (Refs #146)。
+///
+/// 取れなくても日別サマリは返す (控除が 0 になるだけ) — 突合の付帯情報のために本体を落とさない。
+async fn ferry_or_empty(
+    repo: &DynKintaiEventsRepo,
+    month: &str,
+    driver: Option<u64>,
+) -> Vec<serde_json::Value> {
+    match repo.fetch_ferry(month, driver).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("ferry fetch failed — ferry_minus stays 0: {e}");
+            Vec::new()
         }
-        // 画面は月全打刻 (`punches`) も `duplicate_rows` 診断も読まない (Refs #164)
-        ResponseView::Timecard => Ok(Json(serde_json::json!({
-            "month": month,
-            "driver": driver,
-            "days": timecard_days(&days),
-        }))),
-        ResponseView::Full => Ok(Json(serde_json::json!({
-            "month": month,
-            "driver": driver,
-            "days": days,
-            "duplicate_rows": duplicate_rows,
-            "punches": month_punches(&rows, &month),
-        }))),
     }
 }
 
 /// `driver` 省略時 — 全乗務員ぶんを 1 リクエストで畳む (Refs #125)。
 ///
-/// [`daily_summary`] は乗務員を知らない純粋関数なので、**先に
-/// [`split_by_driver`] で分けてから**乗務員ごとに呼ぶ。混ぜたまま渡すと他人の
-/// 休息で勤務が切れる。
-///
-/// **勤務が 1 日も組めなかった乗務員は落とす。** 期間内に打刻も休息も無い人 (退職者・
-/// 内勤) まで空配列で並べると応答が膨らむだけで、受け手にとって「居ない」と同じ。
+/// 窓は fold と同じ: 全員で 1 回読み、乗務員ごとの起点へ切り戻す (Refs
+/// ohishi-exp/nuxt-dtako-admin#1123)。乗務員ごとの組み立て・乗務員CD=0 と
+/// 勤務も打刻も無い乗務員の除外は共有 crate の `for_each_driver` (Refs #322)。
 async fn kosoku_daily_all(
     month: &str,
     repo: DynKintaiEventsRepo,
     params_cfg: &KosokuParams,
     view: ResponseView,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // 窓は fold と同じ: 全員で 1 回読み、乗務員ごとの起点へ切り戻す (Refs
-    // ohishi-exp/nuxt-dtako-admin#1123、`kintai_fold::clip_to_anchors`)
     let anchors = month_anchors(&repo, month).await.map_err(map_repo_err)?;
     let (from, to) = read_window(month, &anchors, None).map_err(map_repo_err)?;
     let rows = repo
         .fetch_all_events_between(&from, &to)
         .await
         .map_err(map_repo_err)?;
-    // 全乗務員ぶんを 1 回で引いて乗務員ごとに分ける (Refs #146)。取れなければ空 =
-    // 控除 0 で続ける — 突合の付帯情報のために日別サマリを落とさない
-    let ferry_by_driver = match repo.fetch_ferry(month, None).await {
-        Ok(rows) => split_ferry_by_driver(rows),
-        Err(e) => {
-            tracing::warn!("ferry fetch failed — ferry_minus stays 0: {e}");
-            Default::default()
-        }
-    };
-    let drivers: Vec<serde_json::Value> = clip_to_anchors(split_by_driver(rows), month, &anchors)
-        .into_iter()
-        // 乗務員CD=0 は打刻の紐付かないデジタコ運行 (構内移動・回送・乗務員未確定等) で
-        // 実在の従業員ではない (Refs #284)。基準は kintai_repo.rs の
-        // timecard_driver_cds / kintai_fold.rs の RECALC_DRIVER_PAGE_SQL と同じ `> 0`。
-        // driver 指定の単一乗務員経路 (このファイルの kosoku_daily) は診断用途を
-        // 残すため対象外 — ここは全乗務員版だけの絞り込み
-        .filter(|(driver, _)| *driver > 0)
-        .map(|(driver, rows)| {
-            // 紙の再現は**重複除去の前**の行で計算する (単一乗務員経路と同じ理由 —
-            // 紙は重複行を二重計上する)。突合経路だけで計算する
-            let paper = (view == ResponseView::Compare).then(|| paper_daily_minutes(&rows, month));
-            // 紙が勤務の外で数えている分 (cause `paper-outside` の実額、Refs #182)
-            let outside = if view == ResponseView::Compare {
-                paper_outside_by_date(&rows, month)
-            } else {
-                Default::default()
-            };
-            // こちらだけが数える時間 (cause `ours-outside` の実額、鏡像)
-            let ours_only = if view == ResponseView::Compare {
-                ours_outside_by_date(&rows, month)
-            } else {
-                Default::default()
-            };
-            // 紙が引く 運行開始 → 始業 (cause `minus-unko` の実額、Refs #546)
-            let minus_unko = if view == ResponseView::Compare {
-                minus_unko_by_date(&rows, month)
-            } else {
-                Default::default()
-            };
-            // 深夜を跨ぐ継ぎ目の暦日配分の差 (cause `gap-midnight` の実額、Refs #546)
-            let gap_midnight = if view == ResponseView::Compare {
-                gap_midnight_by_date(&rows, month)
-            } else {
-                Default::default()
-            };
-            // 乗務員ごとに落とす — 全列同一の行は同じ乗務員にしか現れない
-            let (rows, duplicate_rows) = drop_duplicate_rows(rows);
-            let mut days = daily_summary(&rows, month, params_cfg);
-            // 単一乗務員経路と同じく日別マップも持ち回る — 前月に始業した勤務だけが
-            // 覆う日の控除は勤務に貼れないため、突合はマップを優先して読む
-            let ferry_map = ferry_by_driver
-                .get(&driver)
-                .map(|f| ferry_minus_by_date(f))
-                .unwrap_or_default();
-            apply_ferry_minus(&mut days, &ferry_map);
-            // 紙の再現値との日別の差 (cause `rounding` の実額)
-            let drift = paper
-                .map(|p| paper_drift_by_date(&days, &p))
-                .unwrap_or_default();
-            // 打刻は勤務と切り離して返す — 対になる終業が無い始業も表に出すため (#137)
-            let punches = month_punches(&rows, month);
-            (
-                driver,
-                days,
-                punches,
-                duplicate_rows,
-                drift,
-                ferry_map,
-                outside,
-                ours_only,
-                minus_unko,
-                gap_midnight,
-            )
-        })
-        .filter(|(_, days, punches, _, _, _, _, _, _, _)| !days.is_empty() || !punches.is_empty())
-        .map(
-            |(
-                driver,
-                days,
-                punches,
-                duplicate_rows,
-                drift,
-                ferry_map,
-                outside,
-                ours_only,
-                minus_unko,
-                gap_midnight,
-            )| {
-                // 画面は月全打刻 (`punches` = `month_punches` 由来) を読まない —
-                // `days[].punches` と実質重複しており、丸ごと落とせる (Refs #164)。
-                // `duplicate_rows` 診断も画面は読まない
-                if view == ResponseView::Timecard {
-                    return serde_json::json!({ "driver": driver, "days": timecard_days(&days) });
-                }
-                let mut o = if view == ResponseView::Compare {
-                    // 突合は打刻を見ない。日別も要る項目だけに絞る (Refs #157)
-                    serde_json::json!({ "driver": driver, "days": compare_days(&days) })
-                } else {
-                    serde_json::json!({ "driver": driver, "days": days, "punches": punches })
-                };
-                // 無い方が普通なので、あるときだけ載せる (フェリー控除と同じ規則)
-                if !duplicate_rows.is_empty() {
-                    o["duplicate_rows"] = serde_json::json!(duplicate_rows);
-                }
-                if !drift.is_empty() {
-                    o["paper_drift_by_date"] = serde_json::json!(drift);
-                }
-                if view == ResponseView::Compare && !ferry_map.is_empty() {
-                    o["ferry_minus_by_date"] = serde_json::json!(ferry_map);
-                }
-                if view == ResponseView::Compare && !outside.is_empty() {
-                    o["paper_outside_by_date"] = serde_json::json!(outside);
-                }
-                if view == ResponseView::Compare && !ours_only.is_empty() {
-                    o["ours_outside_by_date"] = serde_json::json!(ours_only);
-                }
-                if view == ResponseView::Compare && !minus_unko.is_empty() {
-                    o["minus_unko_by_date"] = serde_json::json!(minus_unko);
-                }
-                if view == ResponseView::Compare && !gap_midnight.is_empty() {
-                    o["gap_midnight_by_date"] = serde_json::json!(gap_midnight);
-                }
-                o
-            },
-        )
-        .collect();
+    // 全乗務員ぶんを 1 回で引いて乗務員ごとに分ける (Refs #146)
+    let ferry = ferry_or_empty(&repo, month, None).await;
+    let mut drivers = Vec::new();
+    for_each_driver(rows, ferry, month, &anchors, params_cfg, view, |d| {
+        drivers.push(d)
+    });
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let count = drivers.len();
     tracing::info!(month = %month, drivers = count, "kintai kosoku-daily built for all drivers");
@@ -1053,24 +613,6 @@ async fn kosoku_daily_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn valid_months() {
-        assert!(is_valid_month("2026-01"));
-        assert!(is_valid_month("2026-12"));
-    }
-
-    #[test]
-    fn invalid_months() {
-        assert!(!is_valid_month(""));
-        assert!(!is_valid_month("2026-1"));
-        assert!(!is_valid_month("2026-00"));
-        assert!(!is_valid_month("2026-13"));
-        assert!(!is_valid_month("2026/06"));
-        assert!(!is_valid_month("20a6-06"));
-        assert!(!is_valid_month("2026-0a"));
-        assert!(!is_valid_month("2026-006"));
-    }
 
     #[test]
     fn valid_drivers() {
@@ -1088,16 +630,6 @@ mod tests {
         assert_eq!(parse_driver("-1"), None);
         // u64 桁溢れ (書式は数字でもパースできない)
         assert_eq!(parse_driver("99999999999999999999999"), None);
-    }
-
-    #[test]
-    fn view_parsing() {
-        assert_eq!(parse_view(None), ResponseView::Full);
-        assert_eq!(parse_view(Some("compare")), ResponseView::Compare);
-        assert_eq!(parse_view(Some("timecard")), ResponseView::Timecard);
-        // 未知の値は全項目へ倒す (壊さない方に倒す)
-        assert_eq!(parse_view(Some("full")), ResponseView::Full);
-        assert_eq!(parse_view(Some("")), ResponseView::Full);
     }
 
     #[test]
