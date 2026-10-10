@@ -99,7 +99,7 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 - `KINTAI_MARIADB_VPC` — Workers VPC の VPC Service (TCP 3306)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-kintai-mariadb` の id
 - `KINTAI_MARIADB` — Secrets Store の secret。JSON `{"user":…,"password":…,"database":…}` (どれも空でない文字列)。未投入なら `/probe` は 503
 - `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ `GET /api/kintai/*` は 503
-- `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。いまは空 (値は後で入れる)。空の間は `GET /api/kintai/*` は 503
+- `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
 - `CF_VERSION_METADATA` — 版の元
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / `LOCAL_*` の var なし /
   hyperdrive はトップレベル以外に無い。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
@@ -121,6 +121,7 @@ handler を叩いていたものは同じ入力を `parse` に通す形に書き
 `cargo test -p kintai-mysql -p kintai-logic` (DB 不要)。Worker は `cargo build --target wasm32-unknown-unknown` と clippy まで。
 ローカルで VPC や Secrets Store を迂回する var は持たないので、実接続は VPC Service と `KINTAI_MARIADB` を用意してから
 `wrangler dev --remote` で `POST /probe`。Supabase の 5 本も同じく `wrangler dev --remote` (Hyperdrive の経路は CI では通せない)。
+`--var "KINTAI_TENANT_ID:<UUID>"` を渡すと 5 本が 503 ではなく答える。
 
 ## 本番 deploy
 
