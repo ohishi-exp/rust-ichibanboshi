@@ -6,6 +6,7 @@ name: worker-kintai
 #     (この経路は secret も token も使わない)
 #   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
 # merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。
+# 本番のテナントは repo variable KINTAI_EVENTS_TENANT_ID (Cloud Run 版と同じ) を deploy 時に --var で渡す。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。wrangler の出力はファイルに取り、mask してから伏せて出す。
 on:
   pull_request:
@@ -135,10 +136,20 @@ jobs:
       - name: wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          KINTAI_TENANT_ID: ${{ vars.KINTAI_EVENTS_TENANT_ID }}
         run: |
+          # 読み先のテナントは小文字 hex の UUID (nil 以外) だけを通す。値は出さない。
+          # 空のまま deploy すると本番の GET /api/kintai/* が 503 になるので、ここで止める
+          uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if ! [[ "${KINTAI_TENANT_ID}" =~ $uuid_re ]] || [ "${KINTAI_TENANT_ID}" = "00000000-0000-0000-0000-000000000000" ]; then
+            echo "::error::repo variable KINTAI_EVENTS_TENANT_ID が空か UUID でない"
+            exit 1
+          fi
+          echo "::add-mask::${KINTAI_TENANT_ID}"
           log="$RUNNER_TEMP/deploy.log"
           status=0
           npx -y "wrangler@${WRANGLER_VERSION}" deploy \
+            --var "KINTAI_TENANT_ID:${KINTAI_TENANT_ID}" \
             --tag "$GITHUB_REF_NAME" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
           # 何かを出す前に mask を登録する
           grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do

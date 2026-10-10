@@ -51,6 +51,7 @@ binding = "KINTAI_HYPERDRIVE"
 id = "0110becff61044bb8435c457a69c63a1"
 
 # 読み先のテナント (UUID の文字列)。GET /api/kintai/* はこの pin だけでテナントを決め、X-Tenant-ID は読まない。
-# 空・UUID でない・nil UUID なら 503。値は後で入れる
+# 空・UUID でない・nil UUID なら 503。
+# 本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のまま
 [vars]
 KINTAI_TENANT_ID = ""
