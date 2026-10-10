@@ -331,6 +331,7 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 - `output_sha.rs`: 版の畳み方 (`fold_output_sha`)。repo ルートの build.rs と `worker/build.rs` が `include!` する (crate の src の外 = どちらの版の glob にも入らない)
 
 独立した workspace (repo ルートの package・`workers/ichiban`・`workers/kyuyo` からは参照されない)。
+ただし repo ルートの package は `kintai-logic`・`kintai-kosoku`・`kintai-dtako` に path 依存するので、**これらの crate の依存を変えたら root の `Cargo.lock` も同じ PR で更新する** (`cargo metadata --format-version 1`。忘れると main の GCP image が `--locked` で落ちる。`worker-kintai.yml` が PR で検査する)。
 
 ## ローカル検証
 

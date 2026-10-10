@@ -1521,11 +1521,13 @@ dependencies = [
  "kintai-dtako",
  "kintai-kosoku",
  "kintai-mysql",
+ "mime",
  "postgres-types",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha2 0.10.9",
  "uuid",
 ]
 
