@@ -36,6 +36,10 @@ path = "workers/ichiban/logic/src/period.rs"
 [[files]]
 path = "workers/ichiban/logic/src/sales_yoy.rs"
 
+# monthly・by-department・by-customer・yoy (c35)
+[[files]]
+path = "workers/ichiban/logic/src/sales_monthly.rs"
+
 # surcharge/base・schema/columns (c39)
 [[files]]
 path = "workers/ichiban/logic/src/surcharge.rs"
