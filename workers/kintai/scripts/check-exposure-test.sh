@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-exposure.sh の陰性対照。wrangler.toml を tomllib で読んだ dict を 1 か所ずつ崩して TOML に書き戻し、
-# (a)〜(e)・(g)〜(i) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# (a)〜(e)・(g)〜(j) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
 # 4 つ目の引数を渡した行は、出力にその文字列 (どの検査が落としたか) があることも確かめる。
 # 文字列の特定の表の直前に行を挿す作りにはしない (表の中身に紛れて別の表のキーになる — rust-alc-api#698)。
 # CI で check-exposure.sh の直後に走る。
@@ -126,6 +126,21 @@ mutate 1 "(g) トップレベルに残したまま env.staging にも置く" \
   'cfg["env"] = {"staging": {"hyperdrive": [dict(cfg["hyperdrive"][0])]}}' "env.staging.hyperdrive がある"
 mutate 1 "(g) env 以外の表の奥に hyperdrive" 'cfg["observability"]["hyperdrive"] = [dict(cfg["hyperdrive"][0])]' \
   "observability.hyperdrive がある"
+# (i) 社内 CakePHP への口 KINTAI_CAKEPHP_VPC はトップレベルにだけ
+mutate 1 "(i) KINTAI_CAKEPHP_VPC を消す" \
+  'cfg["vpc_services"] = [v for v in cfg["vpc_services"] if v["binding"] != "KINTAI_CAKEPHP_VPC"]' \
+  "vpc_services の KINTAI_CAKEPHP_VPC が無い"
+mutate 1 "(i) KINTAI_CAKEPHP_VPC の binding 名を変える" \
+  'next(v for v in cfg["vpc_services"] if v["binding"] == "KINTAI_CAKEPHP_VPC")["binding"] = "CAKEPHP_VPC"' \
+  "vpc_services の KINTAI_CAKEPHP_VPC が無い"
+mutate 1 "(i) KINTAI_CAKEPHP_VPC を env.staging へ動かす" \
+  'cfg["env"] = {"staging": {"vpc_services": [v for v in cfg["vpc_services"] if v["binding"] == "KINTAI_CAKEPHP_VPC"]}}; cfg["vpc_services"] = [v for v in cfg["vpc_services"] if v["binding"] != "KINTAI_CAKEPHP_VPC"]' \
+  "env.staging.vpc_services がある"
+mutate 1 "(i) トップレベルに残したまま env.staging にも置く" \
+  'cfg["env"] = {"staging": {"vpc_services": [dict(v) for v in cfg["vpc_services"] if v["binding"] == "KINTAI_CAKEPHP_VPC"]}}' \
+  "env.staging.vpc_services がある"
+mutate 1 "(i) env 以外の表の奥に vpc_services" 'cfg["observability"]["vpc_services"] = [dict(cfg["vpc_services"][0])]' \
+  "observability.vpc_services がある"
 # (h) 書き込みの口 (worker/src の Route::Write) があるなら KINTAI_WRITE_TOKEN の binding が要る
 mutate 1 "(h) KINTAI_WRITE_TOKEN を消す" \
   'cfg["secrets_store_secrets"] = [s for s in cfg["secrets_store_secrets"] if s["binding"] != "KINTAI_WRITE_TOKEN"]' \
@@ -163,19 +178,19 @@ mkdir -p "$tmp/src-restraint-only"
 echo 'fn r() { let _ = Route::Restraint(x); }' >"$tmp/src-restraint-only/lib.rs"
 KINTAI_WORKER_SRC="$tmp/src-restraint-only" expect 1 "(h) 拘束サマリの口だけでも KINTAI_WRITE_TOKEN が要る" "$tmp/no-token.toml" \
   "secrets_store_secrets の KINTAI_WRITE_TOKEN が無い"
-# (i) 拘束サマリの口 (worker/src の Route::Restraint) があるなら D1 の KINTAI_RESTRAINT_DB がトップレベルに要る
-mutate 1 "(i) d1_databases を消す" 'del cfg["d1_databases"]' "d1_databases の KINTAI_RESTRAINT_DB が無い"
-mutate 1 "(i) KINTAI_RESTRAINT_DB の binding 名を変える" 'cfg["d1_databases"][0]["binding"] = "OTHER_DB"' \
+# (j) 拘束サマリの口 (worker/src の Route::Restraint) があるなら D1 の KINTAI_RESTRAINT_DB がトップレベルに要る
+mutate 1 "(j) d1_databases を消す" 'del cfg["d1_databases"]' "d1_databases の KINTAI_RESTRAINT_DB が無い"
+mutate 1 "(j) KINTAI_RESTRAINT_DB の binding 名を変える" 'cfg["d1_databases"][0]["binding"] = "OTHER_DB"' \
   "d1_databases の KINTAI_RESTRAINT_DB が無い"
-mutate 1 "(i) database_name を変える" 'cfg["d1_databases"][0]["database_name"] = "other"' \
+mutate 1 "(j) database_name を変える" 'cfg["d1_databases"][0]["database_name"] = "other"' \
   "database_name が ichibanboshi-kintai-restraint でない"
-mutate 1 "(i) migrations_dir を変える" 'cfg["d1_databases"][0]["migrations_dir"] = "sql"' "migrations_dir が migrations でない"
-mutate 1 "(i) migrations_dir を消す" 'del cfg["d1_databases"][0]["migrations_dir"]' "migrations_dir が migrations でない"
-mutate 1 "(i) d1_databases を env.staging へ動かす" \
+mutate 1 "(j) migrations_dir を変える" 'cfg["d1_databases"][0]["migrations_dir"] = "sql"' "migrations_dir が migrations でない"
+mutate 1 "(j) migrations_dir を消す" 'del cfg["d1_databases"][0]["migrations_dir"]' "migrations_dir が migrations でない"
+mutate 1 "(j) d1_databases を env.staging へ動かす" \
   'cfg["env"] = {"staging": {"d1_databases": cfg.pop("d1_databases")}}' "env.staging.d1_databases がある"
-mutate 1 "(i) トップレベルに残したまま env.staging にも置く" \
+mutate 1 "(j) d1_databases をトップレベルに残したまま env.staging にも置く" \
   'cfg["env"] = {"staging": {"d1_databases": [dict(cfg["d1_databases"][0])]}}' "env.staging.d1_databases がある"
-mutate 1 "(i) env 以外の表の奥に d1_databases" 'cfg["observability"]["d1_databases"] = [dict(cfg["d1_databases"][0])]' \
+mutate 1 "(j) env 以外の表の奥に d1_databases" 'cfg["observability"]["d1_databases"] = [dict(cfg["d1_databases"][0])]' \
   "observability.d1_databases がある"
 # 拘束サマリの口が無いソースなら D1 が無くても通る (検査が src を見ていることの対照)
 mkdir -p "$tmp/src-write-only"
@@ -189,8 +204,8 @@ text, n = re.subn(r"\[\[d1_databases\]\]\n(?:[^\n]+\n)*", "", text)
 assert n == 1, n
 open(sys.argv[2], "w", encoding="utf-8").write(text)
 PY
-KINTAI_WORKER_SRC="$tmp/src-write-only" expect 0 "(i) 拘束サマリの口が無いなら D1 が無くても通る" "$tmp/no-d1.toml"
-expect 1 "(i) 拘束サマリの口があるのに D1 が無い (同じ toml・実物の src)" "$tmp/no-d1.toml" \
+KINTAI_WORKER_SRC="$tmp/src-write-only" expect 0 "(j) 拘束サマリの口が無いなら D1 が無くても通る" "$tmp/no-d1.toml"
+expect 1 "(j) 拘束サマリの口があるのに D1 が無い (同じ toml・実物の src)" "$tmp/no-d1.toml" \
   "d1_databases の KINTAI_RESTRAINT_DB が無い"
 # (f) は warning だけ: service_id を実値らしくしても、プレースホルダのままでも exit 0
 mutate 0 "(f) service_id を入れた (warning 無し)" \

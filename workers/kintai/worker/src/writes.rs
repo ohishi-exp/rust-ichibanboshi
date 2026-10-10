@@ -2,6 +2,7 @@
 //!
 //! - `POST /api/kintai/timecard` — 打刻の差分の日だけを反映する (元は Cloud Run 版の `kintai_timecard::receive`)
 //! - `POST /api/kintai/wage-snapshot` — 賃金確定値の 1 か月ぶんを置き換え保存する (元は `wage_snapshot::put_wage_snapshot`)
+//! - `POST /api/dtako/autoload` — csvdata.zip を社内 CakePHP の取り込み口へ中継する (認可の後は [`crate::cakephp`])
 //!
 //! 検査の順は **認可 → 入力 → テナント → DB**:
 //! `X-Kintai-Write-Token` を Secrets Store の `KINTAI_WRITE_TOKEN` と照合 (無い・違う = 403、binding が無い・読めない = 503) →
@@ -31,16 +32,28 @@ pub(crate) async fn serve(
 ) -> Result<serde_json::Value, Fail> {
     let token = req.headers().get(WRITE_TOKEN_HEADER).ok().flatten();
     authorize(load_token(env).await.as_deref(), token.as_deref())?;
+    match write {
+        Write::Timecard => {
+            let (content_type, body) = read_body(req).await?;
+            timecard(content_type.as_deref(), &body, env).await
+        }
+        Write::WageSnapshot => {
+            let (content_type, body) = read_body(req).await?;
+            wage_snapshot(content_type.as_deref(), &body, env).await
+        }
+        // 本文は zip (JSON ではない)。入力の検査と段取りは CakePHP の中継の側
+        Write::DtakoAutoload => crate::cakephp::autoload(req, env).await,
+    }
+}
+
+/// 本文の Content-Type とバイト列。読めない (途中で切れた等) のは axum の `Failed to buffer the request body` (400) と同じ扱い。
+async fn read_body(req: &mut Request) -> Result<(Option<String>, Vec<u8>), Fail> {
     let content_type = req.headers().get("content-type").ok().flatten();
-    // 本文が読めない (途中で切れた等) のは axum の `Failed to buffer the request body` (400) と同じ扱い
     let body = req
         .bytes()
         .await
         .map_err(|_| Fail::new(400, "Failed to buffer the request body"))?;
-    match write {
-        Write::Timecard => timecard(content_type.as_deref(), &body, env).await,
-        Write::WageSnapshot => wage_snapshot(content_type.as_deref(), &body, env).await,
-    }
+    Ok((content_type, body))
 }
 
 /// 共有 secret を読む。binding が無い・secret が未投入は `None` (中身はどこにも出さない)。

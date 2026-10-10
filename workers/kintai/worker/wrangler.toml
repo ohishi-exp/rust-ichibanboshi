@@ -2,16 +2,17 @@
 # Service Binding 専用。口は到達の確認用の POST /probe (社内 MariaDB、自作の MySQL クライアント kintai-mysql) と、
 # Supabase の勤怠スキーマを読む GET /api/kintai/* の 6 本・書く POST の 2 本 (Hyperdrive + alc-worker-db)、
 # 社内 MariaDB を直接読む GET の 10 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime・
-# kosoku-daily・version・timecard/drivers・timecard/events)、拘束サマリの PUT /api/restraint/summaries・GET /api/restraint/{wage-source,
-# synced-months} (D1 KINTAI_RESTRAINT_DB)。
+# kosoku-daily・version・timecard/drivers・timecard/events)、社内 CakePHP (Workers VPC の HTTP) を中継する GET の 2 本
+# (daily・pdf-json) と POST /api/dtako/autoload (書き込みの口)、拘束サマリの PUT /api/restraint/summaries・
+# GET /api/restraint/{wage-source,synced-months} (D1 KINTAI_RESTRAINT_DB)。
 # 本番へはタグ worker-kintai-v* の push で deploy する (.github/workflows/worker-kintai.yml)。
 #
 # ★ 外から届く口を持たない:
 #   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)。
 #   - 読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手 (relay の共有 secret、kyuyo-mcp の OAuth)
-#   - 書き込みの口 (POST の 2 本と拘束サマリの PUT) だけ Worker が共有 secret KINTAI_WRITE_TOKEN を照合する (ユーザー決定 2026-10-10)
+#   - 書き込みの口 (POST の 3 本 = CakePHP への autoload を含む・拘束サマリの PUT) だけ Worker が共有 secret KINTAI_WRITE_TOKEN を照合する (ユーザー決定 2026-10-10)
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
-#   - MariaDB への口 (vpc_services)・Supabase への口 (hyperdrive)・拘束サマリの D1 (d1_databases) はトップレベルにだけ置く。
+#   - MariaDB・CakePHP への口 (vpc_services)・Supabase への口 (hyperdrive)・拘束サマリの D1 (d1_databases) はトップレベルにだけ置く。
 #     ローカルで迂回する LOCAL_* の var は持たない
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
@@ -46,6 +47,14 @@ binding = "CF_VERSION_METADATA"
 [[vpc_services]]
 binding = "KINTAI_MARIADB_VPC"
 service_id = "01a12419-659c-7b21-ac68-945c6f23ccc8"
+remote = true
+
+# 社内 CakePHP (nginx) への口 (HTTP)。GET /api/kintai/{daily,pdf-json} と POST /api/dtako/autoload (③ resetby-unko-no を含む) が
+# fetch する。宛先の host:port は VPC Service 側に閉じる (コードの URL の host は名目)。fetch は 3xx を追わない (redirect: manual)。
+# service_id は VPC Service `ichibanboshi-kintai-cakephp` の id (資格情報でも宛先でもない)。無ければ 3 本は 503 (autoload の preview は configured: false)
+[[vpc_services]]
+binding = "KINTAI_CAKEPHP_VPC"
+service_id = "01a12419-6924-7d63-9335-4693e124fc9e"
 remote = true
 
 # MariaDB の資格情報。store_id は Secrets Store の id、secret_name は secret 名 (どちらも値そのものではない)。

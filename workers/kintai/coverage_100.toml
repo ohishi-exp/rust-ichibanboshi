@@ -101,6 +101,11 @@ path = "workers/kintai/logic/src/cakephp.rs"
 [[files]]
 path = "workers/kintai/logic/src/dtako_autoload.rs"
 
+# 勤怠 Worker の daily・pdf-json・autoload の口の検査・応答・失敗の写像 (root の routes/kintai.rs の写しを含む)。
+# テストは workers/kintai/logic/tests/cakephp_relay.rs
+[[files]]
+path = "workers/kintai/logic/src/cakephp_relay.rs"
+
 # 拘束サマリ (restraint) の 3 口の検査・SQL・bind・応答。root の src/routes/restraint.rs・src/restraint_store.rs から移した
 # (オンプレ版と Worker の D1 版が同じものを使う)。テストは workers/kintai/logic/tests/restraint.rs
 [[files]]
