@@ -13,8 +13,12 @@
 #   (h) Worker のソース (既定 workers/kintai/worker/src、env KINTAI_WORKER_SRC で差し替え) に書き込みの口
 #       (`Route::Write(`) があるなら、トップレベルの secrets_store_secrets に KINTAI_WRITE_TOKEN (secret_name も同名、
 #       store_id は KINTAI_MARIADB と同じ) がある。書き込みの口は共有 secret を照合するので、binding が無いと全部 503 になる
-#       (照合の判定は kintai-logic の write_auth)。secrets_store_secrets もトップレベル以外に置かない
-# (a)〜(e)・(g)・(h) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
+#       (照合の判定は kintai-logic の write_auth)。secrets_store_secrets もトップレベル以外に置かない。
+#       拘束サマリの PUT (`Route::Restraint(`) も同じ secret を照合するので、書き込みの口として数える
+#   (i) Worker のソースに拘束サマリの口 (`Route::Restraint(`) があるなら、トップレベルの d1_databases に KINTAI_RESTRAINT_DB
+#       (database_name = ichibanboshi-kintai-restraint・migrations_dir = "migrations") がある。d1_databases はトップレベル以外
+#       (env.* を含む表の奥) のどこにも置かない (本番の D1 へ届く binding をトップレベルの外へ漏らさない)
+# (a)〜(e)・(g)〜(i) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/kintai/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/kintai/worker/wrangler.toml)
 set -euo pipefail
@@ -108,7 +112,9 @@ for name in nested_hyperdrive(cfg):
 
 # (h) 書き込みの口があるなら、その認可の secret の binding がトップレベルにある
 src = pathlib.Path(sys.argv[2])
-has_write = any("Route::Write(" in f.read_text(encoding="utf-8") for f in src.glob("*.rs"))
+sources = [f.read_text(encoding="utf-8") for f in src.glob("*.rs")]
+has_restraint = any("Route::Restraint(" in t for t in sources)
+has_write = has_restraint or any("Route::Write(" in t for t in sources)
 secrets = cfg.get("secrets_store_secrets") or []
 by_binding = {s.get("binding"): s for s in secrets if isinstance(s, dict)}
 if has_write:
@@ -138,8 +144,37 @@ def nested_secrets(node, prefix=""):
 for name in nested_secrets(cfg):
     err(f"{name} がある (secrets_store_secrets はトップレベルにだけ置く)")
 
+# (i) 拘束サマリの口があるなら D1 の KINTAI_RESTRAINT_DB がトップレベルにある。d1_databases はトップレベル以外に置かない
+d1s = cfg.get("d1_databases") or []
+d1 = next((d for d in d1s if isinstance(d, dict) and d.get("binding") == "KINTAI_RESTRAINT_DB"), None)
+if has_restraint:
+    if d1 is None:
+        err("拘束サマリの口があるのにトップレベルに d1_databases の KINTAI_RESTRAINT_DB が無い")
+    else:
+        if d1.get("database_name") != "ichibanboshi-kintai-restraint":
+            err("KINTAI_RESTRAINT_DB の database_name が ichibanboshi-kintai-restraint でない")
+        if d1.get("migrations_dir") != "migrations":
+            err("KINTAI_RESTRAINT_DB の migrations_dir が migrations でない (表の定義の正本 migrations/0001_restraint.sql)")
+
+
+def nested_d1(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            name = f"{prefix}.{k}" if prefix else k
+            if k == "d1_databases" and prefix:
+                yield name
+            yield from nested_d1(v, name)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from nested_d1(v, f"{prefix}[{i}]")
+
+
+for name in nested_d1(cfg):
+    err(f"{name} がある (d1_databases はトップレベルにだけ置く)")
+
 if errors:
     sys.exit(1)
 write_note = "・書き込みの口の KINTAI_WRITE_TOKEN あり" if has_write else ""
+write_note += "・拘束サマリの D1 はトップレベル" if has_restraint else ""
 print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services と hyperdrive はトップレベル・LOCAL_* 無し{write_note}")
 PY

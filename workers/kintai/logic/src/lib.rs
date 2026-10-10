@@ -11,7 +11,7 @@
 //! kosoku-daily・version・timecard/drivers・timecard/events は `kosoku_reads` (検査・引数・応答)。応答を組む部分は共有 crate
 //! `kintai-kosoku` (`kosoku_daily`・`kintai_version`・`kintai_timecard`) を使う。
 //! 拘束サマリ (restraint) の 3 口は `restraint` (検査・SQL・bind・応答)。写しではなく、オンプレ版 (rusqlite) と
-//! Worker (D1) が同じものを使う。
+//! Worker (D1) が同じものを使う。D1 の batch に流す文の束・結果の行の読み取り・D1 だけの失敗は `restraint_d1`。
 //!
 //! 社内 CakePHP への中継 (daily・pdf-json・autoload と ③ resetby-unko-no) の URL・multipart・応答の型は `cakephp`、
 //! autoload の検査・① ② ③ の段取り・応答・③ の材料を数える SQL は `dtako_autoload` (root の package も path 依存で使う)。
@@ -29,6 +29,7 @@ pub mod kosoku_reads;
 pub mod mariadb_reads;
 pub mod mariadb_rows;
 pub mod restraint;
+pub mod restraint_d1;
 pub mod shift_days;
 pub mod shift_overlaps;
 pub mod timecard_write;

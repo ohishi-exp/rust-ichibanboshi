@@ -5,7 +5,9 @@ name: worker-kintai
 #     公開範囲の検査・wrangler deploy --dry-run。pg-parity job で、Supabase への書き込み部品 (kintai-pg) と root の Cloud Run 版
 #     (sqlx) に同じ入力を与えて書いた後の表を比べる (postgres service。ci.yml の kintai migration + RLS job と同じ形)
 #     (この経路は secret も token も使わない)
-#   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)
+#     拘束サマリの D1 の migration を runner の中の local D1 に当てて確かめる (本番の D1 には触らない)。
+#   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)。その前に本番の D1 に
+#     未適用の migration が無いことを wrangler d1 migrations list --remote で確かめる (当てるのは人。CI は当てない)
 # merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。
 # 本番のテナントは repo variable KINTAI_EVENTS_TENANT_ID (Cloud Run 版と同じ) を deploy 時に --var で渡す。
 # day-events のリンクの base URL は repo variable KINTAI_RYOHI_BASE_URL・KINTAI_DTAKO_BASE_URL (オンプレの設定と同じ値) を同じく --var で渡す。
@@ -23,6 +25,9 @@ on:
       - 'src/routes/kintai_timecard.rs'
       - 'src/routes/wage_snapshot.rs'
       - 'migrations/**'
+      # restraint_d1_parity が比べる相手 (オンプレ版の拘束サマリの口と SQLite の store)
+      - 'src/routes/restraint.rs'
+      - 'src/restraint_store.rs'
   push:
     branches: [main]
     # タグの push には paths が効かない (タグは常に走る)
@@ -36,6 +41,8 @@ on:
       - 'src/routes/kintai_timecard.rs'
       - 'src/routes/wage_snapshot.rs'
       - 'migrations/**'
+      - 'src/routes/restraint.rs'
+      - 'src/restraint_store.rs'
 
 permissions:
   contents: read
@@ -123,6 +130,19 @@ jobs:
         working-directory: workers/kintai/worker
         run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
 
+      # 拘束サマリの D1 の migration (worker/migrations、表の定義の正本) が D1 の SQLite で当たること。
+      # 当てる先は runner の中の local D1 だけ (token も本番の D1 も使わない)。当てた後に未適用が 0 件になること
+      - name: D1 migration (local) applies
+        working-directory: workers/kintai/worker
+        run: |
+          npx -y "wrangler@${WRANGLER_VERSION}" d1 migrations apply KINTAI_RESTRAINT_DB --local
+          out="$(npx -y "wrangler@${WRANGLER_VERSION}" d1 migrations list KINTAI_RESTRAINT_DB --local 2>&1)"
+          echo "$out"
+          if ! grep -q 'No migrations to apply' <<<"$out"; then
+            echo "::error::local D1 に migration を当てた後も未適用が残っている"
+            exit 1
+          fi
+
   # Supabase への書き込み: Worker の部品 (kintai-pg、tokio-postgres の query_typed / execute_typed) と root の Cloud Run 版
   # (sqlx) に同じ入力を与え、kintai.kintai_events・event_changes・wage_snapshot の中身と応答が一致すること
   # (tests/root_parity.rs。KINTAI_TEST_DATABASE_URL が無ければ失敗する)。入力の検査が root の axum の handler と同じ
@@ -195,6 +215,29 @@ jobs:
           save-if: false
 
       - run: cargo install -q worker-build@0.8.7 --locked
+
+      # 拘束サマリの D1 (KINTAI_RESTRAINT_DB) の migration は CI では当てない (本番への適用は人が 1 回だけ手で打つ。
+      # org の token に D1:Edit が無いとタグ deploy が全部止まるため)。ここでは未適用が 0 件であることだけを確かめ、
+      # 1 件でも残っていれば deploy しない (表の無い D1 に新しいコードを出さない)。出力は deploy と同じく伏せてから出す
+      - name: D1 migrations are all applied (remote)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/d1-migrations.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" d1 migrations list KINTAI_RESTRAINT_DB --remote >"$log" 2>&1 || status=$?
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          if [ "$status" != 0 ]; then
+            echo "::error::wrangler d1 migrations list --remote が失敗した (token に D1 の読み取り権限があるか確かめる)"
+            exit "$status"
+          fi
+          if ! grep -q 'No migrations to apply' "$log"; then
+            echo "::error::本番の D1 (KINTAI_RESTRAINT_DB) に未適用の migration がある。先に人が wrangler d1 migrations apply KINTAI_RESTRAINT_DB --remote を打つ"
+            exit 1
+          fi
 
       # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す (ログファイルそのものは出さない)。
       #   - 32 桁の hex (account ID): ::add-mask:: + <account> に置換

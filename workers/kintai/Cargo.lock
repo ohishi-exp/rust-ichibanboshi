@@ -1513,6 +1513,7 @@ dependencies = [
  "chrono",
  "kintai-kosoku",
  "kintai-logic",
+ "rusqlite",
  "rust-ichibanboshi",
  "serde_json",
  "sqlx",

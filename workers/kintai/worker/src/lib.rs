@@ -20,6 +20,10 @@
 //!   kintai-kosoku)。kosoku-daily と version は 1 接続で遡り起点の 2 本 → 本体 (→ フェリー) を流す。
 //!   version の etag の版は build.rs が焼く `KINTAI_WORKER_OUTPUT_SHA` (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値)。
 //!
+//! - 拘束サマリ (restraint) の `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` ([`restraint`]。
+//!   オンプレ版 (SQLite) から D1 (`KINTAI_RESTRAINT_DB`) へ移した。検査・SQL・応答はオンプレ版と同じ kintai-logic の `restraint`。
+//!   **PUT は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**)。
+//!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
 //! **書き込みの口は Worker が共有 secret を照合する** (ユーザー決定 2026-10-10。読みのために binding を持つ呼び手が POST を
@@ -30,6 +34,7 @@
 mod conn;
 mod probe;
 mod reads;
+mod restraint;
 mod tcp;
 mod transport;
 mod writes;
@@ -75,6 +80,9 @@ const OUTPUT_SHA: &str = env!("KINTAI_WORKER_OUTPUT_SHA");
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
     let route = route(req.method().as_ref(), &req.path());
+    if let Route::Restraint(r) = route {
+        return restraint::serve(r, &mut req, &env).await;
+    }
     if let Route::Write(write) = route {
         let outcome = writes::serve(write, &mut req, &env);
         return run_read(write.as_str(), outcome).await;

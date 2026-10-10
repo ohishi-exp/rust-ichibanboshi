@@ -1,9 +1,10 @@
 # workers/kintai
 
-勤怠 (kintai) の Worker `ichibanboshi-kintai` (Refs #322)。口は 2 系統:
+勤怠 (kintai) の Worker `ichibanboshi-kintai` (Refs #322)。口は 3 系統:
 
 - 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` と、直接読む GET の 10 本 (`/api/kintai/*` の 9 本と `/api/dtako/worktime`。オンプレ版から移した。下記)
 - Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 6 本と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
+- D1 (`KINTAI_RESTRAINT_DB`) — 拘束サマリの `PUT /api/restraint/summaries` と `GET /api/restraint/{wage-source,synced-months}` (オンプレ版の SQLite から移した。下記)
 
 ## 到達の経路
 
@@ -279,13 +280,77 @@ kosoku-daily・version・timecard の 2 本も同じで、応答を組む部分�
 テストは `logic/tests/` (DB 不要)。元の単体テストのうちテナント・月の境界・store の写しは `tests/common.rs` に畳み、
 handler を叩いていたものは同じ入力を `parse` に通す形に書き直した。DB を要する元の `tests/*_pg_test.rs` は写していない。
 
+## 拘束サマリ (restraint) の 3 口 — D1 (`KINTAI_RESTRAINT_DB`)
+
+オンプレ版 (root の `src/routes/restraint.rs`・`src/restraint_store.rs`) が SQLite (`restraint_local.sqlite`) に持っていた拘束サマリの写しを
+**D1** に移した。書くのは relay (nuxt-dtako-admin の dtako-scraper-relay)、読むのは relay の wage-report と月タブ。
+**path・検査の順・400 の文言・応答の JSON (キーの順まで)・書く表の中身はオンプレ版と同じ** (呼び手の切替はまだ)。
+検査・SQL の文字列・bind の並び・応答の組み立ては共有 crate `kintai-logic` の `restraint` をオンプレ版と**同じものを使う** (写さない)。
+D1 だけの部分 (1 回の `batch` に流す文の束・結果の行の読み取り・D1 だけの失敗) は `restraint_d1`。
+
+| 口 | 認可 | 入力の検査 (順) | D1 への往復 | 応答 |
+|---|---|---|---|---|
+| `PUT /api/restraint/summaries` | `X-Kintai-Write-Token` | 本文 (axum の `Json` と同じ 415 / 413 / 400 / 422) → `comp_id` → `source` → `month` → entries (`driver_cd` 空・no_data でないのに summary 無し) → entries の数 (500 まで) | 1 回の `batch` (= 1 transaction): 載った乗務員ごとに `restraint_summary` を upsert → `restraint_sync_state` を upsert (`row_count` は同じ batch の中の副問い合わせで数える) | `{saved, synced_at}` |
+| `GET /api/restraint/wage-source` | なし | Query → `comp` → `month` | 1 回の `batch` で 8 文 (当月・前月 × theearth・timecard の `synced_at` と行) | `{comp_id, month, prev_month, current_theearth, current_timecard, prev_theearth, prev_timecard}` |
+| `GET /api/restraint/synced-months` | なし | Query → `comp` | 1 文 (`scope LIKE 'comp:%'`、接頭辞で別 comp を落とす) | `{entries: [{source, month, synced_at, row_count}]}` (scope 昇順) |
+
+### オンプレ版との対照
+
+| | オンプレ版 (SQLite) | Worker (D1) |
+|---|---|---|
+| 認可 | edge の CF Access だけ (Worker ではない) | PUT は `X-Kintai-Write-Token` を Secrets Store の `KINTAI_WRITE_TOKEN` と照合 (書き込みの 2 本と同じ。無い・違う = 403、binding が無い = 503)。GET は認可なし |
+| 400 (検査) | `{"error": "comp_id が不正です"}` 等 | **同じ** (共有 crate の文言) |
+| 400 (entries が 500 件超) | 無い | `{"error": "entries は 1 回の PUT で 500 件までです (分けて PUT してください)"}` |
+| 本文・Query が読めない | axum の拒否 (平文) | **同じ** (`common::parse_json`・`parse_query`) |
+| 403 | 無い (edge) | `{"error": "書き込みの口には正しい X-Kintai-Write-Token が要ります"}` |
+| 503 | store が無効 (`sqlite_path` 空・open 失敗): `拘束サマリ store が利用できません ([restraint] sqlite_path を確認してください)` | **条件は同じ** (書き先が無い = `KINTAI_RESTRAINT_DB` の binding が無い)、**文言は Worker 用**: `拘束サマリの D1 (KINTAI_RESTRAINT_DB) の binding がありません`。PUT の書き込みの認可の設定が読めないのも 503 |
+| 500 / 502 | store の読み書きの失敗は 500 `拘束サマリ store の読み書きに失敗しました` | 502 `拘束サマリの D1 の読み書きに失敗しました: <種別>` (`bind`・`batch`・`query`・`rows`。D1 の message は出さない) |
+| 書く表 | `restraint_summary`・`restraint_sync_state` (同じ定義) | 同じ 2 表 (`migrations/0001_restraint.sql`) |
+| `synced_at` | `format_synced_at(Utc::now())` (RFC3339・ナノ秒 9 桁・`+00:00`) | 同じ書式 (`Date.now()` のミリ秒から。小数部の下 6 桁は 0) |
+| 壊れた summary_json の行 | 行単位で落として warn | 同じ (行単位で落として `console_error`) |
+
+**比べ方**: `pg/tests/restraint_d1_parity.rs` が、root の axum の handler + rusqlite の store と、D1 と同じ文の束を native の SQLite で
+1 transaction ずつ流した経路 (表は `SCHEMA_SQL`、行は D1 と同じ「列名をキーにした object・数は浮動小数」で受ける) に同じ要求の列
+(成功・400・本文 / Query の拒否・部分上書き・年跨ぎ・`LIKE` の `_` で別 comp が混ざらないこと) を与え、status と本文のバイト列
+(`synced_at` の値だけ伏せる) が一致することを確かめる。wasm 専用の部分 (binding・JsValue への写し) は `wrangler dev --local` で
+確かめた (下の「ローカル検証」)。
+
+### 1 回の PUT の entries の上限 — 500
+
+D1 の `batch` は文ごとに 1 クエリと数え、Workers Paid の 1 invocation の上限は 1000 クエリ。PUT は entries + 1 文なので、その半分の 500 に
+した。今の量は 1 か月あたり約 70 名 (2,091 行・最大 9.3KB の summary_json、2026-10-10 の実測)。本文の上限 (2MB、axum と同じ) の方が先に
+効くことが多い。どちらも超えるなら relay が分けて PUT する (載った乗務員だけを upsert するので冪等)。1 文の bind は 8 個 (D1 の上限は 100)。
+
+### binding と migration
+
+- `[[d1_databases]]` の `KINTAI_RESTRAINT_DB` (database `ichibanboshi-kintai-restraint`、`migrations_dir = "migrations"`) を**トップレベルにだけ**置く
+- 表の定義の正本は `worker/migrations/0001_restraint.sql`。共有 crate (`restraint::SCHEMA_SQL`) が `include_str!` で読み、オンプレ版は open の
+  たびにこれを流す (`IF NOT EXISTS`。`PRAGMA user_version` はオンプレ版の init だけが持つ)。**適用済みの migration は変えない** (表を変えるなら
+  `0002_*.sql` を足す)
+- **本番 D1 への適用は人が 1 回だけ手で打つ**: `cd workers/kintai/worker && npx wrangler d1 migrations apply KINTAI_RESTRAINT_DB --remote`。
+  CI の deploy は当てない (org の token に D1:Edit が無いとタグ deploy が全部止まるため)。deploy job は `wrangler d1 migrations list --remote` で
+  **未適用が 0 件であることだけ**を確かめ、残っていれば deploy しない。PR の job は runner の中の local D1 に当てて、当たることを確かめる
+
+### 既存データは移さない — relay の resummarize で作る
+
+SQLite の中身は relay が push した写しで、relay の resummarize (全月) で作り直せる。だから D1 へは**コピーしない**。
+
+### 切り替えの順序 (この順でないと月タブが全部「未同期」になる)
+
+1. **relay の書き先に Worker を足す** (オンプレ版と Worker の両方に PUT する。Worker へは `X-Kintai-Write-Token` を載せる)
+2. **D1 へ resummarize (全月)** を回す (`synced-months` が全月そろうまで)
+3. **relay の読み先を Worker に切る** (`wage-source`・`synced-months`)
+
+先に 3 をやると、D1 が空のうちは `synced-months` が空になり、月タブが全部「未同期」と出る。`wage-source` は `synced_at = null` なら
+relay が R2 にフォールバックするので値の正しさは保たれる (遅くなるだけ)。
+
 ## 到達面と認可
 
 Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
 
 - **読みの口 (GET 全部。`timecard/signatures` を含む) は認可なし** (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手の側
   (relay の共有 secret、kyuyo-mcp の OAuth)
-- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`) は Worker が共有 secret を照合する** (ユーザー決定
+- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`・`PUT /api/restraint/summaries`) は Worker が共有 secret を照合する** (ユーザー決定
   2026-10-10)。読みのために binding を持つ呼び手が POST を転送しても書けないようにするため。ヘッダー `X-Kintai-Write-Token` を
   Secrets Store の `KINTAI_WRITE_TOKEN` と照合し (両方を sha256 にして 32 バイトを定数時間で比べる。`logic/src/write_auth.rs`)、
   無い・違う = 403 (固定文言)、binding が無い・読めない・空 = 503。値は repo に書かない (GCP の Secret Manager が正本)
@@ -295,15 +360,16 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 - `KINTAI_MARIADB_VPC` — Workers VPC の VPC Service (TCP 3306)。宛先 host:port は Service 側で固定。`service_id` は VPC Service `ichibanboshi-kintai-mariadb` の id
 - `KINTAI_MARIADB` — Secrets Store の secret。JSON `{"user":…,"password":…,"database":…}` (どれも空でない文字列)。未投入なら `/probe` と MariaDB の口は 503
   (timecard の 2 本だけは元と同じく 502)
-- `KINTAI_WRITE_TOKEN` — Secrets Store の secret (書き込みの口の共有 secret。store は `KINTAI_MARIADB` と同じ)。無ければ書き込みの 2 本は 503
+- `KINTAI_WRITE_TOKEN` — Secrets Store の secret (書き込みの口の共有 secret。store は `KINTAI_MARIADB` と同じ)。無ければ書き込みの 2 本と拘束サマリの PUT は 503
+- `KINTAI_RESTRAINT_DB` — 拘束サマリの D1 (`[[d1_databases]]`、`migrations_dir = "migrations"`)。**トップレベルにだけ置く**。無ければ restraint の 3 口は 503
 - `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ Supabase の口 (読み 6 本・書き 2 本) は 503
 - `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` (`[vars]`) — day-events のリンクの base URL。空 = そのリンクを省く。本番は deploy 時に同名の repo variable を `--var` で渡す (社内ホスト名を repo に書かない)
 - `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
 - `CF_VERSION_METADATA` — 版の元
 - `[limits] cpu_ms = 120000` — kosoku-daily の全員版のため (上記)
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / `LOCAL_*` の var なし /
-  hyperdrive・secrets_store_secrets はトップレベル以外に無い / 書き込みの口 (`worker/src` の `Route::Write`) があるなら
-  `KINTAI_WRITE_TOKEN` の binding がある。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
+  hyperdrive・secrets_store_secrets・d1_databases はトップレベル以外に無い / 書き込みの口 (`worker/src` の `Route::Write`・`Route::Restraint`) があるなら
+  `KINTAI_WRITE_TOKEN` の binding がある / 拘束サマリの口 (`Route::Restraint`) があるなら `KINTAI_RESTRAINT_DB` (database 名・`migrations_dir`) がある。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
 
 ## 構成
 
@@ -316,17 +382,20 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   (元の route と同じ分類。`kintai-kosoku` に入れると版が変わり、`kintai-logic` に入れると postgres-types 等が root に入るので別 crate)。100% 行カバレッジ gate は `coverage_100.toml`
 - `logic/` (`kintai-logic`): Supabase を読む 6 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
   部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`・timecard の検査 `timecard_write`・認可 `write_auth`、本文の読み方
-  `common::parse_json`)。**repo ルートの package も path 依存で使う** (書き込みの部品と
+  `common::parse_json`)、拘束サマリの 3 口 (`restraint` = オンプレ版と共有の検査・SQL・応答、`restraint_d1` = D1 の文の束・行の読み取り)。
+  **repo ルートの package も path 依存で使う** (書き込みの部品と
   `change_log`・`wage_range`・`wage_snapshot`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 10 本の往復。1 接続を開く `open` とクエリ 1 本の `query`) /
   `build.rs` (version の etag の版 `KINTAI_WORKER_OUTPUT_SHA`) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
   `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの 2 本: 認可 → 本文 → `kintai-pg`) /
+  `restraint.rs` (拘束サマリの 3 口: 認可 → 本文・Query → D1 の `batch`) / `migrations/` (D1 の migration。表の定義の正本) /
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
   kit の `tenant_tx` の中の `query_typed` / `execute_typed` だけで、native でも動く (Worker は Hyperdrive の接続を、テストは native の
   tokio-postgres の接続を渡す)。実 DB が要るので 100% gate には入れず、`pg-parity` job が root と突き合わせる。dev-dependency に
-  repo ルートの package (`rust-ichibanboshi`) を持つ (比べる相手。wasm のビルドには入らない)
+  repo ルートの package (`rust-ichibanboshi`) を持つ (比べる相手。wasm のビルドには入らない)。root を dev-dependency に持つのがここだけなので、
+  拘束サマリのオンプレ版と D1 の経路の比較 (`tests/restraint_d1_parity.rs`、DB 不要) もここに置く
 
 - `output_sha.rs`: 版の畳み方 (`fold_output_sha`)。repo ルートの build.rs と `worker/build.rs` が `include!` する (crate の src の外 = どちらの版の glob にも入らない)
 
@@ -341,6 +410,12 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 `wrangler dev --remote` で `POST /probe` と MariaDB の 10 本 (day-events のリンクを出すなら `--var "KINTAI_RYOHI_BASE_URL:…"` 等)。Supabase の 5 本も同じく `wrangler dev --remote` (Hyperdrive の経路は CI では通せない)。
 `--var "KINTAI_TENANT_ID:<UUID>"` を渡すと Supabase の口が 503 ではなく答える。書き込みの 2 本は `KINTAI_WRITE_TOKEN` の値を
 `X-Kintai-Write-Token` に載せて叩く (Supabase に書くので、書いてよい月・乗務員で)。
+
+拘束サマリの 3 口は local の D1 で回せる (本番の D1 にも token にも触らない)。`worker-build --release` の後、
+`npx wrangler d1 migrations apply KINTAI_RESTRAINT_DB --local --persist-to <dir>` → `npx wrangler secrets-store secret create <store_id>
+--name KINTAI_WRITE_TOKEN --value <任意> --scopes workers --persist-to <dir>` → `npx wrangler dev --local --persist-to <dir>` で叩く
+(`vpc_services`・`hyperdrive` は local で起動できないので、`d1_databases` と `secrets_store_secrets` の `KINTAI_WRITE_TOKEN` だけを書いた
+使い捨ての設定ファイルを `-c` で渡す)。dev の D1 に PUT してよいのは local と dev の D1 だけ。
 
 ## 本番 deploy
 

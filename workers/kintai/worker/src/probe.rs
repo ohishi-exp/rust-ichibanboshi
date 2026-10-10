@@ -5,6 +5,8 @@ use kintai_logic::dtako_reads::DtakoRead;
 use kintai_logic::kosoku_reads::KosokuRead;
 use kintai_logic::mariadb_reads::MariadbRead;
 use kintai_mysql::retry::Phase;
+
+use crate::restraint::Restraint;
 use serde::{Deserialize, Serialize};
 
 /// 経路判定の結果。
@@ -23,6 +25,8 @@ pub(crate) enum Route {
     /// `GET /api/kintai/{kosoku-daily,version,timecard/drivers,timecard/events}` — 社内 MariaDB を直接読む 4 本
     /// (1 接続で SQL を何本か流す)
     Kosoku(KosokuRead),
+    /// `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` — 拘束サマリの D1 (PUT は共有 secret の照合あり)
+    Restraint(Restraint),
     NotFound,
     MethodNotAllowed,
 }
@@ -95,6 +99,13 @@ impl Write {
 /// kosoku-daily・version・timecard/drivers・timecard/events)・POST の 2 本 (Supabase に書く timecard・wage-snapshot)。
 /// path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
+    if let Some(r) = Restraint::from_path(path) {
+        return if method == r.method() {
+            Route::Restraint(r)
+        } else {
+            Route::MethodNotAllowed
+        };
+    }
     if let Some(write) = Write::from_path(path) {
         return if method == "POST" {
             Route::Write(write)
@@ -208,7 +219,8 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
         | Route::Write(_)
         | Route::Mariadb(_)
         | Route::Dtako(_)
-        | Route::Kosoku(_) => return None,
+        | Route::Kosoku(_)
+        | Route::Restraint(_) => return None,
     };
     Some(Reply {
         status,
