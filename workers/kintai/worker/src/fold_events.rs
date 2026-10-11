@@ -1,10 +1,6 @@
 //! fold の読み 3 本 (`FoldEventsIo`) の往復: alc は [`crate::alc::EnvAlc`]、社内 MariaDB は [`EnvMariadb`] (Refs #322)。
 //! 読み方 (順番・合流・ページング・非 2xx の扱い) は kintai-logic の `fold_events::WorkerFoldEvents`。
-//!
-//! **口はまだ無い** — recalc・window・stale-months の口と `FoldStoreIo` (Supabase) の Worker 実装は次の PR で足す。
-//! それまでは誰も作らないので dead_code を許す。
-
-#![allow(dead_code)]
+//! 使うのは fold の口 ([`crate::fold`] の recalc・timecard/window)。
 
 use kintai_logic::common::{mariadb_unconfigured, Fail};
 use kintai_logic::fold_events::{MariadbRun, WorkerFoldEvents};

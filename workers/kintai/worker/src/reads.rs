@@ -1,4 +1,5 @@
-//! Supabase (勤怠スキーマ `kintai.*`) を Hyperdrive (`KINTAI_HYPERDRIVE`) 経由で読む 6 本の口 (`timecard/signatures` を含む)。
+//! Supabase (勤怠スキーマ `kintai.*`) を Hyperdrive (`KINTAI_HYPERDRIVE`) 経由で読む 6 本の口 (`timecard/signatures` を含む) と、
+//! fold の口のうち読むだけの `stale-months` ([`stale_months`]。経路は [`crate::fold`])。
 //!
 //! 入力の検査・SQL・`$n` の型・応答の組み立ては kintai-logic (root の src/ の写し)。ここは DB との往復だけ:
 //! 検査 (400) → binding の有無 (無ければ 503) → テナント (`KINTAI_TENANT_ID`、無ければ 503) → connect (失敗は 502) →
@@ -222,6 +223,49 @@ async fn signatures(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
         .await
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
     Ok(signatures_respond(&req, &sigs))
+}
+
+/// `GET /api/kintai/stale-months` (root の `src/routes/stale_months.rs` と同じ応答。範囲・SQL・応答は kintai-logic の
+/// `stale_months`)。範囲 (400) → binding (503、root の書き先の store と同じ文言) → テナント (503) → connect (502) →
+/// `STALE_MONTHS_SQL` (502) → 応答。版は fold の口と同じ `KosokuParams` の既定値から作る。
+pub(crate) async fn stale_months(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+    use kintai_logic::fold_routes::{logic_version, STALE_DB_WHAT};
+    use kintai_logic::mariadb_reads::jst_today;
+    use kintai_logic::stale_months::{parse, response, StaleMonthRow, STALE_MONTHS_SQL};
+    use tokio_postgres::types::Type;
+    let (lo, hi) = parse(query, jst_today(worker::Date::now().as_millis()))?;
+    let (mut pg, tenant) = open_db(env, STALE_DB_WHAT, true).await?;
+    let version = logic_version();
+    let v = version.clone();
+    let rows = pg
+        .tenant_tx(tenant, move |tx| {
+            Box::pin(async move {
+                let params = [
+                    (
+                        &tenant as &(dyn tokio_postgres::types::ToSql + Sync),
+                        Type::UUID,
+                    ),
+                    (&lo, Type::DATE),
+                    (&hi, Type::DATE),
+                    (&v, Type::TEXT),
+                ];
+                let rows = tx.query_typed(STALE_MONTHS_SQL, &params).await?;
+                let to_row = |r: &Row| -> Result<StaleMonthRow, PgError> {
+                    Ok(StaleMonthRow {
+                        month: r.try_get("month")?,
+                        stale_drivers: r.try_get("stale_drivers")?,
+                        total_drivers: r.try_get("total_drivers")?,
+                    })
+                };
+                rows.iter()
+                    .map(to_row)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Out)
+            })
+        })
+        .await
+        .map_err(|e| db_fail(STALE_DB_WHAT, &kind(&e)))?;
+    Ok(response(&version, lo, hi, &rows.0))
 }
 
 /// `GET /api/kintai/unko-gaps` (root の `src/routes/unko_gaps.rs` と同じ応答。`elapsed_ms` は付けない)。

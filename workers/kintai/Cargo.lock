@@ -1532,7 +1532,9 @@ name = "kintai-worker"
 version = "0.1.0"
 dependencies = [
  "alc-worker-db",
+ "chrono",
  "futures-util",
+ "kintai-kosoku",
  "kintai-logic",
  "kintai-mysql",
  "kintai-pg",

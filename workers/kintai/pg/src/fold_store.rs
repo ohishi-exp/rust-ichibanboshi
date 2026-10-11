@@ -11,13 +11,15 @@
 //! - root の gate の読み書き・digest・運行一覧は pool 直 (transaction もテナント設定も無し) だが、ここは全部
 //!   `tenant_tx` を通る (経路はより厳しい。結果が同じことは parity で見る)
 //! - 全 SQL の `$1` はテナント ([`FoldStore::new`] で固定)
+//! - 打刻の置き換え [`TimecardWindowIo`] (window の口) もここに impl する — 置き換えと畳み直しを同じ接続で回すため。
+//!   root の `impl TimecardWindowIo for KintaiPgStore` との一致は `tests/window_parity.rs` (実 DB)
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use alc_worker_db::{PgClient, TenantTx};
+use alc_worker_db::{kind, PgClient, TenantTx};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use futures_util::lock::Mutex;
-use kintai_kosoku::fold_flow::{FoldGateRow, FoldStoreIo};
+use kintai_kosoku::fold_flow::{BadMonth, FoldGateRow, FoldStoreIo};
 use kintai_kosoku::kintai_fold::{
     day_part_columns, day_summary_columns, months_span, shift_columns, FoldUnit, StaleReport,
     StoredState, DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL, FOLD_GATE_UPSERT_SQL,
@@ -25,39 +27,76 @@ use kintai_kosoku::kintai_fold::{
     STALE_STATE_SQL, STORED_STATES_SQL,
 };
 use kintai_kosoku::kintai_push::{
-    jst_day_bounds, month_date_bounds, MONTH_OPERATIONS_SQL, MONTH_PUNCH_DIGEST_SQL,
-    OPERATION_DRIVER_CDS_SQL,
+    jst_day_bounds, month_date_bounds, DriverPlan, MONTH_OPERATIONS_SQL, MONTH_PUNCH_DIGEST_SQL,
+    OPERATION_DRIVER_CDS_SQL, STORED_WINDOW_SIGNATURES_SQL,
 };
+use kintai_kosoku::route_flow::{BadWindow, TimecardWindowIo};
+use kintai_logic::common::{db_fail, Fail};
+use kintai_logic::fold_routes::{not_configured, read_failed, DB_WHAT};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Error, Row};
 use uuid::Uuid;
 
 use crate::{set_timeout, sources, Out};
 
-/// [`FoldStore`] の失敗。
+/// [`FoldStore`] の失敗。fold の段取り (`kintai_kosoku::route_flow`) は読み (`FoldEventsIo`) と窓の失敗もここへ寄せる。
 #[derive(Debug)]
 pub enum FoldStoreError {
     /// 月が読めない (root の `KintaiPushError::NotConfigured("bad month: …")` と同じ文言)
     BadMonth(String),
-    /// 月の並びが読めない (`months_span` の文面そのまま: `bad month: …` / `months が空です`)
+    /// 月の並び・窓が読めない (`months_span`・`window_spans` の文面そのまま: `bad month: …` / `months が空です`)
     BadMonths(String),
+    /// fold の読み (alc の RPC・社内 MariaDB) の失敗 (root の `KintaiPushError::Read`)
+    Read(Fail),
     /// DB の失敗
     Db(Error),
 }
 
+impl FoldStoreError {
+    /// 応答の status と本文 (root の `map_push_err` と同じ分け方: 月・窓 = 503、読み・DB = 502)。
+    /// **502 の本文には種別だけを載せる** — DB の message は出さず kit の `kind` だけ、上流の本文は
+    /// `kintai_logic::fold_routes::kind_only` で削る。
+    pub fn into_fail(&self) -> Fail {
+        match self {
+            Self::BadMonth(m) => not_configured(&format!("bad month: {m}")),
+            Self::BadMonths(m) => not_configured(m),
+            Self::Read(f) => read_failed(f),
+            Self::Db(e) => db_fail(DB_WHAT, &kind(e)),
+        }
+    }
+}
+
+/// 本文は [`FoldStoreError::into_fail`] と同じ (window の `stale_error` はこれを載せる。DB の message を出さない)。
 impl std::fmt::Display for FoldStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BadMonth(m) => write!(f, "bad month: {m}"),
-            Self::BadMonths(m) => f.write_str(m),
-            Self::Db(e) => write!(f, "kintai fold db failed: {e}"),
-        }
+        f.write_str(&self.into_fail().body)
     }
 }
 
 impl From<Error> for FoldStoreError {
     fn from(e: Error) -> Self {
         Self::Db(e)
+    }
+}
+
+/// fold の読み (`kintai_logic::fold_events::WorkerFoldEvents`) の失敗。
+impl From<Fail> for FoldStoreError {
+    fn from(f: Fail) -> Self {
+        Self::Read(f)
+    }
+}
+
+/// 段取りが月を読めなかった。
+impl From<BadMonth> for FoldStoreError {
+    fn from(e: BadMonth) -> Self {
+        Self::BadMonth(e.0)
+    }
+}
+
+/// 窓の月が読めなかった (`apply_timecard_window`)。
+impl From<BadWindow> for FoldStoreError {
+    fn from(e: BadWindow) -> Self {
+        Self::BadMonths(e.0)
     }
 }
 
@@ -440,5 +479,58 @@ impl FoldStoreIo for FoldStore {
             })
             .await?;
         Ok(out)
+    }
+}
+
+/// 打刻の置き換え (`POST /api/kintai/timecard/window`)。root の `impl TimecardWindowIo for KintaiPgStore` と同じ SQL・同じ値。
+impl TimecardWindowIo for FoldStore {
+    type Error = FoldStoreError;
+
+    /// 名乗った乗務員の `[from, to)` の日別署名 (`STORED_WINDOW_SIGNATURES_SQL`、1 transaction)。
+    async fn stored_window_signatures(
+        &self,
+        drivers: &[i64],
+        from: DateTime<FixedOffset>,
+        to: DateTime<FixedOffset>,
+    ) -> Result<BTreeMap<i64, BTreeMap<NaiveDate, String>>, FoldStoreError> {
+        let (tenant, drivers) = (self.tenant, drivers.to_vec());
+        let out = self
+            .tx(move |tx| {
+                Box::pin(async move {
+                    let src = sources();
+                    let rows = tx
+                        .query_typed(
+                            STORED_WINDOW_SIGNATURES_SQL,
+                            &[
+                                (&tenant, Type::UUID),
+                                (&drivers, Type::INT8_ARRAY),
+                                (&from, Type::TIMESTAMPTZ),
+                                (&to, Type::TIMESTAMPTZ),
+                                (&src, Type::TEXT_ARRAY),
+                            ],
+                        )
+                        .await?;
+                    let mut out: BTreeMap<i64, BTreeMap<NaiveDate, String>> = BTreeMap::new();
+                    for r in &rows {
+                        let sig: String = r.try_get("sig")?;
+                        let (cd, d): (i64, NaiveDate) = (r.try_get("driver_cd")?, r.try_get("d")?);
+                        out.entry(cd).or_default().insert(d, sig);
+                    }
+                    Ok(out)
+                })
+            })
+            .await?;
+        Ok(out)
+    }
+
+    /// 計画どおりに日を丸ごと置き換える (窓ぜんたいで 1 transaction。変更履歴も残す)。既存の [`crate::replace_window`]
+    /// (計画を値で受ける) を同じ接続で呼ぶ。
+    async fn replace_window(
+        &self,
+        plans: &BTreeMap<i64, DriverPlan>,
+    ) -> Result<(), FoldStoreError> {
+        let mut pg = self.pg.lock().await;
+        crate::replace_window(&mut pg, self.tenant, plans.clone()).await?;
+        Ok(())
     }
 }
