@@ -164,7 +164,7 @@ path = "workers/kintai/kosoku/src/kintai_timecard.rs"
 [[files]]
 path = "workers/kintai/kosoku/src/kintai_push.rs"
 
-# 畳んだ 3 表の行・保存済みの姿・SQL・bind の束。root の kintai_fold.rs から移した
+# 畳んだ 3 表の行・保存済みの姿・SQL・bind の束・指紋・logic_version・畳み・報告の型。root の kintai_fold.rs から移した
 [[files]]
 path = "workers/kintai/kosoku/src/kintai_fold.rs"
 
