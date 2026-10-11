@@ -37,6 +37,7 @@ pub mod restraint;
 pub mod restraint_d1;
 pub mod shift_days;
 pub mod shift_overlaps;
+pub mod stale_months;
 pub mod timecard_write;
 pub mod unko_gaps;
 pub mod wage_range;

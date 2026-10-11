@@ -19,7 +19,7 @@
 //! `GET /api/kintai/timecard/drivers` の 50 ([`crate::kintai_diff::DEFAULT_MAX_DRIVERS`])
 //! とは費用の形が違う。あちらは乗務員CD を数える 1 クエリで 1 ページぶんが
 //! 返るのに対し、こちらは**乗務員数によらず月ぶんの生イベントを 1 回丸ごと読む**
-//! ([`crate::kintai_fold::fold_month`] — alc / R2 への往復)。母集団の決定 ([`recalc_driver_page`])
+//! ([`crate::kintai_fold::fold_month`] — alc / R2 への往復)。母集団の決定 ([`crate::kintai_fold::recalc_driver_page`])
 //! もこの 1 回読みを使い回すので、1 乗務員だけ畳んでも 100 人畳んでも読み出し側の
 //! 費用は同じだけ払う。ページを増やす意味は「1 回のリクエストで書く乗務員数」に
 //! しかない。
@@ -154,68 +154,17 @@ use axum::extract::Query;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
-use chrono::NaiveDate;
-use serde::Deserialize;
 
-use crate::kintai_fold::{
-    recalc_driver_page, recalc_drivers_from_units, stale_state, FoldReport, FoldSink, Warnings,
-};
-use crate::kintai_push::KintaiPgStore;
 use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai::is_valid_month;
 use crate::routes::kintai_timecard::{assert_same_tenant, map_push_err, store_for};
 use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
 
-/// 1 回で畳み直す乗務員数の既定。
-///
-/// **2026-07-31 の実測 (2026-06 = 94 名) に基づき 20 → 100 へ引き上げ。**
-/// モジュール docs のとおり費用の主成分は乗務員数に依存しない全量読みなので、
-/// 20 のままだと 94 名を畳むのに全量読みを 5 回払っていた。100 なら 1 回で終わる。
-pub const DEFAULT_MAX_FOLD_DRIVERS: usize = 100;
-
-/// `max_drivers` の上限。呼び出し側が大きな値を入れて proxy を殺すのを防ぐ。
-///
-/// 既定の 1.5 倍。**150 は未実測** — 100 名ぶんの fold (実測の線形外挿で
-/// 15〜23 秒) より上は測っていない。[`crate::kintai_diff::MAX_MAX_DRIVERS`] と
-/// 同じ考え方 (踏んだら下げる) で先に開けてある。
-pub const MAX_MAX_FOLD_DRIVERS: usize = 150;
-
-/// `?month=&after_driver_cd=&max_drivers=&stale_only=`。
-#[derive(Debug, Default, Deserialize)]
-pub struct RecalcQuery {
-    pub month: Option<String>,
-    /// 続きから回す位置。前回の応答の `next_after_driver_cd` を渡す。
-    #[serde(default)]
-    pub after_driver_cd: Option<i64>,
-    #[serde(default)]
-    pub max_drivers: Option<usize>,
-    /// 現行の `logic_version` の行を 1 つも持たない乗務員だけに絞る。
-    ///
-    /// **既定 `false`。** 勤務が 1 本も立たない乗務員は保存行を作れないので
-    /// `true` では毎回この網に残る (収束しない) — 全量を回すときは既定のまま使う。
-    #[serde(default)]
-    pub stale_only: bool,
-}
-
-/// `POST /api/kintai/recalc` の本体。`GET` の query と同じ項目 + `apply`。
-#[derive(Debug, Default, Deserialize)]
-pub struct RecalcRequest {
-    pub month: String,
-    #[serde(default)]
-    pub after_driver_cd: Option<i64>,
-    #[serde(default)]
-    pub max_drivers: Option<usize>,
-    #[serde(default)]
-    pub stale_only: bool,
-    /// **`true` で初めて書く。** 既定は 1 行も書かない。
-    #[serde(default)]
-    pub apply: bool,
-    /// [`crate::kintai_fold::fold_month`] に渡す「今日」。**`#[serde(skip)]` — HTTP の
-    /// JSON body からは絶対に上書きできない** (常に `None` = 実時計)。テストだけが
-    /// Rust の構造体リテラルで直接 `Some` を渡せる (Refs #286-1)。
-    #[serde(skip)]
-    pub today: Option<NaiveDate>,
-}
+// 入力の型・ページの既定と上限・段取り (月ゲート → 畳み → 封 → 応答) は共有 crate (勤怠 Worker と同じもの、Refs #322)。
+// ここは HTTP の殻 (月の 400・書き先とテナントの解決・エラーの status) だけを持つ
+pub use kintai_kosoku::route_flow::{
+    RecalcQuery, RecalcRequest, DEFAULT_MAX_FOLD_DRIVERS, MAX_MAX_FOLD_DRIVERS,
+};
 
 fn bad_request(msg: &str) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, msg.to_string())
@@ -230,15 +179,7 @@ pub async fn preview(
     Extension(params): Extension<std::sync::Arc<crate::kosoku::KosokuParams>>,
     Extension(read_tenant): Extension<ReadTenant>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let req = RecalcRequest {
-        month: q.month.unwrap_or_default(),
-        after_driver_cd: q.after_driver_cd,
-        max_drivers: q.max_drivers,
-        stale_only: q.stale_only,
-        apply: false,
-        today: None,
-    };
-    run(headers, pg, repo, params, read_tenant, req).await
+    run(headers, pg, repo, params, read_tenant, q.into_request()).await
 }
 
 /// POST /api/kintai/recalc — 1 ページぶんを畳み直す。`apply` が無ければ書かない。
@@ -253,6 +194,7 @@ pub async fn recalc(
     run(headers, pg, repo, params, read_tenant, req).await
 }
 
+/// 殻: 月の検査 → 書き先 → 読みと書きのテナントの一致 → 共有 crate の段取り (`route_flow::recalc_page`)。
 async fn run(
     headers: HeaderMap,
     pg: DynKintaiPgStore,
@@ -264,224 +206,14 @@ async fn run(
     if !is_valid_month(&req.month) {
         return Err(bad_request("month は YYYY-MM で指定してください"));
     }
-    let started = std::time::Instant::now();
     let st = store_for(&pg, &headers)?;
     // 読みと書きが別テナントのまま畳まない (窓の受け口と同じ検査)
     assert_same_tenant(read_tenant, st.tenant_id())?;
-
-    // 月ゲート (実装計画 13) — 前回 fold 時から dtako 側 (alc) / 打刻側 (Pg) の
-    // どちらも変わっていなければ、fold_month の全量読みを 1 バイトも払わずに
-    // 「変化無し」を返す ([`crate::kintai_fold::MonthGate`] docs)。miss / unavailable
-    // なら通常どおり進む — miss の digest は末尾の書き込み判定まで運ぶ
-    // (fold 後に作り直さない。理由は MonthGate::Miss の docs)
-    //
-    // **月ゲートの判定にも束 (`gate_sink`) を渡す** (Refs #205 の 21)。指紋を取る
-    // `fetch_etags` は入力の欠けを最初に見る場所で、そこが立てる warning を捨てると
-    // 「封を止める warning が無い」の判定が素通りし、欠けたままの月に「最新」の封をしてしまう。
-    // 封を止めるかは束の `blocks_seal()` で見る — tail gap (診断専用、Refs #205-51) が
-    // 混ざっても封の判定を誤らせない。表示用の文面は今までどおり
-    //
-    // 同じ束に `unsplit` (Refs #205 の 32、alc の `has_kudgivt = FALSE` 一覧) と運行の突合
-    // (Refs #205 の 37 — 押し込み済みの `kintai_events` に在って alc の etags に無い運行の一覧) も
-    // 積まれる。どちらも同じ `fetch_etags` の応答が材料で、判定には使わず応答へ素通しするだけ。
-    // 突合を測るのはこの口だけ ([`FoldSink::measuring_unko_diff`])
-    //
-    // 読みの遡り起点 (Refs ohishi-exp/nuxt-dtako-admin#1123) は**ここで 1 回だけ**引き、
-    // 月ゲートと畳みに同じ値を渡す — 別々に引くと封の材料と畳んだ入力の窓が割れうる
-    let anchors = crate::kintai_fold::month_anchors(&repo, &req.month)
-        .await
-        .map_err(|e| map_push_err(e.into()))?;
-    let mut gate_sink = FoldSink::measuring_unko_diff();
-    let gate = crate::kintai_fold::month_gate_report_with_anchors(
-        &repo,
-        &st,
-        &params,
-        &req.month,
-        req.apply,
-        &anchors,
-        &mut gate_sink,
-    )
-    .await;
-    let FoldSink {
-        warnings: gate_warnings,
-        unsplit,
-        unsplit_total,
-        unko_diff,
-        ..
-    } = gate_sink;
-    let gate = match gate.map_err(map_push_err)? {
-        crate::kintai_fold::MonthGate::Hit(mut report) => {
-            let months = [req.month.clone()];
-            let stale = stale_state(&st, &months, &params)
-                .await
-                .map_err(map_push_err)?;
-            let (n, w) = (report.drivers, report.drivers_written);
-            tracing::info!(n, w, "kintai recalc page done (gate)");
-            // 読みを省いた回でも入力の欠けは応答に出す (指紋が同じ = 入力が増えて
-            // いないだけで、欠けが埋まったわけではない)
-            report.warnings = gate_warnings.texts();
-            return Ok(Json(serde_json::json!({
-                "month": req.month,
-                "apply": req.apply,
-                "drivers": Vec::<i64>::new(),
-                "next_after_driver_cd": Option::<i64>::None,
-                "fold": report,
-                "stale": stale,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-                "unsplit": unsplit,
-                "unsplit_total": unsplit_total,
-                "unko_diff": unko_diff.items,
-                "unko_diff_total": unko_diff.total,
-                "unko_diff_gcp_only": unko_diff.gcp_only,
-                "unko_diff_gcp_only_in_month": unko_diff.gcp_only_in_month,
-                "unko_diff_gcp_only_by_month": unko_diff.gcp_only_by_month,
-                "unko_diff_gcp_only_in_month_by_day": unko_diff.gcp_only_in_month_by_day,
-                "unko_diff_gcp_only_in_month_by_driver": unko_diff.gcp_only_in_month_by_driver,
-                "unko_diff_gcp_only_in_month_unknown_driver": unko_diff.gcp_only_in_month_unknown_driver,
-                "unko_diff_gcp_only_driver_split": unko_diff.gcp_only_driver_split,
-                "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
-                "unko_diff_onprem_sample": unko_diff.onprem_sample,
-                "unko_diff_onprem_shape": unko_diff.onprem_shape,
-                "unko_diff_gcp_shape": unko_diff.gcp_shape,
-                "unko_diff_trials": unko_diff.trials,
-            })));
-        }
-        other => other,
-    };
-
-    let max = req
-        .max_drivers
-        .unwrap_or(DEFAULT_MAX_FOLD_DRIVERS)
-        .clamp(1, MAX_MAX_FOLD_DRIVERS);
-
-    // 生イベントは月 1 回だけ読み、母集団の決定 (#205-12) と畳みの両方に使い回す。
-    // ここで 2 回読むと 1 ページの費用 (全量読み 25〜55 秒、モジュール docs) が
-    // 単純に倍になる。上流 warnings を握り潰さない (束 `fold_warnings` に積む)
-    let mut fold_warnings = Warnings::default();
-    let all_units = crate::kintai_fold::fold_month_with_anchors(
-        &repo,
-        &params,
-        &req.month,
-        None,
-        req.today,
-        &anchors,
-        &mut fold_warnings,
-    )
-    .await
-    .map_err(map_push_err)?;
-    // 指紋を取ったときの warning も同じ列に混ぜる (Refs #205 の 21)。2 つの束は別々に上限が効く
-    // (畳みの束の後ろに月ゲートの束を足す)。封を止めるかどうかも 2 つの束の `||` で合成する
-    // (Refs #205-51 — tail gap のような診断専用が混ざっていても、封を止める warning が片方にでもあれば止める)
-    let mut warnings = fold_warnings.texts();
-    warnings.extend(gate_warnings.texts());
-    let has_blocking_warning = fold_warnings.blocks_seal() || gate_warnings.blocks_seal();
-    // rest-only 乗務員 (Postgres に 1 行も無い) を母集団に足すための集合
-    // ([`recalc_driver_page`] docs)
-    let extra: std::collections::BTreeSet<i64> = all_units
-        .iter()
-        .map(|(cd, _, _)| *cd as i64)
-        .filter(|cd| *cd > 0)
-        .collect();
-
-    let page = recalc_driver_page(
-        &st,
-        &req.month,
-        &params,
-        &extra,
-        req.after_driver_cd,
-        req.stale_only,
-        max,
-    )
-    .await
-    .map_err(map_push_err)?;
-    // 回りきったかは「1 ページに満たなかったか」で決める。次を空で返すより往復が 1 回減る
-    let next = match page.len() < max {
-        true => None,
-        false => page.last().copied(),
-    };
-    let (folded, stale) = fold_page(&st, &params, &req, &page, all_units, warnings).await?;
-
-    // 月ゲート (実装計画 13) — このページで月まるごとを完結させたときだけ書く。
-    // 5 条件は crate::kintai_fold::month_gate_report の呼び出し元向け docs 参照。
-    // digest は呼び出し冒頭で判定した値のまま (fold 後に作り直さない)
-    if let crate::kintai_fold::MonthGate::Miss {
-        dtako_digest,
-        punch_digest,
-        logic_version,
-    } = gate
-    {
-        let completed_the_whole_month = req.apply
-            && req.after_driver_cd.is_none()
-            && next.is_none()
-            && !req.stale_only
-            && !has_blocking_warning;
-        if completed_the_whole_month {
-            // 書けなくてもこの応答は落とさない (Refs #205 の 20 — 畳みは全部
-            // 成功しているので、最適化の書き込み 1 本で 502 にしない)
-            crate::kintai_fold::write_fold_gate_best_effort(
-                &st,
-                &req.month,
-                &dtako_digest,
-                &punch_digest,
-                &logic_version,
-            )
-            .await;
-        }
-    }
-
-    // マクロは 1 行に収める (CLAUDE.md)
-    let (n, w) = (folded.drivers, folded.drivers_written);
-    tracing::info!(n, w, "kintai recalc page done");
-    Ok(Json(serde_json::json!({
-        "month": req.month,
-        "apply": req.apply,
-        "drivers": page,
-        "next_after_driver_cd": next,
-        "fold": folded,
-        "stale": stale,
-        "elapsed_ms": started.elapsed().as_millis() as u64,
-        "unsplit": unsplit,
-        "unsplit_total": unsplit_total,
-        "unko_diff": unko_diff.items,
-        "unko_diff_total": unko_diff.total,
-        "unko_diff_gcp_only": unko_diff.gcp_only,
-        "unko_diff_gcp_only_in_month": unko_diff.gcp_only_in_month,
-        "unko_diff_gcp_only_by_month": unko_diff.gcp_only_by_month,
-        "unko_diff_gcp_only_in_month_by_day": unko_diff.gcp_only_in_month_by_day,
-        "unko_diff_gcp_only_in_month_by_driver": unko_diff.gcp_only_in_month_by_driver,
-        "unko_diff_gcp_only_in_month_unknown_driver": unko_diff.gcp_only_in_month_unknown_driver,
-        "unko_diff_gcp_only_driver_split": unko_diff.gcp_only_driver_split,
-        "unko_diff_gcp_only_sample": unko_diff.gcp_only_sample,
-        "unko_diff_onprem_sample": unko_diff.onprem_sample,
-        "unko_diff_onprem_shape": unko_diff.onprem_shape,
-        "unko_diff_gcp_shape": unko_diff.gcp_shape,
-        "unko_diff_trials": unko_diff.trials,
-    })))
-}
-
-/// 1 ページぶんを畳み、`stale` を数える。
-///
-/// `all_units` は `run` が既に読んでいる全乗務員ぶん ([`crate::kintai_fold::fold_month`])。
-/// ここでは読み直さない ([`recalc_drivers_from_units`])。
-async fn fold_page(
-    st: &KintaiPgStore,
-    params: &crate::kosoku::KosokuParams,
-    req: &RecalcRequest,
-    page: &[i64],
-    all_units: Vec<(u64, crate::kintai_fold::FoldUnit, String)>,
-    warnings: Vec<String>,
-) -> Result<(FoldReport, crate::kintai_fold::StaleReport), (StatusCode, String)> {
-    let drivers: Vec<u64> = page.iter().filter(|d| **d > 0).map(|d| *d as u64).collect();
-    let mut folded =
-        recalc_drivers_from_units(st, params, &req.month, &drivers, all_units, req.apply)
-            .await
-            .map_err(map_push_err)?;
-    folded.warnings = warnings;
-    let months = [req.month.clone()];
-    let stale = stale_state(st, &months, params)
+    let ctx = crate::kintai_fold::ctx(&params);
+    let body = kintai_kosoku::route_flow::recalc_page(&*repo, &st, &ctx, &req)
         .await
         .map_err(map_push_err)?;
-    Ok((folded, stale))
+    Ok(Json(body))
 }
 
 #[cfg(test)]

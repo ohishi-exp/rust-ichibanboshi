@@ -20,6 +20,7 @@ pub mod kintai_version;
 pub mod kosoku;
 pub mod kosoku_daily;
 pub mod kosoku_paper;
+pub mod route_flow;
 pub mod sql;
 pub mod unko_diff;
 pub mod window;
