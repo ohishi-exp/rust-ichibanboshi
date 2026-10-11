@@ -156,8 +156,8 @@ use kintai_logic::dtako_autoload::{self as logic, AutoloadIo, MaterialQuery};
 pub use kintai_logic::dtako_autoload::{AutoloadQuery, MAX_ZIP_BYTES};
 
 /// CakePHP client のエラーを HTTP ステータスへ写す。`routes/kintai.rs` に同じ形の
-/// `map_cakephp_err` があるが、あちらは `build.rs` の glob 対象 (`logic_version` が
-/// 動く) なので import せず独立して持つ (`dtako_day.rs` と同じ方針)。
+/// `map_cakephp_err` があるが、あちらは `build.rs` の glob 対象 (`/api/kintai/version` の
+/// etag が動く) なので import せず独立して持つ (`dtako_day.rs` と同じ方針)。
 fn map_cakephp_err(e: CakephpError) -> (StatusCode, String) {
     let (status, body) = logic::map_err(e, logic::NOT_CONFIGURED_ONPREM);
     // map_err が返すのは 502 / 503 だけ

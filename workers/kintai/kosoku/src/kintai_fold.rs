@@ -363,7 +363,7 @@ pub fn new_report(
 /// 違うので、指紋で stale を数えると全単位を畳み直すのと同じ費用になる。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StaleReport {
-    /// いま走っているコードと設定の [`logic_version`]。
+    /// いま走っている [`LOGIC_BASE`] と設定の [`logic_version`]。
     pub logic_version: String,
     /// **これが 0 でなければ全量再計算が要る** (`POST /api/kintai/recalc`)。
     /// 対象期間に 1 行でも古い版の `day_summaries` を持つ乗務員の数。
