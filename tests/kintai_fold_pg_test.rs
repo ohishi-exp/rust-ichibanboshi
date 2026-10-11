@@ -2790,26 +2790,26 @@ async fn the_stored_state_read_is_one_query_however_many_drivers() {
 /// 上の口は sqlx の tracing event を数えるので、tracing の callsite キャッシュの
 /// ような環境要因で死にうる。`store_units` が乗務員ごとに読んでいないことは
 /// ソースの形でも縛れるので、両方置く。
+///
+/// `store_units` の本体は共有 crate の流れ (`kintai_kosoku::fold_flow`、Refs #322) にあり、
+/// 保存済みの姿は `FoldStoreIo::stored_states` (root は `kintai_fold::stored_states` の sqlx 1 本) で読む。
 #[test]
 fn store_units_reads_the_stored_state_outside_the_loop() {
-    let src = std::fs::read_to_string("src/kintai_fold.rs").expect("read src");
+    let src = std::fs::read_to_string("workers/kintai/kosoku/src/fold_flow.rs").expect("read src");
     let body = src
-        .split_once("async fn store_units(")
+        .split_once("async fn store_units<")
         .expect("store_units")
-        .1
-        .split_once("\n/// 空の [`FoldReport`]")
-        .expect("次の item まで")
-        .0;
+        .1;
     assert_eq!(
-        body.matches("stored_states(store").count(),
+        body.matches("store.stored_states(").count(),
         1,
         "一括読みは 1 箇所だけ"
     );
     assert!(
-        !body.contains("stored_state(store"),
+        !body.contains("stored_state("),
         "乗務員ごとの単数版は呼ばない (往復が人数に比例する)"
     );
-    let batch = body.find("stored_states(store").expect("一括読み");
+    let batch = body.find("store.stored_states(").expect("一括読み");
     let loop_at = body
         .find("for (driver_cd, unit, fp) in units")
         .expect("loop");
