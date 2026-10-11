@@ -1,5 +1,5 @@
 //! fold の書き込み側 `FoldStoreIo` の Worker 実装 (`kintai_pg::FoldStore`、tokio-postgres の `tenant_tx` + `query_typed*` /
-//! `execute_typed`) と root の `KintaiPgStore` (sqlx) に**同じ入力**を与え、7 メソッドの戻りと書いた後の表の中身が一致する
+//! `execute_typed`) と root の `KintaiPgStore` (sqlx) に**同じ入力**を与え、9 メソッドの戻りと書いた後の表の中身が一致する
 //! ことを実 Postgres で確かめる (Refs #322)。
 //!
 //! - 表: `kintai.shifts`・`day_summaries`・`day_parts`・`fold_gate` (テナントと `folded_at` は除く)
@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use alc_worker_db::PgClient;
@@ -413,4 +413,112 @@ async fn hundred_drivers_write_the_same_rows() {
         len(&shifts),
         units.iter().map(|u| u.shifts.len()).sum::<usize>()
     );
+}
+
+/// `stale_state` (月の並びの版の数え上げ) と `recalc_driver_page` (全量再計算の母集団の 1 ページ) が、同じ表を持つ
+/// 2 テナントで一致する。母集団は打刻・保存済み・`extra` の和で、`after`・`stale_only`・`limit`・0 以下の除外が効く。
+/// 壊れた月・空の並びはどちらも落ちる (Worker は root と同じ文面)。
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_state_and_recalc_driver_page_match_the_root_path() {
+    let t = both().await;
+    let units = golden_units();
+    let ver = logic_version(&KosokuParams::default());
+    let months = vec![MONTH.to_string()];
+
+    // 空の月: stale 0・版の一覧は空、母集団は extra だけ (版の列は CHAR(16))
+    let none = BTreeSet::new();
+    let r = t.root.stale_state(&months, &ver).await.unwrap();
+    assert_eq!(r, t.worker.stale_state(&months, &ver).await.unwrap());
+    assert_eq!((r.drivers, r.versions.len()), (0, 0));
+    let extra = BTreeSet::from([-5, 0, 77]);
+    let page = |after, stale_only, limit, extra: BTreeSet<i64>| {
+        let t = &t;
+        let ver = ver.clone();
+        async move {
+            let r = t
+                .root
+                .recalc_driver_page(MONTH, &ver, &extra, after, stale_only, limit)
+                .await
+                .unwrap();
+            let w = t
+                .worker
+                .recalc_driver_page(MONTH, &ver, &extra, after, stale_only, limit)
+                .await
+                .unwrap();
+            assert_eq!(
+                r, w,
+                "after={after:?} stale_only={stale_only} limit={limit}"
+            );
+            w
+        }
+    };
+    assert_eq!(page(None, false, 50, extra.clone()).await, vec![77]);
+    assert!(page(None, false, 50, none.clone()).await.is_empty());
+
+    // 現行版で 1 人目、古い版で 2 人目を書き、打刻だけの乗務員を 1 人足す
+    let (a, b) = (units[0].driver_cd, units[1].driver_cd);
+    write_both(&t, &units[0], &"1".repeat(64), &ver).await;
+    write_both(&t, &units[1], &"2".repeat(64), "0000000000000000").await;
+    for tenant in [t.a, t.b] {
+        sqlx::query(
+            "INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw) \
+             VALUES ($1, 31, '2026-06-03 08:00:00+09', '始業', 'timecard', NULL, '{}'::jsonb)",
+        )
+        .bind(tenant)
+        .execute(&t.pool)
+        .await
+        .expect("seed events");
+    }
+
+    let r = t.root.stale_state(&months, &ver).await.unwrap();
+    assert_eq!(r, t.worker.stale_state(&months, &ver).await.unwrap());
+    assert_eq!(r.drivers, 1, "古い版の乗務員だけ");
+    assert_eq!(r.logic_version, ver);
+    let mut versions = r.versions.clone();
+    versions.sort();
+    let mut want = vec![ver.clone(), "0000000000000000".to_string()];
+    want.sort();
+    assert_eq!(versions, want);
+    // 月が飛んでいても 1 回で数える (並びの順にも依らない)
+    let wide = vec!["2026-08".to_string(), "2026-05".to_string()];
+    assert_eq!(
+        t.root.stale_state(&wide, &ver).await.unwrap(),
+        t.worker.stale_state(&wide, &ver).await.unwrap()
+    );
+
+    let mut all = vec![31, a, b, 77];
+    all.sort();
+    assert_eq!(page(None, false, 50, extra.clone()).await, all);
+    assert_eq!(page(None, false, 2, extra.clone()).await, all[..2].to_vec());
+    assert_eq!(
+        page(Some(all[1]), false, 50, extra.clone()).await,
+        all[2..].to_vec()
+    );
+    let mut stale = vec![31, b, 77];
+    stale.sort();
+    assert_eq!(
+        page(None, true, 50, extra.clone()).await,
+        stale,
+        "現行版の行を持つ乗務員は落ちる"
+    );
+
+    // 壊れた月・空の並び
+    assert!(t.root.stale_state(&[], &ver).await.is_err());
+    let e = t.worker.stale_state(&[], &ver).await.unwrap_err();
+    assert_eq!(e.to_string(), "months が空です");
+    let bad = vec!["2026-13".to_string()];
+    assert!(t.root.stale_state(&bad, &ver).await.is_err());
+    let e = t.worker.stale_state(&bad, &ver).await.unwrap_err();
+    assert_eq!(e.to_string(), "bad month: 2026-13");
+    assert!(t
+        .root
+        .recalc_driver_page("x", &ver, &none, None, false, 5)
+        .await
+        .is_err());
+    let e = t
+        .worker
+        .recalc_driver_page("x", &ver, &none, None, false, 5)
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), "bad month: x");
 }

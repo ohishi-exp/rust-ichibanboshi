@@ -393,7 +393,7 @@ pub async fn receive_window(
     Ok(Json(body))
 }
 
-/// 窓の apply 後に畳み直し、結果を応答へ**書き足す**。
+/// 窓の apply 後に畳み直し、結果を応答へ**書き足す** (段取りは共有 crate の `route_flow::fold_into`、Refs #322)。
 ///
 /// ## fold の失敗で apply の成功を覆い隠さない
 ///
@@ -405,10 +405,8 @@ pub async fn receive_window(
 ///
 /// 代わりに 200 のまま `fold_error` を応答に載せる。#205 のリスク欄の「push した
 /// だけで計算していない状態を作らない」とは矛盾しない — **畳めなかったことが
-/// 応答に明示される**のが、その状態を黙って作らないということ。
-///
-/// `fold` と `stale` は独立に試す。畳めたのに stale の集計だけ落ちたときに、
-/// 何を書いたかの報告まで失わないため。
+/// 応答に明示される**のが、その状態を黙って作らないということ。失敗の status と文面は
+/// [`map_push_err`] (他の口と同じ写し)。
 ///
 /// ## dry-run の窓
 ///
@@ -423,86 +421,12 @@ async fn fold_into(
     result: &crate::kintai_push::TimecardWindowResult,
     body: &mut serde_json::Value,
 ) {
-    match fold_window(repo, st, params, window, result).await {
-        Ok(folded) => {
-            // マクロは 1 行に収める (CLAUDE.md)
-            let (n, wr) = (folded.drivers, folded.drivers_written);
-            tracing::info!(n, wr, "timecard window folded");
-            body["fold"] = serde_json::json!(folded);
-        }
-        Err((code, msg)) => {
-            // 打刻は書けている。畳めなかったことを応答と log の両方で loud に
-            tracing::error!(status = code.as_u16(), "timecard window fold failed");
-            body["fold_error"] = serde_json::json!(msg);
-            body["fold_error_status"] = serde_json::json!(code.as_u16());
-        }
-    }
-    match crate::kintai_fold::stale_state(st, &window.months, params).await {
-        Ok(stale) => {
-            if stale.drivers > 0 {
-                tracing::warn!(s = stale.drivers, "fold is stale — run recalc");
-            }
-            body["stale"] = serde_json::json!(stale);
-        }
-        Err(e) => {
-            tracing::error!("timecard window stale check failed");
-            body["stale_error"] = serde_json::json!(e.to_string());
-        }
-    }
-}
-
-/// 窓ぶんを畳んで [`FoldReport`] を返す。
-///
-/// [`FoldReport`]: crate::kintai_fold::FoldReport
-async fn fold_window(
-    repo: &DynKintaiEventsRepo,
-    st: &KintaiPgStore,
-    params: &crate::kosoku::KosokuParams,
-    window: &TimecardWindow,
-    result: &crate::kintai_push::TimecardWindowResult,
-) -> Result<crate::kintai_fold::FoldReport, (StatusCode, String)> {
-    let drivers: Vec<u64> = result
-        .drivers_changed
-        .iter()
-        .filter(|d| **d > 0)
-        .map(|d| *d as u64)
-        .collect();
-    let apply = !window.dry_run;
-    // 上流 warnings を握り潰さない — R2 の分割遅れの最中に畳むと、欠けた入力を
-    // 「最新」として保存する。tracing だけでは呼び出し側から見えない
-    // 束は月をまたいで 1 つ (上限・重複排除は窓ぜんたいに効く)
-    let mut sink = crate::kintai_fold::FoldSink::default();
-    let mut folded = crate::kintai_fold::FoldReport::default();
-    for month in &window.months {
-        let r =
-            crate::kintai_fold::recalc_drivers(repo, st, params, month, &drivers, apply, &mut sink)
-                .await
-                .map_err(map_push_err)?;
-        folded = merge_fold(folded, r);
-    }
-    folded.warnings = sink.warnings.texts();
-    Ok(folded)
-}
-
-/// 月ごとの [`FoldReport`] を足し合わせる。窓は複数月を覆う。
-///
-/// [`FoldReport`]: crate::kintai_fold::FoldReport
-fn merge_fold(
-    mut acc: crate::kintai_fold::FoldReport,
-    r: crate::kintai_fold::FoldReport,
-) -> crate::kintai_fold::FoldReport {
-    acc.drivers += r.drivers;
-    acc.drivers_written += r.drivers_written;
-    acc.drivers_unchanged += r.drivers_unchanged;
-    acc.shifts += r.shifts;
-    acc.day_summaries += r.day_summaries;
-    acc.day_parts += r.day_parts;
-    acc.skipped.extend(r.skipped);
-    acc.elapsed_ms += r.elapsed_ms;
-    acc.dry_run = r.dry_run;
-    acc.logic_version = r.logic_version;
-    acc.calculated_at = r.calculated_at;
-    acc
+    let ctx = crate::kintai_fold::ctx(params);
+    let status_of = |e| {
+        let (code, msg) = map_push_err(e);
+        (code.as_u16(), msg)
+    };
+    kintai_kosoku::route_flow::fold_into(&**repo, st, &ctx, window, result, body, status_of).await
 }
 
 /// POST /api/kintai/timecard — 差分の日だけを反映する。
@@ -751,47 +675,6 @@ mod tests {
             .unwrap_err();
             assert_eq!(code, StatusCode::BAD_REQUEST);
         }
-    }
-
-    /// 月ごとの報告を足し合わせる。窓は複数月を覆う。
-    #[test]
-    fn fold_reports_add_up_across_months() {
-        let june = crate::kintai_fold::FoldReport {
-            drivers: 1,
-            drivers_written: 1,
-            shifts: 3,
-            day_summaries: 3,
-            day_parts: 4,
-            logic_version: "old".to_string(),
-            ..Default::default()
-        };
-        let july = crate::kintai_fold::FoldReport {
-            drivers: 2,
-            drivers_unchanged: 2,
-            shifts: 1,
-            day_summaries: 1,
-            day_parts: 1,
-            dry_run: true,
-            logic_version: "new".to_string(),
-            calculated_at: "t".to_string(),
-            skipped: vec![crate::kintai_fold::SkipReason::DegenerateShift {
-                start: "a".to_string(),
-                end: "a".to_string(),
-            }],
-            ..Default::default()
-        };
-        let sum = merge_fold(june, july);
-        assert_eq!(sum.drivers, 3);
-        assert_eq!(sum.drivers_written, 1);
-        assert_eq!(sum.drivers_unchanged, 2);
-        assert_eq!(sum.shifts, 4);
-        assert_eq!(sum.day_summaries, 4);
-        assert_eq!(sum.day_parts, 5);
-        assert_eq!(sum.skipped.len(), 1, "落とした行は畳まずに残す");
-        // 版と時刻は月で変わらないので後勝ちでよい
-        assert_eq!(sum.logic_version, "new");
-        assert_eq!(sum.calculated_at, "t");
-        assert!(sum.dry_run);
     }
 
     /// **既定は「畳む」。** 送り主が黙っていたら畳む側に倒す — 運んだのに

@@ -45,7 +45,7 @@
 //! 署名が Rust 側の計算と割れる。よって **[`dedup_events`] が挿入前に決着させる** —
 //! `timecard` を残す (人が確定させた打刻の方が上位) 。署名は残った側だけで作る。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 
@@ -568,27 +568,45 @@ pub async fn apply_timecard_batch(
 /// 検証済みなので、新しい実装は増えない。
 ///
 /// **送り主を信用しない。** 窓の外の日と、名乗っていない乗務員の行は落として数える。
+/// 段取りは共有 crate の `route_flow::apply_timecard_window` (勤怠 Worker と同じもの、Refs #322)。
 pub async fn apply_timecard_window(
     store: &KintaiPgStore,
     window: &TimecardWindow,
 ) -> Result<TimecardWindowResult, KintaiPushError> {
-    let started = std::time::Instant::now();
-    let (spans, lo, hi) = window_spans(&window.months).map_err(KintaiPushError::NotConfigured)?;
+    kintai_kosoku::route_flow::apply_timecard_window(
+        store,
+        window,
+        &crate::kintai_fold::SystemClock,
+    )
+    .await
+}
 
-    let declared: BTreeSet<i64> = window.drivers.iter().copied().collect();
-    let drivers: Vec<i64> = declared.iter().copied().collect();
-    let remote = store
-        .stored_window_signatures(&drivers, jst_day_bounds(lo).0, jst_day_bounds(hi).0)
-        .await?;
-
-    let (plans, mut result) = plan_window(&spans, &declared, &window.events, &remote);
-    result.dry_run = window.dry_run;
-    if !window.dry_run {
-        // **乗務員ごとに往復しない。** 窓ぜんたいで 1 トランザクション
-        store.replace_window(&plans).await?;
+/// 窓の月が読めない (`months が空です` 等) は今までどおり `NotConfigured` の文面。
+impl From<kintai_kosoku::route_flow::BadWindow> for KintaiPushError {
+    fn from(e: kintai_kosoku::route_flow::BadWindow) -> Self {
+        Self::NotConfigured(e.0)
     }
-    result.elapsed_ms = started.elapsed().as_millis() as u64;
-    Ok(result)
+}
+
+/// 打刻の置き換えの I/O (sqlx)。SQL は共有 crate の定数。
+impl kintai_kosoku::route_flow::TimecardWindowIo for KintaiPgStore {
+    type Error = KintaiPushError;
+
+    async fn stored_window_signatures(
+        &self,
+        drivers: &[i64],
+        from: DateTime<FixedOffset>,
+        to: DateTime<FixedOffset>,
+    ) -> Result<BTreeMap<i64, BTreeMap<NaiveDate, String>>, KintaiPushError> {
+        KintaiPgStore::stored_window_signatures(self, drivers, from, to).await
+    }
+
+    async fn replace_window(
+        &self,
+        plans: &BTreeMap<i64, DriverPlan>,
+    ) -> Result<(), KintaiPushError> {
+        KintaiPgStore::replace_window(self, plans).await
+    }
 }
 
 #[cfg(test)]

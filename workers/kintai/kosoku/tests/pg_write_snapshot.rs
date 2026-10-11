@@ -10,8 +10,8 @@ use chrono::{DateTime, FixedOffset};
 use kintai_kosoku::kintai_fold::{
     day_part_columns, day_summary_columns, shift_columns, DayPartRow, DaySummaryRow, FoldUnit,
     ShiftRow, DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL, FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL,
-    INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL, STALE_STATE_SQL, STORED_STATES_SQL,
-    STORED_STATE_SQL,
+    INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL, RECALC_DRIVER_PAGE_SQL, STALE_STATE_SQL,
+    STORED_STATES_SQL, STORED_STATE_SQL,
 };
 use kintai_kosoku::kintai_push::{
     delete_days, event_columns, DriverPlan, PushEvent, DELETE_DAYS_SQL, INSERT_EVENTS_SQL,
@@ -122,6 +122,17 @@ fn every_table_is_schema_qualified() {
             }
         }
     }
+}
+
+/// 再計算の母集団の 1 ページ (root の `src/kintai_fold.rs` から移した。e5aba7d の本文の sha256)。
+/// CTE の `pop` を引くので上の 2 つの検査 (`FROM kintai.`) には入れない。tenant は `$1` で絞る。
+#[test]
+fn the_recalc_page_sql_is_byte_identical_to_the_root_one() {
+    assert_eq!(
+        fx_sha(RECALC_DRIVER_PAGE_SQL),
+        "e1997e9aeb0bd1cf5f03cf6880fb58f4ce41a80d40c28364f74fab079a10c1e7"
+    );
+    assert!(RECALC_DRIVER_PAGE_SQL.contains("tenant_id = $1"));
 }
 
 #[test]

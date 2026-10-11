@@ -533,6 +533,59 @@ SELECT (SELECT coalesce(array_agg(DISTINCT logic_version), '{}')
             GROUP BY driver_cd) t) AS stale_drivers
 "#;
 
+/// 全量再計算の対象乗務員を 1 ページ (`driver_cd` の keyset ページング)。
+///
+/// **母集団は Postgres の distinct driver_cd と `extra` (呼び出し側の `unnest`) の和。**
+///
+/// 昔は Postgres の中だけで決めていた — 生イベントの読み先 (alc / MariaDB) に
+/// 聞くと、乗務員を数えるためだけに月ぶんの `dtako_events` を JSON にして捨てる
+/// ことになる (`kintai_diff::drivers_page` が同じ理由で `UNION` 1 本に絞ったのと
+/// 同じ話)、という考え方自体は正しい。**が、それだと打刻ゼロ・休息由来だけの
+/// 乗務員が母集団から永久に漏れる** — `kintai_events` は打刻由来の行しか持たず、
+/// `day_summaries` は最低 1 回畳まれていないと現れない。1 回も畳んだことが無い
+/// rest-only 乗務員はどちらの表にも 1 行も無い (#205-12、2026-06 実測で 42 名)。
+///
+/// 呼び出し元 ([`crate::route_flow::recalc_page`]) は母集団を決める前に
+/// [`crate::fold_flow::fold_month`] を 1 回読んでいる (ページの畳みそのものに要るので、ここで
+/// もう 1 回生イベントを読み直す必要が無い)。その `split_by_driver` の
+/// キー集合を `extra` として渡せば、月ぶんの読みを増やさずに埋まる。
+pub const RECALC_DRIVER_PAGE_SQL: &str = r#"
+WITH pop AS (
+    SELECT DISTINCT driver_cd FROM kintai.kintai_events
+     WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3
+    UNION
+    SELECT DISTINCT driver_cd FROM kintai.day_summaries
+     WHERE tenant_id = $1 AND date >= $4 AND date < $5
+    UNION
+    SELECT driver_cd FROM unnest($10::int8[]) AS e(driver_cd)
+)
+SELECT driver_cd FROM pop
+ WHERE driver_cd > $6 AND driver_cd > 0
+   AND (NOT $7 OR NOT EXISTS (
+         SELECT 1 FROM kintai.day_summaries s
+          WHERE s.tenant_id = $1 AND s.driver_cd = pop.driver_cd
+            AND s.date >= $4 AND s.date < $5
+            AND s.logic_version = $8))
+ ORDER BY driver_cd
+ LIMIT $9
+"#;
+
+/// 月の並びぜんたいを覆う `[最初の月初, 最後の翌月初)` ([`STALE_STATE_SQL`] の `$2`・`$3`)。
+///
+/// 月が飛んでいても 1 クエリで数える — 隙間ぶんの乗務員が混ざっても
+/// 「stale が多めに出る」だけで、取りこぼす側には倒れない。
+/// `Err` は呼び出し側がそのまま文面にする (`bad month: …` / `months が空です`)。
+pub fn months_span(months: &[String]) -> Result<(NaiveDate, NaiveDate), String> {
+    let mut lo: Option<NaiveDate> = None;
+    let mut hi: Option<NaiveDate> = None;
+    for m in months {
+        let (a, b) = month_date_bounds(m).ok_or_else(|| format!("bad month: {m}"))?;
+        lo = Some(lo.map_or(a, |c: NaiveDate| c.min(a)));
+        hi = Some(hi.map_or(b, |c: NaiveDate| c.max(b)));
+    }
+    lo.zip(hi).ok_or_else(|| "months が空です".to_string())
+}
+
 /// `shifts` を消すと `day_summaries` / `day_parts` は FK の CASCADE で消える。
 pub const DELETE_SHIFTS_SQL: &str = r#"
 DELETE FROM kintai.shifts
@@ -737,6 +790,20 @@ fn day_part_columns_by(unit: &FoldUnit, chunk_rows: usize) -> Vec<DayPartColumns
 mod tests {
     use super::*;
     use crate::kosoku::DayPart;
+
+    #[test]
+    fn months_span_covers_every_month_and_names_the_bad_one() {
+        let d = |y, m| NaiveDate::from_ymd_opt(y, m, 1).unwrap();
+        let ms = ["2026-07".to_string(), "2026-05".to_string()];
+        assert_eq!(months_span(&ms), Ok((d(2026, 5), d(2026, 8))));
+        assert_eq!(
+            months_span(&["2026-12".to_string()]),
+            Ok((d(2026, 12), d(2027, 1)))
+        );
+        let bad = ["2026-07".to_string(), "x".to_string()];
+        assert_eq!(months_span(&bad), Err("bad month: x".to_string()));
+        assert_eq!(months_span(&[]), Err("months が空です".to_string()));
+    }
 
     fn day(date: &str, start: &str, end: &str) -> DaySummary {
         DaySummary {

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::anchors::{clip_to_anchors, HeadAnchors};
 use crate::kintai_fold::{
     fold_driver_month, logic_version, new_report, operations_in_driver_windows, tz, FoldReport,
-    FoldUnit, MonthGate, StoredState,
+    FoldUnit, MonthGate, StaleReport, StoredState,
 };
 use crate::kintai_push::{month_date_bounds, PUSHED_SOURCES};
 use crate::kosoku::{split_by_driver, KosokuParams};
@@ -264,6 +264,26 @@ pub trait FoldStoreIo {
 
     /// `unko_no` 付きの行を一度でも持った乗務員CD (root の `OPERATION_DRIVER_CDS_SQL`)。
     async fn operation_driver_cds(&self) -> Result<HashSet<i64>, Self::Error>;
+
+    /// 月の並びぜんたい ([`crate::kintai_fold::months_span`]) に載っている版を数える (`STALE_STATE_SQL`)。
+    /// 返す [`StaleReport::logic_version`] は渡した `logic_version`。月が読めなければ `months_span` の文面で落とす。
+    async fn stale_state(
+        &self,
+        months: &[String],
+        logic_version: &str,
+    ) -> Result<StaleReport, Self::Error>;
+
+    /// 全量再計算の対象乗務員を 1 ページ (`RECALC_DRIVER_PAGE_SQL`)。`after` は前ページの最後の乗務員CD
+    /// (`None` は `i64::MIN`)、`extra` は Postgres の外から足す母集団、`stale_only` は現行版の行を持たない乗務員に絞る。
+    async fn recalc_driver_page(
+        &self,
+        month: &str,
+        logic_version: &str,
+        extra: &BTreeSet<i64>,
+        after: Option<i64>,
+        stale_only: bool,
+        limit: usize,
+    ) -> Result<Vec<i64>, Self::Error>;
 }
 
 /// 時計。
@@ -285,11 +305,11 @@ pub struct FoldCtx<'a> {
 }
 
 impl FoldCtx<'_> {
-    fn logic_version(&self) -> String {
+    pub(crate) fn logic_version(&self) -> String {
         logic_version(self.params)
     }
 
-    fn new_report(&self, apply: bool) -> FoldReport {
+    pub(crate) fn new_report(&self, apply: bool) -> FoldReport {
         new_report(self.params, apply, self.code_sha, self.clock.now_jst())
     }
 }

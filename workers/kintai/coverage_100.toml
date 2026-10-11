@@ -47,6 +47,10 @@ path = "workers/kintai/logic/src/day_summaries.rs"
 [[files]]
 path = "workers/kintai/logic/src/shift_overlaps.rs"
 
+# stale-months の範囲・SQL・応答。root の routes/stale_months.rs から移した。テストは workers/kintai/logic/tests/stale_months.rs
+[[files]]
+path = "workers/kintai/logic/src/stale_months.rs"
+
 [[files]]
 path = "workers/kintai/logic/src/shift_days.rs"
 
@@ -177,6 +181,11 @@ path = "workers/kintai/kosoku/src/kintai_fold.rs"
 # fold の I/O を含む流れ (月ゲート・畳み・recalc・warnings の束)。I/O は trait で受け取る。root の kintai_fold.rs から移した
 [[files]]
 path = "workers/kintai/kosoku/src/fold_flow.rs"
+
+# 口の段取り (recalc の 1 ページ・窓の畳み直し・打刻の置き換え)。root の routes/kintai_recalc.rs・kintai_timecard.rs・
+# kintai_push.rs から移した。テストは workers/kintai/kosoku/tests/route_flow.rs (fake の I/O)
+[[files]]
+path = "workers/kintai/kosoku/src/route_flow.rs"
 
 # alc の生イベント・etags を読んだあとの純粋部分と読みの流れ (応答の型・写し方・合流・31 日 chunk × keyset・
 # 入力の欠けの検知・月ゲートの指紋)。root の kintai_http_repo.rs から移した。root と勤怠 Worker が往復だけを実装して使う

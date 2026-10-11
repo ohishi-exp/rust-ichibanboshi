@@ -112,53 +112,17 @@ pub fn code_sha() -> &'static str {
 
 // 3 表の行の型・`DaySummary` からの写し・保存済みの姿・SQL 定数・bind の束・指紋と畳みの純粋部分・報告の型は共有 crate に移した (Refs #322)。
 // ここは記録用の `code_sha` と時計を渡す口・sqlx の pool・transaction・bind だけを持つ。呼び出し側のパスを変えないよう再 export する。
+use kintai_kosoku::kintai_fold::months_span;
 pub use kintai_kosoku::kintai_fold::{
     day_part_columns, day_summary_columns, fingerprint, fold_days, fold_driver_month,
     logic_version, shift_columns, tz, DayPartRow, DaySummaryRow, FoldReport, FoldUnit, MonthGate,
     ShiftRow, SkipReason, StaleReport, StoredState, DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL,
     FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL, INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL,
-    STALE_STATE_SQL, STORED_STATES_SQL, STORED_STATE_SQL,
+    RECALC_DRIVER_PAGE_SQL, STALE_STATE_SQL, STORED_STATES_SQL, STORED_STATE_SQL,
 };
 use kintai_kosoku::kintai_push::month_date_bounds;
 
 // ── 保存 ──────────────────────────────────────────────────────────────────
-
-/// 全量再計算の対象乗務員を 1 ページ (`driver_cd` の keyset ページング)。
-///
-/// **母集団は Postgres の distinct driver_cd と `extra` (呼び出し側の `unnest`) の和。**
-///
-/// 昔は Postgres の中だけで決めていた — 生イベントの読み先 (alc / MariaDB) に
-/// 聞くと、乗務員を数えるためだけに月ぶんの `dtako_events` を JSON にして捨てる
-/// ことになる (`kintai_diff::drivers_page` が同じ理由で `UNION` 1 本に絞ったのと
-/// 同じ話)、という考え方自体は正しい。**が、それだと打刻ゼロ・休息由来だけの
-/// 乗務員が母集団から永久に漏れる** — `kintai_events` は打刻由来の行しか持たず、
-/// `day_summaries` は最低 1 回畳まれていないと現れない。1 回も畳んだことが無い
-/// rest-only 乗務員はどちらの表にも 1 行も無い (#205-12、2026-06 実測で 42 名)。
-///
-/// 呼び出し元 ([`crate::routes::kintai_recalc::run`]) は母集団を決める前に
-/// [`fold_month`] を 1 回読んでいる (ページの畳みそのものに要るので、ここで
-/// もう 1 回生イベントを読み直す必要が無い)。その `split_by_driver` の
-/// キー集合を `extra` として渡せば、月ぶんの読みを増やさずに埋まる。
-const RECALC_DRIVER_PAGE_SQL: &str = r#"
-WITH pop AS (
-    SELECT DISTINCT driver_cd FROM kintai.kintai_events
-     WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3
-    UNION
-    SELECT DISTINCT driver_cd FROM kintai.day_summaries
-     WHERE tenant_id = $1 AND date >= $4 AND date < $5
-    UNION
-    SELECT driver_cd FROM unnest($10::int8[]) AS e(driver_cd)
-)
-SELECT driver_cd FROM pop
- WHERE driver_cd > $6 AND driver_cd > 0
-   AND (NOT $7 OR NOT EXISTS (
-         SELECT 1 FROM kintai.day_summaries s
-          WHERE s.tenant_id = $1 AND s.driver_cd = pop.driver_cd
-            AND s.date >= $4 AND s.date < $5
-            AND s.logic_version = $8))
- ORDER BY driver_cd
- LIMIT $9
-"#;
 
 /// 保存済みの姿を読む。
 pub async fn stored_state(
@@ -229,27 +193,13 @@ pub async fn stored_states(
 ///
 /// 窓の受け口が応答に載せるのはこれ。**畳み直しは起こさない** — 全量再計算は
 /// 費用が違う別の口 (`POST /api/kintai/recalc`) の仕事で、ここは「要るかどうか」
-/// だけを 1 クエリで答える。
+/// だけを 1 クエリで答える。本体は [`FoldStoreIo::stale_state`] (月の並びは共有 crate の `months_span`)。
 pub async fn stale_state(
     store: &KintaiPgStore,
     months: &[String],
     params: &KosokuParams,
 ) -> Result<StaleReport, KintaiPushError> {
-    use sqlx::Row;
-    let version = logic_version(params);
-    let (lo, hi) = months_span(months)?;
-    let row = sqlx::query(STALE_STATE_SQL)
-        .bind(store.tenant_id())
-        .bind(lo)
-        .bind(hi)
-        .bind(&version)
-        .fetch_one(store.pool())
-        .await?;
-    Ok(StaleReport {
-        logic_version: version,
-        drivers: row.get::<i64, _>("stale_drivers") as usize,
-        versions: row.get::<Vec<String>, _>("versions"),
-    })
+    FoldStoreIo::stale_state(store, months, &logic_version(params)).await
 }
 
 /// 全量再計算の対象乗務員を 1 ページ返す。`after` は前ページの最後の乗務員CD。
@@ -261,6 +211,7 @@ pub async fn stale_state(
 /// `stale_only` は「対象月に**現行版の行を 1 つも持たない**乗務員」に絞る。
 /// 勤務が 1 本も立たない乗務員 (打刻はあるが全部落ちた月) は保存行を作れないので
 /// **毎回この網に残る** — 収束しないので、全量を回す用途では `false` で使う。
+/// 本体は [`FoldStoreIo::recalc_driver_page`]。
 pub async fn recalc_driver_page(
     store: &KintaiPgStore,
     month: &str,
@@ -270,48 +221,8 @@ pub async fn recalc_driver_page(
     stale_only: bool,
     limit: usize,
 ) -> Result<Vec<i64>, KintaiPushError> {
-    use sqlx::Row;
-    let (m0, m1) = month_date_bounds(month)
-        .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
-    let extra: Vec<i64> = extra.iter().copied().collect();
-    let rows = sqlx::query(RECALC_DRIVER_PAGE_SQL)
-        .bind(store.tenant_id())
-        .bind(jst_day_bounds(m0).0)
-        .bind(jst_day_bounds(m1).0)
-        .bind(m0)
-        .bind(m1)
-        .bind(after.unwrap_or(i64::MIN))
-        .bind(stale_only)
-        .bind(logic_version(params))
-        .bind(limit as i64)
-        .bind(&extra)
-        .fetch_all(store.pool())
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| r.get::<i64, _>("driver_cd"))
-        .collect())
-}
-
-/// 月の並びぜんたいを覆う `[最初の月初, 最後の翌月初)`。
-///
-/// 月が飛んでいても 1 クエリで数える — 隙間ぶんの乗務員が混ざっても
-/// 「stale が多めに出る」だけで、取りこぼす側には倒れない。
-fn months_span(months: &[String]) -> Result<(NaiveDate, NaiveDate), KintaiPushError> {
-    let mut lo: Option<NaiveDate> = None;
-    let mut hi: Option<NaiveDate> = None;
-    for m in months {
-        let (a, b) = month_date_bounds(m)
-            .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {m}")))?;
-        lo = Some(lo.map_or(a, |c: NaiveDate| c.min(a)));
-        hi = Some(hi.map_or(b, |c: NaiveDate| c.max(b)));
-    }
-    match (lo, hi) {
-        (Some(a), Some(b)) => Ok((a, b)),
-        _ => Err(KintaiPushError::NotConfigured(
-            "months が空です".to_string(),
-        )),
-    }
+    let version = logic_version(params);
+    FoldStoreIo::recalc_driver_page(store, month, &version, extra, after, stale_only, limit).await
 }
 
 /// 1 乗務員 1 か月ぶんを置き換える。**1 トランザクション**。
@@ -456,7 +367,7 @@ impl FoldClock for SystemClock {
 }
 
 /// 流れに渡す設定 (記録用の [`code_sha`]、時計は [`SystemClock`])。
-fn ctx(params: &KosokuParams) -> FoldCtx<'_> {
+pub(crate) fn ctx(params: &KosokuParams) -> FoldCtx<'_> {
     FoldCtx {
         params,
         code_sha: code_sha(),
@@ -537,6 +448,59 @@ impl FoldStoreIo for KintaiPgStore {
     ) -> Result<std::collections::HashSet<i64>, KintaiPushError> {
         self.stored_operation_driver_cds().await
     }
+
+    async fn stale_state(
+        &self,
+        months: &[String],
+        logic_version: &str,
+    ) -> Result<StaleReport, KintaiPushError> {
+        use sqlx::Row;
+        let (lo, hi) = months_span(months).map_err(KintaiPushError::NotConfigured)?;
+        let row = sqlx::query(STALE_STATE_SQL)
+            .bind(self.tenant_id())
+            .bind(lo)
+            .bind(hi)
+            .bind(logic_version)
+            .fetch_one(self.pool())
+            .await?;
+        Ok(StaleReport {
+            logic_version: logic_version.to_string(),
+            drivers: row.get::<i64, _>("stale_drivers") as usize,
+            versions: row.get::<Vec<String>, _>("versions"),
+        })
+    }
+
+    async fn recalc_driver_page(
+        &self,
+        month: &str,
+        logic_version: &str,
+        extra: &std::collections::BTreeSet<i64>,
+        after: Option<i64>,
+        stale_only: bool,
+        limit: usize,
+    ) -> Result<Vec<i64>, KintaiPushError> {
+        use sqlx::Row;
+        let (m0, m1) = month_date_bounds(month)
+            .ok_or_else(|| KintaiPushError::NotConfigured(format!("bad month: {month}")))?;
+        let extra: Vec<i64> = extra.iter().copied().collect();
+        let rows = sqlx::query(RECALC_DRIVER_PAGE_SQL)
+            .bind(self.tenant_id())
+            .bind(jst_day_bounds(m0).0)
+            .bind(jst_day_bounds(m1).0)
+            .bind(m0)
+            .bind(m1)
+            .bind(after.unwrap_or(i64::MIN))
+            .bind(stale_only)
+            .bind(logic_version)
+            .bind(limit as i64)
+            .bind(&extra)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<i64, _>("driver_cd"))
+            .collect())
+    }
 }
 
 /// 対象月の遡り起点を引く。月が壊れていれば読む前に落とす。
@@ -599,23 +563,6 @@ pub async fn fold_month_with_anchors(
 ) -> Result<Vec<(u64, FoldUnit, String)>, KintaiPushError> {
     let ctx = ctx(params);
     flow::fold_month_with_anchors(&**repo, &ctx, month, driver, today, anchors, warnings).await
-}
-
-/// gate の書き込み。**書けなくても呼び出し元の口を落とさない** (Refs #205 の 20) —
-/// 書けなければ gate が立たないだけで、次回また全量読みに落ちる安全側。
-pub(crate) async fn write_fold_gate_best_effort(
-    store: &KintaiPgStore,
-    month: &str,
-    dtako_digest: &str,
-    punch_digest: &str,
-    logic_version: &str,
-) {
-    let gate = FoldGateRow {
-        dtako_digest: dtako_digest.to_string(),
-        punch_digest: punch_digest.to_string(),
-        logic_version: logic_version.to_string(),
-    };
-    flow::write_fold_gate_best_effort(store, month, &gate).await
 }
 
 /// 月ゲートを判定する (実装計画 13)。**読むだけで書かない** — 書くかどうかは
@@ -844,23 +791,6 @@ mod tests {
         // build.rs が焼く 16 桁 hex (記録用。版には入らない)
         assert_eq!(code_sha().len(), 16);
         assert!(code_sha().chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    /// 月が飛んでいても端から端まで 1 本の期間にする。
-    #[test]
-    fn months_span_covers_the_ends() {
-        let span = months_span(&["2026-07".to_string(), "2026-05".to_string()]).unwrap();
-        assert_eq!(
-            span,
-            (
-                NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
-            )
-        );
-        let one = months_span(&["2026-12".to_string()]).unwrap();
-        assert_eq!(one.1, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
-        assert!(months_span(&[]).is_err(), "空は書き先が決まらない");
-        assert!(months_span(&["nope".to_string()]).is_err());
     }
 
     /// 版は `LOGIC_BASE` と設定だけで決まり、`build.rs` のソースのハッシュに依らない (Refs #322)。

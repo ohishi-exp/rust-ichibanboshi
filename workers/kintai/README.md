@@ -242,7 +242,7 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
   `query_typed` / `query_typed_one` だけを流す (名前付き prepared statement は Hyperdrive で接続が切れる)。全 `$n` に型を付ける。
   kit の `SET_TENANT` は `search_path = alc_api` にするが、5 本の SQL は全部 `kintai.` で修飾しているのでそのまま動く
 - 移していないもの: `stale-months` (`logic_version` は共有 crate の `LOGIC_BASE` から作るので Worker でも同じ値になる — 移すのは fold と同じ段)。window (`fold` 付きで畳み直す)・fold・recalc と
-  一緒に後の段で移す
+  一緒に後の段で移す。範囲・SQL・応答は既に `kintai-logic` の `stale_months` (root もそれを使う)
 
 ## `GET /api/kintai/unko-gaps` — 取り込み漏れ候補の運行NO (Supabase + alc の etags)
 
@@ -379,6 +379,12 @@ fold の I/O を含む流れ (月ゲート・運行の突合・畳み・保存�
 運行の突合は task_local ではなく呼び出し側の束 (`FoldSink`) に値で積む。時計は `FoldClock` で渡す (wasm32 では `Instant` も `Utc::now` も
 使えない)。Worker 側の 2 つの trait の実装と口は次の段。
 
+口の段取り (`/api/kintai/recalc` の 1 ページ = 遡り起点 → 月ゲート → 1 回読み → 母集団の 1 ページ → 畳み → stale → 封の 5 条件 →
+応答の 23 キー、窓の受け口の畳み直し `fold_into`・`fold_window`・`merge_fold`、打刻の置き換え `apply_timecard_window`) は
+`kintai-kosoku` の `route_flow` が正本 (root の `src/routes/kintai_recalc.rs`・`kintai_timecard.rs` は月の 400・書き先とテナントの解決・
+エラーの status だけの殻)。打刻の置き換えの I/O は `TimecardWindowIo` (root は `KintaiPgStore`。Worker の実装は口と同じ段)。
+テストは `kosoku/tests/route_flow.rs` (fake の I/O。`fold_flow.rs` と `tests/common/` を共有)。
+
 day-events・worktime の純粋部分そのもの (日の窓・畳み方・リンク・層 A の秒数) は写しではなく、オンプレ版と Worker が同じ
 共有 crate `kintai-dtako` を使う。上の 2 行は handler の部分 (検査の順・どの SQL を読むか) だけの対応。
 kosoku-daily・version・timecard の 2 本も同じで、応答を組む部分は共有 crate `kintai-kosoku` (オンプレ版と同じもの)、
@@ -512,7 +518,7 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
-  fold の書き込み側 `FoldStoreIo` (7 メソッド) は `src/fold_store.rs` の `FoldStore` (1 接続を mutex で持ち、メソッドごとに `tenant_tx` 1 回。口は次の PR)。
+  fold の書き込み側 `FoldStoreIo` (9 メソッド。`stale_state`・`recalc_driver_page` を含む) は `src/fold_store.rs` の `FoldStore` (1 接続を mutex で持ち、メソッドごとに `tenant_tx` 1 回。口は次の PR)。
   root の `KintaiPgStore` との一致は `tests/fold_store_parity.rs` (実 DB)。
   kit の `tenant_tx` の中の `query_typed` / `execute_typed` だけで、native でも動く (Worker は Hyperdrive の接続を、テストは native の
   tokio-postgres の接続を渡す)。実 DB が要るので 100% gate には入れず、`pg-parity` job が root と突き合わせる。dev-dependency に

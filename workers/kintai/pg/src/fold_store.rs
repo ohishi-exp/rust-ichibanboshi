@@ -12,19 +12,21 @@
 //!   `tenant_tx` を通る (経路はより厳しい。結果が同じことは parity で見る)
 //! - 全 SQL の `$1` はテナント ([`FoldStore::new`] で固定)
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use alc_worker_db::{PgClient, TenantTx};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use futures_util::lock::Mutex;
 use kintai_kosoku::fold_flow::{FoldGateRow, FoldStoreIo};
 use kintai_kosoku::kintai_fold::{
-    day_part_columns, day_summary_columns, shift_columns, FoldUnit, StoredState, DELETE_SHIFTS_SQL,
-    FOLD_GATE_SELECT_SQL, FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL, INSERT_DAY_SUMMARIES_SQL,
-    INSERT_SHIFTS_SQL, STORED_STATES_SQL,
+    day_part_columns, day_summary_columns, months_span, shift_columns, FoldUnit, StaleReport,
+    StoredState, DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL, FOLD_GATE_UPSERT_SQL,
+    INSERT_DAY_PARTS_SQL, INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL, RECALC_DRIVER_PAGE_SQL,
+    STALE_STATE_SQL, STORED_STATES_SQL,
 };
 use kintai_kosoku::kintai_push::{
-    month_date_bounds, MONTH_OPERATIONS_SQL, MONTH_PUNCH_DIGEST_SQL, OPERATION_DRIVER_CDS_SQL,
+    jst_day_bounds, month_date_bounds, MONTH_OPERATIONS_SQL, MONTH_PUNCH_DIGEST_SQL,
+    OPERATION_DRIVER_CDS_SQL,
 };
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Error, Row};
@@ -37,6 +39,8 @@ use crate::{set_timeout, sources, Out};
 pub enum FoldStoreError {
     /// 月が読めない (root の `KintaiPushError::NotConfigured("bad month: …")` と同じ文言)
     BadMonth(String),
+    /// 月の並びが読めない (`months_span` の文面そのまま: `bad month: …` / `months が空です`)
+    BadMonths(String),
     /// DB の失敗
     Db(Error),
 }
@@ -45,6 +49,7 @@ impl std::fmt::Display for FoldStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadMonth(m) => write!(f, "bad month: {m}"),
+            Self::BadMonths(m) => f.write_str(m),
             Self::Db(e) => write!(f, "kintai fold db failed: {e}"),
         }
     }
@@ -353,6 +358,84 @@ impl FoldStoreIo for FoldStore {
                     rows.iter()
                         .map(|r| r.try_get("driver_cd"))
                         .collect::<Result<HashSet<i64>, _>>()
+                })
+            })
+            .await?;
+        Ok(out)
+    }
+
+    async fn stale_state(
+        &self,
+        months: &[String],
+        logic_version: &str,
+    ) -> Result<StaleReport, FoldStoreError> {
+        let (lo, hi) = months_span(months).map_err(FoldStoreError::BadMonths)?;
+        let (tenant, version) = (self.tenant, logic_version.to_string());
+        let (drivers, versions) = self
+            .tx(move |tx| {
+                Box::pin(async move {
+                    let row = tx
+                        .query_typed_one(
+                            STALE_STATE_SQL,
+                            &[
+                                (&tenant, Type::UUID),
+                                (&lo, Type::DATE),
+                                (&hi, Type::DATE),
+                                (&version, Type::TEXT),
+                            ],
+                        )
+                        .await?;
+                    let drivers: i64 = row.try_get("stale_drivers")?;
+                    let versions: Vec<String> = row.try_get("versions")?;
+                    Ok((drivers, versions))
+                })
+            })
+            .await?;
+        Ok(StaleReport {
+            logic_version: logic_version.to_string(),
+            drivers: drivers as usize,
+            versions,
+        })
+    }
+
+    /// root と同じ束: `$2`/`$3` = 月の JST 00:00 (TIMESTAMPTZ)、`$4`/`$5` = 月の DATE、`$6` = `after` (無ければ `i64::MIN`)。
+    async fn recalc_driver_page(
+        &self,
+        month: &str,
+        logic_version: &str,
+        extra: &BTreeSet<i64>,
+        after: Option<i64>,
+        stale_only: bool,
+        limit: usize,
+    ) -> Result<Vec<i64>, FoldStoreError> {
+        let (m0, m1) = bounds(month)?;
+        let (from, to) = (jst_day_bounds(m0).0, jst_day_bounds(m1).0);
+        let (tenant, version) = (self.tenant, logic_version.to_string());
+        let extra: Vec<i64> = extra.iter().copied().collect();
+        let (after, limit) = (after.unwrap_or(i64::MIN), limit as i64);
+        let out = self
+            .tx(move |tx| {
+                Box::pin(async move {
+                    let rows = tx
+                        .query_typed(
+                            RECALC_DRIVER_PAGE_SQL,
+                            &[
+                                (&tenant, Type::UUID),
+                                (&from, Type::TIMESTAMPTZ),
+                                (&to, Type::TIMESTAMPTZ),
+                                (&m0, Type::DATE),
+                                (&m1, Type::DATE),
+                                (&after, Type::INT8),
+                                (&stale_only, Type::BOOL),
+                                (&version, Type::TEXT),
+                                (&limit, Type::INT8),
+                                (&extra, Type::INT8_ARRAY),
+                            ],
+                        )
+                        .await?;
+                    rows.iter()
+                        .map(|r| r.try_get("driver_cd"))
+                        .collect::<Result<Vec<i64>, _>>()
                 })
             })
             .await?;
