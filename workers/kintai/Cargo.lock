@@ -1513,6 +1513,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures-util",
  "kintai-kosoku",
  "kintai-logic",
  "kintai-mysql",

@@ -512,6 +512,8 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
+  fold の書き込み側 `FoldStoreIo` (7 メソッド) は `src/fold_store.rs` の `FoldStore` (1 接続を mutex で持ち、メソッドごとに `tenant_tx` 1 回。口は次の PR)。
+  root の `KintaiPgStore` との一致は `tests/fold_store_parity.rs` (実 DB)。
   kit の `tenant_tx` の中の `query_typed` / `execute_typed` だけで、native でも動く (Worker は Hyperdrive の接続を、テストは native の
   tokio-postgres の接続を渡す)。実 DB が要るので 100% gate には入れず、`pg-parity` job が root と突き合わせる。dev-dependency に
   repo ルートの package (`rust-ichibanboshi`) を持つ (比べる相手。wasm のビルドには入らない)。root を dev-dependency に持つのがここだけなので、

@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 alc-worker-db = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# fold_store.rs: 1 接続を `&self` のメソッドから使う非同期 mutex (worker と同じ版・同じ feature)
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 kintai-kosoku = { path = "../kosoku" }
 kintai-logic = { path = "../logic" }
 serde_json = "1"
