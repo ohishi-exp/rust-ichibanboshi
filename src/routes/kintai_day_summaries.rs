@@ -18,15 +18,15 @@
 //!
 //! **この口は `X-Tenant-ID` を読まない。** テナントは [`ReadTenant`]
 //! (= `[kintai_events] tenant_id`) の設定 pin で固定される。auth-worker の
-//! `/ichibanboshi-proxy` allowlist に載っているのは**そのため** — あの関門は
+//! (かつての) `/ichibanboshi-proxy` allowlist に載っていたのは**そのため** — あの関門は
 //! `X-Tenant-ID` を素直に信用するので、ヘッダでテナントを選べる口を通すと shared
-//! secret だけで他テナントを引ける。**ヘッダ由来のテナントに変えるなら、同じ PR で
-//! allowlist から外すこと。**
+//! secret だけで他テナントを引ける。**ヘッダ由来のテナントに変えるなら、テナントを
+//! 設定で pin する前提が崩れるので、認可の経路ごと見直すこと。**
 //!
 //! 読むべき行が `ReadTenant` で引けるのは、書き込み側 (`routes::kintai_recalc`) が
 //! `assert_same_tenant` で「読み (生イベント) と書き (畳んだ 3 表) が同じテナント」を
-//! 強制しているため。書き先の pin (`[kintai_push] tenant_id`) は**本番 GCP では空**で
-//! (`.github/workflows/gcp-image.yml`、受け口が `X-Tenant-ID` で名乗る運用)、
+//! 強制しているため。書き先の pin (`[kintai_push] tenant_id`) は**Cloud Run 版では空**で
+//! (受け口が `X-Tenant-ID` で名乗る運用だった)、
 //! [`KintaiPgStore::tenant_id`] は nil になる — かつてここがそれを bind していて、
 //! **本番では常に 0 件**を返していた (Refs #205 の 23)。
 //!

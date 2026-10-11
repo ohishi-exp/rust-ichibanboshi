@@ -74,7 +74,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       # root (repo ルートの package) は kintai-logic・kintai-kosoku・kintai-dtako に path 依存する。
-      # workers/kintai だけを変えて root の Cargo.lock を更新し忘れると、main の GCP image が --locked で落ちる
+      # workers/kintai だけを変えて root の Cargo.lock を更新し忘れると、main の CI (--locked の build) が落ちる
       - name: Root Cargo.lock is up to date
         working-directory: .
         run: |

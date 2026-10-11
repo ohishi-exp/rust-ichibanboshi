@@ -245,7 +245,7 @@ pub struct KintaiEventsConfig {
     ///
     /// **Cloud Run の中ではこれしか選べない。** `auth_token_command` に指定していた
     /// `gcloud auth print-identity-token` は開発機から叩くための経路で、コンテナには
-    /// `gcloud` も `curl` も入っていない (`Dockerfile` は `ca-certificates` だけ)。
+    /// `gcloud` も `curl` も入っていなかった (image は `ca-certificates` だけ)。
     /// audience は `base_url` をそのまま使う。
     #[serde(default)]
     pub auth_token_metadata: bool,
@@ -787,7 +787,7 @@ impl Config {
 
         // ── ローカル状態の置き場 (Refs #205 の G4) ──
         // **`SQLITE_PATH=""` で「置き場を持たない」と宣言できる**必要がある。
-        // イメージに TOML を焼かない方針 (Dockerfile) なので、env で宣言できないと
+        // イメージに TOML を焼かない方針だったので、env で宣言できないと
         // Cloud Run は既定の `/opt/ichibanboshi/state.db` を使い、揮発 FS に空の
         // state.db を作って `/api/uriage/*` が 0 件を返す。`env_str` は空でも
         // 上書きするので、空文字が「未設定」に落ちない

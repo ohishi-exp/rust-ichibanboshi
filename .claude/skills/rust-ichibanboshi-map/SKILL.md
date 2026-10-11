@@ -83,7 +83,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - **月計テーブルは締め時点スナップショット** — 締め後の遡り修正は再集計されないため日報明細と差が出る。
 - **SQL Server 接続**: host `172.18.21.102`、名前付きインスタンス `softec`
   (`using_named_connection()` 必須)、DB `CAPE#01`、`EncryptionLevel::NotSupported`、文字コード Shift_JIS。
-- **実運用は Linux systemd と Cloud Run。** Windows サービスと MSI は #322 で撤去済み。
+- **実運用は Linux systemd (オンプレ) と勤怠 Worker (`workers/kintai`)。** Windows サービスと MSI・Cloud Run への deploy (image の build・smoke・deploy の workflow) は #322 で撤去済み。root の Cloud Run 向けの経路 (`DATABASE_ENABLED=false`・`HttpKintaiEventsRepo` 等) はコードに残り、workers/kintai の parity テストの基準になっている。
 - **CF Access Service Token 必須**: Tunnel 経由のリクエストは `CF-Access-Client-Id/Secret` 無しだと 403。
 
 ## CI / deploy から見た立ち位置
@@ -122,8 +122,8 @@ SQL Server (CAPE#01、172.18.21.102)
 **`state.db` は 3 つの derived store とは別扱い** (`[sqlite] path`、Refs #205 の G4)。
 `uriage_person_*` は SQL Server から作り直せるが、`recalc_jobs` は fingerprint と
 R2 同期状態の**唯一の記録**で、消えると差分再計算の基準が失われる。**空文字で無効宣言**
-でき、その instance では `/api/uriage/*` が 503 になる — GCP (Cloud Run) は
-`SQLITE_PATH=""` を入れること。入れないと揮発 FS に空の `state.db` が生えて
+でき、その instance では `/api/uriage/*` が 503 になる — SQL Server を持たない形
+(Cloud Run 版だった形) は `SQLITE_PATH=""` を入れること。入れないと揮発 FS に空の `state.db` が生えて
 「壊れている」ではなく「0 件」を返す。オンプレは既定のままで挙動不変。
 
 `recalc_jobs.status` の意味:
@@ -596,7 +596,7 @@ CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
 
 サブコマンドを付けると HTTP サーバーではなく一度きりのバッチになる。**省略時は
 従来どおりサーバー起動**なので `ichibanboshi --console` の起動は 1 バイトも変わらない
-(`deploy/ichibanboshi.service` / `Dockerfile` の `CMD` はそのまま)。
+(`deploy/ichibanboshi.service` の起動引数はそのまま)。
 
 | コマンド | 何をするか | 実装 |
 |---|---|---|
@@ -628,8 +628,8 @@ CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
 `day_signature` が 2 実装になり、式のずれが「中身は同じなのに毎回全日が違う」に化ける。
 relay が渡すのは GCP から引いた署名そのもの。
 
-GCP → Cloud Run の hop は auth-worker の `/ichibanboshi-proxy/*` (OIDC mint、
-allowlist は打刻の 2 本だけ)。**あそこに読み出し経路を足さないこと** — 受け口は
+かつての GCP → Cloud Run の hop は auth-worker の `/ichibanboshi-proxy/*` (OIDC mint、
+allowlist は打刻の 2 本だけ。Cloud Run と共に撤去)。**同じ形の関門に読み出し経路を足さないこと** — 受け口は
 `X-Tenant-ID` を素直に信用する ingest なので、読み出しを同じ関門に通すと shared secret
 だけで他テナントを引ける。
 

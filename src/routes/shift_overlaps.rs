@@ -32,12 +32,12 @@
 //! 全月無効になる (`stale_months.rs` / `unko_gaps.rs` と同じ分類)。勤怠の版 (`logic_version`) は手で上げる `LOGIC_BASE`
 //! なのでファイル名では動かない (Refs #322)。
 //!
-//! ## ★ auth-worker の allowlist に載る
+//! ## ★ テナントは設定 pin
 //!
-//! この口は ippoan/auth-worker の `ichibanboshi-proxy` の allowlist に載る。
+//! この口はかつて ippoan/auth-worker の `ichibanboshi-proxy` の allowlist に載っていた。
 //! 載せてよい根拠は、受け口が設定 pin でテナントを決め `X-Tenant-ID` を読まないこと、
 //! 返すのが時刻の組だけで金額を含まないこと。**`X-Tenant-ID` でテナントを決めるように
-//! 変えたら allowlist から外すこと。**
+//! 変えるなら、認可の前提が崩れるので経路ごと見直すこと。**
 //!
 //! ## 認可 — テナントは設定 pin
 //!

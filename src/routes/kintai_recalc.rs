@@ -146,9 +146,9 @@
 //! ## GET は絶対に書かない
 //!
 //! `GET` は `apply` を持たない。「読むだけのつもりが全乗務員を書き直していた」を
-//! 作れないようにするため、書ける口は `POST` だけにしてある。auth-worker の
-//! `/ichibanboshi-proxy` は **path + method の完全一致 allowlist** なので、
-//! 口を足したら `nuxt-dtako-admin` 側の登録も要る。
+//! 作れないようにするため、書ける口は `POST` だけにしてある。かつて auth-worker の
+//! `/ichibanboshi-proxy` が **path + method の完全一致 allowlist** で通していた
+//! 経路は撤去済みで、口を足しても proxy 側の登録は要らない。
 
 use axum::extract::Query;
 use axum::http::{HeaderMap, StatusCode};

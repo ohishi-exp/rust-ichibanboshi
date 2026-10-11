@@ -5,8 +5,7 @@ use rust_ichibanboshi::config::{AppArgs, Config};
 //
 // **`AppArgs` はそのまま平たく取り込む** (`#[command(flatten)]`)。サブコマンドを
 // `Option` にしてあるので、省略時は従来どおり HTTP サーバーとして起動する —
-// `deploy/ichibanboshi.service` の `--console --config ...` も `Dockerfile` の
-// `CMD ["ichibanboshi", "--console"]` も 1 バイトも変えずに動く。
+// `deploy/ichibanboshi.service` の `--console --config ...` も 1 バイトも変えずに動く。
 //
 // doc コメント (`///`) にしないのは、clap が `--help` の説明文として拾ってしまい、
 // `#[command(about)]` の 1 行を押しのけるため。

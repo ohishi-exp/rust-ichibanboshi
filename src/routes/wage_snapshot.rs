@@ -14,18 +14,18 @@
 //! | | Supabase 接続 (`[kintai_push]`) | in-service gate |
 //! |---|---|---|
 //! | オンプレ (ohishi-data) | 無い | あった |
-//! | GCP Cloud Run (`/api/kintai/*` の宛先) | ある | 無い |
+//! | GCP Cloud Run (`/api/kintai/*` の宛先だった) | ある | 無い |
 //!
 //! この表が読み書きする `kintai.wage_snapshot` は Supabase にあり、そこへ繋がるのは
-//! GCP のインスタンスだけ。**Supabase の接続情報を ohishi-data (local) には置かない**
-//! 方針なので (auth-worker 1 箇所に資格情報を集約する設計)、口は GCP 側に置くしかない。
+//! GCP のインスタンスだけだった。**Supabase の接続情報を ohishi-data (local) には置かない**
+//! 方針なので (auth-worker 1 箇所に資格情報を集約する設計)、口は GCP 側に置くしかなかった。
 //!
-//! ## 代わりに何が守っているか
+//! ## 代わりに何が守っていたか
 //!
-//! GCP の Cloud Run は `--no-allow-unauthenticated` で、到達できるのは auth-worker の
+//! Cloud Run は `--no-allow-unauthenticated` で、到達できたのは auth-worker の
 //! `/ichibanboshi-proxy` が OIDC を mint した呼び出しだけ。その手前で
 //! `dtako-scraper-relay` の `restraint-api` が auth-worker JWT + 閲覧者 email で
-//! 認可している。**edge の CF Access だけに寄りかかってはいない。**
+//! 認可していた。**edge の CF Access だけに寄りかかってはいない。**
 //!
 //! in-service gate をここに掛けるには GCP 側に introspect と
 //! allowlist の設定を配る必要があり、それは「資格情報を増やさない」方針と衝突する。
@@ -33,9 +33,9 @@
 //! ## テナントは設定 pin (`X-Tenant-ID` を読まない)
 //!
 //! `kintai_day_summaries` / `stale_months` と同じ [`ReadTenant`]。ヘッダでテナントを
-//! 選べる口にすると、auth-worker の `/ichibanboshi-proxy` allowlist (shared secret で
-//! 通る) 経由で他テナントを引けてしまう。**ヘッダ由来に変えるなら同じ PR で
-//! allowlist から外すこと。**
+//! 選べる口にすると、(かつての) auth-worker `/ichibanboshi-proxy` allowlist (shared secret で
+//! 通る) 経由で他テナントを引けてしまう。**ヘッダ由来に変えるなら認可の経路ごと
+//! 見直すこと。**
 //!
 //! ## 保存は「置き換え」
 //!
