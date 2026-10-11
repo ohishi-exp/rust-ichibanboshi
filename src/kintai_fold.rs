@@ -92,11 +92,10 @@
 //! **書き込みは「その乗務員の月が変わったときだけ」**に絞られる。
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
-use sha2::{Digest, Sha256};
 
 use crate::kintai_push::{jst_day_bounds, KintaiPgStore, KintaiPushError, PUSHED_SOURCES};
 use crate::kintai_repo::{exact_month_range, month_range, DynKintaiEventsRepo, KintaiRepoError};
-use crate::kosoku::{daily_summary, drop_duplicate_rows, KosokuParams};
+use crate::kosoku::KosokuParams;
 use kintai_kosoku::window::parse_dt;
 
 // 乗務員ごとの窓への切り戻しは共有 crate に置く (Refs #322)。
@@ -116,44 +115,32 @@ pub fn output_sha() -> &'static str {
 /// 入り、[`fingerprint`] の材料の先頭でもある。**両方が同じ 1 つの定義から来る**ので、
 /// 「指紋は変わったのに `logic_version` は据え置き」が作れない。
 ///
-/// 材料を `KINTAI_OUTPUT_SHA` 単体にしない理由はモジュール docs 参照。
+/// 材料を `KINTAI_OUTPUT_SHA` 単体にしない理由はモジュール docs 参照。計算は共有 crate
+/// (`kintai_kosoku::kintai_fold::logic_version`、Refs #322) で、ここは [`output_sha`] を渡すだけ。
 pub fn logic_version(params: &KosokuParams) -> String {
-    let mut h = Sha256::new();
-    h.update(output_sha().as_bytes());
-    h.update(b"|");
-    h.update(format!("{params:?}").as_bytes());
-    format!("{:x}", h.finalize())[..LOGIC_VERSION_LEN].to_string()
+    kintai_kosoku::kintai_fold::logic_version(params, output_sha())
 }
 
-/// `logic_version` の桁数。DDL の `CHAR(16)` に合わせる。
-const LOGIC_VERSION_LEN: usize = 16;
-
-// 3 表の行の型・`DaySummary` からの写し・保存済みの姿・SQL 定数・bind の束は共有 crate に移した (Refs #322)。
-// ここは指紋・`logic_version`・sqlx の pool・transaction・bind だけを持つ。呼び出し側のパスを変えないよう再 export する。
+// 3 表の行の型・`DaySummary` からの写し・保存済みの姿・SQL 定数・bind の束・指紋と畳みの純粋部分・報告の型は共有 crate に移した (Refs #322)。
+// ここは `build.rs` の版と時計を渡すラッパー・sqlx の pool・transaction・bind だけを持つ。呼び出し側のパスを変えないよう再 export する。
+use kintai_kosoku::kintai_fold::operations_in_driver_windows;
 pub use kintai_kosoku::kintai_fold::{
     day_part_columns, day_summary_columns, fold_days, shift_columns, tz, DayPartRow, DaySummaryRow,
-    FoldUnit, ShiftRow, SkipReason, StoredState, DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL,
-    FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL, INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL,
-    STALE_STATE_SQL, STORED_STATES_SQL, STORED_STATE_SQL,
+    FoldReport, FoldUnit, MonthGate, ShiftRow, SkipReason, StaleReport, StoredState,
+    DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL, FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL,
+    INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL, STALE_STATE_SQL, STORED_STATES_SQL,
+    STORED_STATE_SQL,
 };
 use kintai_kosoku::kintai_push::month_date_bounds;
 
-/// 指紋。材料はモジュール docs のとおり。
+/// 指紋。材料はモジュール docs のとおり (計算は共有 crate、ここは [`output_sha`] を渡すだけ)。
 pub fn fingerprint(
     driver_cd: i64,
     month: &str,
     params: &KosokuParams,
     rows: &[serde_json::Value],
 ) -> String {
-    let mut lines: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
-    lines.sort();
-    let mut h = Sha256::new();
-    h.update(logic_version(params).as_bytes());
-    h.update(b"|");
-    h.update(format!("{driver_cd}|{month}").as_bytes());
-    h.update(b"|");
-    h.update(lines.join("\n").as_bytes());
-    format!("{:x}", h.finalize())
+    kintai_kosoku::kintai_fold::fingerprint(driver_cd, month, params, rows, output_sha())
 }
 
 /// 1 乗務員 1 か月を畳む。読み出し経路と同じ手順 (モジュール docs 参照)。
@@ -163,88 +150,10 @@ pub fn fold_driver_month(
     params: &KosokuParams,
     rows: Vec<serde_json::Value>,
 ) -> (FoldUnit, String) {
-    let fp = fingerprint(driver_cd, month, params, &rows);
-    let (rows, _duplicates) = drop_duplicate_rows(rows);
-    let days = daily_summary(&rows, month, params);
-    (fold_days(driver_cd, &days), fp)
+    kintai_kosoku::kintai_fold::fold_driver_month(driver_cd, month, params, rows, output_sha())
 }
 
 // ── 保存 ──────────────────────────────────────────────────────────────────
-
-/// 再計算 1 回の集計。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-pub struct FoldReport {
-    pub drivers: usize,
-    pub drivers_written: usize,
-    pub drivers_unchanged: usize,
-    pub shifts: usize,
-    pub day_summaries: usize,
-    pub day_parts: usize,
-    pub skipped: Vec<SkipReason>,
-    /// **`true` なら件数は計画であって実績ではない** (1 行も書いていない)。
-    ///
-    /// [`TimecardWindowResult::dry_run`] と同じ理由で応答に出す — 無いと
-    /// dry-run の `drivers_written` を書けたものと読み違える。
-    ///
-    /// [`TimecardWindowResult::dry_run`]: crate::kintai_push::TimecardWindowResult::dry_run
-    pub dry_run: bool,
-    /// この再計算が使った [`logic_version`]。
-    ///
-    /// **応答に載せるのがリスク欄の筆頭への対応。** 読み出しは計算しないので、
-    /// 畳んだ値が古いままだと遅いのではなく静かに間違う — どの版で畳んだ値かを
-    /// 呼び出し側が読めるようにする。
-    pub logic_version: String,
-    /// 畳んだ時刻 (JST, RFC 3339)。`logic_version` と対で「いつの計算か」を示す。
-    pub calculated_at: String,
-    /// 生イベントを読む途中で**上流が返した warnings**。
-    ///
-    /// R2 の分割遅れ (`NoSuchKey`) の最中に畳むと、欠けた入力を指紋付きで
-    /// 「最新」として保存してしまう。指紋は入力から作るので、次に運行が揃えば
-    /// 指紋が変わって畳み直されるが、**その間は静かに少ない拘束を返す**。
-    /// tracing に落とすだけでは呼び出し側から見えないのでここまで運ぶ。
-    ///
-    /// **診断専用 (tail gap) の警告も含む** — 月ゲートの封を止めるかどうかは
-    /// この `Vec` の空/非空では判定しない (Refs #205-51、
-    /// [`crate::kintai_http_repo::warnings_seen`] 参照)。降格であって削除ではない
-    /// ので、鳴っていることはここから今までどおり読める。
-    pub warnings: Vec<String>,
-    /// 畳むのにかかった時間 (ms)。
-    ///
-    /// 窓の受け口はこれを proxy の 100 秒に収める必要があるので、実測値を出す。
-    /// 1 ページの乗務員数を決めるのもこの値 (`kintai_recalc` のモジュール docs)。
-    pub elapsed_ms: u64,
-}
-
-impl FoldReport {
-    pub fn wrote_anything(&self) -> bool {
-        self.drivers_written > 0
-    }
-
-    /// 想定外があったか (呼び出し側が非 0 終了するのに使う)。
-    ///
-    /// [`SkipReason::is_known`] が真の skip は数えない — 落としたこと自体は
-    /// `skipped` に残るので、表示と応答からは消えない。上流 warnings は
-    /// 引き続き数える (欠けた入力で畳んだかもしれないシグナルなので)。
-    pub fn has_unexpected(&self) -> bool {
-        self.skipped.iter().any(|s| !s.is_known()) || !self.warnings.is_empty()
-    }
-}
-
-/// 保存済みの `logic_version` の姿 (実装計画 06 の stale 検知)。
-///
-/// **`SELECT DISTINCT logic_version` 1 発で済ませる。** 指紋は乗務員ごと・月ごとに
-/// 違うので、指紋で stale を数えると全単位を畳み直すのと同じ費用になる。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-pub struct StaleReport {
-    /// いま走っているコードと設定の [`logic_version`]。
-    pub logic_version: String,
-    /// **これが 0 でなければ全量再計算が要る** (`POST /api/kintai/recalc`)。
-    /// 対象期間に 1 行でも古い版の `day_summaries` を持つ乗務員の数。
-    pub drivers: usize,
-    /// 対象期間の `day_summaries` に載っている版の一覧。
-    /// 現行版だけなら長さ 1、空なら 1 行も畳んでいない。
-    pub versions: Vec<String>,
-}
 
 /// 全量再計算の対象乗務員を 1 ページ (`driver_cd` の keyset ページング)。
 ///
@@ -912,33 +821,6 @@ async fn measure_unko_diff(
     tracing::info!(a, b, "kintai unko diff gcp-only split");
 }
 
-/// 突合に入れる運行を**乗務員ごとの窓**に絞る (Refs ohishi-exp/nuxt-dtako-admin#1123)。
-///
-/// 取得は全員の始端 (`from_global`) から 1 回だが、fold の入力は乗務員ごとに
-/// `[起点 or 月初, to)` へ切り戻している ([`clip_to_anchors`])。突合も同じにしないと、
-/// 1 人の起点で**起点の無い他の乗務員の前月末の運行**まで数え、そこに GCP 側の欠けが
-/// あると fold が読みもしない運行で「dtako 入力欠け」が立ち当月の封を止める。
-///
-/// 材料が暦日 (`last_date`) しか持たないので、判定は日単位 — 運行の最後の記録が
-/// 窓の始端の日以降なら入れる。起点の無い乗務員は始端が月初 0:00 なので正確、
-/// 起点のある乗務員は**起点の日のうち起点より前**に終わった運行まで入る (広い側)。
-fn operations_in_driver_windows(
-    rows: Vec<(i64, String, NaiveDate, NaiveDate)>,
-    month: &str,
-    anchors: &HeadAnchors,
-) -> Vec<(i64, String, NaiveDate, NaiveDate)> {
-    let Some((first, _)) = month_date_bounds(month) else {
-        return rows;
-    };
-    let start = |cd: i64| {
-        let anchor = u64::try_from(cd).ok().and_then(|d| anchors.get(&d));
-        anchor.and_then(|a| parse_dt(a)).map_or(first, |a| a.date())
-    };
-    rows.into_iter()
-        .filter(|(cd, _, _, last)| *last >= start(*cd))
-        .collect()
-}
-
 /// **`unko_no` 付きの行を一度でも持った乗務員CD** (Refs #205 の 39)。
 ///
 /// 引けなければ**空を返して先へ進む** — 内訳の 1 列が埋まらないだけで、突合も
@@ -977,28 +859,6 @@ async fn month_gate_hit(
             && g.dtako_digest == dtako_digest
             && g.punch_digest == punch_digest
     }))
-}
-
-/// 月ゲートの判定結果 (実装計画 13)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MonthGate {
-    /// 一致した — 呼び出し側はこの [`FoldReport`] をそのまま返してよい。
-    /// [`fold_month`] の読みを 1 バイトも払っていない。
-    Hit(FoldReport),
-    /// 一致しなかった (gate が未確立な場合も含む) — 通常どおり読み・畳みへ進む。
-    ///
-    /// **digest は「判定した瞬間の値」。** 月まるごとを完結させたときに書き戻すのは
-    /// 必ずこの値のまま — fold の後に作り直さない。処理中に入力が増えても、
-    /// 古い digest を書く方が安全側 (次回また miss して読み直すだけ)。新しい
-    /// digest を書くと、増えた分が畳まれないまま「最新」として取り残される
-    /// (静かに間違う側の事故)。
-    Miss {
-        dtako_digest: String,
-        punch_digest: String,
-        logic_version: String,
-    },
-    /// 判定できない (alc に口が無い / 上流エラー)。gate を諦めて常に読みに進む。
-    Unavailable,
 }
 
 /// 月ゲートを判定する (実装計画 13)。**読むだけで書かない** — 書くかどうかは
@@ -1266,24 +1126,17 @@ async fn store_units(
     Ok(report)
 }
 
-/// 空の [`FoldReport`]。**版と計算時刻は 1 行も書かなくても載せる** — 呼び出し側が
-/// 「どの版で畳んだ結果か」を必ず読めるようにするため (#205 のリスク欄の筆頭)。
+/// 空の [`FoldReport`] (共有 crate の `new_report` に版と今の時刻を渡す)。
 fn new_report(params: &KosokuParams, apply: bool) -> FoldReport {
-    FoldReport {
-        dry_run: !apply,
-        logic_version: logic_version(params),
-        calculated_at: now_jst(),
-        ..Default::default()
-    }
+    kintai_kosoku::kintai_fold::new_report(params, apply, output_sha(), now_jst())
 }
 
-/// 畳んだ時刻 (JST, RFC 3339)。
-fn now_jst() -> String {
+/// 今の時刻 (JST)。
+fn now_jst() -> DateTime<FixedOffset> {
     use chrono::TimeZone;
     let jst = FixedOffset::east_opt(crate::kintai_push::JST_OFFSET_SECONDS)
         .expect("JST offset is in range");
     jst.from_utc_datetime(&chrono::Utc::now().naive_utc())
-        .to_rfc3339()
 }
 
 // ── 06: push と再計算を束ねる ──────────────────────────────────────────────
@@ -1402,129 +1255,10 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_order_independent_and_hex() {
-        let p = KosokuParams::default();
-        let a = fingerprint(1, "2026-07", &p, &rows());
-        let mut reversed = rows();
-        reversed.reverse();
-        assert_eq!(a, fingerprint(1, "2026-07", &p, &reversed));
-        assert_eq!(a.len(), 64);
-    }
-
-    #[test]
-    fn fingerprint_changes_with_every_ingredient() {
-        let p = KosokuParams::default();
-        let base = fingerprint(1, "2026-07", &p, &rows());
-        assert_ne!(base, fingerprint(2, "2026-07", &p, &rows()), "乗務員");
-        assert_ne!(base, fingerprint(1, "2026-08", &p, &rows()), "月");
-
-        // TOML で再ビルド無しに変えられる設定 — 入れ忘れると古い集計が永久に残る
-        let rounded = KosokuParams {
-            restraint_rounding: crate::kosoku::RestraintRounding::TruncateElapsed,
-            ..p
-        };
-        assert_ne!(base, fingerprint(1, "2026-07", &rounded, &rows()), "丸め方");
-        let threshold = KosokuParams {
-            break_threshold_minutes: 11,
-            ..p
-        };
-        assert_ne!(base, fingerprint(1, "2026-07", &threshold, &rows()), "閾値");
-        let prescribed = KosokuParams {
-            prescribed_minutes: 451,
-            ..p
-        };
-        assert_ne!(
-            base,
-            fingerprint(1, "2026-07", &prescribed, &rows()),
-            "所定"
-        );
-        let legal = KosokuParams {
-            legal_minutes: 481,
-            ..p
-        };
-        assert_ne!(base, fingerprint(1, "2026-07", &legal, &rows()), "法定");
-
-        let mut more = rows();
-        more.push(serde_json::json!({"datetime": "2026-07-02 08:00:00", "source": "timecard", "state": "始業"}));
-        assert_ne!(base, fingerprint(1, "2026-07", &p, &more), "生行");
-    }
-
-    #[test]
     fn fingerprint_folds_the_build_hash() {
         // build.rs が焼く 16 桁 hex。kosoku.rs を 1 バイト直せば必ず変わる
         assert_eq!(output_sha().len(), 16);
         assert!(output_sha().chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    /// `logic_version` は `CHAR(16)` に収まる 16 桁 hex。
-    #[test]
-    fn the_logic_version_fits_the_column() {
-        let v = logic_version(&KosokuParams::default());
-        assert_eq!(v.len(), LOGIC_VERSION_LEN);
-        assert!(v.chars().all(|c| c.is_ascii_hexdigit()), "{v}");
-    }
-
-    /// **TOML の閾値・丸め方を変えると `logic_version` が変わる。**
-    ///
-    /// #205 のテスト計画「`restraint_rounding` を切り替えると全単位が stale になる」
-    /// の本体。`KINTAI_OUTPUT_SHA` 単体だと変わらず、`SELECT DISTINCT logic_version`
-    /// で設定変更由来の stale が捕まえられない。
-    #[test]
-    fn the_logic_version_changes_with_the_toml_settings() {
-        let base = KosokuParams::default();
-        let v = logic_version(&base);
-        // 出力コードのハッシュは同じまま — 変わっているのは設定だけ
-        for (name, changed) in [
-            (
-                "丸め方",
-                KosokuParams {
-                    restraint_rounding: crate::kosoku::RestraintRounding::TruncateElapsed,
-                    ..base
-                },
-            ),
-            (
-                "休憩の閾値",
-                KosokuParams {
-                    break_threshold_minutes: 11,
-                    ..base
-                },
-            ),
-            (
-                "所定",
-                KosokuParams {
-                    prescribed_minutes: 451,
-                    ..base
-                },
-            ),
-            (
-                "法定",
-                KosokuParams {
-                    legal_minutes: 481,
-                    ..base
-                },
-            ),
-        ] {
-            assert_ne!(v, logic_version(&changed), "{name}");
-            assert_eq!(logic_version(&changed).len(), LOGIC_VERSION_LEN, "{name}");
-        }
-    }
-
-    /// 指紋と `logic_version` は**同じ 1 つの定義**から来る。
-    ///
-    /// 別々に組むと「指紋は変わったのに `logic_version` は据え置き」が作れてしまい、
-    /// 保存行の版だけが古いまま残る。
-    #[test]
-    fn the_fingerprint_is_built_on_the_logic_version() {
-        let base = KosokuParams::default();
-        let changed = KosokuParams {
-            restraint_rounding: crate::kosoku::RestraintRounding::TruncateElapsed,
-            ..base
-        };
-        assert_ne!(logic_version(&base), logic_version(&changed));
-        assert_ne!(
-            fingerprint(1, "2026-07", &base, &rows()),
-            fingerprint(1, "2026-07", &changed, &rows()),
-        );
     }
 
     /// 月が飛んでいても端から端まで 1 本の期間にする。
@@ -1544,53 +1278,29 @@ mod tests {
         assert!(months_span(&["nope".to_string()]).is_err());
     }
 
-    /// **dry-run の件数を実績と読み違えない。**
+    /// root のラッパーは共有 crate を `build.rs` の版で呼んだのと同じ値を返す (Refs #322)。
+    /// 値の計算そのものは共有 crate の `the_values_are_the_ones_the_root_computed_before_the_move` が縛る。
     #[test]
-    fn the_report_says_whether_it_wrote() {
-        let dry = FoldReport {
-            dry_run: true,
-            ..Default::default()
-        };
-        assert!(dry.dry_run);
-        assert!(!dry.has_unexpected());
-
-        // 上流 warnings があれば「想定外」に数える — 欠けた入力で畳んでいる
-        let warned = FoldReport {
-            warnings: vec!["NoSuchKey".to_string()],
-            ..Default::default()
-        };
-        assert!(warned.has_unexpected());
-
-        // 既知の skip (is_known) は「想定外」に数えない (Refs #205 の 09) —
-        // 2026-06 の乗務員 1518 のような零長勤務が毎月実在し、数えると CLI が
-        // 毎回 exit 3 になって本当の想定外のシグナルが埋もれる
-        let skipped = FoldReport {
-            skipped: vec![SkipReason::DegenerateShift {
-                start: "a".to_string(),
-                end: "a".to_string(),
-            }],
-            ..Default::default()
-        };
-        assert!(!skipped.has_unexpected());
-
-        // 既知の skip だけでも、上流 warnings が乗れば「想定外」— 2 つの条件は独立
-        let skipped_with_warning = FoldReport {
-            skipped: vec![SkipReason::DegenerateShift {
-                start: "a".to_string(),
-                end: "a".to_string(),
-            }],
-            warnings: vec!["NoSuchKey".to_string()],
-            ..Default::default()
-        };
-        assert!(
-            skipped_with_warning.has_unexpected(),
-            "known skip だけを免除しても warnings は免除しない"
+    fn the_wrappers_match_the_shared_crate_with_the_build_hash() {
+        use kintai_kosoku::kintai_fold as shared;
+        let p = KosokuParams::default();
+        assert_eq!(logic_version(&p), shared::logic_version(&p, output_sha()));
+        assert_eq!(logic_version(&p).len(), shared::LOGIC_VERSION_LEN);
+        let fp = shared::fingerprint(1, "2026-07", &p, &rows(), output_sha());
+        assert_eq!(fingerprint(1, "2026-07", &p, &rows()), fp);
+        let (unit, got) = fold_driver_month(1130, "2026-07", &p, rows());
+        assert_eq!(
+            (unit, got),
+            shared::fold_driver_month(1130, "2026-07", &p, rows(), output_sha())
         );
+        let r = new_report(&p, false);
+        assert!(r.dry_run);
+        assert_eq!(r.logic_version, logic_version(&p));
     }
 
     #[test]
     fn now_jst_is_a_jst_timestamp() {
-        let s = now_jst();
+        let s = now_jst().to_rfc3339();
         assert!(s.ends_with("+09:00"), "{s}");
         assert!(chrono::DateTime::parse_from_rfc3339(&s).is_ok(), "{s}");
     }
@@ -1612,32 +1322,6 @@ mod tests {
         );
         assert_eq!(month_date_bounds("nope"), None);
         assert_eq!(month_date_bounds("2026-13"), None);
-    }
-
-    #[test]
-    fn fold_driver_month_runs_the_read_path_pipeline() {
-        let p = KosokuParams::default();
-        let (unit, fp) = fold_driver_month(1130, "2026-07", &p, rows());
-        assert_eq!(unit.shifts.len(), 1, "始業/終業の対から勤務が 1 本");
-        assert_eq!(unit.day_summaries[0].restraint_minutes, 600);
-        assert_eq!(fp.len(), 64);
-    }
-
-    #[test]
-    fn fold_driver_month_drops_duplicate_rows_like_the_read_path() {
-        let p = KosokuParams::default();
-        let mut dup = rows();
-        dup.extend(rows());
-        let (unit, _) = fold_driver_month(1130, "2026-07", &p, dup);
-        assert_eq!(unit.shifts.len(), 1, "重複しても勤務は 1 本");
-    }
-
-    #[test]
-    fn report_knows_when_it_wrote() {
-        let mut r = FoldReport::default();
-        assert!(!r.wrote_anything());
-        r.drivers_written = 1;
-        assert!(r.wrote_anything());
     }
 
     /// 既知の skip は**報告に残るが非 0 終了にしない**。
@@ -1777,41 +1461,6 @@ mod tests {
     #[test]
     fn push_window_gap_returns_none_for_a_bad_month() {
         assert!(push_window_gap_warning("nope", &[], ymd(2026, 7, 15)).is_none());
-    }
-
-    /// 突合は乗務員ごとの窓 (Refs ohishi-exp/nuxt-dtako-admin#1123)。起点の無い乗務員の
-    /// 前月末の運行は出ず、起点のある乗務員の起点以降の前月の運行は出る。
-    #[test]
-    fn unko_diff_counts_operations_in_each_drivers_window() {
-        let op = |cd: i64, u: &str, f: NaiveDate, l: NaiveDate| (cd, u.to_string(), f, l);
-        let rows = vec![
-            // 1731 (起点 2/21 05:00) の閉じ忘れ運行 — 出る
-            op(1731, "A", ymd(2026, 2, 21), ymd(2026, 3, 2)),
-            // 1731 の起点より前の日に終わった運行 — 出ない
-            op(1731, "B", ymd(2026, 2, 18), ymd(2026, 2, 20)),
-            // 起点の無い 1130 の前月末の運行 — 出ない (from_global では読まれるが)
-            op(1130, "C", ymd(2026, 2, 25), ymd(2026, 2, 27)),
-            // 1130 の月初をまたぐ運行 (最後の記録が当月) — 今までどおり出る
-            op(1130, "D", ymd(2026, 2, 28), ymd(2026, 3, 1)),
-            op(1130, "E", ymd(2026, 3, 10), ymd(2026, 3, 10)),
-        ];
-        let anchors: HeadAnchors = [(1731, "2026-02-21 05:00:00".to_string())]
-            .into_iter()
-            .collect();
-        let got: Vec<String> = operations_in_driver_windows(rows.clone(), "2026-03", &anchors)
-            .into_iter()
-            .map(|(_, u, _, _)| u)
-            .collect();
-        assert_eq!(got, vec!["A", "D", "E"]);
-        // 起点が無ければ全員月初から (前月末だけの運行は落ちる)
-        let none = operations_in_driver_windows(rows.clone(), "2026-03", &HeadAnchors::new());
-        let none: Vec<&str> = none.iter().map(|(_, u, _, _)| u.as_str()).collect();
-        assert_eq!(none, vec!["A", "D", "E"]);
-        // 月が壊れていれば絞らない
-        assert_eq!(
-            operations_in_driver_windows(rows.clone(), "x", &anchors),
-            rows
-        );
     }
 
     #[test]

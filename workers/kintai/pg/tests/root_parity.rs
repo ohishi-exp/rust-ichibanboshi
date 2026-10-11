@@ -194,21 +194,23 @@ async fn timecard_writes_the_same_rows_as_the_root_path() {
                         raw(1130, "2026-06-01 18:02:05", "終業", "timecard", None),
                         // DDL に無い state (数えて落とす)
                         raw(1130, "2026-06-01 09:00:00", "点呼", "timecard", None),
+                        // 別の乗務員 (misplaced)。この日の後に 06-02 が続く (#361 で折り返していた形)
+                        raw(9999, "2026-06-01 08:00:00", "始業", "timecard", None),
                     ],
                 ),
-                // 日のキーと違う行・別の乗務員 (misplaced)。**月の中の最後の日に置く** — 元の
-                // `apply_timecard_batch` は `deduped` を累計の `misplaced` で引くので、misplaced の後に
-                // 月の中の日が続くと引き算が負になる (debug は panic、release は折り返す。元からの挙動)。
-                // misplaced を含む日の後に日が続く入力は避けている (#361)
+                // 日のキーと違う行 (misplaced)
                 (
                     "2026-06-02",
                     vec![
                         raw(1130, "2026-06-02 08:00:00", "始業", "timecard", None),
                         raw(1130, "2026-06-03 08:00:00", "始業", "timecard", None),
-                        raw(9999, "2026-06-02 08:00:00", "始業", "timecard", None),
                     ],
                 ),
-                // 月の外の日
+                // 月の外の日。月の中の日より前 (#361 で折り返していたもう 1 つの形) と後の両方
+                (
+                    "2026-05-31",
+                    vec![raw(1130, "2026-05-31 08:00:00", "始業", "timecard", None)],
+                ),
                 (
                     "2026-07-01",
                     vec![raw(1130, "2026-07-01 08:00:00", "始業", "timecard", None)],

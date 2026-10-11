@@ -309,8 +309,6 @@ Cloud Run 版 (root の `src/routes/kintai_timecard.rs` の `receive`・`signatu
   一致することを実 postgres で確かめる (worker-kintai.yml の `pg-parity` job)。int8[]・timestamptz[]・text[]・jsonb[] (NULL 入り)・
   date[]・int2[]・int4[] (NULL 入り)・bool[] がここを通る。入力の検査は `pg/tests/axum_parity.rs` が root の axum の handler と
   同じ status・本文になることを確かめる (DB 不要)
-- 元の `apply_timecard_batch` の `deduped` の数え方には、misplaced を含む日の後に日が続くと引き算が負になる不具合がある (#361)。
-  Worker も同じ式 (共有 crate) なので一致する
 
 ### 元 (root の src/) と写し (logic/) の対応 — **撤去までは片方を直したらもう片方も直す**
 

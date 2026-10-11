@@ -761,8 +761,10 @@ pub fn plan_received_batch(
             .collect();
         result.misplaced += before - kept.len();
 
+        // その日に残した行から数える (累計の misplaced を引くと前の日の分まで引いて折り返す、#361)
+        let kept_len = kept.len();
         let deduped = dedup_events(kept);
-        result.deduped += before - result.misplaced - deduped.len();
+        result.deduped += kept_len - deduped.len();
         result.events_written += deduped.len();
         changed.insert(*date, deduped);
     }
@@ -1406,6 +1408,58 @@ mod tests {
         let plan = &plans[&1130];
         assert_eq!(plan.changed[&d(2026, 6, 1)].len(), 1);
         assert_eq!(plan.deleted, vec![d(2026, 6, 3)]);
+    }
+
+    /// misplaced を含む日の後に日が続いても `deduped` はその日の重複だけを数える (#361)。
+    /// 前は累計の misplaced を引いていたので、ここで usize が折り返していた。
+    #[test]
+    fn deduped_after_a_day_with_misplaced_rows_counts_only_that_days_duplicates() {
+        let mut b = batch("2026-06");
+        b.days.insert(
+            d(2026, 6, 1),
+            vec![
+                raw(1130, "2026-06-01 08:00:00", "始業"),
+                raw(1130, "2026-06-02 08:00:00", "始業"),
+                raw(9999, "2026-06-01 08:00:00", "始業"),
+            ],
+        );
+        b.days.insert(
+            d(2026, 6, 2),
+            vec![
+                raw(1130, "2026-06-02 08:00:00", "始業"),
+                raw(1130, "2026-06-02 08:00:00", "始業"),
+                raw(1130, "2026-06-02 18:00:00", "終業"),
+            ],
+        );
+        let (plans, result) = plan_received_batch(&b).unwrap();
+        assert_eq!(result.misplaced, 2);
+        assert_eq!(result.deduped, 1);
+        assert_eq!(result.events_written, 3);
+        assert_eq!(plans[&1130].changed[&d(2026, 6, 2)].len(), 2);
+    }
+
+    /// 月の外の日 (行ごと misplaced) が先に来ても、後の日の `deduped` は折り返さない (#361)。
+    #[test]
+    fn deduped_after_an_out_of_month_day_counts_only_that_days_duplicates() {
+        let mut b = batch("2026-06");
+        b.days.insert(
+            d(2026, 5, 31),
+            vec![
+                raw(1130, "2026-05-31 08:00:00", "始業"),
+                raw(1130, "2026-05-31 18:00:00", "終業"),
+            ],
+        );
+        b.days.insert(
+            d(2026, 6, 1),
+            vec![
+                raw(1130, "2026-06-01 08:00:00", "始業"),
+                raw(1130, "2026-06-01 08:00:00", "始業"),
+            ],
+        );
+        let (_, result) = plan_received_batch(&b).unwrap();
+        assert_eq!(result.misplaced, 2);
+        assert_eq!(result.deduped, 1);
+        assert_eq!(result.events_written, 1);
     }
 
     #[test]
