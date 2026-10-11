@@ -489,6 +489,30 @@ pub fn jst_day_bounds(date: NaiveDate) -> (DateTime<FixedOffset>, DateTime<Fixed
     (at(date), at(date.succ_opt().expect("date has a successor")))
 }
 
+/// [`jst_at`] が読めなかった壁時計 (本文は root の `bad range "<値>": <理由>` のまま)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadRange(pub String);
+
+impl std::fmt::Display for BadRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` (JST 壁時計) を `TIMESTAMPTZ` へ渡せる形に。
+///
+/// 書く側 (root の `kintai_push`) と読み返す側 (root の `kintai_pg_repo`・勤怠 Worker の fold の読み) が同じ変換で
+/// 範囲を作る。**写さない** — 書きと読みで壁時計の解釈が 1 箇所でも割れると、書いた行が読めない日ができる。
+pub fn jst_at(s: &str) -> Result<DateTime<FixedOffset>, BadRange> {
+    let naive = NaiveDateTime::parse_from_str(s, DATETIME_FORMAT)
+        .map_err(|e| BadRange(format!("bad range {s:?}: {e}")))?;
+    Ok(FixedOffset::east_opt(JST_OFFSET_SECONDS)
+        .expect("JST offset is in range")
+        .from_local_datetime(&naive)
+        .single()
+        .expect("JST has no DST gap"))
+}
+
 /// 転送 1 回ぶんの本体。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TimecardBatch {
@@ -929,6 +953,17 @@ mod tests {
             unko_no: None,
             raw: json!({}),
         }
+    }
+
+    #[test]
+    fn jst_at_reads_the_wall_clock_as_jst() {
+        let at = jst_at("2026-06-01 00:00:00").unwrap();
+        assert_eq!(at.to_rfc3339(), "2026-06-01T00:00:00+09:00");
+        let err = jst_at("2026-06-01").unwrap_err();
+        assert!(
+            err.to_string().starts_with("bad range \"2026-06-01\": "),
+            "{err}"
+        );
     }
 
     #[test]

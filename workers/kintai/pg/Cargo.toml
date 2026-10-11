@@ -35,7 +35,5 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 rusqlite = "0.32"
 # tests/axum_parity.rs: root の handler を `oneshot` で叩く (DB 不要)
 tower = { version = "0.5", features = ["util"] }
-# tests/fold_events_parity.rs: root の fallback の代役 (KintaiEventsApi は async_trait) と、Worker の MariaDB の fake が返す行の型
-async-trait = "0.1"
-kintai-mysql = { path = "../mysql" }
+# テナントを経路・テストごとに新しく作る
 uuid = { version = "1", features = ["v4"] }

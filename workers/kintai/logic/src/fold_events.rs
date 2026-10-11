@@ -1,32 +1,34 @@
 //! 勤怠 Worker の fold の読み 3 本 (`kintai_kosoku::fold_flow::FoldEventsIo`) の実装 (Refs ohishi-exp/rust-ichibanboshi#322)。
 //!
-//! root の `HttpKintaiEventsRepo` (alc を reqwest で読み、MariaDB の fallback を合流する) と**同じ読み方**を、往復だけ
-//! 差し替えて作る。合流・ページング・指紋・入力の欠けの検知は共有 crate の `kintai_kosoku::alc_events` (root と同じもの):
+//! 本番の Cloud Run 版 (root の `HttpKintaiEventsRepo` が alc を reqwest で読み、fallback の `PgKintaiEventsRepo` = relay が送った
+//! 打刻の写し `kintai.kintai_events` を合流する) と**同じ読み方**を、往復だけ差し替えて作る。合流・ページング・指紋・入力の
+//! 欠けの検知は共有 crate の `kintai_kosoku::alc_events`、写しの SQL・行の形は `kintai_kosoku::pushed_events` (root と同じもの):
 //!
-//! | 読み | root | 勤怠 Worker |
+//! | 読み | root (Cloud Run 版) | 勤怠 Worker |
 //! |---|---|---|
-//! | 遡り起点 | fallback (MariaDB) の `HEAD_RUN_ENDS_SQL` → `HEAD_PUNCHES_SQL` | 同じ 2 本を 1 接続で ([`MariadbRun`]) |
-//! | 全乗務員の行 | alc のページング → fallback の `ALL_EVENTS_SQL` を合流 | alc は auth-worker の `dtakoEvents` ([`AlcRpc`])、MariaDB は同じ SQL |
+//! | 遡り起点 | fallback (写し) の `HEAD_RUN_ENDS_SQL` → `HEAD_PUNCHES_SQL` | 同じ 2 本 ([`PushedEventsRead`]) |
+//! | 全乗務員の行 | alc のページング → fallback (写し) の `ALL_EVENTS_SQL` を合流 | alc は auth-worker の `dtakoEvents` ([`AlcRpc`])、写しは同じ SQL |
 //! | dtako の指紋 | alc の etags | auth-worker の `dtakoEtags` |
 //!
-//! 往復は 2 つの小さな trait で受け取る (worker crate が env の binding と MariaDB の接続で実装する。テストは fake)。
+//! **社内 MariaDB は読まない** (オンプレ版の経路。写しには `休息` の行と最後の送り以降の打刻が無いので、MariaDB を読むと
+//! Cloud Run 版と畳みの入力がずれる)。往復は 2 つの小さな trait で受け取る (worker crate が auth-worker の binding で、kintai-pg の
+//! `FoldStore` が Supabase の接続で実装する。テストは fake)。
 //! **非 2xx の扱いは root の fold と同じ**: 生イベントは 404 を含めて非 2xx は全部 502、etags は 404 だけ「口なし」
 //! (`digest: None`) でそれ以外の非 2xx と parse 失敗は 502 ([`crate::unko_gaps::read_etags_body`])。
 //! `dtakoEvents` / `dtakoEtags` に渡すのは query の鍵 (`date_from`・`date_to`・`page_size`・`after_driver_cd`) だけで、
 //! path・method (GET)・tenant は auth-worker 側で固定される。
 
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use kintai_kosoku::alc_events::{
     fetch_all_events, fetch_dtako_month_read, merge_all_rows, AlcEventsError, AlcEventsGet,
     EventsPage, UpstreamAll, UpstreamEtags,
 };
 use kintai_kosoku::anchors::HeadAnchors;
 use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
-use kintai_mysql::response::Row;
+use kintai_kosoku::kintai_push::jst_at;
+use kintai_kosoku::window::{month_head_anchors, HeadPunch};
 
 use crate::common::Fail;
-use crate::kosoku_reads::{all_events_sql, anchors_between, head_sqls_between};
-use crate::mariadb_rows::{all_event_row, rows_to_json};
 use crate::unko_gaps::{etags_search_between, read_etags_body, RpcResult};
 
 /// auth-worker の `KintaiAlcEntrypoint` の 2 メソッド。どちらも失敗を throw せず `{status, body}` で返す
@@ -39,17 +41,32 @@ pub trait AlcRpc {
     async fn dtako_etags(&self, search: &str) -> Result<RpcResult, Fail>;
 }
 
-/// 社内 MariaDB に 1 接続を開いて SQL を並びのまま流し、結果の行を同じ並びで返す (失敗は 502)。
+/// `[from, to)` の `TIMESTAMPTZ` (JST の壁時計を [`pushed_window`] で変換したもの)。
+pub type Span = (DateTime<FixedOffset>, DateTime<FixedOffset>);
+
+/// relay が送った打刻の写し (`kintai.kintai_events`) の読み 3 本。SQL と行の形は `kintai_kosoku::pushed_events`
+/// (root の `PgKintaiEventsRepo` と同じ)。失敗は 502 で、本文に DB の message・接続先を載せない。
 #[allow(async_fn_in_trait)]
-pub trait MariadbRun {
-    async fn run(&self, sqls: &[String]) -> Result<Vec<Vec<Row>>, Fail>;
+pub trait PushedEventsRead {
+    /// `ALL_EVENTS_SQL` (source は `PUSHED_SOURCES`) の行を 5 キーの JSON で。
+    async fn pushed_all_events(&self, span: Span) -> Result<Vec<serde_json::Value>, Fail>;
+    /// `HEAD_RUN_ENDS_SQL` の (乗務員CD, 運行NO)。
+    async fn pushed_head_run_ends(&self, span: Span) -> Result<Vec<(u64, String)>, Fail>;
+    /// `HEAD_PUNCHES_SQL` の月初時点の打刻の姿。
+    async fn pushed_head_punches(&self, span: Span) -> Result<Vec<HeadPunch>, Fail>;
 }
 
 /// 勤怠 Worker の fold の読み。`today` は月ゲートの末尾検知の切り下げに使う (JST の日付。呼び手が時計から作る)。
-pub struct WorkerFoldEvents<'a, A, M> {
+pub struct WorkerFoldEvents<'a, A, P> {
     pub alc: &'a A,
-    pub mariadb: &'a M,
+    pub pushed: &'a P,
     pub today: NaiveDate,
+}
+
+/// `[from, to)` の JST の壁時計を `TIMESTAMPTZ` に (root の `PgKintaiEventsRepo` と同じ `jst_at`。読めなければ 502)。
+pub fn pushed_window(from: &str, to: &str) -> Result<Span, Fail> {
+    let at = |s: &str| jst_at(s).map_err(|e| Fail::new(502, e.0));
+    Ok((at(from)?, at(to)?))
 }
 
 /// `dtakoEvents` に渡す query 文字列 (鍵は [`EventsPage::params`] の順。値は form-urlencode する)。
@@ -85,7 +102,7 @@ impl From<BadMonth> for Fail {
     }
 }
 
-impl<A: AlcRpc, M> AlcEventsGet for WorkerFoldEvents<'_, A, M> {
+impl<A: AlcRpc, P> AlcEventsGet for WorkerFoldEvents<'_, A, P> {
     type Error = Fail;
 
     async fn events_page(&self, page: &EventsPage) -> Result<UpstreamAll, Fail> {
@@ -102,27 +119,28 @@ impl<A: AlcRpc, M> AlcEventsGet for WorkerFoldEvents<'_, A, M> {
     }
 }
 
-impl<A: AlcRpc, M: MariadbRun> FoldEventsIo for WorkerFoldEvents<'_, A, M> {
+impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P> {
     type Error = Fail;
 
-    /// 遡り起点は MariaDB だけ (alc に口が無い。root も fallback へ委譲する)。
+    /// 遡り起点は写しだけ (alc に口が無い。root も fallback へ委譲する)。規則は root と同じ `month_head_anchors`。
     async fn month_head_anchors(&self, month_start: &str, to: &str) -> Result<HeadAnchors, Fail> {
-        let sqls = head_sqls_between(month_start, to)?;
-        let sets = self.mariadb.run(&sqls).await?;
-        let [runs, punches] = <[Vec<Row>; 2]>::try_from(sets).map_err(|_| shape())?;
-        anchors_between(month_start, &runs, &punches)
+        let span = pushed_window(month_start, to)?;
+        let runs = self.pushed.pushed_head_run_ends(span).await?;
+        let punches = self.pushed.pushed_head_punches(span).await?;
+        Ok(month_head_anchors(month_start, &runs, &punches))
     }
 
-    /// alc のページング → MariaDB の全員行 (root と同じ順)。MariaDB からは alc に口が無い source だけを借りる。
+    /// alc のページング → 写しの全員行 (root と同じ順)。写しからは alc に口が無い source だけを借りる。
     async fn all_events_between(
         &self,
         from: &str,
         to: &str,
     ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), Fail> {
         let (events, warnings) = fetch_all_events(self, from, to).await?;
-        let sets = self.mariadb.run(&[all_events_sql(from, to)?]).await?;
-        let [rows] = <[Vec<Row>; 1]>::try_from(sets).map_err(|_| shape())?;
-        let borrowed = rows_to_json(&rows, all_event_row)?;
+        let borrowed = self
+            .pushed
+            .pushed_all_events(pushed_window(from, to)?)
+            .await?;
         Ok((merge_all_rows(events, Some(borrowed)), warnings))
     }
 
@@ -133,9 +151,4 @@ impl<A: AlcRpc, M: MariadbRun> FoldEventsIo for WorkerFoldEvents<'_, A, M> {
     ) -> Result<DtakoMonthRead, Fail> {
         fetch_dtako_month_read(self, month, since, self.today).await
     }
-}
-
-/// [`MariadbRun`] が流した本数と違う数の結果を返した (実装の誤り。502)。
-fn shape() -> Fail {
-    crate::common::mariadb_fail("rows:sets")
 }

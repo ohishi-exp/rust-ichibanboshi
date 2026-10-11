@@ -6,7 +6,7 @@
 - Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 7 本 (`unko-gaps` は auth-worker の RPC で alc の etags も読む) と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
 - 社内 CakePHP (nginx) — 中継する `GET /api/kintai/{daily,pdf-json}` と `POST /api/dtako/autoload` (③ resetby-unko-no を含む) の 3 本 (オンプレ版から移した。下記)
 - D1 (`KINTAI_RESTRAINT_DB`) — 拘束サマリの `PUT /api/restraint/summaries` と `GET /api/restraint/{wage-source,synced-months}` (オンプレ版の SQLite から移した。下記)
-- fold (Supabase + 社内 MariaDB + auth-worker の RPC) — `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` の 4 本 (Cloud Run 版から移した。下記)
+- fold (Supabase + auth-worker の RPC。社内 MariaDB は読まない) — `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` の 4 本 (Cloud Run 版から移した。下記)
 
 ## 到達の経路
 
@@ -377,7 +377,8 @@ fold の I/O を含む流れ (月ゲート・運行の突合・畳み・保存�
 生イベントの読み 3 本の `FoldEventsIo` (root は `dyn KintaiEventsApi`) と Supabase の読み書きの `FoldStoreIo` (root は
 `KintaiPgStore` の sqlx)。形は `dtako_autoload` の `AutoloadIo` と同じ (`async fn` を直に書く。Send は要らない)。warnings・`unsplit`・
 運行の突合は task_local ではなく呼び出し側の束 (`FoldSink`) に値で積む。時計は `FoldClock` で渡す (wasm32 では `Instant` も `Utc::now` も
-使えない)。Worker 側の 2 つの trait の実装は `worker/src/fold_events.rs` (読み) と `pg/src/fold_store.rs` (書き)、口は下の「fold の 4 口」。
+使えない)。Worker 側の 2 つの trait の実装は kintai-logic の `fold_events` (読み。alc の RPC と、送った写しの読み `PushedEventsRead` を
+`pg/src/fold_store.rs` の `FoldStore` が impl) と `pg/src/fold_store.rs` (書き)、口は下の「fold の 4 口」。
 
 口の段取り (`/api/kintai/recalc` の 1 ページ = 遡り起点 → 月ゲート → 1 回読み → 母集団の 1 ページ → 畳み → stale → 封の 5 条件 →
 応答の 23 キー、窓の受け口の畳み直し `fold_into`・`fold_window`・`merge_fold`、打刻の置き換え `apply_timecard_window`) は
@@ -402,7 +403,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 
 | 部品 | root (Cloud Run 版) | Worker |
 |---|---|---|
-| 読み (`FoldEventsIo`) | `HttpKintaiEventsRepo` (alc を reqwest + MariaDB の fallback) | `worker/src/fold_events.rs` (alc は auth-worker の `KintaiAlcEntrypoint.dtakoEvents`・`dtakoEtags`、MariaDB は 1 接続。読み方は kintai-logic の `fold_events`) |
+| 読み (`FoldEventsIo`) | `HttpKintaiEventsRepo` (alc を reqwest + fallback の `PgKintaiEventsRepo` = relay が送った写し `kintai.kintai_events`。本番の設定は `http+pg`) | kintai-logic の `fold_events::WorkerFoldEvents` (alc は auth-worker の `KintaiAlcEntrypoint.dtakoEvents`・`dtakoEtags`、打刻と遡り起点は同じ写しを kintai-pg の `FoldStore` (`PushedEventsRead`) で。SQL と行の形は共有 crate の `kintai_kosoku::pushed_events`。**社内 MariaDB は読まない**) |
 | 書き (`FoldStoreIo`・`TimecardWindowIo`) | `KintaiPgStore` (sqlx の pool) | kintai-pg の `FoldStore` (Hyperdrive の 1 接続を 1 リクエストで 1 回開き、window は置き換えと畳み直しを同じ接続で回す) |
 | 時計 (`FoldClock`) | `SystemClock` (`Utc::now`・`Instant`) | `worker/src/fold.rs` の `WorkerClock` (`Date.now()` のミリ秒。`now_jst` は +09:00) |
 | `KosokuParams` | 設定ファイル (`[kosoku]` 節が無く既定値) | 既定値 (`kintai_logic::fold_routes::params`)。`logic_version` は本番と同じ `1b8f00ba48e9a77b` (`logic/tests/fold_routes.rs`) |
@@ -413,7 +414,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 
 | 口 | 認可 | 入力の検査 (順) | 400 | 403 | 503 | 502 | 応答 (200) |
 |---|---|---|---|---|---|---|---|
-| `GET /api/kintai/recalc` (preview。**書かない**) | なし | Query → `month` (`is_valid_month`) | `month は YYYY-MM で指定してください` / Query が読めない (`Failed to deserialize query string: …`) | — | binding 無し `[KINTAI_HYPERDRIVE] が無効です (書き先がありません)` / テナント / 段取りの月 (`bad month: …`) | `kintai events read failed: <種別>` (alc・MariaDB) / `kintai push db failed: <SQLSTATE か固定の語>` | `recalc_page` の 23 キー (`month`・`apply`・`drivers`・`next_after_driver_cd`・`fold`・`stale`・`elapsed_ms`・`unsplit`・`unsplit_total`・`unko_diff*` 16 キー) |
+| `GET /api/kintai/recalc` (preview。**書かない**) | なし | Query → `month` (`is_valid_month`) | `month は YYYY-MM で指定してください` / Query が読めない (`Failed to deserialize query string: …`) | — | binding 無し `[KINTAI_HYPERDRIVE] が無効です (書き先がありません)` / テナント / 段取りの月 (`bad month: …`) | `kintai events read failed: <種別>` (alc・写し) / `kintai push db failed: <SQLSTATE か固定の語>` | `recalc_page` の 23 キー (`month`・`apply`・`drivers`・`next_after_driver_cd`・`fold`・`stale`・`elapsed_ms`・`unsplit`・`unsplit_total`・`unko_diff*` 16 キー) |
 | `POST /api/kintai/recalc` | **`X-Kintai-Write-Token`** | 認可 → 本文 (axum の `Json` と同じ 415 / 413 / 400 / 422) → `month` | 同上 (本文は `Failed to parse the request body as JSON: …` 等) | 固定文言 | 同上 + `KINTAI_WRITE_TOKEN` が読めない | 同上 | 同上 (`apply: true` で初めて書く) |
 | `POST /api/kintai/timecard/window` | **`X-Kintai-Write-Token`** | 認可 → 本文 (同上) → `months` が空 → 最初の不正な月 | `months が空です` / `month は YYYY-MM です: <月>` | 固定文言 | 同上 | 置き換え (署名読み・置き換え) の DB の失敗 = `kintai push db failed: <種別>` | `TimecardWindowResult` (`drivers`・`drivers_written`・`drivers_changed`・`days_written`・`days_deleted`・`events_written`・`deduped`・`rejected`・`unknown_states`・`misplaced`・`dry_run`・`elapsed_ms`) + `fold` なら `fold` か `fold_error`・`fold_error_status`、と `stale` か `stale_error` |
 | `GET /api/kintai/stale-months` | なし | Query → `from`・`to` (`resolve_range`) | `to は YYYY-MM で指定してください` / `from は …` / `from は to 以前にしてください` / `月範囲 上限36` / Query が読めない | — | binding 無し (同上) / テナント | `kintai.day_summaries stale read failed: <種別>` | `{logic_version, from, to, default_window_months, months: [{month, stale_drivers, total_drivers}]}` |
@@ -422,7 +423,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
   判定は `kintai_logic::fold_routes::FoldRoute::from_request` (経路の表で最初に見る)
 - **window の畳み直しの失敗は 200** (root と同じ): 打刻は書けているので、`fold_error` (本文)・`fold_error_status` (status) と、独立に試した
   `stale` / `stale_error` を応答に足す (`route_flow::fold_into`)
-- **502 の本文と `fold_error`・`stale_error` は種別だけ**: DB は kit の `kind` (SQLSTATE か固定の語)、上流 (alc の RPC・MariaDB) は
+- **502 の本文と `fold_error`・`stale_error` は種別だけ**: DB は kit の `kind` (SQLSTATE か固定の語)、上流 (alc の RPC) は
   `fold_routes::kind_only` (最初の `": "` より前の固定の頭と、空白・`.`・`/`・引用符を含まない 64 文字以内の種別の語だけ) で削る。
   上流の本文の抜粋・serde の文言・接続先は出さない (`logic/tests/fold_routes.rs`・`pg/tests/window_parity.rs`)
 - 503 の段取りの月 (`bad month: …` / `months が空です`) は口が先に月を検査するので通常は起きない (root の `NotConfigured` と同じ 503・同じ文言)
@@ -435,7 +436,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 | テナント | 書き先は `X-Tenant-ID` (pin と食い違えば 403・どちらも無ければ 400)、読み先との不一致は 403 (`assert_same_tenant`)。stale-months は `[kintai_events]` → `[kintai_push]` の pin | `KINTAI_TENANT_ID` の pin だけ (空・不正は 503 `読み先のテナントが決まりません (KINTAI_TENANT_ID を設定してください)`)。alc のテナントは auth-worker が固定するので不一致の 403 は無い |
 | 503 (書き先が無い) | `[kintai_push] が無効です (書き先がありません)` | `[KINTAI_HYPERDRIVE] が無効です (書き先がありません)` |
 | 502 の本文 | `kintai events read failed: <上流の文言そのまま>` / `kintai push db failed: <sqlx の文言>` / `kintai.day_summaries stale read failed: <sqlx の文言>` | 同じ頭 + **種別だけ** |
-| 読みの資格情報・binding が無い (`KINTAI_MARIADB`・`KINTAI_ALC_RPC`) | 読みの失敗として 502 | 同じく 502 (`kintai events read failed: MariaDB 接続設定が未設定` 等。root の `map_push_err` に合わせる) |
+| 読みの binding が無い (`KINTAI_ALC_RPC`) | 読みの失敗として 502 | 同じく 502 (`kintai events read failed: …`。root の `map_push_err` に合わせる)。写しは書きと同じ `KINTAI_HYPERDRIVE` なので、無ければ先に 503 |
 | `max_drivers` | `usize` (64 bit) | 同じ型だが wasm32 の `usize` は 32 bit。`4294967295` を超える値は Query なら 400・本文なら 422 (root は 150 に丸める)。上限 150 なので実害は無い |
 | `code_sha` | root の版 | Worker の版 (上の表) |
 
@@ -445,7 +446,10 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 - 打刻の置き換え: `pg/tests/window_parity.rs` が root の `apply_timecard_window` (sqlx) と Worker の `FoldStore` に同じ窓を流し、応答
   (`elapsed_ms` を除く)・`kintai.kintai_events`・`event_changes`・`stored_window_signatures` の戻りが一致することを実 postgres で確かめる。
   上流の失敗が `fold_error` に種別だけで載ること、DB の失敗が `kintai push db failed: <SQLSTATE>` だけになることも同じファイル
-- fold の書き (`FoldStoreIo`): `pg/tests/fold_store_parity.rs`、読み (`FoldEventsIo`): `pg/tests/fold_events_parity.rs`
+- fold の書き (`FoldStoreIo`): `pg/tests/fold_store_parity.rs`、読み (`FoldEventsIo`): `pg/tests/fold_events_parity.rs` (root の
+  `HttpKintaiEventsRepo` + `PgKintaiEventsRepo` = 本番の Cloud Run 版の構成と、同じ写し・同じ alc の応答で `all_events_between`・
+  `month_head_anchors`・`dtako_month_read_since` が一致すること。`PUSHED_SOURCES` 外の source・窓の外・別テナントの行が入らないこと)。
+  写しの SQL 3 本が root から移す前と同じことは `kosoku/tests/pushed_events_snapshot.rs` (sha256)
 - 実機 (Hyperdrive・RPC・VPC の経路) は CI では通せない — `wrangler dev --remote` で 1 か月の preview (`GET /api/kintai/recalc?month=`) を叩く
 
 ## 拘束サマリ (restraint) の 3 口 — D1 (`KINTAI_RESTRAINT_DB`)
@@ -569,12 +573,11 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの口: 認可 → 本文 → `kintai-pg`。autoload は認可の後 `cakephp.rs`) /
   `cakephp.rs` (CakePHP への fetch (`redirect: manual`・打ち切り) と autoload の ① ② ③ の送受信) /
   `restraint.rs` (拘束サマリの 3 口: 認可 → 本文・Query → D1 の `batch`) / `alc.rs` (auth-worker の RPC `KintaiAlcEntrypoint.dtakoEtags`・`dtakoEvents` で alc の etags と生イベントを読む) /
-  `fold_events.rs` (fold の読み `FoldEventsIo` の往復: alc の RPC と MariaDB の 1 接続。読み方は kintai-logic の `fold_events`) /
   `fold.rs` (fold の 4 口: 認可 → 入力 → `FoldStore` と読みを配線して `route_flow` を呼ぶ・`WorkerClock`。stale-months の DB の往復は `reads.rs`) / `migrations/` (D1 の migration。表の定義の正本) /
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
-  fold の書き込み側 `FoldStoreIo` (9 メソッド。`stale_state`・`recalc_driver_page` を含む) は `src/fold_store.rs` の `FoldStore` (1 接続を mutex で持ち、メソッドごとに `tenant_tx` 1 回)。同じ `FoldStore` に打刻の置き換え `TimecardWindowIo` (`stored_window_signatures`・
+  fold の書き込み側 `FoldStoreIo` (9 メソッド。`stale_state`・`recalc_driver_page` を含む) は `src/fold_store.rs` の `FoldStore` (1 接続を mutex で持ち、メソッドごとに `tenant_tx` 1 回)。同じ `FoldStore` に fold の読みのうち送った写しの 3 本 `PushedEventsRead` (kintai-logic の trait。SQL は `kintai_kosoku::pushed_events`) と、打刻の置き換え `TimecardWindowIo` (`stored_window_signatures`・
   既存の `replace_window` を同じ接続で) も impl する。失敗の写しは `FoldStoreError::into_fail` (502 は種別だけ)。
   root の `KintaiPgStore` との一致は `tests/fold_store_parity.rs`・`tests/window_parity.rs` (実 DB)。
   kit の `tenant_tx` の中の `query_typed` / `execute_typed` だけで、native でも動く (Worker は Hyperdrive の接続を、テストは native の

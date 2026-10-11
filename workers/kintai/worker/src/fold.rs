@@ -3,9 +3,10 @@
 //! 段取り (遡り起点 → 月ゲート → 畳み → 封 → 応答、打刻の置き換え、窓の畳み直し) は共有 crate の
 //! `kintai_kosoku::route_flow` (root と同じもの)。ここは I/O の配線と HTTP の入出力だけ:
 //!
-//! - 読み (`FoldEventsIo`) = [`crate::fold_events`] (alc は auth-worker の RPC、社内 MariaDB は 1 接続)
+//! - 読み (`FoldEventsIo`) = kintai-logic の `WorkerFoldEvents` (alc は auth-worker の RPC、打刻と遡り起点は relay が送った
+//!   写し `kintai.kintai_events` を `FoldStore` で。Cloud Run 版と同じ入力で、**社内 MariaDB は読まない**)
 //! - 書き (`FoldStoreIo`・`TimecardWindowIo`) = kintai-pg の `FoldStore` (Hyperdrive の 1 接続。window は置き換えと畳み直しを
-//!   同じ接続で回す)
+//!   同じ接続で回すので、置き換えた写しを畳み直しがそのまま読む)
 //! - 時計 = [`WorkerClock`] (`Date.now()`。wasm32 では `Instant`・`SystemTime`・`Utc::now` を使わない)
 //!
 //! 検査の順は root の殻と同じで、書き込みの口 (POST の 2 本) だけ先頭に認可が入る:
@@ -18,15 +19,16 @@ use kintai_kosoku::fold_flow::FoldClock;
 use kintai_kosoku::kintai_push::TimecardWindow;
 use kintai_kosoku::route_flow::{apply_timecard_window, fold_into, recalc_page, RecalcRequest};
 use kintai_logic::common::Fail;
+use kintai_logic::fold_events::WorkerFoldEvents;
 use kintai_logic::fold_routes::{
     fold_ctx, jst_from_ms, parse_recalc_body, parse_recalc_query, parse_window, FoldRoute, DB_WHAT,
 };
+use kintai_logic::mariadb_reads::jst_today;
 use kintai_logic::write_auth::{authorize, WRITE_TOKEN_HEADER};
 use kintai_pg::FoldStore;
 use worker::{console_log, Date, Env, Request};
 
 use crate::alc::EnvAlc;
-use crate::fold_events::{fold_events, EnvMariadb};
 use crate::reads::{open_db, stale_months};
 use crate::writes::{load_token, read_body};
 use crate::OUTPUT_SHA;
@@ -41,6 +43,19 @@ impl FoldClock for WorkerClock {
 
     fn monotonic_ms(&self) -> u64 {
         Date::now().as_millis()
+    }
+}
+
+/// fold の読み: alc は auth-worker の RPC、写しは書きと同じ `FoldStore` (同じ接続)。`today` (月ゲートの末尾検知の切り下げ) は
+/// Worker の時計から JST の日付を作る。
+fn fold_events<'a>(
+    alc: &'a EnvAlc<'a>,
+    store: &'a FoldStore,
+) -> WorkerFoldEvents<'a, EnvAlc<'a>, FoldStore> {
+    WorkerFoldEvents {
+        alc,
+        pushed: store,
+        today: jst_today(Date::now().as_millis()),
     }
 }
 
@@ -73,8 +88,8 @@ pub(crate) async fn serve(
 async fn recalc(req: RecalcRequest, env: &Env) -> Result<serde_json::Value, Fail> {
     let (pg, tenant) = open_db(env, DB_WHAT, true).await?;
     let store = FoldStore::new(pg, tenant);
-    let (alc, mariadb) = (EnvAlc(env), EnvMariadb(env));
-    let repo = fold_events(&alc, &mariadb);
+    let alc = EnvAlc(env);
+    let repo = fold_events(&alc, &store);
     let clock = WorkerClock;
     let ctx = fold_ctx(OUTPUT_SHA, &clock);
     recalc_page(&repo, &store, &ctx, &req)
@@ -94,8 +109,8 @@ async fn window(window: TimecardWindow, env: &Env) -> Result<serde_json::Value, 
     console_log!("kintai timecard/window: written {w}, deleted {d}, misplaced {m}");
     let mut body = serde_json::json!(result);
     if window.fold {
-        let (alc, mariadb) = (EnvAlc(env), EnvMariadb(env));
-        let repo = fold_events(&alc, &mariadb);
+        let alc = EnvAlc(env);
+        let repo = fold_events(&alc, &store);
         let ctx = fold_ctx(OUTPUT_SHA, &clock);
         let status_of = |e: kintai_pg::FoldStoreError| {
             let f = e.into_fail();

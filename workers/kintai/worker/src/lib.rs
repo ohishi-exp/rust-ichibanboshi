@@ -27,8 +27,8 @@
 //!   オンプレ版 (SQLite) から D1 (`KINTAI_RESTRAINT_DB`) へ移した。検査・SQL・応答はオンプレ版と同じ kintai-logic の `restraint`。
 //!   **PUT は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**)。
 //! - fold の `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` ([`fold`]。
-//!   Cloud Run 版と同じ応答。段取りは共有 crate の `kintai_kosoku::route_flow`、読みは [`fold_events`]、書きは kintai-pg の
-//!   `FoldStore`。**POST の 2 本は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**。GET recalc は書かない)。
+//!   Cloud Run 版と同じ応答。段取りは共有 crate の `kintai_kosoku::route_flow`、読みは alc の RPC と送った写し
+//!   (kintai-pg の `FoldStore`。社内 MariaDB は読まない)、書きも `FoldStore`。**POST の 2 本は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**。GET recalc は書かない)。
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
@@ -41,7 +41,6 @@ mod alc;
 mod cakephp;
 mod conn;
 mod fold;
-mod fold_events;
 mod probe;
 mod reads;
 mod restraint;

@@ -129,9 +129,9 @@ path = "workers/kintai/logic/src/restraint_d1.rs"
 [[files]]
 path = "workers/kintai/logic/src/unko_gaps.rs"
 
-# 勤怠 Worker の fold の読み 3 本 (FoldEventsIo: 遡り起点・全乗務員の行・dtako の指紋)。alc の RPC と MariaDB の往復は trait で受け、
-# 合流・ページング・指紋は共有 crate の alc_events (root と同じ)。テストは workers/kintai/logic/tests/fold_events.rs
-# (root と同じ上流の応答を与えた突き合わせは workers/kintai/pg/tests/fold_events_parity.rs)
+# 勤怠 Worker の fold の読み 3 本 (FoldEventsIo: 遡り起点・全乗務員の行・dtako の指紋)。alc の RPC と送った写しの読みは trait で受け、
+# 合流・ページング・指紋は共有 crate の alc_events、写しの SQL と行の形は pushed_events (root と同じ)。社内 MariaDB は読まない。
+# テストは workers/kintai/logic/tests/fold_events.rs (root と同じ写し・上流の応答を与えた突き合わせは workers/kintai/pg/tests/fold_events_parity.rs)
 [[files]]
 path = "workers/kintai/logic/src/fold_events.rs"
 
@@ -200,6 +200,11 @@ path = "workers/kintai/kosoku/src/alc_events.rs"
 # 運行の突合 (オンプレ × GCP、Refs #205 の 37・39)。root の kintai_http_repo.rs から移した
 [[files]]
 path = "workers/kintai/kosoku/src/unko_diff.rs"
+
+# fold が送った写し (kintai.kintai_events) を読む SQL 3 本と行の形。root の kintai_pg_repo.rs から移した (root と勤怠 Worker が使う)。
+# テストは単体テストと workers/kintai/kosoku/tests/pushed_events_snapshot.rs (移す前の SQL の sha256)
+[[files]]
+path = "workers/kintai/kosoku/src/pushed_events.rs"
 
 # ── kintai-dtako (day-events と dtako/worktime の純粋部分。repo ルートの package と共有) ──
 # root の src/routes/dtako_day.rs・dtako_worktime.rs から移した (Refs #322)。テストは各ファイルの単体テスト。
