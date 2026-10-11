@@ -34,6 +34,7 @@
 //! 資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
 //! 社内 MariaDB へは SELECT だけ (SET SESSION はこの接続の打ち切り時間で、データは書かない)。Supabase へは上の 2 本だけが書く。
 
+mod alc;
 mod cakephp;
 mod conn;
 mod probe;

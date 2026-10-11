@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Route {
     /// `POST /probe` — 繋いで `SELECT 1, VERSION(), …` を流す
     Probe,
-    /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 6 本 (`timecard/signatures` を含む)
+    /// `GET /api/kintai/*` — Supabase (Hyperdrive) を読む 7 本 (`timecard/signatures` と、alc の etags も読む `unko-gaps` を含む)
     Read(Read),
     /// `POST /api/kintai/{timecard,wage-snapshot}` — Supabase に書く 2 本、`POST /api/dtako/autoload` — 社内 CakePHP の
     /// 取り込み口への中継 (どれも共有 secret の照合あり)
@@ -44,6 +44,8 @@ pub(crate) enum Read {
     ChangeLog,
     WageRange,
     Signatures,
+    /// 取り込み漏れ候補の運行NO (オンプレ側は Supabase、GCP 側は auth-worker の RPC で alc の etags)
+    UnkoGaps,
 }
 
 impl Read {
@@ -56,6 +58,7 @@ impl Read {
             "/api/kintai/change-log" => Read::ChangeLog,
             "/api/kintai/wage-range" => Read::WageRange,
             "/api/kintai/timecard/signatures" => Read::Signatures,
+            "/api/kintai/unko-gaps" => Read::UnkoGaps,
             _ => return None,
         })
     }
@@ -69,6 +72,7 @@ impl Read {
             Read::ChangeLog => "change-log",
             Read::WageRange => "wage-range",
             Read::Signatures => "timecard/signatures",
+            Read::UnkoGaps => "unko-gaps",
         }
     }
 }
@@ -103,7 +107,7 @@ impl Write {
     }
 }
 
-/// 口は `POST /probe`・GET の 18 本 (Supabase 6 本・MariaDB 4 本 + day-events・dtako/worktime +
+/// 口は `POST /probe`・GET の 19 本 (Supabase 7 本・MariaDB 4 本 + day-events・dtako/worktime +
 /// kosoku-daily・version・timecard/drivers・timecard/events・CakePHP の daily・pdf-json)・POST の 3 本 (Supabase に書く
 /// timecard・wage-snapshot と CakePHP への autoload)。
 /// path が合って method が違えば 405、それ以外の path は 404。

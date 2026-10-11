@@ -3,7 +3,7 @@
 勤怠 (kintai) の Worker `ichibanboshi-kintai` (Refs #322)。口は 4 系統:
 
 - 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` と、直接読む GET の 10 本 (`/api/kintai/*` の 9 本と `/api/dtako/worktime`。オンプレ版から移した。下記)
-- Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 6 本と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
+- Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 7 本 (`unko-gaps` は auth-worker の RPC で alc の etags も読む) と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
 - 社内 CakePHP (nginx) — 中継する `GET /api/kintai/{daily,pdf-json}` と `POST /api/dtako/autoload` (③ resetby-unko-no を含む) の 3 本 (オンプレ版から移した。下記)
 - D1 (`KINTAI_RESTRAINT_DB`) — 拘束サマリの `PUT /api/restraint/summaries` と `GET /api/restraint/{wage-source,synced-months}` (オンプレ版の SQLite から移した。下記)
 
@@ -209,7 +209,7 @@ CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart
 - **呼び手の追従が要る**: 今の呼び手 (kyuyo-mcp → auth-worker → オンプレ版) は `X-Kintai-Write-Token` を送っていない。この Worker に
   切り替える段で、autoload を呼ぶ側 (kyuyo-mcp の `run_dtako_reimport` → relay / auth-worker) が token を付ける必要がある
 
-## `GET /api/kintai/*` (Supabase を読む 6 本)
+## `GET /api/kintai/*` (Supabase を読む 7 本)
 
 Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えていた口を移した。**応答 (JSON の形・キー・数値の型)・
 入力の検査・400 / 502 / 503 の条件は元と同じ**にしてある (呼び手の relay は応答をそのまま返すため)。呼び手の切替はまだ。
@@ -222,6 +222,7 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
 | `change-log` | `from`・`to` 必須 (両端含む・400 日まで)・`driver` 任意 | `kintai.event_changes` |
 | `wage-range` | `comp`・`from`・`to` 必須・`source` (既定 gcp)・任意の現行版 | `kintai.wage_snapshot` |
 | `timecard/signatures` | `month`・`driver_cd` 必須 | `kintai.kintai_events` (日別の署名。下の書き込みの節) |
+| `unko-gaps` | `month` 必須・`driver_cd` 任意 | `kintai.kintai_events` (運行の一覧) + alc の etags (auth-worker の RPC。下の節) |
 
 | 結果 | status | 本文 |
 |---|---|---|
@@ -239,8 +240,36 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
 - DB へは `alc-worker-db` (ippoan/alc-worker-kit、rev は直下の `Cargo.toml` の 1 か所) の `PgClient::tenant_tx` の中で
   `query_typed` / `query_typed_one` だけを流す (名前付き prepared statement は Hyperdrive で接続が切れる)。全 `$n` に型を付ける。
   kit の `SET_TENANT` は `search_path = alc_api` にするが、5 本の SQL は全部 `kintai.` で修飾しているのでそのまま動く
-- 移していないもの: `stale-months` (`logic_version` を Worker で同じ値に作れない)・`unko-gaps` (alc の etags の掃引を含む)。
-  window (`fold` 付きで畳み直す)・fold・recalc と一緒に後の段で移す
+- 移していないもの: `stale-months` (`logic_version` を Worker で同じ値に作れない)。window (`fold` 付きで畳み直す)・fold・recalc と
+  一緒に後の段で移す
+
+## `GET /api/kintai/unko-gaps` — 取り込み漏れ候補の運行NO (Supabase + alc の etags)
+
+root (オンプレ版・Cloud Run 版) の `src/routes/unko_gaps.rs` の口を移した。**検査・判定の核 (`build_gaps`・上限 300 乗務員 / 200 運行NO)・
+応答の組み立ては共有 crate `kintai-logic` の `unko_gaps`** で、root もそれを使う (写さない)。応答の JSON は root と同じキー・同じ並び
+(serde_json はどちらも preserve_order 無し = 名前順)。**`elapsed_ms` だけは Worker が付けない** (root は付ける)。
+
+| 段 (順) | オンプレ版 (root) | Worker |
+|---|---|---|
+| Query・`month` | 400 (`month は必須です (YYYY-MM)` / `month は YYYY-MM で指定してください`) | **同じ** (共有 crate の `check_month`) |
+| 書き先の store / binding | `[kintai_push]` が無効なら 503 | `KINTAI_HYPERDRIVE` が無ければ 503 (他の Supabase の読みと同じ文言) |
+| テナント | `X-Tenant-ID` → `[kintai_push]` の pin、どちらも無ければ 503 (alc へは `[kintai_events] tenant_id`) | Supabase は `KINTAI_TENANT_ID` の pin だけ (空・不正は 503)。alc へのテナントは auth-worker の `KintaiAlcEntrypoint` が固定 (Worker からは渡さない) |
+| オンプレ側 | `MONTH_OPERATIONS_SQL` (sqlx)、失敗は 502 `kintai.kintai_events unko read failed: …` | 同じ SQL を `query_typed` (`$1` uuid・`$2`/`$3` timestamptz・`$4` text[])、失敗は 502 (文言の頭は同じ・後ろは kit の `kind`) |
+| alc の etags | reqwest で `GET /api/dtako/events/etags?date_from=<月初>&date_to=<翌月初>` | auth-worker の勤怠 Worker 専用の `KintaiAlcEntrypoint.dtakoEtags(search)` (binding `KINTAI_ALC_RPC`)。渡すのは期間の query (`etags_search`) だけで、path・method (GET)・tenant は auth-worker 側で固定 |
+| etags が 404 | `gcp_etags_available: false` (200) | **同じ** |
+| etags が 404 以外の非 2xx・本文が読めない・通信断 | **warn だけで `gcp_etags_available: false` (200)** | **502** (`alc dtako-etags status <n>: <本文の先頭 200 字>` / `alc dtako-etags parse: …` / `alc dtako-etags request: rpc`)。auth-worker 自身の拒否 (tenant 未設定の 503 `kintai_alc_tenant_unset`・query 不正の 400) も同じ形で本文に error の語が載る |
+| `KINTAI_ALC_RPC` が無い | (無い) | 503 `auth-worker の binding (KINTAI_ALC_RPC) が無い (alc の etags を読めません)` |
+
+- **★ 呼び手を Worker に切り替えるときに 502 の扱いが要る**: オンプレ版が 200 + `gcp_etags_available: false` (判定不能) で返していた失敗を、
+  Worker は 502 で返す (黙って判定不能にしない。親の判断 Refs #322)。呼び手 (relay・kyuyo-mcp) は 502 を「判定できない」として出す
+- **汎用の `InternalEntrypoint` を使わない理由**: あちらの allowlist (auth-worker の `FORWARDABLE_PATHS`) には書き込みの path (`bulk-by-code` 等) も
+  あり、検査は path だけ・method は見ない・tenant は呼び手が渡す値そのもの。勤怠 Worker 用の path をそこへ足すと、既存の呼び手
+  (relay・timecard-cf-worker) まで同じ口で読めるようになる。そこで auth-worker に勤怠 Worker 専用の `KintaiAlcEntrypoint` を別 class で
+  切り (smb-ingest の entrypoint と同型)、path・method・tenant を auth-worker 側で固定した。勤怠 Worker の引数は query 文字列だけ
+- **deploy の順**: 勤怠 Worker のタグ deploy は、auth-worker の `KintaiAlcEntrypoint` が本番に出て tenant (KV) が入った後
+  (それまでは binding の先に entrypoint が無いか、`kintai_alc_tenant_unset` の 502 になる)
+- RPC は JS の値の await なので、`tenant_tx` (オンプレ側の SQL) の後に transaction の外で打つ。順は root と同じ (DB → alc)
+- **ページ表示で叩く口ではない** (root の docs と同じ。alc への往復のコストを実測するまで on-demand 専用)
 
 ## Supabase に書く口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`) と `GET /api/kintai/timecard/signatures`
 
@@ -308,6 +337,8 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/kintai_repo.rs` の `rest_row_to_json` (`REST_EVENTS_SQL` の 6 列。`vehicle` 無し) | `src/mariadb_rows.rs` の `rest_row` |
 | `src/kintai_repo.rs` の `reading_date_row_to_json` (`OPERATION_READING_DATES_SQL` の 6 列) | `src/mariadb_rows.rs` の `reading_date_row` |
 | `src/kintai_http_repo.rs` の `today_jst` | `src/mariadb_reads.rs` の `jst_today` (Worker が `Date.now()` を渡す) |
+| `src/kintai_push.rs` の `MONTH_OPERATIONS_SQL`・`PUSHED_SOURCES` (unko-gaps のオンプレ側) | `src/unko_gaps.rs` の `MONTH_OPERATIONS_SQL`・`PUSHED_SOURCES` (一致は `pg/tests/unko_gaps_parity.rs` が root の `pub const` と値で比べる) |
+| `src/kintai_http_repo.rs` の alc の etags (`ETAGS_PATH`・`month_etags_bounds`・`UpstreamEtags`/`UpstreamEtagItem`/`UnsplitOperation`・`fetch_etags` の 404 = 口なし・`unko_no` → `driver_cds` の collect) | `src/unko_gaps.rs` の `ETAGS_PATH`・`etags_search`・同名の private な型・`read_etags` (GET・path・`X-Tenant-ID` は auth-worker の `KintaiAlcEntrypoint` 側) (root 側が private なので、`pg/tests/unko_gaps_parity.rs` が root のソースの定義を文字列で固定する。404 以外の失敗の扱いは違う = 上の unko-gaps の節) |
 | `src/routes/dtako_day.rs` の `day_events` (検査の順・`day_range`・`build_operations` に base URL を渡す) | `src/dtako_reads.rs` の `DtakoRead::DayEvents` |
 | `src/routes/dtako_worktime.rs` の `worktime` (検査の順・SQL の選び方・`aggregate`) | `src/dtako_reads.rs` の `DtakoRead::Worktime` |
 | `src/routes/kintai.rs` の `kosoku_daily`・`kosoku_daily_all` (検査の順・起点 → 窓 → 生イベント → フェリーの順・フェリーの失敗を控除 0 にする) | `src/kosoku_reads.rs` の `parse_kosoku_daily`・`DailyRequest` |
@@ -321,6 +352,10 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/kintai_version.rs` の `MarkerRow` (`VERSION_SQL` の 3 列、全部 CHAR) | `src/mariadb_rows.rs` の `version_row` |
 | `src/kintai_repo.rs` の `fetch_timecard_driver_cds_between` の `u64` (`TIMECARD_DRIVERS_SQL` の 1 列) | `src/mariadb_rows.rs` の `timecard_driver_row` |
 | `src/kintai_repo.rs` の `fetch_timecard_window` の行 (`TIMECARD_WINDOW_SQL` の 7 列 = `row_to_json`) | `src/mariadb_rows.rs` の `event_row` (events と共有) |
+
+unko-gaps の上の 2 行は、root の `src/kintai_push.rs`・`src/kintai_http_repo.rs` が勤怠の版の glob の中にあって動かせない (動かすと logic_version が
+変わる) ための期限付きの写しで、fold を移す段で解消する。unko-gaps の判定の核・検査・応答 (`src/unko_gaps.rs` の残り) は写しではなく共有
+(root の `src/routes/unko_gaps.rs` は axum・sqlx・alc の sink と `elapsed_ms` だけを持つ)。
 
 **root の `src/routes/kintai.rs` (勤怠の版の glob の中) は動かせない**ので、daily・pdf-json の上の 3 行はオンプレ版の撤去までの
 期限付きの写し。CakePHP への URL・multipart・応答の型 (`src/cakephp.rs`) と autoload の段取り・材料の SQL
@@ -429,13 +464,17 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   (timecard の 2 本だけは元と同じく 502)
 - `KINTAI_WRITE_TOKEN` — Secrets Store の secret (書き込みの口の共有 secret。store は `KINTAI_MARIADB` と同じ)。無ければ書き込みの 2 本と拘束サマリの PUT は 503
 - `KINTAI_RESTRAINT_DB` — 拘束サマリの D1 (`[[d1_databases]]`、`migrations_dir = "migrations"`)。**トップレベルにだけ置く**。無ければ restraint の 3 口は 503
-- `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ Supabase の口 (読み 6 本・書き 2 本) は 503
+- `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ Supabase の口 (読み 7 本・書き 2 本) は 503
+- `KINTAI_ALC_RPC` — auth-worker の勤怠 Worker 専用の `KintaiAlcEntrypoint` への Service Binding (`[[services]]`、`service = "auth-worker"`・`entrypoint = "KintaiAlcEntrypoint"`)。
+  unko-gaps が `dtakoEtags(search)` で alc の etags を読むためだけに使う (path・method・tenant は auth-worker 側で固定)。**トップレベルにだけ置く** (check-exposure の (k))。
+  無ければ unko-gaps は 503
 - `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` (`[vars]`) — day-events のリンクの base URL。空 = そのリンクを省く。本番は deploy 時に同名の repo variable を `--var` で渡す (社内ホスト名を repo に書かない)
 - `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
 - `CF_VERSION_METADATA` — 版の元
 - `[limits] cpu_ms = 120000` — kosoku-daily の全員版のため (上記)
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / `LOCAL_*` の var なし /
-  hyperdrive・secrets_store_secrets・vpc_services・d1_databases はトップレベル以外に無い / `KINTAI_CAKEPHP_VPC` がトップレベルにある / 書き込みの口 (`worker/src` の `Route::Write`・`Route::Restraint`) があるなら
+  hyperdrive・secrets_store_secrets・vpc_services・d1_databases・services はトップレベル以外に無い / `KINTAI_CAKEPHP_VPC` がトップレベルにある /
+  services の `KINTAI_ALC_RPC` が 1 つだけあり auth-worker の `KintaiAlcEntrypoint` を指す / 書き込みの口 (`worker/src` の `Route::Write`・`Route::Restraint`) があるなら
   `KINTAI_WRITE_TOKEN` の binding がある / 拘束サマリの口 (`Route::Restraint`) があるなら `KINTAI_RESTRAINT_DB` (database 名・`migrations_dir`) がある。`scripts/check-exposure.sh` が CI で検査し、`check-exposure-test.sh` が陰性対照
 
 ## 構成
@@ -450,13 +489,13 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 - `logic/` (`kintai-logic`): Supabase を読む 6 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
   部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`・timecard の検査 `timecard_write`・認可 `write_auth`、本文の読み方
   `common::parse_json`)、社内 CakePHP への中継 (`cakephp`・`dtako_autoload`・`cakephp_relay`)、拘束サマリの 3 口 (`restraint` = オンプレ版と共有の検査・SQL・応答、
-  `restraint_d1` = D1 の文の束・行の読み取り)。**repo ルートの package も path 依存で使う** (書き込みの部品と
+  `restraint_d1` = D1 の文の束・行の読み取り)、取り込み漏れ候補の `unko_gaps` (root と共有の判定の核・検査・応答と、写しの SQL・alc の etags の読み方)。**repo ルートの package も path 依存で使う** (書き込みの部品と
   `change_log`・`wage_range`・`wage_snapshot`・`cakephp`・`dtako_autoload`・`restraint`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 10 本の往復。1 接続を開く `open` とクエリ 1 本の `query`) /
   `build.rs` (version の etag の版 `KINTAI_WORKER_OUTPUT_SHA`) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
   `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの口: 認可 → 本文 → `kintai-pg`。autoload は認可の後 `cakephp.rs`) /
   `cakephp.rs` (CakePHP への fetch (`redirect: manual`・打ち切り) と autoload の ① ② ③ の送受信) /
-  `restraint.rs` (拘束サマリの 3 口: 認可 → 本文・Query → D1 の `batch`) / `migrations/` (D1 の migration。表の定義の正本) /
+  `restraint.rs` (拘束サマリの 3 口: 認可 → 本文・Query → D1 の `batch`) / `alc.rs` (auth-worker の RPC `KintaiAlcEntrypoint.dtakoEtags` で alc の etags を読む) / `migrations/` (D1 の migration。表の定義の正本) /
   `transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern)。`tcp.rs`・`transport.rs` は `workers/ichiban` から写した (共有 crate に畳むのは本実装の段で)
 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。

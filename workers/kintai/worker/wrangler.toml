@@ -1,6 +1,6 @@
 # ichibanboshi-kintai: 勤怠 (kintai) の読み出し Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
 # Service Binding 専用。口は到達の確認用の POST /probe (社内 MariaDB、自作の MySQL クライアント kintai-mysql) と、
-# Supabase の勤怠スキーマを読む GET /api/kintai/* の 6 本・書く POST の 2 本 (Hyperdrive + alc-worker-db)、
+# Supabase の勤怠スキーマを読む GET /api/kintai/* の 7 本 (unko-gaps は auth-worker の RPC で alc の etags も読む)・書く POST の 2 本 (Hyperdrive + alc-worker-db)、
 # 社内 MariaDB を直接読む GET の 10 本 (events・rest-diff・reading-dates・tail-gap-probe・day-events・dtako/worktime・
 # kosoku-daily・version・timecard/drivers・timecard/events)、社内 CakePHP (Workers VPC の HTTP) を中継する GET の 2 本
 # (daily・pdf-json) と POST /api/dtako/autoload (書き込みの口)、拘束サマリの PUT /api/restraint/summaries・
@@ -12,7 +12,7 @@
 #   - 読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手 (relay の共有 secret、kyuyo-mcp の OAuth)
 #   - 書き込みの口 (POST の 3 本 = CakePHP への autoload を含む・拘束サマリの PUT) だけ Worker が共有 secret KINTAI_WRITE_TOKEN を照合する (ユーザー決定 2026-10-10)
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
-#   - MariaDB・CakePHP への口 (vpc_services)・Supabase への口 (hyperdrive)・拘束サマリの D1 (d1_databases) はトップレベルにだけ置く。
+#   - MariaDB・CakePHP への口 (vpc_services)・Supabase への口 (hyperdrive)・拘束サマリの D1 (d1_databases)・auth-worker への RPC (services) はトップレベルにだけ置く。
 #     ローカルで迂回する LOCAL_* の var は持たない
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
@@ -89,6 +89,14 @@ binding = "KINTAI_RESTRAINT_DB"
 database_name = "ichibanboshi-kintai-restraint"
 database_id = "9a70d878-604e-402f-a06a-b07696d99f9f"
 migrations_dir = "migrations"
+
+# auth-worker の勤怠 Worker 専用の named entrypoint KintaiAlcEntrypoint (RPC dtakoEtags(search))。GET /api/kintai/unko-gaps が
+# alc の GET /api/dtako/events/etags を読むためだけに使う。path・method・tenant は auth-worker 側で固定 (渡すのは期間の query だけ)。
+# 汎用の転送口 InternalEntrypoint (path の allowlist だけ・tenant は呼び手任せ) は使わない。無ければ unko-gaps は 503。トップレベルにだけ置く
+[[services]]
+binding = "KINTAI_ALC_RPC"
+service = "auth-worker"
+entrypoint = "KintaiAlcEntrypoint"
 
 # 読み先のテナント (UUID の文字列)。GET /api/kintai/* はこの pin だけでテナントを決め、X-Tenant-ID は読まない。
 # 空・UUID でない・nil UUID なら 503。

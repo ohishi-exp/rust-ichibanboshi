@@ -115,6 +115,11 @@ path = "workers/kintai/logic/src/restraint.rs"
 [[files]]
 path = "workers/kintai/logic/src/restraint_d1.rs"
 
+# unko-gaps の検査・窓・SQL の引数・etags の RPC の引数と戻りの読み方・判定の核・応答。root の src/routes/unko_gaps.rs から移した
+# (root も path 依存で使う)。テストは workers/kintai/logic/tests/unko_gaps.rs (写しと root の一致は workers/kintai/pg/tests/unko_gaps_parity.rs)
+[[files]]
+path = "workers/kintai/logic/src/unko_gaps.rs"
+
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。
