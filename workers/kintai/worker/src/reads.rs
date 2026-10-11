@@ -230,14 +230,13 @@ async fn signatures(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
 /// RPC は JS の値の await なので transaction の外で打つ。
 async fn unko_gaps(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
     use unko_gaps::{
-        etags_search, parse, read_etags, respond, Binds, Onprem, Window, DB_WHAT,
+        broken_month, etags_search, parse, read_etags, respond, Binds, Onprem, Window, DB_WHAT,
         MONTH_OPERATIONS_SQL,
     };
     let req = parse(query)?;
     let (mut pg, tenant) = open(env, DB_WHAT).await?;
-    // parse が通した月では常に Some (root と同じ 400)
-    let bad_month = || Fail::new(400, format!("month が壊れています: {}", req.month));
-    let window = Window::of(&req.month).ok_or_else(bad_month)?;
+    // parse が通した月では常に作れる (作れなければ root と同じ 400)
+    let window = Window::of(&req.month)?;
     let binds = Binds::new(tenant, &window);
     let rows = pg
         .tenant_tx(tenant, move |tx| {
@@ -257,7 +256,7 @@ async fn unko_gaps(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
         .await
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
     let onprem = Onprem::from_rows(rows.0.iter().map(|(d, u)| (*d, u.as_str())));
-    let search = etags_search(&req.month).ok_or_else(bad_month)?;
+    let search = etags_search(&req.month).ok_or_else(|| broken_month(&req.month))?;
     let gcp = read_etags(&crate::alc::fetch_etags(env, &search).await?)?;
     Ok(respond(
         &req.month,

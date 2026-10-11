@@ -80,9 +80,18 @@ pub struct Window {
     pub to: DateTime<FixedOffset>,
 }
 
+/// 400 (`check_month` が通したのに年・月・窓が作れない月。実際には起きない。root の元の文言と同じ)。
+pub fn broken_month(month: &str) -> Fail {
+    bad_request(format!("month が壊れています: {month}"))
+}
+
 impl Window {
-    /// `is_valid_month` が通した月では常に `Some` (root は `None` を 400 `month が壊れています` にする)。
-    pub fn of(month: &str) -> Option<Self> {
+    /// `check_month` が通した月では常に `Ok`。作れなければ [`broken_month`] の 400。
+    pub fn of(month: &str) -> Result<Self, Fail> {
+        Self::read(month).ok_or_else(|| broken_month(month))
+    }
+
+    fn read(month: &str) -> Option<Self> {
         let year: i32 = month.get(..4)?.parse().ok()?;
         let month_num: u32 = month.get(5..7)?.parse().ok()?;
         let (from, to) = month_range(month)?;

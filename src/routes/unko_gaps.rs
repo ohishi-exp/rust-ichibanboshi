@@ -117,11 +117,7 @@ use crate::kintai_push::{KintaiPgStore, MONTH_OPERATIONS_SQL, PUSHED_SOURCES};
 use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
 
-fn bad_request(msg: impl Into<String>) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, msg.into())
-}
-
-/// 共有 crate の失敗 (400 だけ) を axum の形に。
+/// 共有 crate の失敗 (`month` の 400 だけ) を axum の形に。
 fn from_fail(f: Fail) -> (StatusCode, String) {
     (
         StatusCode::from_u16(f.status).unwrap_or(StatusCode::BAD_REQUEST),
@@ -177,8 +173,7 @@ pub async fn unko_gaps(
     // の実測 (2026-06: 1445→5, 1740→10) と揃える。tenant_id は解決済みの読み
     // テナントを bind する (モジュール docs — self.tenant_id を使う既存メソッドは
     // 使わない)
-    let bad_month = || bad_request(format!("month が壊れています: {month}"));
-    let window = Window::of(&month).ok_or_else(bad_month)?;
+    let window = Window::of(&month).map_err(from_fail)?;
     use sqlx::Row;
     let rows = sqlx::query(MONTH_OPERATIONS_SQL)
         .bind(tenant)

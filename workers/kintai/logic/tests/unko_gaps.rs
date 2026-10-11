@@ -7,9 +7,10 @@ use std::collections::{HashMap, HashSet};
 use chrono::{FixedOffset, TimeZone};
 use kintai_logic::common::Fail;
 use kintai_logic::unko_gaps::{
-    alc_rpc_failed, build_gaps, check_month, drop_crew_suffix, etags_search, no_alc_rpc,
-    onprem_count_for, parse, read_etags, respond, Binds, Onprem, Request, RpcResult, Window,
-    ALC_RPC_BINDING, ETAGS_PATH, MAX_UNKO_GAPS_DRIVERS, MAX_UNKO_GAPS_PER_DRIVER, PUSHED_SOURCES,
+    alc_rpc_failed, broken_month, build_gaps, check_month, drop_crew_suffix, etags_search,
+    no_alc_rpc, onprem_count_for, parse, read_etags, respond, Binds, Onprem, Request, RpcResult,
+    Window, ALC_RPC_BINDING, ETAGS_PATH, MAX_UNKO_GAPS_DRIVERS, MAX_UNKO_GAPS_PER_DRIVER,
+    PUSHED_SOURCES,
 };
 use postgres_types::Type;
 use uuid::Uuid;
@@ -76,9 +77,11 @@ fn the_window_is_month_range_in_jst() {
         jst.with_ymd_and_hms(2027, 1, 2, 0, 0, 0).unwrap(),
         "翌月 2 日 (排他)"
     );
-    assert_eq!(Window::of("nope"), None);
-    assert_eq!(Window::of("2026-xx"), None);
-    assert_eq!(Window::of("2026-13"), None);
+    for m in ["nope", "2026-xx", "2026-13"] {
+        let want = Fail::new(400, format!("month が壊れています: {m}"));
+        assert_eq!(Window::of(m), Err(want.clone()), "{m:?}");
+        assert_eq!(broken_month(m), want);
+    }
 }
 
 #[test]
