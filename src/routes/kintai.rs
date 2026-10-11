@@ -417,7 +417,7 @@ pub async fn reading_dates(
 /// GET /api/kintai/tail-gap-probe?month=YYYY-MM[&driver=1078] — **末尾検知 (tail gap)
 /// が鳴らしている乗務員を名指しする** (Refs #205)。
 ///
-/// 月ゲートの封の条件 ([`crate::kintai_http_repo::missing_input_warnings`] の
+/// 月ゲートの封の条件 ([`kintai_kosoku::alc_events::missing_input_warnings`] の
 /// tail gap 側) が本物か・「その期間は働いていない」だけかを切り分けるための診断。
 /// 何を測っているか・**alc の警告と同じ量ではないこと**は
 /// [`crate::kintai_tail_gap_probe`] のモジュール docs。
@@ -462,7 +462,7 @@ pub async fn tail_gap_probe(
     let month_end = chrono::NaiveDate::parse_from_str(&to[..10], "%Y-%m-%d").expect("to is a date")
         - chrono::Duration::days(1);
     let today = crate::kintai_http_repo::today_jst();
-    let expected = month_end.min(today - chrono::Duration::days(1));
+    let expected = kintai_kosoku::window::tail_expected(month_end, today);
     let probe = crate::kintai_tail_gap_probe::tail_gap_probe(&rows, &month, expected, driver);
     // マクロは 1 行に収める (CLAUDE.md)
     let (pop, over) = (probe.population, probe.over_threshold_total);

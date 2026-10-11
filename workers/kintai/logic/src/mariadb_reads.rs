@@ -13,7 +13,7 @@ use kintai_kosoku::kintai_tail_gap_probe::tail_gap_probe;
 use kintai_kosoku::sql::{
     ALL_EVENTS_SQL, EVENTS_SQL, OPERATION_READING_DATES_SQL, REST_EVENTS_SQL,
 };
-use kintai_kosoku::window::{exact_month_range, month_range, parse_dt};
+use kintai_kosoku::window::{exact_month_range, month_range, parse_dt, tail_expected};
 use kintai_mysql::bind::{expand, Value as Bind};
 use kintai_mysql::response::Row;
 use serde::Deserialize;
@@ -192,7 +192,7 @@ impl Request {
                 let rows = rows_to_json(rows, all_event_row)?;
                 // 窓の末尾 (= 月末) と「進行中の月は today - 1 日」の小さい方 (元と同じ)
                 let next = NaiveDate::parse_from_str(&to[..10], "%Y-%m-%d").expect("to is a date");
-                let expected = (next - Duration::days(1)).min(today - Duration::days(1));
+                let expected = tail_expected(next - Duration::days(1), today);
                 let probe = tail_gap_probe(&rows, month, expected, driver);
                 json!({
                     "month": probe.month,

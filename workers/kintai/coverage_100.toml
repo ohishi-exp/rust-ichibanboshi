@@ -116,9 +116,15 @@ path = "workers/kintai/logic/src/restraint.rs"
 path = "workers/kintai/logic/src/restraint_d1.rs"
 
 # unko-gaps の検査・窓・SQL の引数・etags の RPC の引数と戻りの読み方・判定の核・応答。root の src/routes/unko_gaps.rs から移した
-# (root も path 依存で使う)。テストは workers/kintai/logic/tests/unko_gaps.rs (写しと root の一致は workers/kintai/pg/tests/unko_gaps_parity.rs)
+# (root も path 依存で使う)。テストは workers/kintai/logic/tests/unko_gaps.rs
 [[files]]
 path = "workers/kintai/logic/src/unko_gaps.rs"
+
+# 勤怠 Worker の fold の読み 3 本 (FoldEventsIo: 遡り起点・全乗務員の行・dtako の指紋)。alc の RPC と MariaDB の往復は trait で受け、
+# 合流・ページング・指紋は共有 crate の alc_events (root と同じ)。テストは workers/kintai/logic/tests/fold_events.rs
+# (root と同じ上流の応答を与えた突き合わせは workers/kintai/pg/tests/fold_events_parity.rs)
+[[files]]
+path = "workers/kintai/logic/src/fold_events.rs"
 
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
@@ -171,6 +177,11 @@ path = "workers/kintai/kosoku/src/kintai_fold.rs"
 # fold の I/O を含む流れ (月ゲート・畳み・recalc・warnings の束)。I/O は trait で受け取る。root の kintai_fold.rs から移した
 [[files]]
 path = "workers/kintai/kosoku/src/fold_flow.rs"
+
+# alc の生イベント・etags を読んだあとの純粋部分と読みの流れ (応答の型・写し方・合流・31 日 chunk × keyset・
+# 入力の欠けの検知・月ゲートの指紋)。root の kintai_http_repo.rs から移した。root と勤怠 Worker が往復だけを実装して使う
+[[files]]
+path = "workers/kintai/kosoku/src/alc_events.rs"
 
 # 運行の突合 (オンプレ × GCP、Refs #205 の 37・39)。root の kintai_http_repo.rs から移した
 [[files]]

@@ -97,6 +97,14 @@ const UNKO_NO_DATE_DIGITS: usize = 6;
 /// 真実**で、診断側は複製しない — 複製すると drift したときに気付けない。
 pub const MAX_TAIL_GAP_DAYS: i64 = 7;
 
+/// 末尾がここまで届いていてほしい日: 窓の末尾 `window_end` と「進行中の月は `today - 1 日`」の小さい方。
+///
+/// `today` 当日は読み取りがまだ上がっていないのが普通なので 1 日引く。月ゲートの末尾検知
+/// ([`crate::alc_events::InputCoverage`]) と末尾検知の診断の口 (tail-gap-probe) が同じ切り下げを使う。
+pub fn tail_expected(window_end: NaiveDate, today: NaiveDate) -> NaiveDate {
+    window_end.min(today - chrono::Duration::days(1))
+}
+
 /// `unko_no` の先頭 6 桁 (`YYMMDD`) = **運行開始日**。
 ///
 /// 定義を書いた場所は alc にも本リポにも無い (`運行NO` はデジタコ由来の不透明な
@@ -128,7 +136,7 @@ pub fn unko_no_start_datetime(unko_no: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(unko_no.get(..12)?, "%y%m%d%H%M%S").ok()
 }
 
-/// `kintai_http_repo::in_window` の中身。**開始・終了 (区間なら) だけで判定する**ので、fold が
+/// [`crate::alc_events`] の `in_window` の中身。**開始・終了 (区間なら) だけで判定する**ので、fold が
 /// 読んだ行を乗務員ごとの窓へ切り戻すとき (`kintai_fold`、Refs
 /// ohishi-exp/nuxt-dtako-admin#1123) も同じ述語を使う — 絞り方が 2 実装に
 /// ならないように。
@@ -267,6 +275,19 @@ mod tests {
 
     fn dt(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, DATETIME_FORMAT).unwrap()
+    }
+
+    /// 畳む前の 3 か所 (月ゲートの InputCoverage・root と Worker の tail-gap-probe) の式
+    /// `end.min(today - 1 日)` と同じ値になる (進行中の月・境目・過ぎた月)。
+    #[test]
+    fn tail_expected_is_the_window_end_clamped_to_yesterday() {
+        let end = d(2026, 6, 30);
+        for today in [d(2026, 6, 20), d(2026, 7, 1), d(2026, 8, 1)] {
+            let before = end.min(today - chrono::Duration::days(1));
+            assert_eq!(tail_expected(end, today), before, "{today}");
+        }
+        assert_eq!(tail_expected(end, d(2026, 6, 20)), d(2026, 6, 19));
+        assert_eq!(tail_expected(end, d(2026, 7, 1)), end);
     }
 
     const APRIL: &str = "2026-04-01 00:00:00";

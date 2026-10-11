@@ -57,7 +57,7 @@
 //! ### 材料の行は**全乗務員版の形**
 //!
 //! 全乗務員版の行は `unko_no` / `vehicle` を**キーごと持たない**
-//! (`kintai_repo::all_row_to_json` / `kintai_http_repo::event_to_all_json`)。
+//! (`kintai_repo::all_row_to_json` / `kintai_kosoku::alc_events::event_to_all_json`)。
 //! 単一乗務員版 (`/api/kintai/events`) は持つので、**同じ打刻でも行 JSON が経路で
 //! 違い、指紋も違う値になる。**
 //!
