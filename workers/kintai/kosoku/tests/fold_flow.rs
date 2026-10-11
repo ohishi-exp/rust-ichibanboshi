@@ -222,7 +222,7 @@ fn params() -> KosokuParams {
 fn ctx(params: &KosokuParams) -> FoldCtx<'_> {
     FoldCtx {
         params,
-        output_sha: SHA,
+        code_sha: SHA,
         clock: &CLOCK,
     }
 }
@@ -429,7 +429,7 @@ fn fold_month_reads_once_and_collects_the_warnings() {
     assert_eq!(repo.reads.get(), 1);
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].0, DRIVER);
-    let (unit, fp) = fold_driver_month(DRIVER as i64, MONTH, &p, repo.rows.clone(), SHA);
+    let (unit, fp) = fold_driver_month(DRIVER as i64, MONTH, &p, repo.rows.clone());
     assert_eq!((units[0].1.clone(), units[0].2.clone()), (unit, fp));
     let t = texts(&w);
     assert_eq!(t[0], "NoSuchKey: U1", "上流の warning が先");
@@ -686,7 +686,7 @@ fn the_gate_misses_then_hits_on_the_same_digests() {
         &mut sink,
     ))
     .unwrap();
-    let version = logic_version(&p, SHA);
+    let version = logic_version(&p);
     let miss = MonthGate::Miss {
         dtako_digest: "d1".into(),
         punch_digest: "punch-digest".into(),
@@ -1052,7 +1052,7 @@ fn recalc_month_fails_on_a_bad_month_or_failed_reads() {
 #[test]
 fn store_units_skips_current_drivers_and_surfaces_store_failures() {
     let p = params();
-    let (unit, fp) = fold_driver_month(DRIVER as i64, MONTH, &p, june_rows(), SHA);
+    let (unit, fp) = fold_driver_month(DRIVER as i64, MONTH, &p, june_rows());
     let current = StoredState {
         fingerprints: vec![fp.clone()],
         shifts: unit.shifts.len() as i64,
@@ -1111,7 +1111,7 @@ fn store_units_skips_current_drivers_and_surfaces_store_failures() {
 fn recalc_drivers_from_units_writes_only_the_named_drivers() {
     let p = params();
     let store = Store::default();
-    let (unit, fp) = fold_driver_month(DRIVER as i64, MONTH, &p, june_rows(), SHA);
+    let (unit, fp) = fold_driver_month(DRIVER as i64, MONTH, &p, june_rows());
     let all = vec![(DRIVER, unit, fp), (2000, FoldUnit::default(), "x".into())];
     let r = block_on(recalc_drivers_from_units(
         &store,
@@ -1130,7 +1130,7 @@ fn recalc_drivers_from_units_writes_only_the_named_drivers() {
         vec![DRIVER as i64, 4242],
         "乗務員CD 順。2000 は名指ししていない"
     );
-    assert_eq!(written[0].3, logic_version(&p, SHA));
+    assert_eq!(written[0].3, logic_version(&p));
     let empty = block_on(recalc_drivers_from_units(
         &store,
         &ctx(&p),
@@ -1178,7 +1178,7 @@ fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     *store.gate.borrow_mut() = Some(FoldGateRow {
         dtako_digest: "d1".into(),
         punch_digest: "punch-digest".into(),
-        logic_version: logic_version(&p, SHA),
+        logic_version: logic_version(&p),
     });
     let hit = block_on(recalc_drivers(
         &repo,

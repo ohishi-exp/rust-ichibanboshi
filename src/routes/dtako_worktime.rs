@@ -14,11 +14,11 @@
 //! ## ファイル名がなぜ `dtako_worktime.rs` か (`kintai`/`kosoku` で始めない)
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` は `src/` と `src/routes/` をファイル名の
-//! **接頭辞** (`kintai` / `kosoku`) で拾い、拾われた内容のハッシュが `logic_version`
-//! (`/api/kintai/version` の etag) に畳まれる。この口は既存の生イベント読み出しを
+//! **接頭辞** (`kintai` / `kosoku`) で拾い、拾われた内容のハッシュが `/api/kintai/version`
+//! の etag に畳まれる。この口は既存の生イベント読み出しを
 //! **そのまま再利用するだけ**で `/api/kintai/{daily,kosoku-daily,version}` の応答を
 //! 一切変えないので、`kintai` で始まる名前を付けると無関係な deploy まで
-//! 全乗務員を stale にしてしまう ([`crate::routes::dtako_day`] と同じ理由)。
+//! relay の上流キャッシュを全月無効にしてしまう ([`crate::routes::dtako_day`] と同じ理由)。
 //!
 //! ## read-only
 //!
@@ -39,7 +39,7 @@ use crate::routes::kintai::{map_repo_err, parse_driver};
 /// 同時実行を絞る。
 ///
 /// **`kintai.rs` の `KOSOKU_DB_PERMITS` とは別枠**で、合算の上限にはならない
-/// (あちらは private static で、`pub` にすると `logic_version` が動くため共有
+/// (あちらは private static で、`pub` にすると etag が動くため共有
 /// できない)。守れるのは「この口が単独で DB を溢れさせないこと」だけ。
 static DTAKO_WORKTIME_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 

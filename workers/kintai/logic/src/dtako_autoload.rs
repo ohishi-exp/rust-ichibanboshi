@@ -241,7 +241,7 @@ struct ResetOutcome {
 /// - **`休憩` は材料ではない** (`休息` とは別のイベント)。`休息` だけを数えていた旧実装は運行開始/運行終了しか
 ///   無い運行を誤ってスキップした (#290)
 ///
-/// 社内 MariaDB の SQL だが `kintai-kosoku` の `sql.rs` には置かない (kosoku は勤怠の版の glob の中)。
+/// 社内 MariaDB の SQL だが `kintai-kosoku` の `sql.rs` には置かない (kosoku はversion の etag の glob の中)。
 pub const RESET_MATERIAL_SQL: &str = r#"
 SELECT CAST(COUNT(*) AS SIGNED) AS n FROM (
   SELECT e.`運行NO` AS unko_no

@@ -5,7 +5,9 @@ include!("workers/kintai/output_sha.rs");
 
 /// `KINTAI_OUTPUT_SHA` の対象 (Refs #191)。
 ///
-/// `/api/kintai/{daily,kosoku-daily,version}` の**応答を形づくるコード**だけを覆う。
+/// `/api/kintai/{daily,kosoku-daily,version}` の**応答を形づくるコード**だけを覆う。使い道は version の etag と、
+/// recalc・version の応答に載せる記録用の `code_sha` の 2 つ。**勤怠の版 (`logic_version`) には使わない** — 版は共有
+/// crate の `kintai_fold::LOGIC_BASE` を手で上げる (ソースのハッシュだとコメント 1 文字で全員 stale になる、Refs #322)。
 /// ディレクトリと接頭辞で glob するので、同じ接頭辞の新しいモジュールは自動で入る
 /// (列挙漏れ対策 — 個別列挙にすると新設ファイルを黙って取りこぼす)。
 ///
@@ -20,7 +22,7 @@ const KINTAI_OUTPUT_GLOBS: &[(&str, &str)] = &[
 ];
 
 /// 上の glob が必ず拾わなければならないファイル。**1 つでも欠けたらビルドを落とす** —
-/// リネームや移動で対象から黙って抜けるのが、この仕組みで唯一の「古い値」事故になる。
+/// リネームや移動で対象から黙って抜けるのが、この仕組み (etag) で唯一の「古い値」事故になる。
 const KINTAI_OUTPUT_REQUIRED: &[&str] = &[
     "src/kintai_repo.rs",
     "src/kintai_store.rs",

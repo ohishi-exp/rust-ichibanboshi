@@ -1,4 +1,5 @@
 // 勤怠の「応答を形づくるコード」の版の畳み方 (Refs ohishi-exp/rust-ichibanboshi#191 / #322)。
+// 使い道は version の etag と記録用の `code_sha` だけ。勤怠の版 (`logic_version`) は手で上げる `LOGIC_BASE` で、これは使わない。
 //
 // repo ルートの build.rs (オンプレ版・Cloud Run 版の KINTAI_OUTPUT_SHA) と workers/kintai/worker/build.rs (勤怠 Worker の
 // KINTAI_WORKER_OUTPUT_SHA) の両方が `include!` する。畳み方を 2 実装にしないため、ここにだけ置く。

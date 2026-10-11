@@ -56,8 +56,8 @@
 //!
 //! ## ファイル名は `shift_days.rs` で固定 (`kintai` / `kosoku` で始めない)
 //!
-//! `build.rs` の `KINTAI_OUTPUT_GLOBS` に入ると `logic_version` の指紋が動き、全乗務員・
-//! 全月が stale になる (`shift_overlaps.rs` のモジュール doc と同じ分類)。
+//! `build.rs` の `KINTAI_OUTPUT_GLOBS` に入ると `/api/kintai/version` の etag が動く
+//! (`shift_overlaps.rs` のモジュール doc と同じ分類)。
 //!
 //! ## ★ auth-worker の allowlist に載る
 //!

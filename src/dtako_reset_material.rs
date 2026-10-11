@@ -23,11 +23,11 @@
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` は `src/` 配下をファイル名の接頭辞
 //! (`kosoku` / `kintai`、`src/routes/` は `kintai` のみ) で拾い、拾われたファイルの
-//! 内容ハッシュが `logic_version` (`/api/kintai/version` の etag) に畳まれる。この
+//! 内容ハッシュが `/api/kintai/version` の etag に畳まれる。この
 //! materialカウントは勤怠の計算 (`kosoku-daily` / `daily`) に一切関与しない
-//! (①②③の導線専用) ので、`kintai_repo.rs` を触ると無関係な deploy まで全乗務員
-//! stale にしてしまう ([`crate::routes::dtako_day`] / [`crate::routes::unko_gaps`]
-//! と同じ理由)。**この理由から `fetch_rest_events_between` は変更せず、独立した
+//! (①②③の導線専用) ので、`kintai_repo.rs` を触ると無関係な deploy まで relay の
+//! 上流キャッシュを全月無効にしてしまう ([`crate::routes::dtako_day`] / [`crate::routes::unko_gaps`]
+//! と同じ理由。勤怠の版 `logic_version` は手で上げる `LOGIC_BASE` で、ここでは動かない)。**この理由から `fetch_rest_events_between` は変更せず、独立した
 //! trait・SQL・MariaDB pool をこのファイルに持つ** — [`crate::kintai_version`]
 //! (`events` と同じ MariaDB を読むが trait / pool を分ける) と同じ形。
 //!

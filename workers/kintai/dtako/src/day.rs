@@ -66,7 +66,7 @@ pub fn day_range(date: NaiveDate) -> (String, String) {
 /// panic しない)。
 ///
 /// root の `kintai_http_repo.rs` の `onprem_unko_no` と同じ変換を独立して持つ (あちらは
-/// `build.rs` の glob の中で、ここから借りると `logic_version` が動く)。
+/// `build.rs` の etag の glob の中で、ここから借りると `/api/kintai/version` の etag が動く)。
 /// **同じ考え方の実装が 2 か所にある**ので、桁の境目 (`ONPREM_CREW_SUFFIX_LEN` =
 /// 1) が変わったら両方直すこと。
 pub fn to_ope_no(unko_no: &str) -> &str {

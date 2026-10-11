@@ -100,6 +100,12 @@ async fn returns_month_and_etag_with_matching_header() {
     assert!(etag.starts_with('"') && etag.ends_with('"'));
     // ヘッダと body は同じ値
     assert_eq!(etag_header.as_deref(), Some(etag));
+    // 記録用のソースのハッシュ (build.rs が焼く 16 桁 hex)。勤怠の版 (logic_version) ではない
+    assert_eq!(json["code_sha"], env!("KINTAI_OUTPUT_SHA"));
+    assert_ne!(
+        json["code_sha"].as_str(),
+        Some(rust_ichibanboshi::kintai_fold::logic_version(&Default::default()).as_str())
+    );
 }
 
 #[tokio::test]

@@ -13,8 +13,9 @@
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` はディレクトリ + ファイル名前方一致
 //! (`("src","kosoku")` / `("src","kintai")` / `("src/routes","kintai")`) で
-//! `logic_version` の指紋を作る。ここに入ると 1 バイトの変更でも全乗務員・全月が
-//! stale になり、収束に全月ぶんの `run_kintai_recalc` が要る (高くつく)。パスに
+//! `/api/kintai/version` の etag を作る。ここに入ると 1 バイトの変更でも relay の上流キャッシュが
+//! 全月無効になる。勤怠の版 (`logic_version`) は手で上げる `LOGIC_BASE`
+//! なのでファイル名では動かない (Refs #322)。パスに
 //! `kintai` が入っても glob が見るのはファイル名だけなので `/api/kintai/stale-months`
 //! は問題ない (`dtako_day.rs` と同じ分類)。
 //!

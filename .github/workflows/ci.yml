@@ -61,7 +61,7 @@ jobs:
 
       # 版は rust-toolchain.toml が持つ (rustfmt / clippy / llvm-tools-preview も
       # そちらで指定)。@stable のまま浮かせると、stable が上がるだけで fmt の
-      # 整形結果が変わり KINTAI_OUTPUT_SHA が回転する
+      # 整形結果が変わり KINTAI_OUTPUT_SHA (version の etag) が回転する
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"

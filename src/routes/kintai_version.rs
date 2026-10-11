@@ -3,7 +3,8 @@
 //! `GET /api/kintai/version?month=YYYY-MM` — nuxt-dtako-admin relay
 //! (dtako-scraper-relay) の条件付き再検証キャッシュが「上流のデータが変わったか」を
 //! 数十バイトで確認するための読み出し口。応答は
-//! `{"month":"YYYY-MM","etag":"…"}` で、同じ値を `ETag` ヘッダにも載せる。
+//! `{"month":"YYYY-MM","etag":"…","code_sha":"…"}` で、etag と同じ値を `ETag` ヘッダにも載せる。
+//! `code_sha` は記録用 (どのコードの build か)。勤怠の版 (`logic_version`) ではない (Refs #322)
 //!
 //! - **パラメータと認可は `/kintai/kosoku-daily` に揃える** — `month` 必須
 //!   (`YYYY-MM`、不正は 400)、認可は CF Access Service Token (edge)。応答は
@@ -49,18 +50,20 @@ pub async fn version(
         ));
     }
     let markers = repo.fetch_markers(&month).await.map_err(map_repo_err)?;
-    // KINTAI_OUTPUT_SHA: 応答を形づくるコード (kosoku* / kintai* / routes/kintai*) の
-    //   内容ハッシュ。**リポジトリ全体の BUILD_SHA ではない** — 全体を畳むと ETC・日報など
+    // KINTAI_OUTPUT_SHA (= code_sha): 応答を形づくるコード (kosoku* / kintai* / routes/kintai*) の
+    //   内容ハッシュ。etag に畳み、記録用に応答へ載せる (勤怠の版 logic_version には入れない、Refs #322)。
+    //   **リポジトリ全体の BUILD_SHA ではない** — 全体を畳むと ETC・日報など
     //   kintai と無関係なデプロイでも relay の上流キャッシュが全月無効になる (Refs #191)。
     //   対象の決め方と「取りこぼしたら古い値」の警戒点は build.rs 参照
     // KosokuParams: 再ビルド無しの TOML 変更 (丸め方・閾値) でも応答が変わるため畳む
     // (畳み方は共有 crate。版は呼び手が渡す — 勤怠 Worker は自分の build の版を渡す、Refs #322)
-    let etag = version_etag(&month, env!("KINTAI_OUTPUT_SHA"), &params_cfg, &markers);
+    let code_sha = crate::kintai_fold::code_sha();
+    let etag = version_etag(&month, code_sha, &params_cfg, &markers);
     // 件数は先に出す — `tracing::info!` の引数は購読者が居ないと評価されない
     let sources = markers.len();
     tracing::info!(month = %month, sources, "kintai version built");
     Ok((
         [(header::ETAG, etag.clone())],
-        Json(serde_json::json!({ "month": month, "etag": etag })),
+        Json(serde_json::json!({ "month": month, "etag": etag, "code_sha": code_sha })),
     ))
 }

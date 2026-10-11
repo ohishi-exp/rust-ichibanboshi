@@ -10,9 +10,9 @@
 //!
 //! ## ファイル名は `change_log.rs` で固定 (`kintai` / `kosoku` で始めない)
 //!
-//! `build.rs` の `KINTAI_OUTPUT_GLOBS` に入ると `logic_version` が変わり、deploy で
-//! 全乗務員が stale になる。ここは勤怠の値を形づくらない (記録を残すだけ) ので
-//! glob の外が正しい分類。
+//! `build.rs` の `KINTAI_OUTPUT_GLOBS` に入ると `/api/kintai/version` の etag が変わり、
+//! relay の上流キャッシュが全月無効になる。ここは勤怠の値を形づくらない (記録を残すだけ) ので
+//! glob の外が正しい分類。勤怠の版 (`logic_version`) は手で上げる `LOGIC_BASE` なのでファイル名では動かない (Refs #322)。
 //!
 //! ## 往復の回数
 //!

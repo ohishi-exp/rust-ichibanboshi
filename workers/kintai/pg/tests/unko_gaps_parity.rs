@@ -2,7 +2,7 @@
 //! 固定する (Refs #322)。DB は要らない。`MONTH_OPERATIONS_SQL`・`PUSHED_SOURCES`・`UnsplitOperation` は共有 crate
 //! (`kintai_kosoku`) に移し、root と Worker が同じものを使うので比べない。
 //!
-//! etags の読み方は root の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の中 (`src/kintai_http_repo.rs`) にあり、root 側が private
+//! etags の読み方は root の `KINTAI_OUTPUT_SHA` (version の etag) の glob の中 (`src/kintai_http_repo.rs`) にあり、root 側が private
 //! (`ETAGS_PATH`・`UpstreamEtagItem`・`UpstreamEtags`・`month_etags_bounds`・`fetch_etags`) で値を外から取れないので、
 //! root のソースの該当の定義を**文字列で**固定する (text pin)。
 //! ここが落ちたら root の etags の読み方が変わっている — `logic/src/unko_gaps.rs` の写しも直してから pin を更新する

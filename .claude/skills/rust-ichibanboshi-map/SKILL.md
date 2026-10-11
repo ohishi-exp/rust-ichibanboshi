@@ -53,7 +53,7 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
   (計算しない・金額なし)。`month` も `driver` も必須。**始業 (JST) の月に出る**ので、
   前月末に始業した勤務は前月を読む。`parts[].night_minutes` は所定内・法定内残業ぶんの
   深夜だけ。テナントは設定 pin (`shift_overlaps.rs` の `store` / `read_tenant_of` /
-  `month_bounds` を共有)。ファイル名を `kintai` / `kosoku` で始めない (`logic_version`)
+  `month_bounds` を共有)。ファイル名を `kintai` / `kosoku` で始めない (version の etag)
   - **`non_working` = 勤務の中の実働でない区間** (`kintai.day_summaries.non_working`、009 の
     JSONB をそのまま返す)。`[{start, end, kind}]`、分の格子・始まりの昇順・重ならない。
     **長さの和 = (終業 − 始業) − 実働**。`kind` は `rest` (勤務の中に残った休息) /
@@ -386,7 +386,9 @@ nuxt-dtako-admin の relay (dtako-scraper-relay) が上流応答キャッシュ 
   作る内容ハッシュで、**リポジトリ全体の `BUILD_SHA` ではない** (Refs #191) — 全体だと
   ETC・日報など kintai と無関係なデプロイでも relay の上流キャッシュが全月飛んでいた。
   対象ファイルが消えたら**ビルドが落ちる** (`KINTAI_OUTPUT_REQUIRED`)。接頭辞の外に
-  出力ロジックを新設したら build.rs の glob を同じ PR で足すこと (取りこぼし =「古い値」)
+  出力ロジックを新設したら build.rs の glob を同じ PR で足すこと (取りこぼし =「古い値」)。
+  同じ値を記録用の `code_sha` として version・recalc の応答と CLI に載せる。**勤怠の版
+  (`logic_version`) には使わない** (下記「指紋」、Refs #322)
 - 覆えないもの: dailyJson の国民の祝日 (外部 API `holidays-jp.github.io`、DB に無い)
 - **GRANT 前提**: `kintai_reader` に `daily_report_other_detail` / `drivers` /
   `offices` / `time_card_non_legal_holiday` の SELECT が要る。無ければ **502
@@ -656,9 +658,12 @@ allowlist は打刻の 2 本だけ)。**あそこに読み出し経路を足さ�
 - **`kintai_events` の PK は `source` を含まない。** 同じ秒・同じ state が
   `time_card_dstate` と `time_card_dtako` の両方にあると衝突するので、`ON CONFLICT` に
   任せず挿入前に Rust 側で決着させる (`timecard` を残す)
-- **指紋の材料に `KosokuParams` を入れる。** `restraint_rounding` などは TOML で再ビルド
-  無しに変えられて出力を変えるため。`KINTAI_OUTPUT_SHA` は `build.rs` が焼く内容
-  ハッシュなので「上げ忘れ」は原理的に存在しない
+- **版 `logic_version` = `sha256(LOGIC_BASE | KosokuParams)[..16]`。** `LOGIC_BASE` は共有 crate
+  (`workers/kintai/kosoku/src/kintai_fold.rs`) の定数で、**計算結果を変えたら手で上げる**
+  (上げると全乗務員・全月 stale → 畳み直し)。コメント・移設では上げない。上げ忘れは golden
+  (`workers/kintai/kosoku/tests/logic_golden.rs`、`LOGIC_BASE` → 出力ハッシュの追記のみの表) が落とす。
+  `KosokuParams` を入れるのは `restraint_rounding` などが TOML で再ビルド無しに変えられて出力を変えるため。
+  ソースのハッシュ (`KINTAI_OUTPUT_SHA`) は版に入れない (#322 まではそうで、コメント 1 文字で全員 stale になっていた)
 - **打刻の置き換えは前後を `kintai.event_changes` に残す** (008、Refs
   ohishi-exp/nuxt-dtako-admin#1133)。`replace_window` が DELETE の直前に同じ
   トランザクションで `change_log::record_changes` を呼ぶ (旧 events の SELECT 1 文 +
@@ -666,7 +671,8 @@ allowlist は打刻の 2 本だけ)。**あそこに読み出し経路を足さ�
   `GET /api/kintai/change-log` (`src/routes/change_log.rs`)。どちらも glob の外の名前
 - 再計算の単位は **(乗務員, 月)**。勤務が日を跨ぐので日単独では計算できない
 - `src/kintai*.rs` は `build.rs` の glob に自動で入るため、この 2 モジュールを触ると
-  `KINTAI_OUTPUT_SHA` が回転して relay の上流キャッシュが全月 stale になる
+  `KINTAI_OUTPUT_SHA` が回転して relay の上流キャッシュ (version の etag) が全月無効になる
+  (勤怠の版 `logic_version` は動かない)
 
 ### テスト
 

@@ -28,8 +28,9 @@
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` はディレクトリ + ファイル名前方一致
 //! (`("src","kosoku")` / `("src","kintai")` / `("src/routes","kintai")`) で
-//! `logic_version` の指紋を作る。ここに入ると 1 バイトの変更でも全乗務員・全月が
-//! stale になる (`stale_months.rs` / `unko_gaps.rs` と同じ分類)。
+//! `/api/kintai/version` の etag を作る。ここに入ると 1 バイトの変更でも relay の上流キャッシュが
+//! 全月無効になる (`stale_months.rs` / `unko_gaps.rs` と同じ分類)。勤怠の版 (`logic_version`) は手で上げる `LOGIC_BASE`
+//! なのでファイル名では動かない (Refs #322)。
 //!
 //! ## ★ auth-worker の allowlist に載る
 //!
@@ -41,7 +42,7 @@
 //! ## 認可 — テナントは設定 pin
 //!
 //! [`read_tenant_of`] は `day_parts::read_tenant_of` と同じ形 (向こうを pub にすると
-//! `logic_version` が動くため写しを持つ)。正は `[kintai_events] tenant_id`、無ければ
+//! etag が動くため写しを持つ)。正は `[kintai_events] tenant_id`、無ければ
 //! `[kintai_push] tenant_id`、どちらも無ければ 503。`[kintai_push]` が無効 (オンプレ)
 //! なら 503。
 

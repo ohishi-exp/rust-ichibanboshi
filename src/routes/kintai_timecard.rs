@@ -347,7 +347,7 @@ pub async fn window_events(
 ///
 /// ## 全量再計算はここでやらない
 ///
-/// deploy や TOML 変更で**全乗務員が stale** になったときは、窓 1 往復では終わらない。
+/// `LOGIC_BASE` を上げた deploy や TOML 変更で**全乗務員が stale** になったときは、窓 1 往復では終わらない。
 /// 応答の `stale.drivers` がそれを示すので、呼び出し側はページングする
 /// `POST /api/kintai/recalc` ([`crate::routes::kintai_recalc`]) に回す。
 ///
