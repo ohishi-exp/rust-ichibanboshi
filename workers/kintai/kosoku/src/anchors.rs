@@ -12,7 +12,7 @@ pub type HeadAnchors = std::collections::BTreeMap<u64, String>;
 /// 落とす** — 広げた窓のせいで現れただけの乗務員に単位を立てない (今までの母集団を
 /// 保つ)。
 ///
-/// 述語は HTTP 実装の読み (`kintai_http_repo` の `in_window`) と同じ
+/// 述語は HTTP 実装の読み (`alc_events` の `in_window`) と同じ
 /// [`crate::window::window_holds`]。起点の無い乗務員は、月初から読んだ
 /// ときと同じ行の集合に戻る。時刻が読めない行は落とさない (読み先が窓で絞って
 /// 返したものなので、今までも入っていた)。

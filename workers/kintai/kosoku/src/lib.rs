@@ -7,6 +7,7 @@
 //! ここのファイルは全部 repo ルートの `build.rs` の `KINTAI_OUTPUT_SHA` (etag と記録用の `code_sha`) に入る。
 //! 勤怠の版 (`logic_version`) は [`kintai_fold::LOGIC_BASE`] を手で上げる — 計算結果を変えたら上げる (Refs #322)。
 
+pub mod alc_events;
 pub mod anchors;
 pub mod fold_flow;
 pub mod kintai_fold;

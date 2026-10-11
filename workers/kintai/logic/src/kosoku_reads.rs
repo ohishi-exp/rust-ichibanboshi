@@ -105,7 +105,14 @@ fn bad_month() -> Fail {
 /// 遡り起点の 2 本 (`HEAD_RUN_ENDS_SQL` → `HEAD_PUNCHES_SQL`)。窓は `month_range` (元の `month_anchors` と同じ)。
 pub fn head_sqls(month: &str) -> Result<[String; 2], Fail> {
     let (from, to) = month_range(month).ok_or_else(bad_month)?;
-    let binds = [("from", at(&from)), ("to", at(&to))];
+    head_sqls_between(&from, &to)
+}
+
+/// [`head_sqls`] の窓 `[from, to)` を直に受ける版 (fold の読み `FoldEventsIo::month_head_anchors` が使う)。
+/// 窓の端が日時として読めなければ 502 (`bad_month`。fold は `month_range` の出力しか渡さないので起きない)。
+pub fn head_sqls_between(from: &str, to: &str) -> Result<[String; 2], Fail> {
+    let bound = |s: &str| parse_dt(s).map(Bind::DateTime).ok_or_else(bad_month);
+    let binds = [("from", bound(from)?), ("to", bound(to)?)];
     Ok([
         sql_text(HEAD_RUN_ENDS_SQL, &binds)?,
         sql_text(HEAD_PUNCHES_SQL, &binds)?,
@@ -115,9 +122,24 @@ pub fn head_sqls(month: &str) -> Result<[String; 2], Fail> {
 /// 2 本の結果から乗務員ごとの遡り起点を決める (元の `mariadb_month_head_anchors`)。1 行でも読めなければ 502。
 pub fn anchors_from(month: &str, runs: &[Row], punches: &[Row]) -> Result<HeadAnchors, Fail> {
     let (month_start, _) = month_range(month).ok_or_else(bad_month)?;
+    anchors_between(&month_start, runs, punches)
+}
+
+/// [`anchors_from`] の月初を直に受ける版 (fold の読み)。
+pub fn anchors_between(
+    month_start: &str,
+    runs: &[Row],
+    punches: &[Row],
+) -> Result<HeadAnchors, Fail> {
     let runs = rows_to_json(runs, head_run_end_row)?;
     let punches = rows_to_json(punches, head_punch_row)?;
-    Ok(month_head_anchors(&month_start, &runs, &punches))
+    Ok(month_head_anchors(month_start, &runs, &punches))
+}
+
+/// 全乗務員の生イベント `ALL_EVENTS_SQL` (5 列) の窓 `[from, to)` (元の `fetch_all_events_between`)。
+/// 窓の端は呼び手が読めることを確かめてから渡す (kosoku-daily は `read_window`、fold は alc の読みの `parse_window`)。
+pub fn all_events_sql(from: &str, to: &str) -> Result<String, Fail> {
+    sql_text(ALL_EVENTS_SQL, &[("from", at(from)), ("to", at(to))])
 }
 
 // ── kosoku-daily ──
@@ -168,13 +190,16 @@ impl DailyRequest {
     /// `fetch_all_events_between` と同じ。
     pub fn events_sql(&self, anchors: &HeadAnchors) -> Result<String, Fail> {
         let (from, to) = read_window(&self.month, anchors, self.driver).ok_or_else(bad_month)?;
-        let mut binds = vec![("from", at(&from)), ("to", at(&to))];
         match self.driver {
             Some(d) => {
-                binds.push(("driver", Bind::UInt(d)));
+                let binds = [
+                    ("from", at(&from)),
+                    ("to", at(&to)),
+                    ("driver", Bind::UInt(d)),
+                ];
                 sql_text(EVENTS_SQL, &binds)
             }
-            None => sql_text(ALL_EVENTS_SQL, &binds),
+            None => all_events_sql(&from, &to),
         }
     }
 

@@ -6,23 +6,24 @@
 //! `query_typed` と auth-worker の RPC (`KintaiAlcEntrypoint.dtakoEtags`) で材料を引いてここへ渡す。口の意味 (「無い」と
 //! 「引けていない」の区別・22 桁・上限) は root の module docs。
 //!
-//! [`MONTH_OPERATIONS_SQL`]・[`PUSHED_SOURCES`] と `unsplit` の型は共有 crate (`kintai_kosoku`) のものを root と同じく使う。
-//! ただし alc の etags の path・期間・応答の読み方は **root の `KINTAI_OUTPUT_SHA` (version の etag) の glob の中**
-//! (`src/kintai_http_repo.rs`) にあり root はそちらを使い続けるので、ここに置くのは**写し** (対応表は README):
-//!
-//! - [`ETAGS_PATH`]・[`etags_search`]・[`read_etags`] (root の `kintai_http_repo` の `ETAGS_PATH`・`month_etags_bounds`・
-//!   `UpstreamEtags`・`fetch_etags`。private なので一致は `pg/tests/unko_gaps_parity.rs` が root のソースの文字列で固定する)
+//! [`MONTH_OPERATIONS_SQL`]・[`PUSHED_SOURCES`] と alc の etags の path・期間・応答の型 (`ETAGS_PATH`・`month_etags_bounds`・
+//! `UpstreamEtags`) は共有 crate (`kintai_kosoku`) のものを root と同じく使う (写さない。Refs #322)。ここに残るのは RPC の
+//! 戻り (`{status, body}`) の読み方 ([`read_etags`]) だけで、404 以外の非 2xx を 502 で名指しするのは勤怠 Worker の決定。
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime};
 use postgres_types::Type;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::common::{bad_request, is_valid_month, month_bounds, parse_query, Fail, Param};
-use kintai_kosoku::fold_flow::UnsplitOperation;
+use crate::common::{bad_request, is_valid_month, parse_query, Fail, Param};
+use kintai_kosoku::alc_events::{month_etags_bounds, UpstreamEtags};
 use kintai_kosoku::window::{month_range, unko_no_start_date};
+
+// alc の etags の path は共有 crate のもの (勤怠 Worker からは渡さない。auth-worker の `KintaiAlcEntrypoint` が path・
+// method (GET)・tenant を固定して転送する)。
+pub use kintai_kosoku::alc_events::ETAGS_PATH;
 
 // 押し込み済みの運行一覧の SQL と押し込む source は共有 crate のもの (root の fold の月ゲートと同じ文。Refs #322)。
 pub use kintai_kosoku::kintai_push::{MONTH_OPERATIONS_SQL, PUSHED_SOURCES};
@@ -179,18 +180,20 @@ pub fn drop_crew_suffix(unko_no: &str) -> String {
 
 // ── GCP 側 (alc の etags。auth-worker の RPC 越し) ────────────────────────────
 
-/// **写し** — root の `kintai_http_repo::ETAGS_PATH`。勤怠 Worker からは渡さない (auth-worker の `KintaiAlcEntrypoint` が
-/// path・method (GET)・tenant を固定して転送する)。ここに置くのは root と同じ path を叩いていることを固定するためだけ。
-pub const ETAGS_PATH: &str = "/api/dtako/events/etags";
-
 /// auth-worker の `KintaiAlcEntrypoint` (勤怠 Worker 専用の entrypoint) への Service Binding (wrangler.toml のトップレベルにだけ置く)。
 pub const ALC_RPC_BINDING: &str = "KINTAI_ALC_RPC";
 
-/// `dtakoEtags(search)` に渡す query 文字列 `date_from=<月初>&date_to=<翌月初>`。期間は root の `month_etags_bounds` と同じ
-/// `[月初, 翌月初]` (閉区間の暦日)。**RPC の引数はこれだけ** (path・method・tenant は auth-worker 側で固定)。`None` は月が読めないとき。
+/// `dtakoEtags(search)` に渡す query 文字列 `date_from=<月初>&date_to=<翌月初>`。期間は共有の `month_etags_bounds`
+/// (`[月初, 翌月初]`、閉区間の暦日。root の月ゲートと同じ)。**RPC の引数はこれだけ** (path・method・tenant は auth-worker
+/// 側で固定)。`None` は月が読めないとき。
 pub fn etags_search(month: &str) -> Option<String> {
-    let (first, next_first) = month_bounds(month)?;
-    Some(format!("date_from={first}&date_to={next_first}"))
+    let (first, next_first) = month_etags_bounds(month)?;
+    Some(etags_search_between(first, next_first))
+}
+
+/// [`etags_search`] の期間を直に受ける版 (fold の読みは始端を遡り起点まで下げる)。
+pub fn etags_search_between(date_from: NaiveDate, date_to: NaiveDate) -> String {
+    format!("date_from={date_from}&date_to={date_to}")
 }
 
 /// RPC の戻り (`AlcRpcResult`)。`contentType` は読まない。
@@ -198,31 +201,6 @@ pub fn etags_search(month: &str) -> Option<String> {
 pub struct RpcResult {
     pub status: u16,
     pub body: String,
-}
-
-/// **写し** — root の `kintai_http_repo::UpstreamEtagItem`。
-#[derive(Debug, Clone, Deserialize)]
-struct UpstreamEtagItem {
-    unko_no: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    etag: Option<String>,
-    #[serde(default)]
-    driver_cds: Vec<String>,
-}
-
-/// **写し** — root の `kintai_http_repo::UpstreamEtags`。
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct UpstreamEtags {
-    #[serde(default)]
-    items: Vec<UpstreamEtagItem>,
-    #[serde(default)]
-    warnings: Vec<String>,
-    #[serde(default)]
-    unsplit: Vec<UnsplitOperation>,
-    #[serde(default)]
-    unsplit_total: usize,
 }
 
 /// etags の `unko_no` → `driver_cds`。同じ `unko_no` が 2 回来たら後勝ち (root の `collect` と同じ)。
@@ -234,6 +212,16 @@ pub type GcpDriverCds = HashMap<String, Vec<String>>;
 /// (黙って判定不能にしない。親の判断 Refs #322)。auth-worker 自身の拒否 (tenant 未設定の 503 `kintai_alc_tenant_unset`・
 /// query 不正の 400) も同じく 502 で、本文の先頭 200 字に auth-worker の error の語が載る。
 pub fn read_etags(res: &RpcResult) -> Result<Option<GcpDriverCds>, Fail> {
+    let map = |parsed: UpstreamEtags| {
+        let items = parsed.items.into_iter();
+        items.map(|it| (it.unko_no, it.driver_cds)).collect()
+    };
+    Ok(read_etags_body(res)?.map(map))
+}
+
+/// [`read_etags`] の応答を畳む前の形 (fold の読みは etag・warnings・unsplit も使う)。404 だけ `Ok(None)`、他の非 2xx と
+/// parse 失敗は 502 (root の fold の `fetch_etags` と同じ分け方)。
+pub fn read_etags_body(res: &RpcResult) -> Result<Option<UpstreamEtags>, Fail> {
     if res.status == 404 {
         return Ok(None);
     }
@@ -244,12 +232,7 @@ pub fn read_etags(res: &RpcResult) -> Result<Option<GcpDriverCds>, Fail> {
     }
     let parsed: UpstreamEtags = serde_json::from_str(&res.body)
         .map_err(|e| Fail::new(502, format!("alc dtako-etags parse: {e}")))?;
-    let map = parsed
-        .items
-        .into_iter()
-        .map(|it| (it.unko_no, it.driver_cds))
-        .collect();
-    Ok(Some(map))
+    Ok(Some(parsed))
 }
 
 /// 503 (`KINTAI_ALC_RPC` の binding が無い)。

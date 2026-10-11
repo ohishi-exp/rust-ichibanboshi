@@ -1,13 +1,13 @@
 //! **末尾検知 (tail gap) が鳴らしている乗務員を、乗務員別に名指しする** (Refs #205)。
 //!
 //! **直す口ではなく、見える口。** 月ゲートの封の条件・閾値・warning 文言には
-//! 一切触れない — `kintai_http_repo::InputCoverage` が実際に見ている量
+//! 一切触れない — [`crate::alc_events::InputCoverage`] が実際に見ている量
 //! (最後の運行開始日 → 窓末尾までの空き) を、オンプレの実データで乗務員ごとに
 //! 並べるだけ。
 //!
 //! ## これは alc の tail gap 警告と**同じ量ではない**
 //!
-//! 本物の警告 (`kintai_http_repo::missing_input_warnings`) は GCP 側で
+//! 本物の警告 ([`crate::alc_events::missing_input_warnings`]) は GCP 側で
 //! **alc の etags** (R2 の CSV の有無) から測っている。この口が読むのは
 //! **オンプレの MariaDB 直読み** (`dtako_events`) — 経路も母集団の取り方も別物。
 //! `/health` の `backends.kintai_events` が `mariadb` のとき、オンプレは alc を
@@ -16,7 +16,7 @@
 //!
 //! ## 母集団はミラーする — 「その月に運行が始まった乗務員」だけ
 //!
-//! `kintai_http_repo::InputCoverage` の母集団の絞り方 (Refs #205 の 37)
+//! [`crate::alc_events::InputCoverage`] の母集団の絞り方 (Refs #205 の 37)
 //! と同じ理由で、**この月に `dtako_events` の `運行開始` を 1 件も持たない乗務員は
 //! 対象に入れない。** 入れると「そもそも稼働していない」全員が「末尾が欠けた」に
 //! 化ける (本番実測でこの絞りが無かったとき 73 名が 37 日超で鳴った実例がある)。

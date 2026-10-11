@@ -20,8 +20,8 @@
 #   (j) Worker のソースに拘束サマリの口 (`Route::Restraint(`) があるなら、トップレベルの d1_databases に KINTAI_RESTRAINT_DB
 #       (database_name = ichibanboshi-kintai-restraint・migrations_dir = "migrations") がある。d1_databases はトップレベル以外
 #       (env.* を含む表の奥) のどこにも置かない (本番の D1 へ届く binding をトップレベルの外へ漏らさない)
-#   (k) トップレベルの services に KINTAI_ALC_RPC が 1 つだけあり、auth-worker の KintaiAlcEntrypoint を指す (unko-gaps が alc の
-#       etags を読む RPC。workers/kyuyo の (h) と同じ形)。services はトップレベル以外 (env.* を含む表の奥) のどこにも置かない
+#   (k) トップレベルの services に KINTAI_ALC_RPC が 1 つだけあり、auth-worker の KintaiAlcEntrypoint を指す (unko-gaps と fold の読みが
+#       alc の etags・生イベントを読む RPC dtakoEtags・dtakoEvents。workers/kyuyo の (h) と同じ形)。services はトップレベル以外 (env.* を含む表の奥) のどこにも置かない
 # (a)〜(e)・(g)〜(k) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/kintai/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/kintai/worker/wrangler.toml)

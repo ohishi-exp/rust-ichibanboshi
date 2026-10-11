@@ -169,7 +169,7 @@ fn single_row(e: &Ev) -> Value {
 }
 
 /// 全乗務員版の行。`unko_no` / `vehicle` は**キーごと出さない**
-/// (`kintai_repo::all_row_to_json` / `kintai_http_repo::event_to_all_json`)。
+/// (`kintai_repo::all_row_to_json` / `kintai_kosoku::alc_events::event_to_all_json`)。
 fn all_row(e: &Ev) -> Value {
     json!({
         "datetime": e.at,

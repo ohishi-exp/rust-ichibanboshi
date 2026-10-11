@@ -90,8 +90,9 @@ database_name = "ichibanboshi-kintai-restraint"
 database_id = "9a70d878-604e-402f-a06a-b07696d99f9f"
 migrations_dir = "migrations"
 
-# auth-worker の勤怠 Worker 専用の named entrypoint KintaiAlcEntrypoint (RPC dtakoEtags(search))。GET /api/kintai/unko-gaps が
-# alc の GET /api/dtako/events/etags を読むためだけに使う。path・method・tenant は auth-worker 側で固定 (渡すのは期間の query だけ)。
+# auth-worker の勤怠 Worker 専用の named entrypoint KintaiAlcEntrypoint (RPC dtakoEtags(search)・dtakoEvents(search))。GET /api/kintai/unko-gaps が
+# alc の GET /api/dtako/events/etags を、fold の読み (口は次の PR) が etags と GET /api/dtako/events を読むのに使う。path・method・tenant は
+# auth-worker 側で固定 (渡すのは query の鍵だけ)。
 # 汎用の転送口 InternalEntrypoint (path の allowlist だけ・tenant は呼び手任せ) は使わない。無ければ unko-gaps は 503。トップレベルにだけ置く
 [[services]]
 binding = "KINTAI_ALC_RPC"
