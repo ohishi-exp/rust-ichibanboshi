@@ -713,9 +713,16 @@ async fn test_april_fold_does_not_restart_a_shift_begun_on_march_31() {
     let params = KosokuParams::default();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 1);
 
-    let april = fold_month(&repo, &params, "2026-04", None, today)
-        .await
-        .expect("april");
+    let april = fold_month(
+        &repo,
+        &params,
+        "2026-04",
+        None,
+        today,
+        &mut Default::default(),
+    )
+    .await
+    .expect("april");
     let starts: Vec<String> = april
         .iter()
         .filter(|(cd, ..)| *cd == CROSS_DRIVER as u64)
@@ -724,9 +731,16 @@ async fn test_april_fold_does_not_restart_a_shift_begun_on_march_31() {
     assert!(starts.is_empty(), "4/1 始業の余分な勤務: {starts:?}");
 
     // 3 月は今までどおり 3/31 始業の 1 本を持つ
-    let march = fold_month(&repo, &params, "2026-03", None, today)
-        .await
-        .expect("march");
+    let march = fold_month(
+        &repo,
+        &params,
+        "2026-03",
+        None,
+        today,
+        &mut Default::default(),
+    )
+    .await
+    .expect("march");
     let (_, unit, _) = march
         .iter()
         .find(|(cd, ..)| *cd == CROSS_DRIVER as u64)

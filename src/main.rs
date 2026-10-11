@@ -103,8 +103,7 @@ fn run_console(args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// バッチを 1 回走らせて終わる。
 fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use rust_ichibanboshi::kintai_fold::{recalc_month, sync_month};
-    use rust_ichibanboshi::kintai_http_repo::with_warning_sink;
+    use rust_ichibanboshi::kintai_fold::{recalc_month, sync_month, FoldSink};
     use rust_ichibanboshi::kintai_push::{push_month, KintaiPgStore, PushOptions};
     use rust_ichibanboshi::server::{build_kintai_events_repo, build_kosoku_params};
 
@@ -158,7 +157,8 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
             // 上流 warnings を握り潰さない — R2 の分割遅れの最中に畳むと、
             // 欠けた入力を「最新」として保存する
             Command::Recalc(_) => {
-                let (r, warnings) = with_warning_sink(recalc_month(
+                let mut sink = FoldSink::default();
+                let mut r = recalc_month(
                     &repo,
                     &store,
                     &params,
@@ -166,18 +166,17 @@ fn run_batch(command: Command, args: AppArgs) -> Result<(), Box<dyn std::error::
                     opts.driver,
                     opts.apply,
                     None,
-                ))
-                .await;
-                let mut r = r?;
-                r.warnings = warnings;
+                    &mut sink,
+                )
+                .await?;
+                r.warnings = sink.warnings.texts();
                 print_fold(&r);
                 r.has_unexpected()
             }
             Command::Sync(_) => {
-                let (r, warnings) =
-                    with_warning_sink(sync_month(&repo, &store, &params, &opts)).await;
-                let mut r = r?;
-                r.fold.warnings = warnings;
+                let mut sink = FoldSink::default();
+                let mut r = sync_month(&repo, &store, &params, &opts, &mut sink).await?;
+                r.fold.warnings = sink.warnings.texts();
                 print_push(&r.push);
                 print_fold(&r.fold);
                 r.has_unexpected()

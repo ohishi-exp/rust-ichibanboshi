@@ -470,18 +470,17 @@ async fn fold_window(
     let apply = !window.dry_run;
     // 上流 warnings を握り潰さない — R2 の分割遅れの最中に畳むと、欠けた入力を
     // 「最新」として保存する。tracing だけでは呼び出し側から見えない
-    let (folded, warnings) = crate::kintai_http_repo::with_warning_sink(async {
-        let mut report = crate::kintai_fold::FoldReport::default();
-        for month in &window.months {
-            let r = crate::kintai_fold::recalc_drivers(repo, st, params, month, &drivers, apply)
-                .await?;
-            report = merge_fold(report, r);
-        }
-        Ok::<_, KintaiPushError>(report)
-    })
-    .await;
-    let mut folded = folded.map_err(map_push_err)?;
-    folded.warnings = warnings;
+    // 束は月をまたいで 1 つ (上限・重複排除は窓ぜんたいに効く)
+    let mut sink = crate::kintai_fold::FoldSink::default();
+    let mut folded = crate::kintai_fold::FoldReport::default();
+    for month in &window.months {
+        let r =
+            crate::kintai_fold::recalc_drivers(repo, st, params, month, &drivers, apply, &mut sink)
+                .await
+                .map_err(map_push_err)?;
+        folded = merge_fold(folded, r);
+    }
+    folded.warnings = sink.warnings.texts();
     Ok(folded)
 }
 

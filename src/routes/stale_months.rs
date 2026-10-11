@@ -3,7 +3,7 @@
 //! `/restraint-wage` の月タブに「この月は畳み直しが要るか」を出したい。ところが本物の
 //! 突合 (`GET /restraint-api/kintai/diff?month=`) は約 50 秒かかり、12 か月ぶんで
 //! 10 分になるので丸には使えない。#620 で親が調査済みのとおり **50 秒の正体は
-//! `with_unko_diff_sink` / `with_unsplit_sink` (alc の etags 掃引) と fold であって、
+//! 月ゲートの etags 掃引 (運行の突合・`unsplit`) と fold であって、
 //! `stale` はそこに相乗りしているだけ** — [`crate::kintai_fold::stale_state`] は
 //! Postgres 1 往復のみで alc も R2 も etags も触らない。切り離せるので、この口は
 //! 既存の `STALE_STATE_SQL` 相当を月単位の `GROUP BY` に書き換えるだけで組む

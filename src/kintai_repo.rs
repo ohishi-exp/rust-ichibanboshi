@@ -50,6 +50,8 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{params, Pool};
 
 use crate::config::MariadbConfig;
+use kintai_kosoku::anchors::HeadAnchors;
+use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
 use kintai_kosoku::sql::{
     ALL_EVENTS_SQL, EVENTS_SQL, FERRY_SQL, HEAD_PUNCHES_SQL, HEAD_RUN_ENDS_SQL,
     OPERATION_READING_DATES_SQL, REST_EVENTS_SQL, TIMECARD_DRIVERS_SQL, TIMECARD_EVENTS_SQL,
@@ -368,9 +370,73 @@ pub trait KintaiEventsApi: Send + Sync {
     ) -> Result<std::collections::BTreeMap<u64, String>, KintaiRepoError> {
         Ok(std::collections::BTreeMap::new())
     }
+
+    /// [`fetch_all_events_between`] に、読みの途中で上流が返した warnings を添えた版
+    /// (fold の読み、Refs #322)。**既定は warnings 無し** — 上流の warnings を持つのは
+    /// [`crate::kintai_http_repo::HttpKintaiEventsRepo`] だけ。
+    ///
+    /// [`fetch_all_events_between`]: KintaiEventsApi::fetch_all_events_between
+    async fn fetch_all_events_with_warnings(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), KintaiRepoError> {
+        Ok((self.fetch_all_events_between(from, to).await?, Vec::new()))
+    }
+
+    /// [`fetch_dtako_month_digest_since`] に etags の控え (`unsplit`・運行一覧) と
+    /// warnings を添えた版 (月ゲート、Refs #322)。**既定は指紋だけ** — 控えを持つのは
+    /// [`crate::kintai_http_repo::HttpKintaiEventsRepo`] だけ。
+    ///
+    /// [`fetch_dtako_month_digest_since`]: KintaiEventsApi::fetch_dtako_month_digest_since
+    async fn fetch_dtako_month_read_since(
+        &self,
+        month: &str,
+        since: Option<chrono::NaiveDate>,
+    ) -> Result<DtakoMonthRead, KintaiRepoError> {
+        let digest = self.fetch_dtako_month_digest_since(month, since).await?;
+        Ok(DtakoMonthRead::digest_only(digest))
+    }
 }
 
 pub type DynKintaiEventsRepo = Arc<dyn KintaiEventsApi>;
+
+/// fold の流れ (共有 crate の `kintai_kosoku::fold_flow`) が使う読み 3 本 (Refs #322)。
+/// 呼び出し側は `&*repo` (`DynKintaiEventsRepo` の中身) を渡す。
+impl FoldEventsIo for dyn KintaiEventsApi + '_ {
+    type Error = KintaiRepoError;
+
+    async fn month_head_anchors(
+        &self,
+        month_start: &str,
+        to: &str,
+    ) -> Result<HeadAnchors, KintaiRepoError> {
+        self.fetch_month_head_anchors(month_start, to).await
+    }
+
+    async fn all_events_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), KintaiRepoError> {
+        self.fetch_all_events_with_warnings(from, to).await
+    }
+
+    async fn dtako_month_read_since(
+        &self,
+        month: &str,
+        since: Option<chrono::NaiveDate>,
+    ) -> Result<DtakoMonthRead, KintaiRepoError> {
+        self.fetch_dtako_month_read_since(month, since).await
+    }
+}
+
+/// 共有 crate の流れが月を読めなかったとき。文面は今までの `bad month: …` のまま。
+impl From<BadMonth> for KintaiRepoError {
+    fn from(e: BadMonth) -> Self {
+        Self::QueryFailed(e.to_string())
+    }
+}
 
 /// `[mariadb]` 未設定時の実装 — 常に `NotConfigured` (= 503)。
 ///

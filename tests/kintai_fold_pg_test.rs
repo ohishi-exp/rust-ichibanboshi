@@ -14,7 +14,7 @@ use rust_ichibanboshi::kintai_fold::{
     recalc_month, stale_state, stored_state, stored_states, sync_month, write_unit, DayPartRow,
     DaySummaryRow, FoldUnit, MonthGate, ShiftRow,
 };
-use rust_ichibanboshi::kintai_http_repo::with_warning_sink;
+use rust_ichibanboshi::kintai_fold::{FoldSink, Warning};
 use rust_ichibanboshi::kintai_push::{KintaiPgStore, PushOptions, TimecardWindow};
 use rust_ichibanboshi::kintai_repo::{DynKintaiEventsRepo, KintaiEventsApi, KintaiRepoError};
 use rust_ichibanboshi::kosoku::{KosokuParams, RestraintRounding};
@@ -214,9 +214,18 @@ async fn rest_events_still_produce_shifts_after_the_fold() {
         run("2026-07-02 14:10:00", "運行終了", "A"),
         rest("2026-07-02 16:18:00", "2026-07-03 06:01:00"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
     assert_eq!(r.shifts, 1, "休息で切った勤務が立つ");
 
     let source: String =
@@ -240,9 +249,18 @@ async fn a_shift_crossing_midnight_splits_into_day_parts() {
         punch("2026-07-01 22:00:00", "始業"),
         punch("2026-07-02 09:00:00", "終業"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
     assert_eq!(r.shifts, 1);
     assert!(r.day_parts >= 2, "暦日で割れる: {}", r.day_parts);
 
@@ -271,9 +289,18 @@ async fn a_39_hour_shift_spans_three_days_and_the_parts_add_up() {
         punch("2026-07-05 22:00:00", "始業"),
         punch("2026-07-07 13:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
 
     let total: i32 = sqlx::query_scalar(
         "SELECT restraint_minutes FROM kintai.day_summaries WHERE tenant_id = $1",
@@ -306,14 +333,32 @@ async fn a_shift_crossing_the_month_belongs_to_the_starting_month() {
     ]);
 
     // 7 月として畳んでも勤務は立たない (始業日が 6 月)
-    let july = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("july");
+    let july = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("july");
     assert_eq!(july.shifts, 0, "始業月ではないので勤務は出ない");
 
-    let june = recalc_month(&repo, &store, &params(), "2026-06", None, true, None)
-        .await
-        .expect("june");
+    let june = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-06",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("june");
     assert_eq!(june.shifts, 1);
 
     let dates: Vec<NaiveDate> =
@@ -350,14 +395,32 @@ async fn a_second_recalc_is_a_no_op() {
         punch("2026-07-10 08:00:00", "始業"),
         punch("2026-07-10 18:00:00", "終業"),
     ]);
-    let first = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("1st");
+    let first = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("1st");
     assert_eq!(first.drivers_written, 1);
 
-    let second = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("2nd");
+    let second = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("2nd");
     assert_eq!(second.drivers_written, 0, "指紋が一致するので書かない");
     assert_eq!(second.drivers_unchanged, 1);
     assert!(!second.wrote_anything());
@@ -374,9 +437,18 @@ async fn changing_the_rounding_makes_every_unit_stale() {
         punch("2026-07-12 08:00:30", "始業"),
         punch("2026-07-12 18:00:20", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("1st");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("1st");
     let before: Vec<String> =
         sqlx::query_scalar("SELECT fingerprint FROM kintai.shifts WHERE tenant_id = $1")
             .bind(store.tenant_id())
@@ -388,9 +460,18 @@ async fn changing_the_rounding_makes_every_unit_stale() {
         restraint_rounding: RestraintRounding::TruncateElapsed,
         ..params()
     };
-    let again = recalc_month(&repo, &store, &other, "2026-07", None, true, None)
-        .await
-        .expect("2nd");
+    let again = recalc_month(
+        &repo,
+        &store,
+        &other,
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("2nd");
     assert_eq!(again.drivers_written, 1, "丸め方を変えたら書き直す");
 
     let after: Vec<String> =
@@ -412,9 +493,18 @@ async fn logic_version_is_the_code_and_settings_hash() {
         punch("2026-07-14 08:00:00", "始業"),
         punch("2026-07-14 18:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
     let v: String =
         sqlx::query_scalar("SELECT logic_version FROM kintai.shifts WHERE tenant_id = $1")
             .bind(store.tenant_id())
@@ -437,9 +527,18 @@ async fn changing_the_rounding_shows_up_in_the_stored_logic_version() {
         punch("2026-07-21 08:00:00", "始業"),
         punch("2026-07-21 18:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
 
     let months = ["2026-07".to_string()];
     let fresh = stale_state(&store, &months, &params())
@@ -475,9 +574,18 @@ async fn the_recalc_page_walks_drivers_from_postgres() {
         punch("2026-07-23 08:00:00", "始業"),
         punch("2026-07-23 18:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
 
     let none = std::collections::BTreeSet::new();
     let all = recalc_driver_page(&store, "2026-07", &params(), &none, None, false, 50)
@@ -531,9 +639,16 @@ async fn the_recalc_page_pulls_in_rest_only_drivers_via_extra() {
         rest_of(REST_ONLY, "2026-07-01 16:19:00", "2026-07-02 04:42:00"),
         rest_of(REST_ONLY, "2026-07-02 16:18:00", "2026-07-03 06:01:00"),
     ]);
-    let units = fold_month(&repo, &params(), "2026-07", None, None)
-        .await
-        .expect("fold_month");
+    let units = fold_month(
+        &repo,
+        &params(),
+        "2026-07",
+        None,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("fold_month");
     assert!(
         units.iter().any(|(cd, _, _)| *cd == REST_ONLY),
         "前提: rest-only 乗務員は fold_month の split_by_driver には出る"
@@ -584,26 +699,50 @@ async fn recalc_drivers_only_touches_the_named_ones() {
         punch("2026-07-24 18:00:00", "終業"),
     ]);
 
-    let none = recalc_drivers(&repo, &store, &params(), "2026-07", &[], true)
-        .await
-        .expect("empty");
+    let none = recalc_drivers(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("empty");
     assert_eq!(none.drivers, 0);
     assert_eq!(shift_count(&pool, store.tenant_id()).await, 0);
     assert_eq!(none.logic_version.len(), 16, "版は空でも載せる");
     assert!(!none.calculated_at.is_empty(), "計算時刻も載せる");
 
-    let one = recalc_drivers(&repo, &store, &params(), "2026-07", &[DRIVER], true)
-        .await
-        .expect("one");
+    let one = recalc_drivers(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[DRIVER],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("one");
     assert_eq!(one.drivers, 1);
     assert_eq!(one.drivers_written, 1);
     assert!(!one.dry_run);
     assert_eq!(shift_count(&pool, store.tenant_id()).await, 1);
 
     // 2 回目は指紋一致で据え置き (#205 テスト計画「2 回連続で 2 回目差分ゼロ」)
-    let twice = recalc_drivers(&repo, &store, &params(), "2026-07", &[DRIVER], true)
-        .await
-        .expect("twice");
+    let twice = recalc_drivers(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[DRIVER],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("twice");
     assert_eq!(twice.drivers_written, 0, "2 回目は 1 行も書かない");
     assert_eq!(twice.drivers_unchanged, 1);
 }
@@ -812,9 +951,17 @@ async fn recalc_drivers_dry_run_writes_nothing_and_says_so() {
         punch("2026-07-25 08:00:00", "始業"),
         punch("2026-07-25 18:00:00", "終業"),
     ]);
-    let r = recalc_drivers(&repo, &store, &params(), "2026-07", &[DRIVER], false)
-        .await
-        .expect("dry");
+    let r = recalc_drivers(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[DRIVER],
+        false,
+        &mut Default::default(),
+    )
+    .await
+    .expect("dry");
     assert!(r.dry_run, "件数を実績と読み違えさせない");
     assert_eq!(r.drivers_written, 1, "書く対象としては数える");
     assert_eq!(
@@ -832,9 +979,18 @@ async fn recalc_dry_run_writes_nothing() {
         punch("2026-07-16 08:00:00", "始業"),
         punch("2026-07-16 18:00:00", "終業"),
     ]);
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, false, None)
-        .await
-        .expect("dry run");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        false,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("dry run");
     assert_eq!(r.drivers_written, 1, "書く対象としては数える");
     assert_eq!(
         shift_count(&pool, store.tenant_id()).await,
@@ -852,9 +1008,18 @@ async fn changing_the_input_rewrites_the_folded_rows() {
         punch("2026-07-18 18:00:00", "終業"),
     ]));
     let repo: DynKintaiEventsRepo = stub.clone();
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("1st");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("1st");
     let before: i32 = sqlx::query_scalar(
         "SELECT restraint_minutes FROM kintai.day_summaries WHERE tenant_id = $1",
     )
@@ -868,9 +1033,18 @@ async fn changing_the_input_rewrites_the_folded_rows() {
         punch("2026-07-18 08:00:00", "始業"),
         punch("2026-07-18 19:00:00", "終業"),
     ];
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("2nd");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("2nd");
     let after: i32 = sqlx::query_scalar(
         "SELECT restraint_minutes FROM kintai.day_summaries WHERE tenant_id = $1",
     )
@@ -911,9 +1085,18 @@ async fn non_working_is_stored_per_shift_and_replaced_by_a_refold() {
         punch("2026-07-19 18:00:00", "終業"),
     ]));
     let repo: DynKintaiEventsRepo = stub.clone();
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("1st");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("1st");
     let want = vec![Some(lunch("2026-07-18 13:00:00")), Some(json!([]))];
     assert_eq!(non_working().await, want);
 
@@ -924,9 +1107,18 @@ async fn non_working_is_stored_per_shift_and_replaced_by_a_refold() {
         punch("2026-07-19 14:00:00", "始業"),
         punch("2026-07-19 18:00:00", "終業"),
     ];
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("2nd");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("2nd");
     let want = vec![Some(lunch("2026-07-18 12:30:00")), Some(json!([]))];
     assert_eq!(non_working().await, want);
 }
@@ -941,9 +1133,18 @@ async fn deleting_a_shift_cascades_to_the_derived_rows() {
         punch("2026-07-20 22:00:00", "始業"),
         punch("2026-07-21 09:00:00", "終業"),
     ]);
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM kintai.day_parts WHERE tenant_id = $1")
         .bind(store.tenant_id())
         .fetch_one(&pool)
@@ -990,9 +1191,18 @@ async fn the_unnest_write_matches_the_folded_unit_column_by_column() {
         rows.push(punch(&format!("2026-07-{d:02} 18:{:02}:00", d), "終業"));
     }
     let repo = repo(rows.clone());
-    let r = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc");
     assert_eq!(r.shifts, 28);
 
     // 畳んだ結果そのもの。DB に入った姿と 1 列ずつ比べる
@@ -1054,9 +1264,18 @@ async fn the_unnest_write_matches_the_folded_unit_column_by_column() {
     assert!(distinct > 1, "全日同じ値では取り違えを検知できない");
 
     // 2 回目は指紋が一致して 1 行も書かない
-    let again = recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("2nd");
+    let again = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("2nd");
     assert_eq!(again.drivers_written, 0, "unnest 化しても据え置きになる");
     assert_eq!(again.drivers_unchanged, 1);
     assert!(!again.wrote_anything());
@@ -1164,6 +1383,7 @@ async fn a_driver_with_nothing_to_fold_is_not_counted_as_written() {
             Some(DRIVER),
             true,
             None,
+            &mut Default::default(),
         )
         .await
         .expect(pass);
@@ -1194,6 +1414,7 @@ async fn an_emptied_month_still_clears_the_stored_rows() {
         Some(DRIVER),
         true,
         None,
+        &mut Default::default(),
     )
     .await
     .expect("1st");
@@ -1209,6 +1430,7 @@ async fn an_emptied_month_still_clears_the_stored_rows() {
         Some(DRIVER),
         true,
         None,
+        &mut Default::default(),
     )
     .await
     .expect("2nd");
@@ -1233,7 +1455,7 @@ async fn sync_pushes_and_folds_in_one_pass() {
         driver: None,
         apply: true,
     };
-    let r = sync_month(&repo, &store, &params(), &opts)
+    let r = sync_month(&repo, &store, &params(), &opts, &mut Default::default())
         .await
         .expect("sync");
     assert_eq!(r.push.days_changed, 1);
@@ -1251,7 +1473,7 @@ async fn sync_pushes_and_folds_in_one_pass() {
     assert_eq!(shift_count(&pool, store.tenant_id()).await, 1);
 
     // 2 回目は両方とも据え置き
-    let again = sync_month(&repo, &store, &params(), &opts)
+    let again = sync_month(&repo, &store, &params(), &opts, &mut Default::default())
         .await
         .expect("2nd");
     assert!(!again.push.wrote_anything());
@@ -1271,7 +1493,7 @@ async fn sync_dry_run_writes_to_neither_layer() {
         driver: None,
         apply: false,
     };
-    sync_month(&repo, &store, &params(), &opts)
+    sync_month(&repo, &store, &params(), &opts, &mut Default::default())
         .await
         .expect("sync");
     let events: i64 =
@@ -1303,6 +1525,7 @@ async fn driver_filter_touches_only_that_driver() {
         Some(DRIVER),
         true,
         None,
+        &mut Default::default(),
     )
     .await
     .expect("recalc");
@@ -1442,9 +1665,8 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
         &digest("v1"),
     );
 
-    // gate を書くのは `warnings_seen() == Some(false)` のときだけなので、
-    // `main.rs` と同じく `with_warning_sink` の内側で呼ぶ (Refs #205-17)
-    let first = with_warning_sink(recalc_month(
+    // gate を書くのは束に封を止める warning が無いときだけ (Refs #205-17)
+    let first = recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1452,9 +1674,9 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut Default::default(),
+    )
     .await
-    .0
     .expect("1st");
     assert_eq!(
         first.drivers_written, 1,
@@ -1468,9 +1690,18 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
     );
 
     // 同じ digest で 2 回目 — gate が刺さり、fold_month の読みが増えない
-    let second = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("2nd");
+    let second = recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("2nd");
     assert_eq!(
         repo.read_calls(),
         1,
@@ -1481,7 +1712,7 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
 
     // dtako 側が変わった (alc の etag が変化) — gate が外れて読み直す
     repo.set_digest(&digest("v2"));
-    let third = with_warning_sink(recalc_month(
+    let third = recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1489,9 +1720,9 @@ async fn month_gate_skips_the_read_when_the_input_is_unchanged() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut Default::default(),
+    )
     .await
-    .0
     .expect("3rd");
     assert_eq!(repo.read_calls(), 2, "digest が変われば読み直す");
     assert_eq!(
@@ -1521,9 +1752,18 @@ async fn month_gate_is_not_written_on_a_dry_run() {
         ],
         &digest("dry"),
     );
-    recalc_month(&dyn_repo, &store, &params(), "2026-07", None, false, None)
-        .await
-        .expect("dry-run");
+    recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        false,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("dry-run");
     assert_eq!(
         repo.read_calls(),
         1,
@@ -1554,8 +1794,8 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     );
 
     // recalc_month (driver 省略) だけが gate を書ける。ここで最初の gate を立てる
-    // (gate を書くのは Some(false) のときだけなので with_warning_sink で包む)
-    with_warning_sink(recalc_month(
+    // (gate を書くのは束に封を止める warning が無いときだけ)
+    recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1563,9 +1803,9 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut Default::default(),
+    )
     .await
-    .0
     .expect("establish gate");
     assert_eq!(repo.read_calls(), 1);
     assert_eq!(
@@ -1574,9 +1814,17 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     );
 
     // 同じ digest のまま recalc_drivers — gate が刺さり、読みを増やさず即返る
-    let hit = recalc_drivers(&dyn_repo, &store, &params(), "2026-07", &[DRIVER], true)
-        .await
-        .expect("recalc_drivers hit");
+    let hit = recalc_drivers(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[DRIVER],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc_drivers hit");
     assert_eq!(repo.read_calls(), 1, "gate 一致で fold_month を呼ばない");
     assert_eq!(hit.drivers, 1);
     assert_eq!(hit.drivers_unchanged, 1);
@@ -1585,9 +1833,17 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     // dtako 側が変わった状態で recalc_drivers — gate は外れて読み直すが、
     // **書くのは recalc_month だけ**なので gate 自体は "a" のまま動かない
     repo.set_digest(&digest("b"));
-    let miss = recalc_drivers(&dyn_repo, &store, &params(), "2026-07", &[DRIVER], true)
-        .await
-        .expect("recalc_drivers miss");
+    let miss = recalc_drivers(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[DRIVER],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("recalc_drivers miss");
     assert_eq!(
         repo.read_calls(),
         2,
@@ -1601,7 +1857,7 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
     );
 
     // recalc_month が改めて全量を通れば、そのときだけ gate が新しい digest に動く
-    with_warning_sink(recalc_month(
+    recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1609,9 +1865,9 @@ async fn recalc_drivers_reads_the_gate_but_never_writes_it() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut Default::default(),
+    )
     .await
-    .0
     .expect("recalc_month catches up");
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
@@ -1641,6 +1897,7 @@ async fn month_gate_is_skipped_when_a_single_driver_is_named() {
         Some(DRIVER),
         true,
         None,
+        &mut Default::default(),
     )
     .await
     .expect("single-driver recalc");
@@ -1660,6 +1917,7 @@ async fn month_gate_is_skipped_when_a_single_driver_is_named() {
         Some(DRIVER),
         true,
         None,
+        &mut Default::default(),
     )
     .await
     .expect("single-driver recalc again");
@@ -1683,9 +1941,16 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
     );
 
     // gate がまだ無い — Miss (「判定できない」ではなく「一致しない」= 通常どおり進め)
-    let first = month_gate_report(&dyn_repo, &store, &params(), "2026-07", true)
-        .await
-        .expect("no gate yet");
+    let first = month_gate_report(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("no gate yet");
     assert!(matches!(first, MonthGate::Miss { .. }));
     assert_eq!(
         repo.read_calls(),
@@ -1694,7 +1959,7 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
     );
 
     // recalc_month (driver 省略) だけが gate を書ける
-    with_warning_sink(recalc_month(
+    recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1702,16 +1967,23 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut Default::default(),
+    )
     .await
-    .0
     .expect("establish gate");
     assert_eq!(repo.read_calls(), 1);
 
     // 同じ digest — 刺さる。fold_month はやはり呼ばれない
-    let hit = month_gate_report(&dyn_repo, &store, &params(), "2026-07", true)
-        .await
-        .expect("hit");
+    let hit = month_gate_report(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("hit");
     match hit {
         MonthGate::Hit(report) => assert!(!report.wrote_anything()),
         other => panic!("gate should hit, got {other:?}"),
@@ -1720,9 +1992,16 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
 
     // dtako 側が変わった — 外れる
     repo.set_digest(&digest("report-v2"));
-    let miss = month_gate_report(&dyn_repo, &store, &params(), "2026-07", true)
-        .await
-        .expect("miss");
+    let miss = month_gate_report(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("miss");
     assert!(
         matches!(miss, MonthGate::Miss { .. }),
         "digest が変われば Miss (呼び出し側が通常どおり読みに進む)"
@@ -1735,10 +2014,11 @@ async fn month_gate_report_mirrors_recalc_month_hit_and_miss() {
 // `routes::kintai_recalc::run` は #242 で「上流 warnings が空」を書く条件の
 // 1 つに入れたが、`recalc_month` (CLI の Recalc / Sync 経由) は取り残されていた
 // — R2 の分割遅れ中に欠けた入力を「最新」と刻む同じリスクがある。
-// `recalc_month` は `main.rs` で `with_warning_sink` に包まれて呼ばれる前提
-// なので、`kintai_http_repo::warnings_seen()` を覗いて判断する。
+// `recalc_month` は呼び出し側が渡す束 (`FoldSink`) に封を止める warning が積まれたかで判断する
+// (Refs #322 で task-local の `warnings_seen()` から値渡しに変えた)。束ぜんたいを見るので、
+// 月ゲートの判定 (etags) で立っても畳みの読みで立っても止まり、診断専用だけなら止まらない。
 
-/// **書く: 収集器の中で warnings ゼロなら gate が立ち、2 回目は gate hit になる。**
+/// **書く: 束に warnings が無ければ gate が立ち、2 回目は gate hit になる。**
 #[tokio::test]
 async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
     let (store, pool) = require_db!();
@@ -1750,7 +2030,8 @@ async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
         &digest("no-warnings"),
     );
 
-    let (first, warnings) = with_warning_sink(recalc_month(
+    let mut sink = FoldSink::default();
+    let first = recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1758,9 +2039,10 @@ async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut sink,
+    )
     .await;
-    assert!(warnings.is_empty(), "GatedRepo は warnings を出さない");
+    assert!(sink.warnings.is_empty(), "GatedRepo は warnings を出さない");
     assert_eq!(first.expect("1st").drivers_written, 1);
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
@@ -1769,7 +2051,7 @@ async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
     );
 
     // gate が立っているので 2 回目は fold_month を呼ばずに hit する
-    with_warning_sink(recalc_month(
+    recalc_month(
         &dyn_repo,
         &store,
         &params(),
@@ -1777,14 +2059,14 @@ async fn recalc_month_writes_the_gate_when_warnings_are_confirmed_empty() {
         None,
         true,
         Some(fixed_today()),
-    ))
+        &mut Default::default(),
+    )
     .await
-    .0
     .expect("2nd");
     assert_eq!(repo.read_calls(), 1, "gate hit で読みが増えない");
 }
 
-/// **書かない: 収集器の中でも warnings があれば gate は空のまま。**
+/// **書かない: 呼び出し側が先に積んだ封を止める warning があれば gate は空のまま。**
 #[tokio::test]
 async fn recalc_month_does_not_write_the_gate_when_warnings_are_present() {
     let (store, pool) = require_db!();
@@ -1796,12 +2078,21 @@ async fn recalc_month_does_not_write_the_gate_when_warnings_are_present() {
         &digest("with-warnings"),
     );
 
-    let (r, warnings) = with_warning_sink(async {
-        rust_ichibanboshi::kintai_http_repo::record_warning_for_test("NoSuchKey: U1/KUDGIVT.csv");
-        recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true, None).await
-    })
+    let mut sink = FoldSink::default();
+    sink.warnings
+        .push(Warning::blocking("NoSuchKey: U1/KUDGIVT.csv"));
+    let r = recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut sink,
+    )
     .await;
-    assert!(!warnings.is_empty());
+    assert!(!sink.warnings.is_empty());
     assert_eq!(r.expect("recalc").drivers_written, 1, "書くこと自体は行う");
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
@@ -1810,28 +2101,110 @@ async fn recalc_month_does_not_write_the_gate_when_warnings_are_present() {
     );
 }
 
-/// **書かない: 収集器の外 (`with_warning_sink` に包まれていない) では判断できない
-/// ので gate を書かない。**「無い」と「分からない」を混同しないための分岐。
+/// **書かない: 月ゲートの判定 (etags) で封を止める warning が立った** (CLI 経路)。
 #[tokio::test]
-async fn recalc_month_does_not_write_the_gate_outside_the_warning_sink() {
+async fn recalc_month_does_not_write_the_gate_when_the_digest_saw_missing_input() {
     let (store, pool) = require_db!();
-    let (_repo, dyn_repo) = gated(
-        vec![
-            punch("2026-07-21 08:00:00", "始業"),
-            punch("2026-07-21 18:00:00", "終業"),
-        ],
-        &digest("no-sink"),
-    );
-
-    // with_warning_sink に包まずそのまま呼ぶ — main.rs の呼び方から外れた形
-    let r = recalc_month(&dyn_repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("recalc");
+    let dyn_repo: DynKintaiEventsRepo = std::sync::Arc::new(DigestWarningRepo {
+        inner: GatedRepo::new(
+            vec![
+                punch("2026-07-21 08:00:00", "始業"),
+                punch("2026-07-21 18:00:00", "終業"),
+            ],
+            &digest("cli-digest-warnings"),
+        ),
+    });
+    let mut sink = FoldSink::default();
+    let r = recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        Some(fixed_today()),
+        &mut sink,
+    )
+    .await
+    .expect("recalc");
     assert_eq!(r.drivers_written, 1, "書くこと自体は行う");
+    assert!(sink.warnings.blocks_seal(), "{:?}", sink.warnings);
     assert_eq!(
         stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
         None,
-        "収集器の外では判断がつかないので gate を書かない"
+        "月ゲートの判定で立った warning でも封をしない"
+    );
+}
+
+/// **書かない: 畳みの読みで封を止める warning が立った** (CLI 経路)。
+#[tokio::test]
+async fn recalc_month_does_not_write_the_gate_when_the_fold_read_saw_missing_input() {
+    let (store, pool) = require_db!();
+    let dyn_repo: DynKintaiEventsRepo = std::sync::Arc::new(WarningRepo {
+        inner: GatedRepo::new(
+            vec![
+                punch("2026-07-22 08:00:00", "始業"),
+                punch("2026-07-22 18:00:00", "終業"),
+            ],
+            &digest("cli-fold-warnings"),
+        ),
+    });
+    let mut sink = FoldSink::default();
+    let r = recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        Some(fixed_today()),
+        &mut sink,
+    )
+    .await
+    .expect("recalc");
+    assert_eq!(r.drivers_written, 1, "書くこと自体は行う");
+    assert!(sink.warnings.blocks_seal(), "{:?}", sink.warnings);
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        None,
+        "畳みの読みで立った warning でも封をしない"
+    );
+}
+
+/// **書く: 診断専用 (tail gap・読み窓の遡り) だけなら封は止めない** (Refs #205-51)。
+#[tokio::test]
+async fn recalc_month_writes_the_gate_when_only_diagnostic_warnings_are_present() {
+    let (store, pool) = require_db!();
+    let (_repo, dyn_repo) = gated(
+        vec![
+            punch("2026-07-23 08:00:00", "始業"),
+            punch("2026-07-23 18:00:00", "終業"),
+        ],
+        &digest("diagnostic-only"),
+    );
+    let mut sink = FoldSink::default();
+    sink.warnings
+        .push(Warning::diagnostic("dtako 末尾ギャップ (診断)"));
+    recalc_month(
+        &dyn_repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        Some(fixed_today()),
+        &mut sink,
+    )
+    .await
+    .expect("recalc");
+    assert_eq!(
+        sink.warnings.texts(),
+        vec!["dtako 末尾ギャップ (診断)".to_string()]
+    );
+    assert_eq!(
+        stored_gate_digest(&pool, store.tenant_id(), "2026-07").await,
+        Some(digest("diagnostic-only")),
+        "診断専用だけなら gate を書く"
     );
 }
 
@@ -2039,10 +2412,17 @@ impl KintaiEventsApi for WarningRepo {
         from: &str,
         to: &str,
     ) -> Result<Vec<serde_json::Value>, KintaiRepoError> {
-        // 上流 warnings を模す — 実物 (HttpKintaiEventsRepo) は R2 の分割遅れ中に
-        // これを task-local sink 経由で呼び出し側へ運ぶ
-        rust_ichibanboshi::kintai_http_repo::record_warning_for_test("NoSuchKey: U1/KUDGIVT.csv");
         self.inner.fetch_all_events_between(from, to).await
+    }
+    async fn fetch_all_events_with_warnings(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), KintaiRepoError> {
+        // 上流 warnings を模す — 実物 (HttpKintaiEventsRepo) は R2 の分割遅れ中に
+        // これを戻り値で呼び出し側へ運ぶ
+        let rows = self.inner.fetch_all_events_between(from, to).await?;
+        Ok((rows, vec![Warning::blocking("NoSuchKey: U1/KUDGIVT.csv")]))
     }
     async fn fetch_ferry_between(
         &self,
@@ -2088,7 +2468,7 @@ async fn http_recalc_does_not_write_the_gate_when_upstream_warnings_are_non_empt
 
 // ── #205 の 21: 指紋を取ったときの warning が gate を止めること ───────────
 //
-// `routes::kintai_recalc::run` は `fold_month` だけを `with_warning_sink` に入れて
+// `routes::kintai_recalc::run` は `fold_month` だけを warnings の収集器に入れて
 // いた。入力の欠けを最初に見るのは指紋側 (`fetch_dtako_month_digest` →
 // `fetch_etags`) なので、そこが立てた warning は sink の外で黙って捨てられ、
 // 5 条件の `warnings.is_empty()` が素通りしていた。ここで固定するのはその穴。
@@ -2127,9 +2507,20 @@ impl KintaiEventsApi for DigestWarningRepo {
         &self,
         month: &str,
     ) -> Result<Option<String>, KintaiRepoError> {
-        // 実物 (HttpKintaiEventsRepo) が etags の一覧から入力の欠けを見つけた形
-        rust_ichibanboshi::kintai_http_repo::record_warning_for_test("dtako 入力欠け: 運行が …");
         self.inner.fetch_dtako_month_digest(month).await
+    }
+    async fn fetch_dtako_month_read_since(
+        &self,
+        month: &str,
+        _since: Option<NaiveDate>,
+    ) -> Result<rust_ichibanboshi::kintai_http_repo::DtakoMonthRead, KintaiRepoError> {
+        // 実物 (HttpKintaiEventsRepo) が etags の一覧から入力の欠けを見つけた形
+        let mut read = rust_ichibanboshi::kintai_http_repo::DtakoMonthRead::digest_only(
+            self.inner.fetch_dtako_month_digest(month).await?,
+        );
+        read.warnings
+            .push(Warning::blocking("dtako 入力欠け: 運行が …"));
+        Ok(read)
     }
 }
 
@@ -2191,9 +2582,18 @@ async fn stored_states_matches_stored_state_driver_by_driver() {
     let (store, _pool) = require_db!();
     let saved = [1101_u64, 1102, 1103];
     let repo = repo(punches_for(&saved));
-    recalc_month(&repo, &store, &params(), "2026-07", None, true, None)
-        .await
-        .expect("fold");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("fold");
 
     // 空: 1 往復もせず空の map
     assert!(
@@ -2241,18 +2641,34 @@ async fn a_driver_with_no_stored_rows_still_gets_folded_in_a_batch() {
     let (store, pool) = require_db!();
     // 1104 は打刻あり、1105 は打刻ゼロ (畳んでも書くものが無い)
     let repo = repo(punches_for(&[1104]));
-    let r = recalc_drivers(&repo, &store, &params(), "2026-07", &[1104, 1105], true)
-        .await
-        .expect("fold");
+    let r = recalc_drivers(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[1104, 1105],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("fold");
     assert_eq!(r.drivers, 2, "2 名とも数える");
     assert_eq!(r.drivers_written, 1, "書くものがあるのは 1104 だけ");
     assert_eq!(shift_count(&pool, store.tenant_id()).await, 1);
 
     // 2 回目は 2 名とも据え置き — 打刻ゼロの 1105 が毎回 stale に見えると
     // `wrote_anything` が誤検知し続ける (StoredState::is_current の「空 = 空」)
-    let again = recalc_drivers(&repo, &store, &params(), "2026-07", &[1104, 1105], true)
-        .await
-        .expect("again");
+    let again = recalc_drivers(
+        &repo,
+        &store,
+        &params(),
+        "2026-07",
+        &[1104, 1105],
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("again");
     assert_eq!(again.drivers_written, 0, "2 回目は 1 行も書かない");
     assert_eq!(again.drivers_unchanged, 2);
 }
@@ -2346,9 +2762,17 @@ async fn the_stored_state_read_is_one_query_however_many_drivers() {
 
     async fn count_reads(store: &KintaiPgStore, drivers: &[u64]) -> usize {
         let repo = repo(punches_for(drivers));
-        recalc_drivers(&repo, store, &params(), "2026-07", drivers, true)
-            .await
-            .expect("fold");
+        recalc_drivers(
+            &repo,
+            store,
+            &params(),
+            "2026-07",
+            drivers,
+            true,
+            &mut Default::default(),
+        )
+        .await
+        .expect("fold");
         take_reads()
     }
 
@@ -2548,9 +2972,17 @@ async fn refolding_april_removes_the_shifts_restarted_from_march_31() {
 
     // 修正前の窓 (起点なし) で畳んで保存した状態 = 本番で重なっていた 2 本
     let empty = Default::default();
-    let old = fold_month_with_anchors(&repo, &params(), "2026-04", None, None, &empty)
-        .await
-        .expect("old fold");
+    let old = fold_month_with_anchors(
+        &repo,
+        &params(),
+        "2026-04",
+        None,
+        None,
+        &empty,
+        &mut Default::default(),
+    )
+    .await
+    .expect("old fold");
     recalc_drivers_from_units(&store, &params(), "2026-04", &[DRIVER], old, true)
         .await
         .expect("store old");
@@ -2560,17 +2992,35 @@ async fn refolding_april_removes_the_shifts_restarted_from_march_31() {
     );
 
     // 畳み直し — 4 月には 1194 の勤務が 1 本も残らない
-    let r = recalc_month(&repo, &store, &params(), "2026-04", None, true, None)
-        .await
-        .expect("april");
+    let r = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-04",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("april");
     assert_eq!(r.drivers_written, 1, "余分な 2 本を消す書き込み");
     assert!(dates_in(&pool, t, "shifts", "date_start").await.is_empty());
     assert!(dates_in(&pool, t, "day_summaries", "date").await.is_empty());
 
     // 3 月は 3/31 始業の 1 本、暦日は 3/31 と 4/1
-    recalc_month(&repo, &store, &params(), "2026-03", None, true, None)
-        .await
-        .expect("march");
+    recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-03",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("march");
     let march31 = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
     assert_eq!(
         dates_in(&pool, t, "shifts", "date_start").await,
@@ -2582,9 +3032,18 @@ async fn refolding_april_removes_the_shifts_restarted_from_march_31() {
     );
 
     // 2 回目は何も書かない (指紋が安定している)
-    let again = recalc_month(&repo, &store, &params(), "2026-04", None, true, None)
-        .await
-        .expect("april again");
+    let again = recalc_month(
+        &repo,
+        &store,
+        &params(),
+        "2026-04",
+        None,
+        true,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("april again");
     assert_eq!(again.drivers_written, 0);
     assert!(!again.wrote_anything());
 }
@@ -2607,9 +3066,16 @@ async fn the_month_gate_looks_back_to_the_same_anchor() {
     let gate = |repo: DynKintaiEventsRepo| {
         let store = &store;
         async move {
-            month_gate_report(&repo, store, &params(), "2026-04", true)
-                .await
-                .expect("gate")
+            month_gate_report(
+                &repo,
+                store,
+                &params(),
+                "2026-04",
+                true,
+                &mut Default::default(),
+            )
+            .await
+            .expect("gate")
         }
     };
     let insert = |at: &'static str, state: &'static str| {
@@ -2653,9 +3119,16 @@ async fn the_month_gate_looks_back_to_the_same_anchor() {
     let anchors = rust_ichibanboshi::kintai_fold::month_anchors(&repo, "2026-04")
         .await
         .expect("anchors");
-    let direct =
-        month_gate_report_with_anchors(&repo, &store, &params(), "2026-04", true, &anchors)
-            .await
-            .expect("direct");
+    let direct = month_gate_report_with_anchors(
+        &repo,
+        &store,
+        &params(),
+        "2026-04",
+        true,
+        &anchors,
+        &mut Default::default(),
+    )
+    .await
+    .expect("direct");
     assert_eq!(punch_digest(direct), with_after);
 }

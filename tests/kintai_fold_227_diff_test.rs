@@ -262,9 +262,16 @@ async fn http_repo_and_onprem_repo_fold_to_the_same_rows() {
     let onprem: DynKintaiEventsRepo = Arc::new(OnpremStub {
         rows: onprem_rows(),
     });
-    let onprem_units = fold_month(&onprem, &params, MONTH, Some(DRIVER), None)
-        .await
-        .expect("onprem fold");
+    let onprem_units = fold_month(
+        &onprem,
+        &params,
+        MONTH,
+        Some(DRIVER),
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("onprem fold");
 
     // GCP 形: push 経路が実際に運ぶ行 (#227 で休息を落とした残り) だけを
     // kintai.kintai_events へ書き、HttpKintaiEventsRepo の fallback として読む
@@ -287,9 +294,16 @@ async fn http_repo_and_onprem_repo_fold_to_the_same_rows() {
     ));
     let gcp = HttpKintaiEventsRepo::new(&http_cfg(&server.uri()), Some(fallback)).unwrap();
     let gcp: DynKintaiEventsRepo = Arc::new(gcp);
-    let gcp_units = fold_month(&gcp, &params, MONTH, Some(DRIVER), None)
-        .await
-        .expect("gcp fold");
+    let gcp_units = fold_month(
+        &gcp,
+        &params,
+        MONTH,
+        Some(DRIVER),
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .expect("gcp fold");
 
     assert_eq!(onprem_units.len(), 1);
     assert_eq!(gcp_units.len(), 1);
