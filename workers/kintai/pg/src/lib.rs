@@ -14,6 +14,10 @@
 //!   他テナントに触れない唯一の担保。SQL は全部 `kintai.` で修飾済み (kit は `search_path = alc_api` にする)
 //! - 型なしの `ANY($5)` は SQL を書き換えず、`Type::TEXT_ARRAY` を渡して型を決める
 
+mod fold_store;
+
+pub use fold_store::{FoldStore, FoldStoreError};
+
 use std::collections::BTreeMap;
 
 use alc_worker_db::{PgClient, TenantTx, TxOutput};

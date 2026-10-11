@@ -64,23 +64,8 @@ pub use kintai_kosoku::kintai_push::{
     NOT_CARRIED_STATES, PUSHED_SOURCES, STORED_SIGNATURES_SQL, STORED_WINDOW_SIGNATURES_SQL,
 };
 // `MONTH_OPERATIONS_SQL` (押し込み済みの運行一覧) は共有 crate に移した (勤怠 Worker の unko-gaps と同じ文、Refs #322)。
-pub use kintai_kosoku::kintai_push::MONTH_OPERATIONS_SQL;
-
-/// **押し込み済みに `unko_no` 付きの行を「一度でも」持ったことがある乗務員CD**
-/// (Refs #205 の 39)。
-///
-/// [`MONTH_OPERATIONS_SQL`] の `WHERE` から**窓だけ外した**もの。逆方向
-/// (GCP にしか無い運行) が「そもそも `time_card_dtako` に出ない乗務員」なのか
-/// 「出るはずなのに対象月だけ落ちた」のかを分けるために要る
-/// ([`kintai_kosoku::unko_diff::UnkoDiffDriverSplit`])。
-///
-/// **「一度でも」の範囲は押し込み済みのぶんだけ**で、オンプレ MariaDB の全履歴
-/// ではない。push していない月のことはこの問いでは分からない。
-pub const OPERATION_DRIVER_CDS_SQL: &str = r#"
-SELECT DISTINCT driver_cd
-  FROM kintai.kintai_events
- WHERE tenant_id = $1 AND source = ANY($2) AND unko_no IS NOT NULL AND unko_no <> ''
-"#;
+// `OPERATION_DRIVER_CDS_SQL` (unko_no 付きの行を一度でも持った乗務員CD) も同じく共有 crate に移した (勤怠 Worker の fold と同じ文)。
+pub use kintai_kosoku::kintai_push::{MONTH_OPERATIONS_SQL, OPERATION_DRIVER_CDS_SQL};
 
 // ── Postgres 側 ────────────────────────────────────────────────────────────
 
