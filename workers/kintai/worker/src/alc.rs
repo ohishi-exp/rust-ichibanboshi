@@ -33,8 +33,6 @@ extern "C" {
 #[derive(Clone, Copy)]
 enum Method {
     Etags,
-    /// fold の読みの口 (次の PR) までは誰も呼ばない
-    #[allow(dead_code)]
     Events,
 }
 
@@ -65,9 +63,7 @@ pub(crate) async fn fetch_etags(env: &Env, search: &str) -> Result<RpcResult, Fa
     call(env, Method::Etags, search).await
 }
 
-/// fold の読み (`kintai_logic::fold_events::WorkerFoldEvents`) に渡す RPC。
-/// 口 (recalc・window・stale-months) は次の PR で足すので、今は誰も作らない。
-#[allow(dead_code)]
+/// fold の読み (`kintai_logic::fold_events::WorkerFoldEvents`) に渡す RPC (recalc・timecard/window の口が使う)。
 pub(crate) struct EnvAlc<'a>(pub &'a Env);
 
 impl AlcRpc for EnvAlc<'_> {

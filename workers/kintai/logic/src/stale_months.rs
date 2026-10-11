@@ -7,7 +7,9 @@
 
 use chrono::{Datelike, NaiveDate};
 use kintai_kosoku::window::is_valid_month;
+use serde::Deserialize;
 
+use crate::common::{bad_request, parse_query, Fail};
 use crate::wage_snapshot::{add_months, month_start};
 
 /// 範囲省略時の窓の広さ (月数)。
@@ -76,6 +78,20 @@ pub fn resolve_range(
         return Err(format!("月範囲 上限{MAX_WINDOW_MONTHS}"));
     }
     Ok((from_month, add_months(to_month, 1)))
+}
+
+/// `?from=YYYY-MM&to=YYYY-MM` (勤怠 Worker。root の `StaleMonthsQuery` から「今日」の上書きを除いたもの)。
+#[derive(Debug, Default, Deserialize)]
+pub struct StaleMonthsQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// 勤怠 Worker の `GET /api/kintai/stale-months` のクエリを `[lo, hi)` に (root と同じ順: Query → 範囲。どちらも 400)。
+/// `today` は Worker の時計から作った JST の日付。
+pub fn parse(query: &str, today: NaiveDate) -> Result<(NaiveDate, NaiveDate), Fail> {
+    let q: StaleMonthsQuery = parse_query(query)?;
+    resolve_range(q.from.as_deref(), q.to.as_deref(), today).map_err(bad_request)
 }
 
 /// [`STALE_MONTHS_SQL`] の 1 行。

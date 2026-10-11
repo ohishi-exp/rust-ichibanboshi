@@ -178,6 +178,11 @@ mkdir -p "$tmp/src-restraint-only"
 echo 'fn r() { let _ = Route::Restraint(x); }' >"$tmp/src-restraint-only/lib.rs"
 KINTAI_WORKER_SRC="$tmp/src-restraint-only" expect 1 "(h) 拘束サマリの口だけでも KINTAI_WRITE_TOKEN が要る" "$tmp/no-token.toml" \
   "secrets_store_secrets の KINTAI_WRITE_TOKEN が無い"
+# (h) fold の 4 口 (Route::Fold。POST の recalc・timecard/window) も書き込みの口として数える
+mkdir -p "$tmp/src-fold-only"
+echo 'fn f() { let _ = Route::Fold(x); }' >"$tmp/src-fold-only/lib.rs"
+KINTAI_WORKER_SRC="$tmp/src-fold-only" expect 1 "(h) fold の口だけでも KINTAI_WRITE_TOKEN が要る" "$tmp/no-token.toml" \
+  "secrets_store_secrets の KINTAI_WRITE_TOKEN が無い"
 # (j) 拘束サマリの口 (worker/src の Route::Restraint) があるなら D1 の KINTAI_RESTRAINT_DB がトップレベルに要る
 mutate 1 "(j) d1_databases を消す" 'del cfg["d1_databases"]' "d1_databases の KINTAI_RESTRAINT_DB が無い"
 mutate 1 "(j) KINTAI_RESTRAINT_DB の binding 名を変える" 'cfg["d1_databases"][0]["binding"] = "OTHER_DB"' \

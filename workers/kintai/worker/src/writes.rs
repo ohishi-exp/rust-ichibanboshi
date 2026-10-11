@@ -47,7 +47,7 @@ pub(crate) async fn serve(
 }
 
 /// 本文の Content-Type とバイト列。読めない (途中で切れた等) のは axum の `Failed to buffer the request body` (400) と同じ扱い。
-async fn read_body(req: &mut Request) -> Result<(Option<String>, Vec<u8>), Fail> {
+pub(crate) async fn read_body(req: &mut Request) -> Result<(Option<String>, Vec<u8>), Fail> {
     let content_type = req.headers().get("content-type").ok().flatten();
     let body = req
         .bytes()

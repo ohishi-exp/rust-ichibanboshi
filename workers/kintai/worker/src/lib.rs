@@ -26,6 +26,9 @@
 //! - 拘束サマリ (restraint) の `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` ([`restraint`]。
 //!   オンプレ版 (SQLite) から D1 (`KINTAI_RESTRAINT_DB`) へ移した。検査・SQL・応答はオンプレ版と同じ kintai-logic の `restraint`。
 //!   **PUT は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**)。
+//! - fold の `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` ([`fold`]。
+//!   Cloud Run 版と同じ応答。段取りは共有 crate の `kintai_kosoku::route_flow`、読みは [`fold_events`]、書きは kintai-pg の
+//!   `FoldStore`。**POST の 2 本は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**。GET recalc は書かない)。
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
@@ -37,6 +40,7 @@
 mod alc;
 mod cakephp;
 mod conn;
+mod fold;
 mod fold_events;
 mod probe;
 mod reads;
@@ -81,6 +85,7 @@ const SET_STATEMENT_TIME: &str = "SET SESSION max_statement_time=60";
 const PROBE_SQL: &str = "SELECT 1, VERSION(), @@character_set_connection, CURRENT_USER()";
 
 /// version の etag に畳む「応答を形づくるコード」の版 (build.rs が workers/kintai の 4 crate の src を畳んで焼く)。
+/// fold の応答の `code_sha` (記録用) にも載せる。
 const OUTPUT_SHA: &str = env!("KINTAI_WORKER_OUTPUT_SHA");
 
 #[event(fetch)]
@@ -88,6 +93,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     let route = route(req.method().as_ref(), &req.path());
     if let Route::Restraint(r) = route {
         return restraint::serve(r, &mut req, &env).await;
+    }
+    if let Route::Fold(r) = route {
+        let query = req.url()?.query().unwrap_or("").to_string();
+        let outcome = fold::serve(r, &query, &mut req, &env);
+        return run_read(r.as_str(), outcome).await;
     }
     if let Route::Write(write) = route {
         let outcome = writes::serve(write, &mut req, &env);

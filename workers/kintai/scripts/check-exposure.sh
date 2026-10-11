@@ -14,7 +14,8 @@
 #       (`Route::Write(`) があるなら、トップレベルの secrets_store_secrets に KINTAI_WRITE_TOKEN (secret_name も同名、
 #       store_id は KINTAI_MARIADB と同じ) がある。書き込みの口は共有 secret を照合するので、binding が無いと全部 503 になる
 #       (照合の判定は kintai-logic の write_auth)。secrets_store_secrets もトップレベル以外に置かない。
-#       拘束サマリの PUT (`Route::Restraint(`) も同じ secret を照合するので、書き込みの口として数える
+#       拘束サマリの PUT (`Route::Restraint(`) と fold の 4 口 (`Route::Fold(`。POST の recalc・timecard/window) も同じ secret を
+#       照合するので、書き込みの口として数える
 #   (i) トップレベルに vpc_services の KINTAI_CAKEPHP_VPC (社内 CakePHP への HTTP の口) があり、vpc_services がトップレベル以外
 #       (env.* を含む表の奥) のどこにも無い (社内への口をトップレベルの外へ置かない)
 #   (j) Worker のソースに拘束サマリの口 (`Route::Restraint(`) があるなら、トップレベルの d1_databases に KINTAI_RESTRAINT_DB
@@ -118,7 +119,7 @@ for name in nested_hyperdrive(cfg):
 src = pathlib.Path(sys.argv[2])
 sources = [f.read_text(encoding="utf-8") for f in src.glob("*.rs")]
 has_restraint = any("Route::Restraint(" in t for t in sources)
-has_write = has_restraint or any("Route::Write(" in t for t in sources)
+has_write = has_restraint or any(("Route::Write(" in t) or ("Route::Fold(" in t) for t in sources)
 secrets = cfg.get("secrets_store_secrets") or []
 by_binding = {s.get("binding"): s for s in secrets if isinstance(s, dict)}
 if has_write:

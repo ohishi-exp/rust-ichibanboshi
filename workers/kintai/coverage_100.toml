@@ -51,6 +51,11 @@ path = "workers/kintai/logic/src/shift_overlaps.rs"
 [[files]]
 path = "workers/kintai/logic/src/stale_months.rs"
 
+# fold の 4 口 (recalc GET/POST・timecard/window・stale-months) の殻: 経路・入力の検査・失敗の写し・時計・fold の設定。
+# テストは workers/kintai/logic/tests/fold_routes.rs
+[[files]]
+path = "workers/kintai/logic/src/fold_routes.rs"
+
 [[files]]
 path = "workers/kintai/logic/src/shift_days.rs"
 
