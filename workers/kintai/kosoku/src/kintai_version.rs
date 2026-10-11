@@ -3,7 +3,7 @@
 //! オンプレ版の `kintai_version.rs` から I/O (MariaDB の往復) を除いた部分を移したもの。ソーステーブルの列挙・
 //! マーカーの形・範囲の決め方の理由はオンプレ版のモジュール docs を参照。
 //!
-//! **版 (`build`) は引数で受ける** — オンプレ版は root の `build.rs` が焼く `KINTAI_OUTPUT_SHA`、勤怠 Worker は
+//! **etag に畳むソースのハッシュ (`build`) は引数で受ける** (勤怠の版 `logic_version` とは別物) — オンプレ版は root の `build.rs` が焼く `KINTAI_OUTPUT_SHA`、勤怠 Worker は
 //! 自分の build で焼く版を渡す (出どころが違うので、ここでは `env!` しない)。
 
 use sha2::{Digest, Sha256};

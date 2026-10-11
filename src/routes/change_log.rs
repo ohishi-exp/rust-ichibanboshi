@@ -11,8 +11,8 @@
 //!
 //! ## ファイル名は `change_log.rs` で固定 (`kintai` / `kosoku` で始めない)
 //!
-//! `build.rs` の `KINTAI_OUTPUT_GLOBS` に入ると `logic_version` が変わる
-//! (`shift_overlaps.rs` / `unko_gaps.rs` と同じ分類)。
+//! `build.rs` の `KINTAI_OUTPUT_GLOBS` に入ると `/api/kintai/version` の etag が変わる
+//! (`shift_overlaps.rs` / `unko_gaps.rs` と同じ分類。勤怠の版 `logic_version` は `LOGIC_BASE` で、ファイル名では動かない)。
 //!
 //! ## テナント
 //!

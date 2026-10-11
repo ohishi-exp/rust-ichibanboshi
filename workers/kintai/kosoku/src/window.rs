@@ -121,9 +121,9 @@ pub fn unko_no_start_date(unko_no: &str) -> Option<NaiveDate> {
 /// ([`crate::window::month_head_anchors`])。日付版は 6 桁しか要らない呼び出し
 /// (短い fixture を含む) のために別に残す。
 ///
-/// `routes/dtako_day.rs` にも同じ 1 行があるが、あちらは `build.rs` の glob の外に
-/// 置くために別に持っている。fold の出力を決めるこちらを glob の外から借りると、
-/// 変えても `logic_version` が回らなくなるのでここに置く。
+/// `routes/dtako_day.rs` にも同じ 1 行があるが、あちらは `build.rs` の etag の glob の外に
+/// 置くために別に持っている。fold の出力を決めるのはこちらで、変えて出力が変わるなら
+/// `LOGIC_BASE` を上げる (上げ忘れは `tests/logic_golden.rs` が落とす)。
 pub fn unko_no_start_datetime(unko_no: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(unko_no.get(..12)?, "%y%m%d%H%M%S").ok()
 }

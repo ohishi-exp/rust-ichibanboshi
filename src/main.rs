@@ -242,8 +242,8 @@ fn print_fold(r: &rust_ichibanboshi::kintai_fold::FoldReport) {
         r.shifts, r.day_summaries, r.day_parts
     );
     println!(
-        "recalc: logic_version {} / 計算時刻 {}",
-        r.logic_version, r.calculated_at
+        "recalc: logic_version {} / code_sha {} / 計算時刻 {}",
+        r.logic_version, r.code_sha, r.calculated_at
     );
     for s in &r.skipped {
         println!("recalc: 写せなかった行 {s:?}");

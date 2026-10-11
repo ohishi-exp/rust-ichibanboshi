@@ -7,7 +7,7 @@
 //! 「引けていない」の区別・22 桁・上限) は root の module docs。
 //!
 //! [`MONTH_OPERATIONS_SQL`]・[`PUSHED_SOURCES`] と `unsplit` の型は共有 crate (`kintai_kosoku`) のものを root と同じく使う。
-//! ただし alc の etags の path・期間・応答の読み方は **root の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の中**
+//! ただし alc の etags の path・期間・応答の読み方は **root の `KINTAI_OUTPUT_SHA` (version の etag) の glob の中**
 //! (`src/kintai_http_repo.rs`) にあり root はそちらを使い続けるので、ここに置くのは**写し** (対応表は README):
 //!
 //! - [`ETAGS_PATH`]・[`etags_search`]・[`read_etags`] (root の `kintai_http_repo` の `ETAGS_PATH`・`month_etags_bounds`・

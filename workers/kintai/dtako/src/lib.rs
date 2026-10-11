@@ -4,7 +4,7 @@
 //! 勤怠 Worker が同じものを使うための共有 crate。DB も I/O も持たない。依存は serde_json・chrono・
 //! kintai-kosoku だけで、wasm32 でも build できる。
 //!
-//! **repo ルートの `build.rs` の `KINTAI_OUTPUT_SHA` (勤怠の版) には入らない** — 元の 2 ファイルが
+//! **repo ルートの `build.rs` の `KINTAI_OUTPUT_SHA` (version の etag) には入らない** — 元の 2 ファイルが
 //! glob の外 (`kintai`/`kosoku` で始まらない名前) にあったのと同じ分類。この 2 本は
 //! `/api/kintai/{daily,kosoku-daily,version}` の応答を形づくらない。
 

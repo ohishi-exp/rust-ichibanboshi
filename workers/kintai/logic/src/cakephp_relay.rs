@@ -3,7 +3,7 @@
 //!
 //! - URL・multipart・応答の型・autoload の段取りはオンプレ版と共有 ([`crate::cakephp`]・[`crate::dtako_autoload`])
 //! - daily・pdf-json の検査・`map_cakephp_err`・`with_source_meta` は root の `src/routes/kintai.rs` の**写し**
-//!   (あちらは勤怠の版の glob の中で動かせないため。対応表は `workers/kintai/README.md`。**撤去までは片方を直したらもう片方も直す**)
+//!   (あちらはversion の etag の glob の中で動かせないため。対応表は `workers/kintai/README.md`。**撤去までは片方を直したらもう片方も直す**)
 //! - **daily はキャッシュを持たない** (ユーザー決定 2026-10-10)。毎回 CakePHP を叩くので `source` は常に `live`。`refresh=1` は受けて無視する
 //! - 503 の「CakePHP base_url が未設定」は Worker では「VPC の binding が無い」([`NOT_CONFIGURED`])
 //! - autoload の待ちの打ち切り (`timeout`) は 502 だが「失敗」ではなく「不明」([`AUTOLOAD_TIMEOUT`])。取り込みは応答より前に走る

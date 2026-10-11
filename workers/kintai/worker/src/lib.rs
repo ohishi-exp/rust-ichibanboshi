@@ -18,7 +18,7 @@
 //! - 同じく社内 MariaDB を読む `GET /api/kintai/{kosoku-daily,version,timecard/drivers,timecard/events}` (オンプレ版と
 //!   同じ応答・同じ 400/502/503。検査・SQL の引数・応答は kintai-logic の `kosoku_reads`、応答を組む部分は共有 crate
 //!   kintai-kosoku)。kosoku-daily と version は 1 接続で遡り起点の 2 本 → 本体 (→ フェリー) を流す。
-//!   version の etag の版は build.rs が焼く `KINTAI_WORKER_OUTPUT_SHA` (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値)。
+//!   version の etag の版は build.rs が焼く `KINTAI_WORKER_OUTPUT_SHA` (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値。応答の `code_sha` にも載る)。
 //!
 //! - 社内 CakePHP (`yhonda-ohishi/nginx`) を Workers VPC の HTTP (`KINTAI_CAKEPHP_VPC`) で中継する `GET /api/kintai/{daily,pdf-json}`
 //!   (認可なし) と `POST /api/dtako/autoload` (書き込みの口。`preview` も照合する) ([`cakephp`]。オンプレ版と同じ応答・

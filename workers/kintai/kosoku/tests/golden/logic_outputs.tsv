@@ -1,0 +1,4 @@
+# 勤怠の版 LOGIC_BASE → 固定入力 (fold_input.json) を畳んだ出力の sha256 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# 追記のみ。行は KINTAI_GOLDEN_APPEND=1 cargo test -p kintai-kosoku --test logic_golden が足す (今の LOGIC_BASE の行が無いときだけ)。
+# 既存の行を書き換えない — 出力を変えたら workers/kintai/kosoku/src/kintai_fold.rs の LOGIC_BASE を上げる。
+f1d20fa098afb2b8	2da9aaf4658e34a8b9d66128833c3a5f8baf6896088b8eafa297fd004c341e46

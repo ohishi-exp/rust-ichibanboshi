@@ -523,7 +523,10 @@ fn version_etag_folds_the_markers_with_the_given_build() {
         etag,
         version_etag("2026-07", "abc", &KosokuParams::default(), &markers)
     );
-    assert_eq!(body, json!({"month": "2026-07", "etag": etag}));
+    assert_eq!(
+        body,
+        json!({"month": "2026-07", "etag": etag, "code_sha": "abc"})
+    );
     assert!(etag.starts_with('"') && etag.ends_with('"'));
     // 版が違えば etag も違う
     assert_ne!(version_respond("2026-07", &rows, "abd").unwrap().1, etag);

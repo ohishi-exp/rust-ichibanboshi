@@ -142,7 +142,8 @@ Service Binding を持つ Worker からだけ呼べる。実機の確認は `wra
   `kosoku`・`logic`・`mysql`・`worker` の src の全 .rs (応答を組むコードが worker の src にもあるため worker も入れる。dtako は
   kosoku-daily と無関係なので入れない)。畳み方は repo ルートの build.rs の `KINTAI_OUTPUT_SHA` と同じ関数 (`output_sha.rs` を両方が
   `include!`。どちらの glob にも入らない場所に置く)。必ず拾うファイルの一覧 (`REQUIRED`) から 1 つでも欠けたらビルドが落ちる。
-  **オンプレ版の etag とは値が違う** (対象のファイルが違う) — 呼び手を一斉に切り替えるので、切替時に relay のキャッシュが 1 回捨てられるだけ
+  **オンプレ版の etag とは値が違う** (対象のファイルが違う) — 呼び手を一斉に切り替えるので、切替時に relay のキャッシュが 1 回捨てられるだけ。
+  応答の `code_sha` はこの値そのもの (記録用。勤怠の版 `logic_version` ではない)
 - `max_drivers` は元が `usize` (64 bit) なので `u64` で受ける (wasm32 の `usize` は 32 bit で、そのまま受けると元が通す値を 400 にする)
 
 ### 持たないもの
@@ -240,7 +241,7 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
 - DB へは `alc-worker-db` (ippoan/alc-worker-kit、rev は直下の `Cargo.toml` の 1 か所) の `PgClient::tenant_tx` の中で
   `query_typed` / `query_typed_one` だけを流す (名前付き prepared statement は Hyperdrive で接続が切れる)。全 `$n` に型を付ける。
   kit の `SET_TENANT` は `search_path = alc_api` にするが、5 本の SQL は全部 `kintai.` で修飾しているのでそのまま動く
-- 移していないもの: `stale-months` (`logic_version` を Worker で同じ値に作れない)。window (`fold` 付きで畳み直す)・fold・recalc と
+- 移していないもの: `stale-months` (`logic_version` は共有 crate の `LOGIC_BASE` から作るので Worker でも同じ値になる — 移すのは fold と同じ段)。window (`fold` 付きで畳み直す)・fold・recalc と
   一緒に後の段で移す
 
 ## `GET /api/kintai/unko-gaps` — 取り込み漏れ候補の運行NO (Supabase + alc の etags)
@@ -350,13 +351,13 @@ Cloud Run 版の勤怠の再 deploy と応答の比較が要るため)。**Cloud
 | `src/kintai_repo.rs` の `fetch_timecard_driver_cds_between` の `u64` (`TIMECARD_DRIVERS_SQL` の 1 列) | `src/mariadb_rows.rs` の `timecard_driver_row` |
 | `src/kintai_repo.rs` の `fetch_timecard_window` の行 (`TIMECARD_WINDOW_SQL` の 7 列 = `row_to_json`) | `src/mariadb_rows.rs` の `event_row` (events と共有) |
 
-unko-gaps の上の 1 行は、root の `src/kintai_http_repo.rs` が勤怠の版の glob の中にあって private なための期限付きの写し。
+unko-gaps の上の 1 行は、root の `src/kintai_http_repo.rs` がversion の etag の glob の中にあって private なための期限付きの写し。
 押し込み済みの運行一覧の SQL (`MONTH_OPERATIONS_SQL`)・`PUSHED_SOURCES`・`unsplit` の型 (`UnsplitOperation`) は共有 crate
 (`kintai_kosoku`) に移し、root と Worker が同じものを使う (Refs #322、fold の I/O の流れを共有 crate に寄せた段)。unko-gaps の
 判定の核・検査・応答 (`src/unko_gaps.rs` の残り) も写しではなく共有 (root の `src/routes/unko_gaps.rs` は axum・sqlx・alc の etags の読みと
 `elapsed_ms` だけを持つ)。
 
-**root の `src/routes/kintai.rs` (勤怠の版の glob の中) は動かせない**ので、daily・pdf-json の上の 3 行はオンプレ版の撤去までの
+**root の `src/routes/kintai.rs` (version の etag の glob の中) は動かせない**ので、daily・pdf-json の上の 3 行はオンプレ版の撤去までの
 期限付きの写し。CakePHP への URL・multipart・応答の型 (`src/cakephp.rs`) と autoload の段取り・材料の SQL
 (`src/dtako_autoload.rs`) は写しではなく共有 (root の `src/cakephp.rs`・`src/routes/dtako_autoload.rs`・`src/dtako_reset_material.rs`
 は reqwest・axum・mysql_async の送受信だけを持つ)。移す前とオンプレ版が CakePHP へ送るリクエスト・autoload の応答が同じことは、
@@ -489,14 +490,18 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   HandshakeResponse41・mysql_native_password・Auth Switch) / `response.rs` (OK / ERR / EOF・COM_QUERY・テキストの結果セット) /
   `bind.rs` (名前付き引数を整数・日時・NULL・数字だけの文字列のリテラルに展開) / `retry.rs` (接続のやり直しの判断)。
   CLIENT_DEPRECATE_EOF は立てない (結果セットは EOF で区切られる形に固定)。テストは `mysql/tests/codec.rs`、100% 行カバレッジ gate は `coverage_100.toml`
+- `kosoku/` (`kintai-kosoku`): 拘束・休息の純粋ロジックと fold (**勤怠の版 `logic_version` = `sha256(LOGIC_BASE | KosokuParams)` の先頭 16 桁**)。
+  **計算結果を変えたら `src/kintai_fold.rs` の `LOGIC_BASE` を手で上げ**、`KINTAI_GOLDEN_APPEND=1 cargo test -p kintai-kosoku --test logic_golden`
+  で `tests/golden/logic_outputs.tsv` に行を足す (追記のみ。上げ忘れは golden が落とす)。コメント・移設では上げない (= 畳み直し不要)。
+  残る穴: 固定入力 `tests/golden/fold_input.json` が通らない分岐だけを変えた変更は golden で検知できない
 - `dtako/` (`kintai-dtako`): day-events と dtako/worktime の純粋部分 (`day.rs`・`worktime.rs`)。**repo ルートの package も path 依存で使う共有 crate**
-  (root の 2 つの route は handler だけ)。依存は serde_json・chrono・kintai-kosoku だけ。root の `build.rs` の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の外
-  (元の route と同じ分類。`kintai-kosoku` に入れると版が変わり、`kintai-logic` に入れると postgres-types 等が root に入るので別 crate)。100% 行カバレッジ gate は `coverage_100.toml`
+  (root の 2 つの route は handler だけ)。依存は serde_json・chrono・kintai-kosoku だけ。root の `build.rs` の `KINTAI_OUTPUT_SHA` (version の etag) の glob の外
+  (元の route と同じ分類。`kintai-kosoku` に入れると etag が変わり、`kintai-logic` に入れると postgres-types 等が root に入るので別 crate)。100% 行カバレッジ gate は `coverage_100.toml`
 - `logic/` (`kintai-logic`): Supabase を読む 6 本と社内 MariaDB を読む 10 本の口の純粋部分 (上の対応表)、Supabase への書き込みの
   部品 (変更履歴 `change_log`・賃金スナップショット `wage_write`・timecard の検査 `timecard_write`・認可 `write_auth`、本文の読み方
   `common::parse_json`)、社内 CakePHP への中継 (`cakephp`・`dtako_autoload`・`cakephp_relay`)、拘束サマリの 3 口 (`restraint` = オンプレ版と共有の検査・SQL・応答、
   `restraint_d1` = D1 の文の束・行の読み取り)、取り込み漏れ候補の `unko_gaps` (root と共有の判定の核・検査・応答と、写しの alc の etags の読み方)。**repo ルートの package も path 依存で使う** (書き込みの部品と
-  `change_log`・`wage_range`・`wage_snapshot`・`cakephp`・`dtako_autoload`・`restraint`。root の build.rs の勤怠の版の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
+  `change_log`・`wage_range`・`wage_snapshot`・`cakephp`・`dtako_autoload`・`restraint`。root の build.rs の version の etag の glob の外)。100% 行カバレッジ gate は `coverage_100.toml`
 - `worker/` (`kintai-worker`): `lib.rs` (fetch・段ごとの打ち切り時間・MariaDB の 10 本の往復。1 接続を開く `open` とクエリ 1 本の `query`) /
   `build.rs` (version の etag の版 `KINTAI_WORKER_OUTPUT_SHA`) / `conn.rs` (socket とコーデックの間) / `probe.rs` (経路・段・応答・資格情報の検証) /
   `reads.rs` (Hyperdrive への接続・テナント・`tenant_tx` の中の `query_typed`・行の詰め直し) / `writes.rs` (書き込みの口: 認可 → 本文 → `kintai-pg`。autoload は認可の後 `cakephp.rs`) /
@@ -510,7 +515,7 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
   repo ルートの package (`rust-ichibanboshi`) を持つ (比べる相手。wasm のビルドには入らない)。root を dev-dependency に持つのがここだけなので、
   拘束サマリのオンプレ版と D1 の経路の比較 (`tests/restraint_d1_parity.rs`、DB 不要) もここに置く
 
-- `output_sha.rs`: 版の畳み方 (`fold_output_sha`)。repo ルートの build.rs と `worker/build.rs` が `include!` する (crate の src の外 = どちらの版の glob にも入らない)
+- `output_sha.rs`: ソースのハッシュの畳み方 (`fold_output_sha`。version の etag と記録用の `code_sha`)。repo ルートの build.rs と `worker/build.rs` が `include!` する (crate の src の外 = どちらの glob にも入らない)
 
 独立した workspace (repo ルートの package・`workers/ichiban`・`workers/kyuyo` からは参照されない)。
 ただし repo ルートの package は `kintai-logic`・`kintai-kosoku`・`kintai-dtako` に path 依存するので、**これらの crate の依存を変えたら root の `Cargo.lock` も同じ PR で更新する** (`cargo metadata --format-version 1`。忘れると main の GCP image が `--locked` で落ちる。`worker-kintai.yml` が PR で検査する)。

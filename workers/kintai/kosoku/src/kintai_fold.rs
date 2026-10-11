@@ -3,8 +3,8 @@
 //!
 //! root の `src/kintai_fold.rs` から移した。**DB も I/O も持たない** — 3 表の行の型・`DaySummary` から行への
 //! 写し・保存済みの姿の判定・SQL 定数・bind に渡す「列ごとの Vec の束」まで。bind と transaction は root (sqlx) と
-//! 勤怠 Worker がそれぞれ持つ。指紋・`logic_version`・1 乗務員 1 か月の畳み・報告の型もここ (版の材料
-//! `output_sha` と時計は呼び出し側が渡す。`env!` は root の `build.rs` 側に残る)。
+//! 勤怠 Worker がそれぞれ持つ。指紋・`logic_version`・1 乗務員 1 か月の畳み・報告の型もここ (版の材料は
+//! 手で上げる [`LOGIC_BASE`]。時計と記録用の `code_sha` は呼び出し側が渡す)。
 //! 束の中身と SQL の文字列は移す前と同じ (`tests/pg_write_snapshot.rs` が基点の値で縛る)。
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
@@ -205,20 +205,34 @@ pub fn fold_days(driver_cd: i64, days: &[DaySummary]) -> FoldUnit {
 
 // ── 指紋・`logic_version`・畳み・報告 (Refs #322) ─────────────────────────────
 //
-// root の `src/kintai_fold.rs` から移した。版の材料 (`KINTAI_OUTPUT_SHA`) は root の `build.rs` が焼くので、
-// ここは `output_sha` を引数で受ける (`env!` を持たない)。時計 (`now`) も引数で受ける。
+// root の `src/kintai_fold.rs` から移した。時計 (`now`) と記録用の `code_sha` は引数で受ける (`env!` を持たない)。
 
 /// `logic_version` の桁数。DDL の `CHAR(16)` に合わせる。
 pub const LOGIC_VERSION_LEN: usize = 16;
 
-/// 保存行に焼く「コード + 設定」の印 (16 桁 hex) = `sha256(output_sha | KosokuParams の Debug)` の先頭 16 桁。
+/// **勤怠の計算ロジックの版。計算結果 (3 表に書く値) を変える変更をしたら、手でこの値を上げる。**
+///
+/// 値は重複しない文字列なら何でもよい (旧版と同じ値に戻さない)。`tests/logic_golden.rs` が固定入力の畳みの
+/// 出力を「この値 → 出力ハッシュ」の対応表で縛るので、上げ忘れるとそこで落ちる。上げると全乗務員・全月が
+/// stale になり畳み直しが要る (`run_kintai_recalc`)。コメント・移設・リネームなど出力を変えない変更では上げない。
+///
+/// 初期値は 560d21d まで版の材料だったソースのハッシュ (`KINTAI_OUTPUT_SHA`) の値 — 手で上げる定数に替えた
+/// 時点で保存済みの版が stale にならないよう、同じ値から始めた (Refs #322)。
+pub const LOGIC_BASE: &str = "f1d20fa098afb2b8";
+
+/// 保存行に焼く「ロジック + 設定」の印 (16 桁 hex) = `sha256(LOGIC_BASE | KosokuParams の Debug)` の先頭 16 桁。
 ///
 /// `shifts.logic_version` / `day_summaries.logic_version` (`CHAR(16)`) にそのまま入り、[`fingerprint`] の
 /// 材料の先頭でもある。**両方が同じ 1 つの定義から来る**ので「指紋は変わったのに版は据え置き」が作れない。
-/// `output_sha` 単体にしないのは、TOML で再ビルド無しに変えられる閾値・丸め方も出力を変えるため。
-pub fn logic_version(params: &KosokuParams, output_sha: &str) -> String {
+/// [`LOGIC_BASE`] 単体にしないのは、TOML で再ビルド無しに変えられる閾値・丸め方も出力を変えるため。
+/// ソースのハッシュ (`code_sha`) は材料にしない — コメント 1 文字で全員が stale になるため (記録用に応答へ載せるだけ)。
+pub fn logic_version(params: &KosokuParams) -> String {
+    version_of(LOGIC_BASE, params)
+}
+
+fn version_of(base: &str, params: &KosokuParams) -> String {
     let mut h = Sha256::new();
-    h.update(output_sha.as_bytes());
+    h.update(base.as_bytes());
     h.update(b"|");
     h.update(format!("{params:?}").as_bytes());
     format!("{:x}", h.finalize())[..LOGIC_VERSION_LEN].to_string()
@@ -230,12 +244,20 @@ pub fn fingerprint(
     month: &str,
     params: &KosokuParams,
     rows: &[serde_json::Value],
-    output_sha: &str,
+) -> String {
+    fingerprint_on(&logic_version(params), driver_cd, month, rows)
+}
+
+fn fingerprint_on(
+    version: &str,
+    driver_cd: i64,
+    month: &str,
+    rows: &[serde_json::Value],
 ) -> String {
     let mut lines: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
     lines.sort();
     let mut h = Sha256::new();
-    h.update(logic_version(params, output_sha).as_bytes());
+    h.update(version.as_bytes());
     h.update(b"|");
     h.update(format!("{driver_cd}|{month}").as_bytes());
     h.update(b"|");
@@ -249,9 +271,8 @@ pub fn fold_driver_month(
     month: &str,
     params: &KosokuParams,
     rows: Vec<serde_json::Value>,
-    output_sha: &str,
 ) -> (FoldUnit, String) {
-    let fp = fingerprint(driver_cd, month, params, &rows, output_sha);
+    let fp = fingerprint(driver_cd, month, params, &rows);
     let (rows, _duplicates) = drop_duplicate_rows(rows);
     let days = daily_summary(&rows, month, params);
     (fold_days(driver_cd, &days), fp)
@@ -280,6 +301,9 @@ pub struct FoldReport {
     /// 畳んだ値が古いままだと遅いのではなく静かに間違う — どの版で畳んだ値かを
     /// 呼び出し側が読めるようにする。
     pub logic_version: String,
+    /// 畳んだコードのソースのハッシュ (root は `build.rs` の `KINTAI_OUTPUT_SHA`)。**記録用** —
+    /// どのコードで計算したかを読めるようにするだけで、stale の判定・指紋には使わない (版は [`LOGIC_BASE`])。
+    pub code_sha: String,
     /// 畳んだ時刻 (JST, RFC 3339)。`logic_version` と対で「いつの計算か」を示す。
     pub calculated_at: String,
     /// 生イベントを読む途中で**上流が返した warnings**。
@@ -321,12 +345,13 @@ impl FoldReport {
 pub fn new_report(
     params: &KosokuParams,
     apply: bool,
-    output_sha: &str,
+    code_sha: &str,
     now: DateTime<FixedOffset>,
 ) -> FoldReport {
     FoldReport {
         dry_run: !apply,
-        logic_version: logic_version(params, output_sha),
+        logic_version: logic_version(params),
+        code_sha: code_sha.to_string(),
         calculated_at: now.to_rfc3339(),
         ..Default::default()
     }
@@ -338,7 +363,7 @@ pub fn new_report(
 /// 違うので、指紋で stale を数えると全単位を畳み直すのと同じ費用になる。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StaleReport {
-    /// いま走っているコードと設定の [`logic_version`]。
+    /// いま走っている [`LOGIC_BASE`] と設定の [`logic_version`]。
     pub logic_version: String,
     /// **これが 0 でなければ全量再計算が要る** (`POST /api/kintai/recalc`)。
     /// 対象期間に 1 行でも古い版の `day_summaries` を持つ乗務員の数。
@@ -1042,7 +1067,7 @@ mod tests {
 
     // ── 指紋・logic_version・畳み・報告 (root から移した) ──
 
-    /// 版の材料の代わりに使う固定値 (root では `build.rs` が焼く 16 桁 hex)。
+    /// 560d21d まで版の材料だったソースのハッシュの代わりに使う固定値 (移す前の root の式の検算用)。
     const SHA: &str = "0123456789abcdef";
 
     fn rows() -> Vec<serde_json::Value> {
@@ -1062,42 +1087,57 @@ mod tests {
     #[test]
     fn the_values_are_the_ones_the_root_computed_before_the_move() {
         let p = KosokuParams::default();
-        assert_eq!(logic_version(&p, SHA), "a6ae550be16b63c3");
+        let v = version_of(SHA, &p);
+        assert_eq!(v, "a6ae550be16b63c3");
         assert_eq!(
-            fingerprint(1, "2026-07", &p, &rows(), SHA),
+            fingerprint_on(&v, 1, "2026-07", &rows()),
             "9cb376c435693319a74f7d6bed7aaf710244ef448356efa970a3501192ac7180"
         );
     }
 
+    /// **[`LOGIC_BASE`] の初期値で、版は 560d21d の本番と同じ値のまま** (= この切り替えで畳み直しが要らない)。
+    ///
+    /// `1b8f00ba48e9a77b` は 2026-10-11 の本番の recalc の応答の `logic_version`。手で上げたらこのテストも
+    /// 新しい値に直す (旧値は 560d21d 時点の記録としてコメントに残す)。
     #[test]
-    fn the_logic_version_folds_the_output_sha() {
+    fn the_logic_version_is_the_one_in_production() {
+        assert_eq!(LOGIC_BASE, "f1d20fa098afb2b8");
+        assert_eq!(logic_version(&KosokuParams::default()), "1b8f00ba48e9a77b");
+    }
+
+    /// 版の材料は [`LOGIC_BASE`] と設定だけ。ソースのハッシュは引数にも無い (コメント 1 文字では動かない)。
+    #[test]
+    fn the_logic_version_folds_the_logic_base() {
         let p = KosokuParams::default();
+        assert_eq!(logic_version(&p), version_of(LOGIC_BASE, &p));
         assert_ne!(
-            logic_version(&p, SHA),
-            logic_version(&p, "fedcba9876543210")
+            version_of(LOGIC_BASE, &p),
+            version_of("fedcba9876543210", &p)
         );
     }
 
     #[test]
     fn fingerprint_is_order_independent_and_hex() {
         let p = KosokuParams::default();
-        let a = fingerprint(1, "2026-07", &p, &rows(), SHA);
+        let a = fingerprint(1, "2026-07", &p, &rows());
         let mut reversed = rows();
         reversed.reverse();
-        assert_eq!(a, fingerprint(1, "2026-07", &p, &reversed, SHA));
+        assert_eq!(a, fingerprint(1, "2026-07", &p, &reversed));
         assert_eq!(a.len(), 64);
     }
 
     #[test]
     fn fingerprint_changes_with_every_ingredient() {
         let p = KosokuParams::default();
-        let fp = |cd: i64, m: &str, p: &KosokuParams, r: &[serde_json::Value]| {
-            fingerprint(cd, m, p, r, SHA)
-        };
+        let fp = fingerprint;
         let base = fp(1, "2026-07", &p, &rows());
+        assert_eq!(
+            base,
+            fingerprint_on(&logic_version(&p), 1, "2026-07", &rows())
+        );
         assert_ne!(base, fp(2, "2026-07", &p, &rows()), "乗務員");
         assert_ne!(base, fp(1, "2026-08", &p, &rows()), "月");
-        assert_ne!(base, fingerprint(1, "2026-07", &p, &rows(), "x"), "版");
+        assert_ne!(base, fingerprint_on(SHA, 1, "2026-07", &rows()), "版");
 
         // TOML で再ビルド無しに変えられる設定 — 入れ忘れると古い集計が永久に残る
         let rounded = KosokuParams {
@@ -1129,7 +1169,7 @@ mod tests {
     /// `logic_version` は `CHAR(16)` に収まる 16 桁 hex。
     #[test]
     fn the_logic_version_fits_the_column() {
-        let v = logic_version(&KosokuParams::default(), SHA);
+        let v = logic_version(&KosokuParams::default());
         assert_eq!(v.len(), LOGIC_VERSION_LEN);
         assert!(v.chars().all(|c| c.is_ascii_hexdigit()), "{v}");
     }
@@ -1137,13 +1177,13 @@ mod tests {
     /// **TOML の閾値・丸め方を変えると `logic_version` が変わる。**
     ///
     /// #205 のテスト計画「`restraint_rounding` を切り替えると全単位が stale になる」
-    /// の本体。版の材料単体だと変わらず、`SELECT DISTINCT logic_version`
+    /// の本体。[`LOGIC_BASE`] 単体だと変わらず、`SELECT DISTINCT logic_version`
     /// で設定変更由来の stale が捕まえられない。
     #[test]
     fn the_logic_version_changes_with_the_toml_settings() {
         let base = KosokuParams::default();
-        let v = logic_version(&base, SHA);
-        // 出力コードのハッシュは同じまま — 変わっているのは設定だけ
+        let v = logic_version(&base);
+        // LOGIC_BASE は同じまま — 変わっているのは設定だけ
         for (name, changed) in [
             (
                 "丸め方",
@@ -1174,12 +1214,8 @@ mod tests {
                 },
             ),
         ] {
-            assert_ne!(v, logic_version(&changed, SHA), "{name}");
-            assert_eq!(
-                logic_version(&changed, SHA).len(),
-                LOGIC_VERSION_LEN,
-                "{name}"
-            );
+            assert_ne!(v, logic_version(&changed), "{name}");
+            assert_eq!(logic_version(&changed).len(), LOGIC_VERSION_LEN, "{name}");
         }
     }
 
@@ -1194,20 +1230,20 @@ mod tests {
             restraint_rounding: crate::kosoku::RestraintRounding::TruncateElapsed,
             ..base
         };
-        assert_ne!(logic_version(&base, SHA), logic_version(&changed, SHA));
+        assert_ne!(logic_version(&base), logic_version(&changed));
         assert_ne!(
-            fingerprint(1, "2026-07", &base, &rows(), SHA),
-            fingerprint(1, "2026-07", &changed, &rows(), SHA),
+            fingerprint(1, "2026-07", &base, &rows()),
+            fingerprint(1, "2026-07", &changed, &rows()),
         );
     }
 
     #[test]
     fn fold_driver_month_runs_the_read_path_pipeline() {
         let p = KosokuParams::default();
-        let (unit, fp) = fold_driver_month(1130, "2026-07", &p, rows(), SHA);
+        let (unit, fp) = fold_driver_month(1130, "2026-07", &p, rows());
         assert_eq!(unit.shifts.len(), 1, "始業/終業の対から勤務が 1 本");
         assert_eq!(unit.day_summaries[0].restraint_minutes, 600);
-        assert_eq!(fp, fingerprint(1130, "2026-07", &p, &rows(), SHA));
+        assert_eq!(fp, fingerprint(1130, "2026-07", &p, &rows()));
     }
 
     #[test]
@@ -1215,7 +1251,7 @@ mod tests {
         let p = KosokuParams::default();
         let mut dup = rows();
         dup.extend(rows());
-        let (unit, _) = fold_driver_month(1130, "2026-07", &p, dup, SHA);
+        let (unit, _) = fold_driver_month(1130, "2026-07", &p, dup);
         assert_eq!(unit.shifts.len(), 1, "重複しても勤務は 1 本");
     }
 
@@ -1269,7 +1305,13 @@ mod tests {
         let now = tz(ymd(2026, 7, 1).and_hms_opt(9, 30, 0).unwrap());
         let r = new_report(&p, false, SHA, now);
         assert!(r.dry_run);
-        assert_eq!(r.logic_version, logic_version(&p, SHA));
+        assert_eq!(r.logic_version, logic_version(&p));
+        // 記録用の code_sha は載るが、版には入らない
+        assert_eq!(r.code_sha, SHA);
+        assert_eq!(
+            r.logic_version,
+            new_report(&p, false, "x", now).logic_version
+        );
         assert_eq!(r.calculated_at, "2026-07-01T09:30:00+09:00");
         assert!(!new_report(&p, true, SHA, now).dry_run);
         let gate = MonthGate::Hit(r.clone());

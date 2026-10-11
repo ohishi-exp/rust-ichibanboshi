@@ -483,11 +483,11 @@ async fn changing_the_rounding_makes_every_unit_stale() {
     assert_ne!(before, after, "指紋が変わる");
 }
 
-/// **保存行の `logic_version` はコードと設定を畳んだ値。**
+/// **保存行の `logic_version` は手で上げる `LOGIC_BASE` と設定を畳んだ値。**
 ///
-/// `kosoku.rs` を 1 バイト直しても、TOML の閾値を変えても必ず変わる。
+/// `LOGIC_BASE` を上げるか TOML の閾値を変えると変わる。ソースのコメント・移設では変わらない (Refs #322)。
 #[tokio::test]
-async fn logic_version_is_the_code_and_settings_hash() {
+async fn logic_version_is_the_logic_base_and_settings_hash() {
     let (store, pool) = require_db!();
     let repo = repo(vec![
         punch("2026-07-14 08:00:00", "始業"),
@@ -547,7 +547,7 @@ async fn changing_the_rounding_shows_up_in_the_stored_logic_version() {
     assert_eq!(fresh.drivers, 0, "畳んだ直後は古い版が無い");
     assert_eq!(fresh.versions, vec![fresh.logic_version.clone()]);
 
-    // TOML だけを変える (再ビルドしていない = KINTAI_OUTPUT_SHA は同じ)
+    // TOML だけを変える (再ビルドしていない = LOGIC_BASE は同じ)
     let other = KosokuParams {
         restraint_rounding: RestraintRounding::TruncateElapsed,
         ..params()

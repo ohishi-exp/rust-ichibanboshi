@@ -277,19 +277,20 @@ pub trait FoldClock {
 /// 流れに渡す設定と時計。
 pub struct FoldCtx<'a> {
     pub params: &'a KosokuParams,
-    /// 勤怠の版 (root は `build.rs` の `KINTAI_OUTPUT_SHA`)。
-    pub output_sha: &'a str,
+    /// 記録用のソースのハッシュ (root は `build.rs` の `KINTAI_OUTPUT_SHA`)。[`FoldReport::code_sha`] に載せるだけで、
+    /// 版・指紋には入らない (版は [`crate::kintai_fold::LOGIC_BASE`])。
+    pub code_sha: &'a str,
     /// `Sync` を求めるのは root (axum) の future を Send に保つため (Worker の時計は状態を持たないので満たす)。
     pub clock: &'a (dyn FoldClock + Sync),
 }
 
 impl FoldCtx<'_> {
     fn logic_version(&self) -> String {
-        logic_version(self.params, self.output_sha)
+        logic_version(self.params)
     }
 
     fn new_report(&self, apply: bool) -> FoldReport {
-        new_report(self.params, apply, self.output_sha, self.clock.now_jst())
+        new_report(self.params, apply, self.code_sha, self.clock.now_jst())
     }
 }
 
@@ -453,14 +454,13 @@ where
         .into_iter()
         .filter(|(cd, _)| driver.is_none_or(|want| want == *cd))
         .map(|(cd, rows)| {
-            let (unit, fp) = fold_driver_month(cd as i64, month, ctx.params, rows, ctx.output_sha);
+            let (unit, fp) = fold_driver_month(cd as i64, month, ctx.params, rows);
             (cd, unit, fp)
         })
         .collect();
     if let Some(cd) = driver {
         if units.is_empty() {
-            let (unit, fp) =
-                fold_driver_month(cd as i64, month, ctx.params, Vec::new(), ctx.output_sha);
+            let (unit, fp) = fold_driver_month(cd as i64, month, ctx.params, Vec::new());
             units.push((cd, unit, fp));
         }
     }
@@ -837,8 +837,7 @@ where
     // ここで拾わないと、保存済みの古い勤務が消えずに残る
     let seen: BTreeSet<u64> = units.iter().map(|(cd, _, _)| *cd).collect();
     for cd in want.difference(&seen).copied() {
-        let (unit, fp) =
-            fold_driver_month(cd as i64, month, ctx.params, Vec::new(), ctx.output_sha);
+        let (unit, fp) = fold_driver_month(cd as i64, month, ctx.params, Vec::new());
         units.push((cd, unit, fp));
     }
     units.sort_by_key(|(cd, _, _)| *cd);

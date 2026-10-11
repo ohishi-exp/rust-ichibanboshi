@@ -23,10 +23,10 @@
 //! ## ファイル名がなぜ `dtako_autoload.rs` か (`kintai`/`kosoku` で始めない)
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` は `src/routes/` 配下を**ファイル名の接頭辞**
-//! (`kintai`) で拾い、拾われたファイルの内容ハッシュが `logic_version`
-//! (`/api/kintai/version` の etag) に畳まれる。この endpoint は勤怠の計算に一切
-//! 関与しない (取り込みの中継だけ) ので、`kintai` で始まる名前を付けると無関係な
-//! deploy まで全乗務員 stale にしてしまう ([`crate::routes::dtako_day`] と同じ理由)。
+//! (`kintai`) で拾い、拾われたファイルの内容ハッシュが `/api/kintai/version` の etag に
+//! 畳まれる。この endpoint は勤怠の計算に一切関与しない (取り込みの中継だけ) ので、
+//! `kintai` で始まる名前を付けると無関係な deploy まで relay の上流キャッシュを全月無効に
+//! してしまう ([`crate::routes::dtako_day`] と同じ理由)。
 //!
 //! ## 一括取り込みを作らない (受け入れ条件3)
 //!
@@ -120,7 +120,7 @@
 //! ([`crate::dtako_reset_material::count_reset_material`]、Refs #633 の 5)。
 //! 実装は独立ファイル [`crate::dtako_reset_material`] に持つ — 理由は
 //! `kintai_repo.rs` (build.rs の `KINTAI_OUTPUT_GLOBS` 対象) に新しい SQL を
-//! 足すと `logic_version` が動いてしまうため、そちらのモジュール doc 参照。
+//! 足すと etag が動いてしまうため、そちらのモジュール doc 参照。
 //!
 //! **旧実装は `休息` だけを数えていて、実害を出した** (issue #281 の再発、
 //! 2026-08-04): 運行 `26060608220000000041571` (乗務員 1740) は `dtako_events`
@@ -156,8 +156,8 @@ use kintai_logic::dtako_autoload::{self as logic, AutoloadIo, MaterialQuery};
 pub use kintai_logic::dtako_autoload::{AutoloadQuery, MAX_ZIP_BYTES};
 
 /// CakePHP client のエラーを HTTP ステータスへ写す。`routes/kintai.rs` に同じ形の
-/// `map_cakephp_err` があるが、あちらは `build.rs` の glob 対象 (`logic_version` が
-/// 動く) なので import せず独立して持つ (`dtako_day.rs` と同じ方針)。
+/// `map_cakephp_err` があるが、あちらは `build.rs` の glob 対象 (`/api/kintai/version` の
+/// etag が動く) なので import せず独立して持つ (`dtako_day.rs` と同じ方針)。
 fn map_cakephp_err(e: CakephpError) -> (StatusCode, String) {
     let (status, body) = logic::map_err(e, logic::NOT_CONFIGURED_ONPREM);
     // map_err が返すのは 502 / 503 だけ

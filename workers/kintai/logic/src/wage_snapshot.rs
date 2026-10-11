@@ -14,10 +14,10 @@
 //! ## ファイル名を `kintai` / `kosoku` で始めない
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` はディレクトリ + ファイル名前方一致で
-//! 勤怠の `logic_version` の指紋を作る。ここに入ると 1 バイトの変更で全乗務員・
-//! 全月が stale になり、収束に全月ぶんの `run_kintai_recalc` が要る。賃金の計算は
-//! **relay 側 (TypeScript)** にあって勤怠の畳み直しとは無関係なので、指紋を汚さない
-//! 名前にしている (`stale_months.rs` と同じ判断)。
+//! `/api/kintai/version` の etag を作る。ここに入ると 1 バイトの変更で relay の上流キャッシュが
+//! 全月無効になる。賃金の計算は **relay 側 (TypeScript)** にあって勤怠の応答とは無関係なので、
+//! etag を汚さない名前にしている (`stale_months.rs` と同じ判断。勤怠の版 `logic_version` は手で上げる
+//! `LOGIC_BASE` なのでファイル名では動かない、Refs #322)。
 //!
 //! ## 合算の規則 — 足してはいけないものを足さない
 //!

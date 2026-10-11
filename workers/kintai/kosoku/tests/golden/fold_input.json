@@ -1,0 +1,60 @@
+{
+  "_comment": "logic_golden.rs の固定入力 (手で作った架空の 3 名・2026-06)。打刻と休憩・休息で割る長距離・深夜・日曜・残業・日跨ぎ・月末跨ぎ・打刻無し (休息で決める勤務)・重複行・終業だけの打刻を通す。足すのはよいが、足したら出力が変わるので LOGIC_BASE の行を追記し直すことになる (既存行は書き換えない)",
+  "month": "2026-06",
+  "drivers": {
+    "1001": [
+      {"datetime": "2026-06-02 07:58:12", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-02 07:58:12", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-02 08:05:00", "end_datetime": null, "source": "dtako", "state": "運行開始"},
+      {"datetime": "2026-06-02 08:05:00", "end_datetime": "2026-06-02 12:00:00", "source": "dtako_events", "state": "運転"},
+      {"datetime": "2026-06-02 12:00:00", "end_datetime": "2026-06-02 12:55:30", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-02 15:00:00", "end_datetime": "2026-06-02 15:05:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-02 19:20:00", "end_datetime": null, "source": "dtako", "state": "運行終了"},
+      {"datetime": "2026-06-02 19:31:40", "end_datetime": null, "source": "timecard", "state": "終業"},
+
+      {"datetime": "2026-06-07 08:00:00", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-07 12:00:00", "end_datetime": "2026-06-07 13:00:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-07 17:00:00", "end_datetime": null, "source": "timecard", "state": "終業"},
+
+      {"datetime": "2026-06-09 21:00:00", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-10 01:00:00", "end_datetime": "2026-06-10 01:45:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-10 06:30:00", "end_datetime": null, "source": "timecard", "state": "終業"},
+
+      {"datetime": "2026-06-11 10:00:00", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-11 13:00:00", "end_datetime": "2026-06-11 14:00:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-11 23:30:00", "end_datetime": null, "source": "timecard", "state": "終業"},
+
+      {"datetime": "2026-06-14 20:00:00", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-15 02:00:00", "end_datetime": "2026-06-15 02:30:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-15 07:00:00", "end_datetime": null, "source": "timecard", "state": "終業"},
+
+      {"datetime": "2026-06-30 22:10:00", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-07-01 07:05:00", "end_datetime": null, "source": "timecard", "state": "終業"}
+    ],
+    "1002": [
+      {"datetime": "2026-06-03 05:00:00", "end_datetime": null, "source": "timecard", "state": "始業"},
+      {"datetime": "2026-06-03 05:10:00", "end_datetime": null, "source": "dtako", "state": "運行開始"},
+      {"datetime": "2026-06-03 11:00:00", "end_datetime": "2026-06-03 11:40:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-03 20:00:00", "end_datetime": "2026-06-04 05:00:00", "source": "dtako_events", "state": "休息"},
+      {"datetime": "2026-06-04 12:00:00", "end_datetime": "2026-06-04 12:30:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-04 21:00:00", "end_datetime": "2026-06-05 06:00:00", "source": "dtako_events", "state": "休息"},
+      {"datetime": "2026-06-05 14:00:00", "end_datetime": null, "source": "dtako", "state": "運行終了"},
+      {"datetime": "2026-06-05 14:20:00", "end_datetime": null, "source": "timecard", "state": "終業"},
+
+      {"datetime": "2026-06-20 15:37:43", "end_datetime": null, "source": "timecard", "state": "終業"},
+      {"datetime": "2026-06-20 15:37:43", "end_datetime": null, "source": "dtako", "state": "運行終了"},
+      {"datetime": "2026-06-20 15:37:43", "end_datetime": "2026-06-20 15:37:43", "source": "dtako_events", "state": "休息"}
+    ],
+    "1003": [
+      {"datetime": "2026-06-03 05:10:00", "end_datetime": null, "source": "dtako", "state": "運行開始"},
+      {"datetime": "2026-06-03 11:00:00", "end_datetime": "2026-06-03 11:40:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-03 20:00:00", "end_datetime": "2026-06-04 05:00:00", "source": "dtako_events", "state": "休息"},
+      {"datetime": "2026-06-04 21:00:00", "end_datetime": "2026-06-05 06:00:00", "source": "dtako_events", "state": "休息"},
+      {"datetime": "2026-06-05 14:00:00", "end_datetime": null, "source": "dtako", "state": "運行終了"},
+
+      {"datetime": "2026-06-21 06:00:00", "end_datetime": null, "source": "dtako", "state": "運行開始"},
+      {"datetime": "2026-06-21 12:00:00", "end_datetime": "2026-06-21 12:50:00", "source": "dtako_events", "state": "休憩"},
+      {"datetime": "2026-06-21 22:30:00", "end_datetime": null, "source": "dtako", "state": "運行終了"}
+    ]
+  }
+}

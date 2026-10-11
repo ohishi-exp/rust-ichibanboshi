@@ -34,9 +34,9 @@
 //! ## 指紋 — 何が変わったら再計算するか
 //!
 //! ```text
-//! logic_version = sha256(KINTAI_OUTPUT_SHA + "|" + KosokuParams)[..16]
+//! logic_version = sha256(LOGIC_BASE + "|" + KosokuParams)[..16]
 //! fingerprint   = sha256(
-//!     logic_version               // コードと設定を畳んだ 16 桁 hex
+//!     logic_version               // ロジックの版と設定を畳んだ 16 桁 hex
 //!   + "|" + 乗務員CD + 対象月
 //!   + "|" + その乗務員の月の生行 (正規化して並べたもの)
 //! )
@@ -45,8 +45,10 @@
 //! - **`KosokuParams` を材料に入れるのが必須。** `restraint_rounding` などは TOML で
 //!   再ビルド無しに変えられて出力を変える。入れないと切り替えても全単位が stale に
 //!   ならず、古い集計が永久にスキップされる (#205 のリスク欄)
-//! - **`KINTAI_OUTPUT_SHA` は手で上げる版番号ではない。** `kosoku.rs` を 1 バイト
-//!   直せば必ず変わるので「上げ忘れ」が原理的に存在しない (`build.rs`)
+//! - **`LOGIC_BASE` は手で上げる版** (共有 crate の `kintai_fold::LOGIC_BASE`)。計算結果を
+//!   変えるときだけ上げる。コメント・移設では上げない (= 全員 stale にならない)。上げ忘れは
+//!   golden テスト (`workers/kintai/kosoku/tests/logic_golden.rs`) が落とす。ソースのハッシュ
+//!   (`KINTAI_OUTPUT_SHA`) は材料にせず、記録用に [`code_sha`] として応答に載せるだけ (Refs #322)
 //! - 材料の生行は**行まるごと**を畳む。`daily_summary` が読むのは 4 列だけだが、
 //!   `drop_duplicate_rows` は行の完全一致で重複を判定するので、列が増えれば
 //!   結果が変わり得る。**広い方に倒す** — 余分に再計算するのは安全側で、
@@ -72,9 +74,9 @@
 //! 単一指定の再計算と月次バッチが**互いに相手の書いた行を stale と見て毎回書き直す**。
 //! 指紋を跨いで比べてよいのは「同じ読み方をした指紋」だけ。
 //!
-//! ## `logic_version` は保存行に焼く「コード + 設定」の印
+//! ## `logic_version` は保存行に焼く「ロジックの版 + 設定」の印
 //!
-//! `KINTAI_OUTPUT_SHA` **単体ではない** ([`logic_version`])。単体にすると TOML の
+//! `LOGIC_BASE` **単体ではない** ([`logic_version`])。単体にすると TOML の
 //! 閾値・丸め方を変えたときに保存行の `logic_version` が変わらず、`SELECT DISTINCT
 //! logic_version` では設定変更由来の stale が捕まらない — 指紋には入っているので
 //! 再計算そのものは走るが、「走らせるべきか」を**読むだけで判る**手段が消える。
@@ -102,54 +104,22 @@ pub use kintai_kosoku::anchors::{clip_to_anchors, HeadAnchors};
 
 /// `build.rs` が焼き込む「出力に効くコード」の内容ハッシュ (16 桁 hex)。
 ///
-/// これ**単体は保存しない**。TOML で変えられる [`KosokuParams`] を畳んだ
-/// [`logic_version`] が保存行に入る値。
-pub fn output_sha() -> &'static str {
+/// **記録用。** 版 ([`logic_version`]) にも指紋にも入れない — 入れるとコメント 1 文字で全乗務員・全月が
+/// stale になる (Refs #322)。recalc の応答 ([`FoldReport::code_sha`]) と CLI の表示に載せるだけ。
+pub fn code_sha() -> &'static str {
     env!("KINTAI_OUTPUT_SHA")
 }
 
-/// 保存行に焼く「コード + 設定」の印 (16 桁 hex)。
-///
-/// `shifts.logic_version` / `day_summaries.logic_version` (`CHAR(16)`) にそのまま
-/// 入り、[`fingerprint`] の材料の先頭でもある。**両方が同じ 1 つの定義から来る**ので、
-/// 「指紋は変わったのに `logic_version` は据え置き」が作れない。
-///
-/// 材料を `KINTAI_OUTPUT_SHA` 単体にしない理由はモジュール docs 参照。計算は共有 crate
-/// (`kintai_kosoku::kintai_fold::logic_version`、Refs #322) で、ここは [`output_sha`] を渡すだけ。
-pub fn logic_version(params: &KosokuParams) -> String {
-    kintai_kosoku::kintai_fold::logic_version(params, output_sha())
-}
-
 // 3 表の行の型・`DaySummary` からの写し・保存済みの姿・SQL 定数・bind の束・指紋と畳みの純粋部分・報告の型は共有 crate に移した (Refs #322)。
-// ここは `build.rs` の版と時計を渡すラッパー・sqlx の pool・transaction・bind だけを持つ。呼び出し側のパスを変えないよう再 export する。
+// ここは記録用の `code_sha` と時計を渡す口・sqlx の pool・transaction・bind だけを持つ。呼び出し側のパスを変えないよう再 export する。
 pub use kintai_kosoku::kintai_fold::{
-    day_part_columns, day_summary_columns, fold_days, shift_columns, tz, DayPartRow, DaySummaryRow,
-    FoldReport, FoldUnit, MonthGate, ShiftRow, SkipReason, StaleReport, StoredState,
-    DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL, FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL,
-    INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL, STALE_STATE_SQL, STORED_STATES_SQL,
-    STORED_STATE_SQL,
+    day_part_columns, day_summary_columns, fingerprint, fold_days, fold_driver_month,
+    logic_version, shift_columns, tz, DayPartRow, DaySummaryRow, FoldReport, FoldUnit, MonthGate,
+    ShiftRow, SkipReason, StaleReport, StoredState, DELETE_SHIFTS_SQL, FOLD_GATE_SELECT_SQL,
+    FOLD_GATE_UPSERT_SQL, INSERT_DAY_PARTS_SQL, INSERT_DAY_SUMMARIES_SQL, INSERT_SHIFTS_SQL,
+    STALE_STATE_SQL, STORED_STATES_SQL, STORED_STATE_SQL,
 };
 use kintai_kosoku::kintai_push::month_date_bounds;
-
-/// 指紋。材料はモジュール docs のとおり (計算は共有 crate、ここは [`output_sha`] を渡すだけ)。
-pub fn fingerprint(
-    driver_cd: i64,
-    month: &str,
-    params: &KosokuParams,
-    rows: &[serde_json::Value],
-) -> String {
-    kintai_kosoku::kintai_fold::fingerprint(driver_cd, month, params, rows, output_sha())
-}
-
-/// 1 乗務員 1 か月を畳む。読み出し経路と同じ手順 (モジュール docs 参照)。
-pub fn fold_driver_month(
-    driver_cd: i64,
-    month: &str,
-    params: &KosokuParams,
-    rows: Vec<serde_json::Value>,
-) -> (FoldUnit, String) {
-    kintai_kosoku::kintai_fold::fold_driver_month(driver_cd, month, params, rows, output_sha())
-}
 
 // ── 保存 ──────────────────────────────────────────────────────────────────
 
@@ -485,11 +455,11 @@ impl FoldClock for SystemClock {
     }
 }
 
-/// 流れに渡す設定 (版は `build.rs` の [`output_sha`]、時計は [`SystemClock`])。
+/// 流れに渡す設定 (記録用の [`code_sha`]、時計は [`SystemClock`])。
 fn ctx(params: &KosokuParams) -> FoldCtx<'_> {
     FoldCtx {
         params,
-        output_sha: output_sha(),
+        code_sha: code_sha(),
         clock: &SystemClock,
     }
 }
@@ -870,10 +840,10 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_folds_the_build_hash() {
-        // build.rs が焼く 16 桁 hex。kosoku.rs を 1 バイト直せば必ず変わる
-        assert_eq!(output_sha().len(), 16);
-        assert!(output_sha().chars().all(|c| c.is_ascii_hexdigit()));
+    fn the_code_sha_is_the_build_hash() {
+        // build.rs が焼く 16 桁 hex (記録用。版には入らない)
+        assert_eq!(code_sha().len(), 16);
+        assert!(code_sha().chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// 月が飛んでいても端から端まで 1 本の期間にする。
@@ -893,23 +863,21 @@ mod tests {
         assert!(months_span(&["nope".to_string()]).is_err());
     }
 
-    /// root のラッパーは共有 crate を `build.rs` の版で呼んだのと同じ値を返す (Refs #322)。
-    /// 値の計算そのものは共有 crate の `the_values_are_the_ones_the_root_computed_before_the_move` が縛る。
+    /// 版は `LOGIC_BASE` と設定だけで決まり、`build.rs` のソースのハッシュに依らない (Refs #322)。
+    /// 値そのもの (本番の `1b8f00ba48e9a77b`) は共有 crate の `the_logic_version_is_the_one_in_production` が縛る。
     #[test]
-    fn the_wrappers_match_the_shared_crate_with_the_build_hash() {
+    fn the_logic_version_does_not_depend_on_the_build_hash() {
         use kintai_kosoku::kintai_fold as shared;
         let p = KosokuParams::default();
-        assert_eq!(logic_version(&p), shared::logic_version(&p, output_sha()));
         assert_eq!(logic_version(&p).len(), shared::LOGIC_VERSION_LEN);
-        let fp = shared::fingerprint(1, "2026-07", &p, &rows(), output_sha());
-        assert_eq!(fingerprint(1, "2026-07", &p, &rows()), fp);
-        let (unit, got) = fold_driver_month(1130, "2026-07", &p, rows());
-        assert_eq!(
-            (unit, got),
-            shared::fold_driver_month(1130, "2026-07", &p, rows(), output_sha())
+        assert_ne!(
+            logic_version(&p),
+            code_sha(),
+            "ソースのハッシュそのものではない"
         );
-        // 流れに渡す版は build.rs の値
-        assert_eq!(ctx(&p).output_sha, output_sha());
+        assert_eq!(fingerprint(1, "2026-07", &p, &rows()).len(), 64);
+        // 流れに渡すのは記録用の code_sha
+        assert_eq!(ctx(&p).code_sha, code_sha());
     }
 
     #[test]

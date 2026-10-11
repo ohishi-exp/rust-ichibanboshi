@@ -317,7 +317,7 @@ pub async fn run(
         // 同じ乗務員の勤務の時間帯が重なっている組を返す (Refs
         // ohishi-exp/nuxt-dtako-admin#1123)。読むだけ・保存値の比較だけ (ファイル名は
         // kintai/kosoku で始めない — shift_overlaps.rs のモジュール doc 参照、
-        // logic_version は動かさない)
+        // version の etag は動かさない)
         .route(
             "/kintai/shift-overlaps",
             get(routes::shift_overlaps::shift_overlaps),
@@ -330,7 +330,7 @@ pub async fn run(
         // 月別 stale (畳み直しが要るか) を 1 往復で返す軽い口 (Refs #620 の 1)。
         // 読むだけ・既存の kintai.day_summaries 突合を月単位に割っただけ (ファイル名
         // は kintai/kosoku で始めない — stale_months.rs のモジュール doc 参照、
-        // logic_version は動かさない)
+        // version の etag は動かさない)
         .route(
             "/kintai/stale-months",
             get(routes::stale_months::stale_months),
@@ -338,23 +338,23 @@ pub async fn run(
         // 取り込み漏れ候補 (also_in_month) の GCP にしか無い運行の運行NO
         // (Refs ohishi-exp/nuxt-dtako-admin#623 の 1)。読むだけ・既存の etags 部品
         // (pub) を呼ぶだけ (ファイル名は kintai/kosoku で始めない — unko_gaps.rs
-        // のモジュール doc 参照、logic_version は動かさない)
+        // のモジュール doc 参照、version の etag は動かさない)
         .route("/kintai/unko-gaps", get(routes::unko_gaps::unko_gaps))
         // 取り込み後に打刻が直された前後の記録 (Refs ohishi-exp/nuxt-dtako-admin#1133)。
-        // 読むだけ (ファイル名は kintai/kosoku で始めない — logic_version は動かさない)
+        // 読むだけ (ファイル名は kintai/kosoku で始めない — version の etag は動かさない)
         .route("/kintai/change-log", get(routes::change_log::change_log))
         // 乗務員CD + 日付 → 運行NO・全イベント・修正用リンク (Refs #205 の 57)。
         // 読むだけ・既存の events 取得を再利用する (ファイル名は kintai/kosoku で
-        // 始めない — dtako_day.rs のモジュール doc 参照、logic_version は動かさない)
+        // 始めない — dtako_day.rs のモジュール doc 参照、version の etag は動かさない)
         .route("/kintai/day-events", get(routes::dtako_day::day_events))
         // `dtako_events` の作業区分 (層 A) を 乗務員 × 暦日 × 区分 の秒数で返す
         // (Refs ohishi-exp/nuxt-dtako-admin#612 の PR-2)。読むだけ・既存の events
         // 取得を再利用する。合成 (荷役 = 積み + 降し) はしない — 足し方の判断は
         // 呼ぶ側 1 か所に閉じ込める (dtako_worktime.rs のモジュール doc 参照)。
-        // ファイル名は kintai/kosoku で始めない = logic_version は動かさない
+        // ファイル名は kintai/kosoku で始めない = version の etag は動かさない
         .route("/dtako/worktime", get(routes::dtako_worktime::worktime))
         // csvdata.zip → 社内 nginx の取り込み口へ 1 件ずつ中継 (Refs #205 の 58 /
-        // #274)。ファイル名は kintai/kosoku で始めない — logic_version は動かさない
+        // #274)。ファイル名は kintai/kosoku で始めない — version の etag は動かさない
         // (dtako_autoload.rs のモジュール doc 参照)。zip 本体を受けるので既定の
         // body 上限 (2 MiB) をこの route だけ緩める (他の route には影響しない)
         .route(

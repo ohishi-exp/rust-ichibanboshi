@@ -16,8 +16,8 @@
 //! [`crate::routes::stale_months`] と同じ理由。`build.rs` の
 //! `KINTAI_OUTPUT_GLOBS` はディレクトリ + ファイル名前方一致
 //! (`("src","kosoku")` / `("src","kintai")` / `("src/routes","kintai")`) で
-//! `logic_version` の指紋を作るので、そこに入ると 1 バイトの変更でも
-//! 全乗務員・全月が stale になる。**この口が読む部品
+//! `/api/kintai/version` の etag を作るので、そこに入ると 1 バイトの変更でも
+//! relay の上流キャッシュが全月無効になる。**この口が読む部品
 //! (`fetch_dtako_month_read_since` / `unko_no_start_date`) はすべて既に `pub` で公開済み**
 //! なので、glob 内 (`kintai_http_repo.rs` / `kintai_fold.rs` / `kintai_push.rs` / `kintai_repo.rs`) を
 //! 呼ぶだけで組める。

@@ -8,10 +8,11 @@
 //! ## ファイル名がなぜ `dtako_day.rs` か (`kintai`/`kosoku` で始めない)
 //!
 //! `build.rs` の `KINTAI_OUTPUT_GLOBS` は `src/routes/` 配下を**ファイル名の接頭辞**
-//! (`kintai`) で拾い、拾われたファイルの内容ハッシュが `logic_version` (`/api/kintai/
-//! version` の etag) に畳まれる。この endpoint は既存の生イベント読み出しを**そのまま
-//! 再利用するだけ**で `/api/kintai/{daily,kosoku-daily,version}` の応答を一切変えない
-//! ので、`kintai` で始まる名前を付けると無関係な deploy まで全乗務員 stale にしてしまう。
+//! (`kintai`) で拾い、拾われたファイルの内容ハッシュが `/api/kintai/version` の etag に
+//! 畳まれる。この endpoint は既存の生イベント読み出しを**そのまま再利用するだけ**で
+//! `/api/kintai/{daily,kosoku-daily,version}` の応答を一切変えないので、`kintai` で始まる
+//! 名前を付けると無関係な deploy まで relay の上流キャッシュを全月無効にしてしまう
+//! (勤怠の版 `logic_version` は手で上げる `LOGIC_BASE` で、ファイル名では動かない、Refs #322)。
 //!
 //! 同じ理由で [`crate::kintai_http_repo`] の `onprem_unko_no` (unko_no の桁変換) も
 //! **import せず、同じロジックを共有 crate `kintai-dtako` に独立して持つ** — あちらは

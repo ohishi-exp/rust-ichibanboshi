@@ -1,5 +1,9 @@
 # #205-30 共通キー 65 行の値差 — 原因と判断材料
 
+> **注記 (2026-10-11、Refs #322)**: この文書は当時の記録として書き換えない。当時は `logic_version` の材料が
+> ソースのハッシュ (`KINTAI_OUTPUT_SHA`) で「ファイルを触ると全乗務員 stale」だったが、今は共有 crate の
+> `LOGIC_BASE` を手で上げたときだけ版が変わる (`workers/kintai/README.md` の `kosoku/` の項)。
+
 2026-06。キー = `乗務員CD|暦日|開始時刻`、乗務員CD 0 は除外 (基準にだけ 19 行)。
 基準 (オンプレ `/api/kintai/kosoku-daily`) 3,372 行 / GCP (`kintai_fold` の
 `day_summaries`) 3,230 行、共通キー 3,229 件のうち **65 件で値が違う**。

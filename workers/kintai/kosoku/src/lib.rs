@@ -4,7 +4,8 @@
 //! 依存は serde・serde_json・chrono・sha2・tracing だけで、wasm32 でも build できる (sqlx にも tokio-postgres にも依存しない —
 //! Supabase への書き込みは SQL 定数と bind に渡す Vec の束までで、bind は root と Worker がそれぞれ書く)。
 //! fold の I/O を含む流れ (`fold_flow`) は I/O を trait で受け取るので、ここには持ち込まない。
-//! ここのファイルは全部 repo ルートの `build.rs` の `KINTAI_OUTPUT_SHA` に入る。
+//! ここのファイルは全部 repo ルートの `build.rs` の `KINTAI_OUTPUT_SHA` (etag と記録用の `code_sha`) に入る。
+//! 勤怠の版 (`logic_version`) は [`kintai_fold::LOGIC_BASE`] を手で上げる — 計算結果を変えたら上げる (Refs #322)。
 
 pub mod anchors;
 pub mod fold_flow;

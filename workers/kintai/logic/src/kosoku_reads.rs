@@ -333,12 +333,16 @@ pub fn version_sql(month: &str, anchors: &HeadAnchors) -> Result<String, Fail> {
     )
 }
 
-/// version の応答 `{month, etag}` と `ETag` ヘッダの値 (同じ文字列)。`build` は勤怠 Worker の版
-/// (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値)。`KosokuParams` は既定値 (オンプレ版も設定ファイルに `[kosoku]` 節が無い)。
+/// version の応答 `{month, etag, code_sha}` と `ETag` ヘッダの値 (etag と同じ文字列)。`build` は勤怠 Worker のソースのハッシュ
+/// (オンプレ版の `KINTAI_OUTPUT_SHA` とは別の値)。etag に畳み、記録用に `code_sha` としても載せる (勤怠の版 `logic_version`
+/// ではない、Refs #322)。`KosokuParams` は既定値 (オンプレ版も設定ファイルに `[kosoku]` 節が無い)。
 pub fn version_respond(month: &str, rows: &[Row], build: &str) -> Result<(Value, String), Fail> {
     let markers = rows_to_json(rows, version_row)?;
     let etag = version_etag(month, build, &KosokuParams::default(), &markers);
-    Ok((serde_json::json!({ "month": month, "etag": etag }), etag))
+    Ok((
+        serde_json::json!({ "month": month, "etag": etag, "code_sha": build }),
+        etag,
+    ))
 }
 
 // ── timecard/drivers・timecard/events ──

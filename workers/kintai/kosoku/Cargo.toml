@@ -1,7 +1,8 @@
 # 勤怠の拘束・休息の純粋ロジックと社内 MariaDB の SQL 文 (Refs ohishi-exp/rust-ichibanboshi#322)。
 # repo ルートの package (オンプレ版・Cloud Run 版) が path 依存で使い、勤怠 Worker も同じものを使う (写さない)。
 # DB も I/O も持たない (Supabase への書き込みは SQL 定数と bind の Vec の束まで。sqlx にも tokio-postgres にも依存しない)。依存は serde・serde_json・chrono・sha2 (version の etag)・tracing (fold の流れの運用ログ) だけで、wasm32 でも build できること。
-# ここの src/ は全部 repo ルートの build.rs の KINTAI_OUTPUT_SHA (勤怠の版) に入る。
+# ここの src/ は全部 repo ルートの build.rs の KINTAI_OUTPUT_SHA (version の etag と記録用の code_sha) に入る。
+# 勤怠の版 (logic_version) は src/kintai_fold.rs の LOGIC_BASE を手で上げる (計算結果を変えたら上げる)。
 [package]
 name = "kintai-kosoku"
 version = "0.1.0"
