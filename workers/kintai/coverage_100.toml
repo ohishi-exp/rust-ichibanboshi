@@ -168,6 +168,14 @@ path = "workers/kintai/kosoku/src/kintai_push.rs"
 [[files]]
 path = "workers/kintai/kosoku/src/kintai_fold.rs"
 
+# fold の I/O を含む流れ (月ゲート・畳み・recalc・warnings の束)。I/O は trait で受け取る。root の kintai_fold.rs から移した
+[[files]]
+path = "workers/kintai/kosoku/src/fold_flow.rs"
+
+# 運行の突合 (オンプレ × GCP、Refs #205 の 37・39)。root の kintai_http_repo.rs から移した
+[[files]]
+path = "workers/kintai/kosoku/src/unko_diff.rs"
+
 # ── kintai-dtako (day-events と dtako/worktime の純粋部分。repo ルートの package と共有) ──
 # root の src/routes/dtako_day.rs・dtako_worktime.rs から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ (実行行 0) なので登録しない

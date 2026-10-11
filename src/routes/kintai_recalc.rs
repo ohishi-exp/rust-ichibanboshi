@@ -156,7 +156,9 @@ use axum::Json;
 use chrono::NaiveDate;
 use serde::Deserialize;
 
-use crate::kintai_fold::{recalc_driver_page, recalc_drivers_from_units, stale_state, FoldReport};
+use crate::kintai_fold::{
+    recalc_driver_page, recalc_drivers_from_units, stale_state, FoldReport, FoldSink, Warnings,
+};
 use crate::kintai_push::KintaiPgStore;
 use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai::is_valid_month;
@@ -272,36 +274,40 @@ async fn run(
     // なら通常どおり進む — miss の digest は末尾の書き込み判定まで運ぶ
     // (fold 後に作り直さない。理由は MonthGate::Miss の docs)
     //
-    // **`with_warning_sink_blocking` で包むのは `fold_month` だけでは足りない**
-    // (Refs #205 の 21)。指紋を取る `fetch_etags` は入力の欠けを最初に見る場所で、
-    // そこが立てる warning は sink の外だと黙って捨てられる — 「封を止める warning
-    // が無い」の判定が素通りし、欠けたままの月に「最新」の封をしてしまう。
-    // **`_blocking` 版を使うのは、tail gap (診断専用、Refs #205-51) が混ざっても
-    // 封の判定を誤らせないため** — 表示用の `Vec<String>` は今までどおり
+    // **月ゲートの判定にも束 (`gate_sink`) を渡す** (Refs #205 の 21)。指紋を取る
+    // `fetch_etags` は入力の欠けを最初に見る場所で、そこが立てる warning を捨てると
+    // 「封を止める warning が無い」の判定が素通りし、欠けたままの月に「最新」の封をしてしまう。
+    // 封を止めるかは束の `blocks_seal()` で見る — tail gap (診断専用、Refs #205-51) が
+    // 混ざっても封の判定を誤らせない。表示用の文面は今までどおり
     //
-    // `with_unsplit_sink` を重ねて包むのは `unsplit` (Refs #205 の 32、alc の
-    // `has_kudgivt = FALSE` 一覧) も同じ `fetch_etags` の応答から拾うため。判定には
-    // 使わない素通しで、142 行差の仮説検証用に応答へそのまま載せるだけ
-    //
-    // `with_unko_diff_sink` をさらに重ねるのは運行の突合 (Refs #205 の 37) — オンプレ
-    // (押し込み済みの `kintai_events`) に在って GCP (alc の etags) に無い運行の一覧。
-    // これも同じ `fetch_etags` の応答が材料で、判定には使わず応答へ素通しするだけ
+    // 同じ束に `unsplit` (Refs #205 の 32、alc の `has_kudgivt = FALSE` 一覧) と運行の突合
+    // (Refs #205 の 37 — 押し込み済みの `kintai_events` に在って alc の etags に無い運行の一覧) も
+    // 積まれる。どちらも同じ `fetch_etags` の応答が材料で、判定には使わず応答へ素通しするだけ。
+    // 突合を測るのはこの口だけ ([`FoldSink::measuring_unko_diff`])
     //
     // 読みの遡り起点 (Refs ohishi-exp/nuxt-dtako-admin#1123) は**ここで 1 回だけ**引き、
     // 月ゲートと畳みに同じ値を渡す — 別々に引くと封の材料と畳んだ入力の窓が割れうる
     let anchors = crate::kintai_fold::month_anchors(&repo, &req.month)
         .await
         .map_err(|e| map_push_err(e.into()))?;
-    #[allow(clippy::type_complexity)]
-    let (((gate, gate_warnings, gate_blocking), unsplit, unsplit_total), unko_diff) =
-        crate::kintai_http_repo::with_unko_diff_sink(crate::kintai_http_repo::with_unsplit_sink(
-            crate::kintai_http_repo::with_warning_sink_blocking(
-                crate::kintai_fold::month_gate_report_with_anchors(
-                    &repo, &st, &params, &req.month, req.apply, &anchors,
-                ),
-            ),
-        ))
-        .await;
+    let mut gate_sink = FoldSink::measuring_unko_diff();
+    let gate = crate::kintai_fold::month_gate_report_with_anchors(
+        &repo,
+        &st,
+        &params,
+        &req.month,
+        req.apply,
+        &anchors,
+        &mut gate_sink,
+    )
+    .await;
+    let FoldSink {
+        warnings: gate_warnings,
+        unsplit,
+        unsplit_total,
+        unko_diff,
+        ..
+    } = gate_sink;
     let gate = match gate.map_err(map_push_err)? {
         crate::kintai_fold::MonthGate::Hit(mut report) => {
             let months = [req.month.clone()];
@@ -312,7 +318,7 @@ async fn run(
             tracing::info!(n, w, "kintai recalc page done (gate)");
             // 読みを省いた回でも入力の欠けは応答に出す (指紋が同じ = 入力が増えて
             // いないだけで、欠けが埋まったわけではない)
-            report.warnings = gate_warnings;
+            report.warnings = gate_warnings.texts();
             return Ok(Json(serde_json::json!({
                 "month": req.month,
                 "apply": req.apply,
@@ -349,21 +355,25 @@ async fn run(
 
     // 生イベントは月 1 回だけ読み、母集団の決定 (#205-12) と畳みの両方に使い回す。
     // ここで 2 回読むと 1 ページの費用 (全量読み 25〜55 秒、モジュール docs) が
-    // 単純に倍になる。上流 warnings を握り潰さない
-    // ([`crate::kintai_http_repo::with_warning_sink_blocking`])
-    let (all_units, warnings, fold_blocking) = crate::kintai_http_repo::with_warning_sink_blocking(
-        crate::kintai_fold::fold_month_with_anchors(
-            &repo, &params, &req.month, None, req.today, &anchors,
-        ),
+    // 単純に倍になる。上流 warnings を握り潰さない (束 `fold_warnings` に積む)
+    let mut fold_warnings = Warnings::default();
+    let all_units = crate::kintai_fold::fold_month_with_anchors(
+        &repo,
+        &params,
+        &req.month,
+        None,
+        req.today,
+        &anchors,
+        &mut fold_warnings,
     )
-    .await;
-    let all_units = all_units.map_err(map_push_err)?;
-    // 指紋を取ったときの warning も同じ列に混ぜる (Refs #205 の 21)。封を止める
-    // かどうかも 2 つの scope の `||` で合成する (Refs #205-51 — tail gap のような
-    // 診断専用が混ざっていても、封を止める warning が片方にでもあれば止める)
-    let mut warnings = warnings;
-    warnings.extend(gate_warnings);
-    let has_blocking_warning = fold_blocking || gate_blocking;
+    .await
+    .map_err(map_push_err)?;
+    // 指紋を取ったときの warning も同じ列に混ぜる (Refs #205 の 21)。2 つの束は別々に上限が効く
+    // (畳みの束の後ろに月ゲートの束を足す)。封を止めるかどうかも 2 つの束の `||` で合成する
+    // (Refs #205-51 — tail gap のような診断専用が混ざっていても、封を止める warning が片方にでもあれば止める)
+    let mut warnings = fold_warnings.texts();
+    warnings.extend(gate_warnings.texts());
+    let has_blocking_warning = fold_warnings.blocks_seal() || gate_warnings.blocks_seal();
     // rest-only 乗務員 (Postgres に 1 行も無い) を母集団に足すための集合
     // ([`recalc_driver_page`] docs)
     let extra: std::collections::BTreeSet<i64> = all_units

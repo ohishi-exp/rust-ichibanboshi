@@ -63,30 +63,8 @@ pub use kintai_kosoku::kintai_push::{
     INSERT_EVENTS_SQL, JST_OFFSET_SECONDS, MAX_REPORTED_STATES, MONTH_PUNCH_DIGEST_SQL,
     NOT_CARRIED_STATES, PUSHED_SOURCES, STORED_SIGNATURES_SQL, STORED_WINDOW_SIGNATURES_SQL,
 };
-/// **オンプレ側の運行一覧** (Refs #205 の 37)。GCP 側 (alc の etags) と突き合わせて
-/// 「オンプレに在って GCP に無い運行」を名指しするための材料。
-///
-/// 実体は押し込み済みの `kintai.kintai_events` で、`unko_no` を持つのは `dtako`
-/// (= オンプレ MariaDB の `time_card_dtako`) 由来の行だけ ([`PUSHED_SOURCES`])。
-/// 打刻だけの行 (`timecard`) は `unko_no` が NULL なので自然に落ちる。
-///
-/// **窓は `fold_month` が実際に読む窓と同じにする** — 終端は
-/// [`crate::kintai_repo::month_range`] (翌月 2 日)、始端は月初。ただし月初をまたぐ
-/// 運行・勤務の遡り起点がある月は、始端を起点の最小 (`from_global`、
-/// [`crate::kintai_fold::read_window`]) まで下げる (Refs ohishi-exp/nuxt-dtako-admin#1123)。
-/// 窓は呼び出し側 ([`crate::kintai_fold`] の月ゲート) が渡す。ずらすと「fold の入力には
-/// 在るのに突合には出ない」運行ができる。日付は署名 SQL と同じく JST の暦日で返す。
-pub const MONTH_OPERATIONS_SQL: &str = r#"
-SELECT driver_cd,
-       unko_no,
-       min((occurred_at AT TIME ZONE 'Asia/Tokyo')::date) AS first_date,
-       max((occurred_at AT TIME ZONE 'Asia/Tokyo')::date) AS last_date
-  FROM kintai.kintai_events
- WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3
-   AND source = ANY($4) AND unko_no IS NOT NULL AND unko_no <> ''
- GROUP BY 1, 2
- ORDER BY 1, 2
-"#;
+// `MONTH_OPERATIONS_SQL` (押し込み済みの運行一覧) は共有 crate に移した (勤怠 Worker の unko-gaps と同じ文、Refs #322)。
+pub use kintai_kosoku::kintai_push::MONTH_OPERATIONS_SQL;
 
 /// **押し込み済みに `unko_no` 付きの行を「一度でも」持ったことがある乗務員CD**
 /// (Refs #205 の 39)。
@@ -94,7 +72,7 @@ SELECT driver_cd,
 /// [`MONTH_OPERATIONS_SQL`] の `WHERE` から**窓だけ外した**もの。逆方向
 /// (GCP にしか無い運行) が「そもそも `time_card_dtako` に出ない乗務員」なのか
 /// 「出るはずなのに対象月だけ落ちた」のかを分けるために要る
-/// ([`crate::kintai_http_repo::UnkoDiffDriverSplit`])。
+/// ([`kintai_kosoku::unko_diff::UnkoDiffDriverSplit`])。
 ///
 /// **「一度でも」の範囲は押し込み済みのぶんだけ**で、オンプレ MariaDB の全履歴
 /// ではない。push していない月のことはこの問いでは分からない。
@@ -128,6 +106,13 @@ impl std::fmt::Display for KintaiPushError {
 }
 
 impl std::error::Error for KintaiPushError {}
+
+/// 共有 crate の流れが月を読めなかったとき。文面は今までの `bad month: …` のまま。
+impl From<kintai_kosoku::fold_flow::BadMonth> for KintaiPushError {
+    fn from(e: kintai_kosoku::fold_flow::BadMonth) -> Self {
+        Self::NotConfigured(e.to_string())
+    }
+}
 
 impl From<KintaiRepoError> for KintaiPushError {
     fn from(e: KintaiRepoError) -> Self {

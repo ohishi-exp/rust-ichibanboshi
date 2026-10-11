@@ -2,17 +2,16 @@
 //! 運行の運行NO の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
 //!
 //! root の `src/routes/unko_gaps.rs` (オンプレ版・Cloud Run 版) から移した。**写しではなく共有** — root も path 依存で
-//! これを使い、axum・sqlx・alc への reqwest (sink 経由) と `elapsed_ms` だけを持つ。勤怠 Worker は Hyperdrive の
+//! これを使い、axum・sqlx・alc への reqwest と `elapsed_ms` だけを持つ。勤怠 Worker は Hyperdrive の
 //! `query_typed` と auth-worker の RPC (`KintaiAlcEntrypoint.dtakoEtags`) で材料を引いてここへ渡す。口の意味 (「無い」と
 //! 「引けていない」の区別・22 桁・上限) は root の module docs。
 //!
-//! ただし次の 2 つは **root の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の中** (`src/kintai_push.rs`・`src/kintai_http_repo.rs`)
-//! にあり root はそちらを使い続けるので、ここに置くのは**写し** (fold を移す段で解消する。対応表は README):
+//! [`MONTH_OPERATIONS_SQL`]・[`PUSHED_SOURCES`] と `unsplit` の型は共有 crate (`kintai_kosoku`) のものを root と同じく使う。
+//! ただし alc の etags の path・期間・応答の読み方は **root の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の中**
+//! (`src/kintai_http_repo.rs`) にあり root はそちらを使い続けるので、ここに置くのは**写し** (対応表は README):
 //!
-//! - [`MONTH_OPERATIONS_SQL`]・[`PUSHED_SOURCES`] (root の `kintai_push`。一致は `pg/tests/unko_gaps_parity.rs`)
-//! - alc の etags の path・期間・応答の読み方 ([`ETAGS_PATH`]・[`etags_search`]・[`read_etags`]。root の
-//!   `kintai_http_repo` の `ETAGS_PATH`・`month_etags_bounds`・`UpstreamEtags`・`fetch_etags`。private なので
-//!   一致は同じテストが root のソースの文字列で固定する)
+//! - [`ETAGS_PATH`]・[`etags_search`]・[`read_etags`] (root の `kintai_http_repo` の `ETAGS_PATH`・`month_etags_bounds`・
+//!   `UpstreamEtags`・`fetch_etags`。private なので一致は `pg/tests/unko_gaps_parity.rs` が root のソースの文字列で固定する)
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,7 +21,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::common::{bad_request, is_valid_month, month_bounds, parse_query, Fail, Param};
+use kintai_kosoku::fold_flow::UnsplitOperation;
 use kintai_kosoku::window::{month_range, unko_no_start_date};
+
+// 押し込み済みの運行一覧の SQL と押し込む source は共有 crate のもの (root の fold の月ゲートと同じ文。Refs #322)。
+pub use kintai_kosoku::kintai_push::{MONTH_OPERATIONS_SQL, PUSHED_SOURCES};
 
 /// 応答に載せる乗務員数の上限 (`UnkoDiffDriverSplit` の `MAX_UNKO_DIFF_DRIVERS` と同じ思想 — 桁違いの入力が
 /// 来たときに応答を膨らませない蓋)。
@@ -112,22 +115,6 @@ fn parse_jst(s: &str) -> Option<DateTime<FixedOffset>> {
 }
 
 // ── オンプレ側 (押し込み済み `kintai.kintai_events`) ─────────────────────────
-
-/// **写し** — root の `src/kintai_push.rs` の `MONTH_OPERATIONS_SQL` (glob の中)。一致は `pg/tests/unko_gaps_parity.rs`。
-pub const MONTH_OPERATIONS_SQL: &str = r#"
-SELECT driver_cd,
-       unko_no,
-       min((occurred_at AT TIME ZONE 'Asia/Tokyo')::date) AS first_date,
-       max((occurred_at AT TIME ZONE 'Asia/Tokyo')::date) AS last_date
-  FROM kintai.kintai_events
- WHERE tenant_id = $1 AND occurred_at >= $2 AND occurred_at < $3
-   AND source = ANY($4) AND unko_no IS NOT NULL AND unko_no <> ''
- GROUP BY 1, 2
- ORDER BY 1, 2
-"#;
-
-/// **写し** — root の `kintai_kosoku::kintai_push::PUSHED_SOURCES` を root の `kintai_push` が再 export したもの。
-pub const PUSHED_SOURCES: [&str; 2] = ["timecard", "dtako"];
 
 /// [`MONTH_OPERATIONS_SQL`] の引数。`$1` = テナント (UUID の pin)、`$2`/`$3` = [`Window`] (TIMESTAMPTZ)、
 /// `$4` = [`PUSHED_SOURCES`] (TEXT[])。
@@ -222,15 +209,6 @@ struct UpstreamEtagItem {
     etag: Option<String>,
     #[serde(default)]
     driver_cds: Vec<String>,
-}
-
-/// **写し** — root の `kintai_http_repo::UnsplitOperation` (応答の型を root と同じにするためだけに持つ。値は使わない)。
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct UnsplitOperation {
-    unko_no: String,
-    driver_cd: String,
-    reading_date: String,
 }
 
 /// **写し** — root の `kintai_http_repo::UpstreamEtags`。

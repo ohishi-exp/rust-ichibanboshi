@@ -361,9 +361,16 @@ async fn the_production_writer_role_can_use_the_fold_gate() {
     let repo = gate_repo("writer");
 
     // 1 回目は Miss。**Unavailable ではない** = SELECT が権限で弾かれていない
-    let gate = month_gate_report(&repo, &store, &params(), MONTH, true)
-        .await
-        .expect("gate");
+    let gate = month_gate_report(
+        &repo,
+        &store,
+        &params(),
+        MONTH,
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("gate");
     assert!(
         matches!(gate, MonthGate::Miss { .. }),
         "kintai_writer で fold_gate が読めていない (GRANT 漏れ): {gate:?}"
@@ -384,9 +391,16 @@ async fn the_production_writer_role_can_use_the_fold_gate() {
     );
 
     // 2 回目は Hit — 全量読みごと省ける (この経路が本番で成立してほしかった形)
-    let gate = month_gate_report(&repo, &store, &params(), MONTH, true)
-        .await
-        .expect("gate again");
+    let gate = month_gate_report(
+        &repo,
+        &store,
+        &params(),
+        MONTH,
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("gate again");
     assert!(matches!(gate, MonthGate::Hit(_)), "2 回目は Hit: {gate:?}");
 }
 
@@ -407,9 +421,16 @@ async fn an_unreadable_fold_gate_degrades_instead_of_failing_the_request() {
     let store = KintaiPgStore::from_pool(pool, tenant);
     let repo = gate_repo("nogate");
 
-    let gate = month_gate_report(&repo, &store, &params(), MONTH, true)
-        .await
-        .expect("gate は Err にならない");
+    let gate = month_gate_report(
+        &repo,
+        &store,
+        &params(),
+        MONTH,
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("gate は Err にならない");
     assert_eq!(
         gate,
         MonthGate::Unavailable,
@@ -447,9 +468,16 @@ async fn an_unwritable_fold_gate_does_not_fail_a_finished_recalc() {
     let repo = gate_repo("rogate");
 
     // 読めるので Miss まで進む (Unavailable ではない)
-    let gate = month_gate_report(&repo, &store, &params(), MONTH, true)
-        .await
-        .expect("gate");
+    let gate = month_gate_report(
+        &repo,
+        &store,
+        &params(),
+        MONTH,
+        true,
+        &mut Default::default(),
+    )
+    .await
+    .expect("gate");
     assert!(matches!(gate, MonthGate::Miss { .. }), "{gate:?}");
 
     let resp = call_recalc(&store, &repo, true).await.expect("recalc");

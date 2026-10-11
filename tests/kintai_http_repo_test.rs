@@ -641,9 +641,16 @@ async fn test_folding_a_month_costs_one_all_drivers_read() {
         .await;
 
     let repo: DynKintaiEventsRepo = Arc::new(repo(&server.uri()));
-    let units = fold_month(&repo, &KosokuParams::default(), "2026-07", None, None)
-        .await
-        .unwrap();
+    let units = fold_month(
+        &repo,
+        &KosokuParams::default(),
+        "2026-07",
+        None,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         units.iter().map(|(cd, ..)| *cd).collect::<Vec<_>>(),
@@ -1188,8 +1195,16 @@ async fn test_month_digest_broken_month_fails_before_any_request() {
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }
 
+/// `2026-01` の etags を読む (指紋・控え・warnings)。
+async fn read_2026_01(server: &MockServer) -> rust_ichibanboshi::kintai_http_repo::DtakoMonthRead {
+    repo(&server.uri())
+        .fetch_dtako_month_read_since("2026-01", None)
+        .await
+        .unwrap()
+}
+
 /// 上流の warnings は握り潰さず、成功した digest と一緒に持ち出せる
-/// ([`with_warning_sink`] 経由)。他の read 系と同じ配線であることの固定。
+/// (`fetch_dtako_month_read_since` の戻り値)。読みそのものは落とさない。
 #[tokio::test]
 async fn test_month_digest_upstream_warnings_do_not_fail_the_read() {
     let server = MockServer::start().await;
@@ -1206,6 +1221,16 @@ async fn test_month_digest_upstream_warnings_do_not_fail_the_read() {
         .await
         .unwrap();
     assert!(digest.is_some());
+    let read = repo(&server.uri())
+        .fetch_dtako_month_read_since("2026-07", None)
+        .await
+        .unwrap();
+    let texts: Vec<&str> = read.warnings.iter().map(|w| w.text.as_str()).collect();
+    assert!(
+        texts.contains(&"U2: KUDGIVT 取得失敗 (NoSuchKey)"),
+        "{texts:?}"
+    );
+    assert!(read.warnings[0].blocks_seal, "上流の warning は封を止める");
 }
 
 /// 一覧が空でも `Some(digest)` — 「対象が無い」と「判定できない」を混ぜない
@@ -1234,8 +1259,9 @@ async fn test_month_digest_of_an_empty_month_is_still_some() {
 // エラーも警告も無く消える。#205-20 が実証したとおり、いまの warnings は**上流の
 // 応答の横流しだけ**なので、運行が alc の索引ごと無い形は誰も気付けない。
 // ここで固定するのは「月ゲートが毎回引いている etags の一覧から自分で見つけて
-// `record_warning` に流す」配線 — 乗るのは `FoldReport::warnings` と
-// `warnings_seen()` の両方で、gate の 5 条件と #205-17 の CLI 経路が同時に守られる。
+// warnings に足す」配線 — `fetch_dtako_month_read_since` の戻り値に乗り、月ゲートの束
+// (`FoldSink`) を通って `FoldReport::warnings` と封の判定の両方に効く (gate の 5 条件と
+// #205-17 の CLI 経路が同時に守られる)。
 //
 // `unko_no` の先頭 6 桁が運行開始日であることはオンプレの生イベント口で
 // 891 運行 (乗務員 47 名 × 2025-12 / 2026-01 / 2026-06) を突き合わせて裏を取った。
@@ -1257,13 +1283,9 @@ async fn test_month_digest_is_silent_when_the_dtako_input_covers_the_window() {
         })))
         .mount(&server)
         .await;
-    let (digest, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await
-    })
-    .await;
-    assert!(digest.unwrap().is_some());
+    let read = read_2026_01(&server).await;
+    assert!(read.digest.is_some());
+    let warnings = read.warnings;
     assert!(warnings.is_empty(), "揃っていれば静か: {warnings:?}");
 }
 
@@ -1283,24 +1305,18 @@ async fn test_month_digest_warns_when_the_tail_of_the_month_is_missing() {
         })))
         .mount(&server)
         .await;
-    let (digest, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
-        let d = repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await;
-        // tail gap は診断専用 — 表示 (warnings) には乗るが封は止めない
-        // (`routes::kintai_recalc` の 5 条件 / `kintai_fold::recalc_month` の
-        // `warnings_seen()` はどちらもこの警告だけでは `Some(true)` にならない)
-        assert_eq!(
-            rust_ichibanboshi::kintai_http_repo::warnings_seen(),
-            Some(false),
-            "tail gap 単独では封を止めない (Refs #205-51)"
-        );
-        d
-    })
-    .await;
-    assert!(digest.unwrap().is_some(), "digest 自体は作れる");
+    let read = read_2026_01(&server).await;
+    assert!(read.digest.is_some(), "digest 自体は作れる");
+    let warnings = read.warnings;
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("2026-01-24"), "{warnings:?}");
+    assert!(warnings[0].text.contains("2026-01-24"), "{warnings:?}");
+    // tail gap は診断専用 — 表示 (warnings) には乗るが封は止めない
+    // (`routes::kintai_recalc` の 5 条件 / `kintai_fold::recalc_month` の封の判定は
+    // どちらもこの警告だけでは止まらない)
+    assert!(
+        !warnings[0].blocks_seal,
+        "tail gap 単独では封を止めない (Refs #205-51)"
+    );
 }
 
 /// `etag: null` (alc の DB に運行はあるが R2 に CSV が無い) は閾値の要らない欠け。
@@ -1319,20 +1335,14 @@ async fn test_month_digest_warns_for_operations_without_an_r2_etag() {
         })))
         .mount(&server)
         .await;
-    let (_, warnings, blocking) =
-        rust_ichibanboshi::kintai_http_repo::with_warning_sink_blocking(async {
-            repo(&server.uri())
-                .fetch_dtako_month_digest("2026-01")
-                .await
-        })
-        .await;
+    let warnings = read_2026_01(&server).await.warnings;
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].contains("R2 に CSV の無い運行 1 件"),
+        warnings[0].text.contains("R2 に CSV の無い運行 1 件"),
         "{warnings:?}"
     );
     assert!(
-        blocking,
+        warnings[0].blocks_seal,
         "no_etag は封を止める (tail gap との対比、Refs #205-51)"
     );
 }
@@ -1346,13 +1356,10 @@ async fn test_month_digest_does_not_warn_when_the_etags_route_is_absent() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
-    let (digest, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await
-    })
-    .await;
-    assert!(digest.unwrap().is_none(), "口が無い = None");
+    let read = read_2026_01(&server).await;
+    assert!(read.digest.is_none(), "口が無い = None");
+    assert!(read.etags.is_none(), "控えも無い");
+    let warnings = read.warnings;
     assert!(
         warnings.is_empty(),
         "口が無いだけで欠けてはいない: {warnings:?}"
@@ -1383,16 +1390,11 @@ async fn test_month_digest_catches_a_single_drivers_gap_via_real_json_driver_cds
         })))
         .mount(&server)
         .await;
-    let (_, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await
-    })
-    .await;
+    let warnings = read_2026_01(&server).await.warnings;
     // 期待 (窓の端) = 2026-02-01。D1 last=01-31 (gap 1、静か)。D3 last=01-20 (gap 12、鳴る)
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].contains("乗務員1名の末尾が12日超"),
+        warnings[0].text.contains("乗務員1名の末尾が12日超"),
         "{warnings:?}"
     );
 }
@@ -1415,19 +1417,14 @@ async fn test_month_digest_reads_multiple_driver_cds_on_one_operation() {
         })))
         .mount(&server)
         .await;
-    let (_, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await
-    })
-    .await;
+    let warnings = read_2026_01(&server).await.warnings;
     assert!(
         warnings.is_empty(),
         "D1/D2 とも窓の端まで在るので静か: {warnings:?}"
     );
 }
 
-/// **`unsplit` は前方互換で受けて `with_unsplit_sink` の戻り値まで素通しする。**
+/// **`unsplit` は前方互換で受けて `fetch_dtako_month_read_since` の戻り値 (etags の控え) まで素通しする。**
 /// 判定には使わない — 応答から読めることだけを固定する (Refs #205 の 32)。
 #[tokio::test]
 async fn test_unsplit_passes_through_from_the_real_etags_response() {
@@ -1444,13 +1441,13 @@ async fn test_unsplit_passes_through_from_the_real_etags_response() {
         })))
         .mount(&server)
         .await;
-    let (digest, items, total) = rust_ichibanboshi::kintai_http_repo::with_unsplit_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-06")
-            .await
-    })
-    .await;
-    assert!(digest.unwrap().is_some());
+    let read = repo(&server.uri())
+        .fetch_dtako_month_read_since("2026-06", None)
+        .await
+        .unwrap();
+    assert!(read.digest.is_some());
+    let etags = read.etags.expect("etags を読めた");
+    let (items, total) = (etags.unsplit, etags.unsplit_total);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].unko_no, "U1");
     assert_eq!(items[0].driver_cd, "D1");
@@ -1470,15 +1467,14 @@ async fn test_unsplit_defaults_to_empty_when_the_upstream_omits_it() {
         })))
         .mount(&server)
         .await;
-    let (digest, items, total) = rust_ichibanboshi::kintai_http_repo::with_unsplit_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-06")
-            .await
-    })
-    .await;
-    assert!(digest.unwrap().is_some());
-    assert!(items.is_empty());
-    assert_eq!(total, 0);
+    let read = repo(&server.uri())
+        .fetch_dtako_month_read_since("2026-06", None)
+        .await
+        .unwrap();
+    assert!(read.digest.is_some());
+    let etags = read.etags.expect("etags を読めた");
+    assert!(etags.unsplit.is_empty());
+    assert_eq!(etags.unsplit_total, 0);
 }
 
 // ── #205 の 37: 運行の突合 (オンプレ × GCP) ─────────────────────────────────
@@ -1499,14 +1495,14 @@ async fn test_unko_diff_names_the_operations_missing_from_the_real_etags_respons
         })))
         .mount(&server)
         .await;
-    let (digest, diff) = rust_ichibanboshi::kintai_http_repo::with_unko_diff_sink(async {
-        let d = repo(&server.uri())
-            .fetch_dtako_month_digest("2026-01")
-            .await;
-        // 突き合わせるのは kintai_fold の仕事 — ここでは同じ口を直に叩いて配線を見る
-        let gcp = rust_ichibanboshi::kintai_http_repo::collected_etag_unko_nos();
-        let gcp = gcp.expect("etags を引いた後は集合が立っている");
-        assert!(gcp.contains("26013110000000000023021"), "{gcp:?}");
+    let read = read_2026_01(&server).await;
+    // 突き合わせるのは月ゲートの流れの仕事 — ここでは同じ口を直に叩いて配線を見る
+    let gcp = read
+        .etags
+        .expect("etags を引いた後は集合が立っている")
+        .unko_nos;
+    assert!(gcp.contains("26013110000000000023021"), "{gcp:?}");
+    let (diff, warnings) = {
         let onprem = vec![
             rust_ichibanboshi::kintai_http_repo::OnpremOperation {
                 driver_cd: 1078,
@@ -1521,16 +1517,15 @@ async fn test_unko_diff_names_the_operations_missing_from_the_real_etags_respons
                 last_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
             },
         ];
-        rust_ichibanboshi::kintai_http_repo::record_unko_diff(
+        rust_ichibanboshi::kintai_http_repo::unko_diff_with_warnings(
             &onprem,
             &gcp,
             &Default::default(),
             Some((2026, 1)),
-        );
-        d
-    })
-    .await;
-    assert!(digest.unwrap().is_some(), "月ゲートの指紋は従来どおり");
+        )
+    };
+    assert!(read.digest.is_some(), "月ゲートの指紋は従来どおり");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert_eq!(diff.total, 1, "{diff:?}");
     assert_eq!(diff.items[0].driver_cd, 1517);
     assert_eq!(diff.items[0].unko_no, "260124100555000000230221", "生の値");
@@ -1544,28 +1539,13 @@ async fn test_unko_diff_names_the_operations_missing_from_the_real_etags_respons
     assert_eq!(diff.gcp_only, 0);
 }
 
-/// 突合していない呼び出し (sink は張ったが `record_unko_diff` を呼ばない) は空。
-#[tokio::test]
-async fn test_unko_diff_defaults_to_empty_without_a_comparison() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "period": {"date_from": "2026-06-01", "date_to": "2026-06-30"},
-            "items": [],
-            "warnings": [],
-        })))
-        .mount(&server)
-        .await;
-    let (digest, diff) = rust_ichibanboshi::kintai_http_repo::with_unko_diff_sink(async {
-        repo(&server.uri())
-            .fetch_dtako_month_digest("2026-06")
-            .await
-    })
-    .await;
-    assert!(digest.unwrap().is_some());
-    assert_eq!(diff.total, 0);
-    assert!(diff.items.is_empty());
-    assert_eq!(diff.gcp_only, 0);
+/// etags の読みだけでは突合しない — 月ゲートの束 (`FoldSink`) の突合は既定で空。
+#[test]
+fn test_unko_diff_defaults_to_empty_without_a_comparison() {
+    let sink = rust_ichibanboshi::kintai_fold::FoldSink::default();
+    assert_eq!(sink.unko_diff.total, 0);
+    assert!(sink.unko_diff.items.is_empty());
+    assert_eq!(sink.unko_diff.gcp_only, 0);
 }
 
 // ── 月初をまたぐ運行・勤務 (Refs ohishi-exp/nuxt-dtako-admin#1123) ────────────
@@ -1795,13 +1775,28 @@ async fn test_other_drivers_anchor_does_not_move_a_driver_that_does_not_straddle
     let params = KosokuParams::default();
     let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 15);
 
-    let new = fold_month(&repo, &params, "2026-07", None, today)
-        .await
-        .unwrap();
+    let new = fold_month(
+        &repo,
+        &params,
+        "2026-07",
+        None,
+        today,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
     let empty = Default::default();
-    let old = fold_month_with_anchors(&repo, &params, "2026-07", None, today, &empty)
-        .await
-        .unwrap();
+    let old = fold_month_with_anchors(
+        &repo,
+        &params,
+        "2026-07",
+        None,
+        today,
+        &empty,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
     let pick = |v: &[(u64, rust_ichibanboshi::kintai_fold::FoldUnit, String)], cd: u64| {
         v.iter().find(|(d, ..)| *d == cd).cloned()
     };

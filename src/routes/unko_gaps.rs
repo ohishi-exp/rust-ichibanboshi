@@ -18,26 +18,20 @@
 //! (`("src","kosoku")` / `("src","kintai")` / `("src/routes","kintai")`) で
 //! `logic_version` の指紋を作るので、そこに入ると 1 バイトの変更でも
 //! 全乗務員・全月が stale になる。**この口が読む部品
-//! (`with_unko_diff_sink` / `collected_etag_unko_nos` / `collected_etag_driver_cds` /
-//! `fetch_dtako_month_digest` / `unko_no_start_date`) はすべて既に `pub` /
-//! `pub(crate)` で公開済み**なので、glob 内 (`kintai_http_repo.rs` /
-//! `kintai_fold.rs` / `kintai_push.rs` / `kintai_repo.rs`) を**1 行も変えずに**
+//! (`fetch_dtako_month_read_since` / `unko_no_start_date`) はすべて既に `pub` で公開済み**
+//! なので、glob 内 (`kintai_http_repo.rs` / `kintai_fold.rs` / `kintai_push.rs` / `kintai_repo.rs`) を
 //! 呼ぶだけで組める。
 //!
-//! ## sink を埋める — glob を触らずに `fetch_etags` (private) へ届く経路
+//! ## etags の控えを読む — `fetch_etags` (private) へ届く経路
 //!
 //! `fetch_etags` (alc の `GET /api/dtako/events/etags` を叩く実装) は
 //! `HttpKintaiEventsRepo` の private メソッドで、外から直接呼べない。だが
-//! **`KintaiEventsApi::fetch_dtako_month_digest(month)` という `pub` トレイト
+//! **`KintaiEventsApi::fetch_dtako_month_read_since(month, None)` という `pub` トレイト
 //! メソッドが、内部で `fetch_etags` を「対象月だけの窓」で呼んでいる**
 //! ([`crate::kintai_http_repo::HttpKintaiEventsRepo`] の実装、
-//! `month_etags_bounds` = `[月初, 翌月初]` の閉区間)。これは
-//! [`crate::kintai_fold::compute_month_digests`] が月ゲートの指紋を取るのと
-//! **全く同じ呼び方** — 呼んだ結果 (digest 文字列) は使わず、副作用として
-//! [`crate::kintai_http_repo::UNKO_SINK`] task-local に積まれる
-//! `unko_no` 集合と `unko_no → driver_cds` を
-//! [`crate::kintai_http_repo::collected_etag_unko_nos`] /
-//! [`crate::kintai_http_repo::collected_etag_driver_cds`] で読むだけ。
+//! `month_etags_bounds` = `[月初, 翌月初]` の閉区間)。月ゲートが指紋を取るのと
+//! **同じ読み** — 指紋は使わず、戻り値の etags の控え (`unko_no` の集合と
+//! `unko_no → driver_cds`) だけを読む (Refs #322 で task-local をやめ、値で返る形にした)。
 //!
 //! **fold が使う窓 (実測 `2026-04-20..2026-07-02`、前後 2.5 か月ぶん) より
 //! 狭い** — この口は `also_in_month` の判定に対象月だけで足りるので、
@@ -68,7 +62,7 @@
 //! ## 「無い」と「引けていない」を区別する
 //!
 //! - `gcp_etags_available`: `false` なら alc の etags 口が使えない環境
-//!   (`collected_etag_unko_nos` が `None`)。この状態の `drivers: []` は
+//!   (読みの戻り値の etags の控えが `None`)。この状態の `drivers: []` は
 //!   「候補が居ない」ではなく「判定できない」
 //! - `driver_cds_available`: `false` なら etags は引けたが `driver_cds`
 //!   (乗務員別の内訳) を 1 件も持たない環境。この状態でも GCP-only-in-month の
@@ -101,7 +95,7 @@
 //! ## 純粋部分は共有 crate (`kintai_logic::unko_gaps`)
 //!
 //! 判定・整形の核 (`build_gaps`・`drop_crew_suffix`・上限・応答の組み立て) と `month` の検査は勤怠 Worker
-//! (`workers/kintai`) と共有する (写さない。Refs #322)。ここに残るのは axum・sqlx・alc の etags の sink と
+//! (`workers/kintai`) と共有する (写さない。Refs #322)。ここに残るのは axum・sqlx・alc の etags の読みと
 //! `elapsed_ms` だけ。
 
 use axum::extract::Query;
@@ -190,21 +184,14 @@ pub async fn unko_gaps(
     let onprem = Onprem::from_rows(pairs.iter().map(|(d, u)| (*d, u.as_str())));
 
     // GCP 側の etags — 対象月だけの narrow window (モジュール docs 参照)。
-    // `collected_etag_unko_nos` / `collected_etag_driver_cds` は
-    // `with_unko_diff_sink` が張る task-local の中でしか実体を持たないので、
-    // 呼び出し (`fetch_dtako_month_digest`) と同じ future の中で読む
-    let ((digest, gcp_unko_nos, gcp_driver_cds), _unused_diff) =
-        crate::kintai_http_repo::with_unko_diff_sink(async {
-            let d = repo.fetch_dtako_month_digest(&month).await;
-            let u = crate::kintai_http_repo::collected_etag_unko_nos();
-            let dc = crate::kintai_http_repo::collected_etag_driver_cds();
-            (d, u, dc)
-        })
-        .await;
-    if let Err(e) = &digest {
+    // 指紋は使わず、etags の控え (読めたときだけ `Some`) だけを読む
+    let read = repo.fetch_dtako_month_read_since(&month, None).await;
+    if let Err(e) = &read {
         tracing::warn!(month = %month, error = %e, "kintai unko-gaps dtako digest failed");
     }
-    let gcp_etags_available = gcp_unko_nos.is_some();
+    let etags = read.ok().and_then(|r| r.etags);
+    let gcp_etags_available = etags.is_some();
+    let gcp_driver_cds = etags.map(|e| e.driver_cds).unwrap_or_default();
     let gcp = gcp_etags_available.then_some(&gcp_driver_cds);
 
     let mut body = respond(&month, &window, q.driver_cd, &onprem, gcp);

@@ -279,7 +279,9 @@ async fn folding_from_one_read_matches_the_per_driver_read() {
     let (repo, _) = repo();
 
     let old = fold_month_per_driver(&repo, &params, MONTH).await;
-    let new = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
+    let new = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
+        .await
+        .unwrap();
 
     assert!(!old.is_empty(), "fixture が空では何も確かめていない");
     assert_eq!(
@@ -320,7 +322,9 @@ async fn the_duplicate_unko_no_row_changes_the_fingerprint_but_not_the_values() 
     let (repo, _) = repo();
 
     let old = fold_month_per_driver(&repo, &params, MONTH).await;
-    let new = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
+    let new = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
+        .await
+        .unwrap();
     let pick = |v: &[(u64, FoldUnit, String)]| {
         v.iter()
             .find(|(cd, ..)| *cd == 1526)
@@ -344,7 +348,9 @@ async fn folding_a_month_reads_the_events_once() {
     let params = KosokuParams::default();
     let (repo, counts) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
+    let units = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
+        .await
+        .unwrap();
 
     assert_eq!(counts.all.load(Ordering::SeqCst), 1, "全量読みは月 1 回");
     assert_eq!(
@@ -376,9 +382,16 @@ async fn naming_one_driver_still_reads_once() {
     let params = KosokuParams::default();
     let (repo, counts) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, Some(1130), None)
-        .await
-        .unwrap();
+    let units = fold_month(
+        &repo,
+        &params,
+        MONTH,
+        Some(1130),
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].0, 1130);
@@ -396,9 +409,16 @@ async fn naming_a_driver_with_no_rows_still_yields_an_empty_unit() {
     let params = KosokuParams::default();
     let (repo, _) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, Some(4242), None)
-        .await
-        .unwrap();
+    let units = fold_month(
+        &repo,
+        &params,
+        MONTH,
+        Some(4242),
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].0, 4242);
@@ -412,7 +432,9 @@ async fn a_driver_outside_the_month_is_not_folded() {
     let params = KosokuParams::default();
     let (repo, _) = repo();
 
-    let units = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
+    let units = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
+        .await
+        .unwrap();
 
     assert!(
         !units.iter().any(|(cd, ..)| *cd == 1999),
@@ -425,9 +447,11 @@ async fn a_bad_month_is_rejected_before_reading() {
     let params = KosokuParams::default();
     let (repo, counts) = repo();
 
-    assert!(fold_month(&repo, &params, "nope", None, None)
-        .await
-        .is_err());
+    assert!(
+        fold_month(&repo, &params, "nope", None, None, &mut Default::default())
+            .await
+            .is_err()
+    );
     assert_eq!(counts.all.load(Ordering::SeqCst), 0, "読む前に落とす");
 }
 
@@ -650,13 +674,23 @@ async fn a_shift_begun_last_month_is_not_restarted_this_month() {
     let params = KosokuParams::default();
     let (repo, _) = cross_repo();
 
-    let july = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
+    let july = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
+        .await
+        .unwrap();
     assert!(starts(&july, 1194).is_empty(), "{:?}", starts(&july, 1194));
     assert!(starts(&july, 1401).is_empty(), "打刻だけで遡る形も同じ");
 
-    let base = fold_month_with_anchors(&repo, &params, MONTH, None, None, &Default::default())
-        .await
-        .unwrap();
+    let base = fold_month_with_anchors(
+        &repo,
+        &params,
+        MONTH,
+        None,
+        None,
+        &Default::default(),
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         starts(&base, 1194),
         vec!["2026-07-01 04:38:00", "2026-07-01 08:30:00"],
@@ -670,12 +704,27 @@ async fn last_months_fold_is_unchanged() {
     let params = KosokuParams::default();
     let (repo, _) = cross_repo();
 
-    let june = fold_month(&repo, &params, "2026-06", None, None)
-        .await
-        .unwrap();
-    let base = fold_month_with_anchors(&repo, &params, "2026-06", None, None, &Default::default())
-        .await
-        .unwrap();
+    let june = fold_month(
+        &repo,
+        &params,
+        "2026-06",
+        None,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
+    let base = fold_month_with_anchors(
+        &repo,
+        &params,
+        "2026-06",
+        None,
+        None,
+        &Default::default(),
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(june, base, "6 月には遡る起点が無い");
     let (u, _) = unit_of(&june, 1194).unwrap();
     assert_eq!(starts(&june, 1194), vec!["2026-06-30 21:36:00"]);
@@ -688,7 +737,9 @@ async fn last_months_fold_is_unchanged() {
 async fn looking_back_still_reads_the_events_once() {
     let params = KosokuParams::default();
     let (repo, counts) = cross_repo();
-    fold_month(&repo, &params, MONTH, None, None).await.unwrap();
+    fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
+        .await
+        .unwrap();
     assert_eq!(counts.all.load(Ordering::SeqCst), 1);
     assert_eq!(counts.single.load(Ordering::SeqCst), 0);
 }
@@ -700,10 +751,20 @@ async fn other_drivers_anchors_do_not_move_the_rest() {
     let params = KosokuParams::default();
     let (repo, _) = cross_repo();
 
-    let new = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
-    let base = fold_month_with_anchors(&repo, &params, MONTH, None, None, &Default::default())
+    let new = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
         .await
         .unwrap();
+    let base = fold_month_with_anchors(
+        &repo,
+        &params,
+        MONTH,
+        None,
+        None,
+        &Default::default(),
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
     for cd in [1130, 1400] {
         let n = unit_of(&new, cd).expect("new");
         assert!(!n.0.shifts.is_empty(), "乗務員 {cd} の勤務が立っていない");
@@ -734,11 +795,11 @@ async fn the_anchors_follow_the_rules_and_are_reported() {
         "1400 (当月の最初が始業) は遡らない"
     );
 
-    let (units, warnings) = rust_ichibanboshi::kintai_http_repo::with_warning_sink(fold_month(
-        &repo, &params, MONTH, None, None,
-    ))
-    .await;
-    units.unwrap();
+    let mut sink = rust_ichibanboshi::kintai_fold::Warnings::default();
+    fold_month(&repo, &params, MONTH, None, None, &mut sink)
+        .await
+        .unwrap();
+    let warnings = sink.texts();
     let lookback: Vec<&String> = warnings.iter().filter(|w| w.contains("遡り")).collect();
     assert_eq!(lookback.len(), 4, "{warnings:?}");
     assert!(lookback
@@ -749,11 +810,11 @@ async fn the_anchors_follow_the_rules_and_are_reported() {
         .any(|w| w.contains("1194") && w.contains("1 日前")));
     // 診断なので封は止めない (今日を固定して push 窓ずれの警告を混ぜない)
     let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 15);
-    let (_, _, blocks) = rust_ichibanboshi::kintai_http_repo::with_warning_sink_blocking(
-        fold_month(&repo, &params, MONTH, None, today),
-    )
-    .await;
-    assert!(!blocks, "遡りの warning は封を止めない");
+    let mut sink = rust_ichibanboshi::kintai_fold::Warnings::default();
+    fold_month(&repo, &params, MONTH, None, today, &mut sink)
+        .await
+        .unwrap();
+    assert!(!sink.blocks_seal(), "遡りの warning は封を止めない");
 }
 
 /// 前月始業の長い勤務を割った欠片のうち、当月始業のものだけが当月に出て、前月の
@@ -762,10 +823,19 @@ async fn the_anchors_follow_the_rules_and_are_reported() {
 async fn split_fragments_of_a_long_shift_do_not_overlap_across_months() {
     let params = KosokuParams::default();
     let (repo, _) = cross_repo();
-    let june = fold_month(&repo, &params, "2026-06", None, None)
+    let june = fold_month(
+        &repo,
+        &params,
+        "2026-06",
+        None,
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap();
+    let july = fold_month(&repo, &params, MONTH, None, None, &mut Default::default())
         .await
         .unwrap();
-    let july = fold_month(&repo, &params, MONTH, None, None).await.unwrap();
     let spans = |v: &[(u64, FoldUnit, String)]| -> Vec<(String, String)> {
         unit_of(v, 1600)
             .map(|(u, _)| {

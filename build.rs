@@ -29,6 +29,7 @@ const KINTAI_OUTPUT_REQUIRED: &[&str] = &[
     "src/routes/kintai_version.rs",
     // 共有 crate は全ファイルを列挙する (Refs #322)
     "workers/kintai/kosoku/src/anchors.rs",
+    "workers/kintai/kosoku/src/fold_flow.rs",
     "workers/kintai/kosoku/src/kintai_fold.rs",
     "workers/kintai/kosoku/src/kintai_push.rs",
     "workers/kintai/kosoku/src/kintai_reading_dates.rs",
@@ -41,6 +42,7 @@ const KINTAI_OUTPUT_REQUIRED: &[&str] = &[
     "workers/kintai/kosoku/src/kosoku_paper.rs",
     "workers/kintai/kosoku/src/lib.rs",
     "workers/kintai/kosoku/src/sql.rs",
+    "workers/kintai/kosoku/src/unko_diff.rs",
     "workers/kintai/kosoku/src/window.rs",
 ];
 

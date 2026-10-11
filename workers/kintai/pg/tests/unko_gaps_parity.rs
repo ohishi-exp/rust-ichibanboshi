@@ -1,34 +1,18 @@
-//! unko-gaps の写し 2 つ (`kintai_logic::unko_gaps` の `MONTH_OPERATIONS_SQL`・`PUSHED_SOURCES` と、alc の etags の
-//! path・期間・応答の読み方) が root と一致することを固定する (Refs #322)。DB は要らない。
+//! unko-gaps の写し (`kintai_logic::unko_gaps` の alc の etags の path・期間・応答の読み方) が root と一致することを
+//! 固定する (Refs #322)。DB は要らない。`MONTH_OPERATIONS_SQL`・`PUSHED_SOURCES`・`UnsplitOperation` は共有 crate
+//! (`kintai_kosoku`) に移し、root と Worker が同じものを使うので比べない。
 //!
-//! どちらも root の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の中 (`src/kintai_push.rs`・`src/kintai_http_repo.rs`) にあり、
-//! root を動かすと logic_version が変わるので共有にできない (fold を移す段で解消する)。
-//!
-//! - SQL は root の `pub const` と値で比べる
-//! - etags は root 側が private (`ETAGS_PATH`・`UpstreamEtagItem`・`UpstreamEtags`・`UnsplitOperation`・`month_etags_bounds`・
-//!   `fetch_etags`) で値を外から取れないので、root のソースの該当の定義を**文字列で**固定する (text pin)。
-//!   ここが落ちたら root の etags の読み方が変わっている — `logic/src/unko_gaps.rs` の写しも直してから pin を更新する
+//! etags の読み方は root の勤怠の版 (`KINTAI_OUTPUT_SHA`) の glob の中 (`src/kintai_http_repo.rs`) にあり、root 側が private
+//! (`ETAGS_PATH`・`UpstreamEtagItem`・`UpstreamEtags`・`month_etags_bounds`・`fetch_etags`) で値を外から取れないので、
+//! root のソースの該当の定義を**文字列で**固定する (text pin)。
+//! ここが落ちたら root の etags の読み方が変わっている — `logic/src/unko_gaps.rs` の写しも直してから pin を更新する
 //!
 //! この crate に置くのは、repo ルートの package を dev-dependency に持つのがここだけだから。
 
-use kintai_logic::unko_gaps::{
-    etags_search, read_etags, RpcResult, ETAGS_PATH, MONTH_OPERATIONS_SQL, PUSHED_SOURCES,
-};
+use kintai_logic::unko_gaps::{etags_search, read_etags, RpcResult, ETAGS_PATH};
 
 /// root の alc の etags を読む実装 (`HttpKintaiEventsRepo` の `fetch_etags` まわり)。
 const ROOT_HTTP_REPO: &str = include_str!("../../../../src/kintai_http_repo.rs");
-
-#[test]
-fn month_operations_sql_and_sources_match_root() {
-    assert_eq!(
-        MONTH_OPERATIONS_SQL,
-        rust_ichibanboshi::kintai_push::MONTH_OPERATIONS_SQL
-    );
-    assert_eq!(
-        PUSHED_SOURCES,
-        rust_ichibanboshi::kintai_push::PUSHED_SOURCES
-    );
-}
 
 /// root のソースに `snippet` がそのまま 1 回だけ在ること。
 fn pinned(snippet: &str) {
@@ -43,7 +27,8 @@ fn the_etags_path_matches_root() {
     assert_eq!(ETAGS_PATH, "/api/dtako/events/etags");
 }
 
-/// pin: root の etags の応答の型 3 つ (写しは `logic/src/unko_gaps.rs` の同名の private な型。欄・型・`serde(default)` が同じ)。
+/// pin: root の etags の応答の型 2 つ (写しは `logic/src/unko_gaps.rs` の同名の private な型。欄・型・`serde(default)` が同じ)。
+/// `unsplit` の 1 件 (`UnsplitOperation`) は共有 crate の型を両方が使う。
 #[test]
 fn the_etags_response_types_match_root() {
     pinned(
@@ -53,13 +38,6 @@ fn the_etags_response_types_match_root() {
     etag: Option<String>,
     #[serde(default)]
     driver_cds: Vec<String>,
-}",
-    );
-    pinned(
-        "pub struct UnsplitOperation {
-    pub unko_no: String,
-    pub driver_cd: String,
-    pub reading_date: String,
 }",
     );
     pinned(
