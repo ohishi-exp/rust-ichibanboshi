@@ -47,7 +47,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 
 use crate::config::KintaiPushConfig;
 use crate::kintai_repo::{exact_month_range, DynKintaiEventsRepo, KintaiRepoError};
@@ -406,16 +406,10 @@ impl KintaiPgStore {
 
 /// `YYYY-MM-DD HH:MM:SS` (JST 壁時計) を `TIMESTAMPTZ` へ渡せる形に。
 ///
-/// 読み返す側 ([`crate::kintai_pg_repo`]) も同じ変換で範囲を作る。**写さない** —
-/// 書きと読みで壁時計の解釈が 1 箇所でも割れると、書いた行が読めない日ができる。
+/// 変換は共有 crate の `kintai_kosoku::kintai_push::jst_at` (読み返す側 [`crate::kintai_pg_repo`] と勤怠 Worker の
+/// fold の読みも同じもの)。**写さない** — 書きと読みで壁時計の解釈が 1 箇所でも割れると、書いた行が読めない日ができる。
 pub fn jst_at(s: &str) -> Result<DateTime<FixedOffset>, KintaiPushError> {
-    let naive = NaiveDateTime::parse_from_str(s, DATETIME_FORMAT)
-        .map_err(|e| KintaiPushError::NotConfigured(format!("bad range {s:?}: {e}")))?;
-    Ok(FixedOffset::east_opt(JST_OFFSET_SECONDS)
-        .expect("JST offset is in range")
-        .from_local_datetime(&naive)
-        .single()
-        .expect("JST has no DST gap"))
+    kintai_kosoku::kintai_push::jst_at(s).map_err(|e| KintaiPushError::NotConfigured(e.0))
 }
 
 // ── push 本体 ──────────────────────────────────────────────────────────────

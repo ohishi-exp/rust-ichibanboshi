@@ -13,6 +13,8 @@
 //! - 全 SQL の `$1` はテナント ([`FoldStore::new`] で固定)
 //! - 打刻の置き換え [`TimecardWindowIo`] (window の口) もここに impl する — 置き換えと畳み直しを同じ接続で回すため。
 //!   root の `impl TimecardWindowIo for KintaiPgStore` との一致は `tests/window_parity.rs` (実 DB)
+//! - fold の読みのうち送った写しの 3 本 (`kintai_logic::fold_events::PushedEventsRead`) もここに impl する — 書きと同じ接続で
+//!   読むため。root の `PgKintaiEventsRepo` との一致は `tests/fold_events_parity.rs` (実 DB)
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -30,8 +32,13 @@ use kintai_kosoku::kintai_push::{
     jst_day_bounds, month_date_bounds, DriverPlan, MONTH_OPERATIONS_SQL, MONTH_PUNCH_DIGEST_SQL,
     OPERATION_DRIVER_CDS_SQL, STORED_WINDOW_SIGNATURES_SQL,
 };
+use kintai_kosoku::pushed_events::{
+    all_event_json, head_punch, head_run_end, ALL_EVENTS_SQL, HEAD_PUNCHES_SQL, HEAD_RUN_ENDS_SQL,
+};
 use kintai_kosoku::route_flow::{BadWindow, TimecardWindowIo};
+use kintai_kosoku::window::HeadPunch;
 use kintai_logic::common::{db_fail, Fail};
+use kintai_logic::fold_events::{PushedEventsRead, Span};
 use kintai_logic::fold_routes::{not_configured, read_failed, DB_WHAT};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Error, Row};
@@ -46,7 +53,7 @@ pub enum FoldStoreError {
     BadMonth(String),
     /// 月の並び・窓が読めない (`months_span`・`window_spans` の文面そのまま: `bad month: …` / `months が空です`)
     BadMonths(String),
-    /// fold の読み (alc の RPC・社内 MariaDB) の失敗 (root の `KintaiPushError::Read`)
+    /// fold の読み (alc の RPC・送った写し) の失敗 (root の `KintaiPushError::Read`)
     Read(Fail),
     /// DB の失敗
     Db(Error),
@@ -533,4 +540,98 @@ impl TimecardWindowIo for FoldStore {
         crate::replace_window(&mut pg, self.tenant, plans.clone()).await?;
         Ok(())
     }
+}
+
+/// fold の読みのうち、relay が送った打刻の写し (`kintai.kintai_events`) の 3 本 (`WorkerFoldEvents` の `pushed`)。
+/// root の `PgKintaiEventsRepo` (`fetch_all_events_between`・`fetch_month_head_anchors`) と同じ SQL・同じ bind・同じ行の形
+/// (`kintai_kosoku::pushed_events`)。書きと同じ接続なので、window の口は置き換えた写しをそのまま畳み直しで読む。
+/// 失敗は 502 `kintai_events read failed: <種別>` (root の `db_err` と同じ頭。DB の message・接続先は出さない)。
+impl PushedEventsRead for FoldStore {
+    async fn pushed_all_events(&self, span: Span) -> Result<Vec<serde_json::Value>, Fail> {
+        let (tenant, (from, to)) = (self.tenant, span);
+        let out = self.tx(move |tx| {
+            Box::pin(async move {
+                let src = sources();
+                let rows = tx
+                    .query_typed(
+                        ALL_EVENTS_SQL,
+                        &[
+                            (&tenant, Type::UUID),
+                            (&from, Type::TIMESTAMPTZ),
+                            (&to, Type::TIMESTAMPTZ),
+                            (&src, Type::TEXT_ARRAY),
+                        ],
+                    )
+                    .await?;
+                let row = |r: &Row| -> Result<_, Error> {
+                    Ok(all_event_json(
+                        r.try_get("datetime")?,
+                        r.try_get("driver_id")?,
+                        r.try_get("source")?,
+                        r.try_get("state")?,
+                    ))
+                };
+                rows.iter().map(row).collect::<Result<Vec<_>, _>>()
+            })
+        });
+        out.await.map_err(pushed_fail)
+    }
+
+    async fn pushed_head_run_ends(&self, span: Span) -> Result<Vec<(u64, String)>, Fail> {
+        let (tenant, (from, to)) = (self.tenant, span);
+        let out = self.tx(move |tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_typed(HEAD_RUN_ENDS_SQL, &window_params(&tenant, &from, &to))
+                    .await?;
+                let row = |r: &Row| -> Result<_, Error> {
+                    Ok(head_run_end(r.try_get("driver_cd")?, r.try_get("unko_no")?))
+                };
+                rows.iter().map(row).collect::<Result<Vec<_>, _>>()
+            })
+        });
+        out.await.map_err(pushed_fail)
+    }
+
+    async fn pushed_head_punches(&self, span: Span) -> Result<Vec<HeadPunch>, Fail> {
+        let (tenant, (from, to)) = (self.tenant, span);
+        let out = self.tx(move |tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_typed(HEAD_PUNCHES_SQL, &window_params(&tenant, &from, &to))
+                    .await?;
+                let row = |r: &Row| -> Result<_, Error> {
+                    Ok(head_punch(
+                        r.try_get("driver_cd")?,
+                        r.try_get("first_state")?,
+                        r.try_get("last_start")?,
+                        r.try_get("last_end")?,
+                    ))
+                };
+                rows.iter().map(row).collect::<Result<Vec<_>, _>>()
+            })
+        });
+        out.await.map_err(pushed_fail)
+    }
+}
+
+/// 遡り起点の 2 本の bind (`$1` テナント・`$2`/`$3` 窓)。
+fn window_params<'a>(
+    tenant: &'a Uuid,
+    from: &'a DateTime<FixedOffset>,
+    to: &'a DateTime<FixedOffset>,
+) -> [(&'a (dyn ToSql + Sync), Type); 3] {
+    [
+        (tenant, Type::UUID),
+        (from, Type::TIMESTAMPTZ),
+        (to, Type::TIMESTAMPTZ),
+    ]
+}
+
+/// 写しの読みの失敗の本文の頭 (root の `kintai_pg_repo::db_err` と同じ)。
+pub const PUSHED_WHAT: &str = "kintai_events read";
+
+/// 写しの読みの失敗 (502、種別だけ)。
+fn pushed_fail(e: Error) -> Fail {
+    db_fail(PUSHED_WHAT, &kind(&e))
 }

@@ -1,8 +1,9 @@
 //! 勤怠 Worker の fold の読み 3 本 (`kintai_logic::fold_events`) の単体テスト (DB も RPC も要らない。往復は fake)。
 //!
-//! root の `HttpKintaiEventsRepo` と同じ読み方であること — 読みの順番 (alc のページング → MariaDB の全員行、遡り起点は
-//! MariaDB だけ、指紋は etags だけ)・`dtakoEvents` / `dtakoEtags` に渡す query・404 / 非 2xx の扱い — を固定する。
-//! root と同じ上流の応答を与えた突き合わせは `workers/kintai/pg/tests/fold_events_parity.rs`。
+//! 本番の Cloud Run 版 (root の `HttpKintaiEventsRepo` + fallback の `PgKintaiEventsRepo`) と同じ読み方であること — 読みの順番
+//! (alc のページング → 送った写しの全員行、遡り起点は写しだけ、指紋は etags だけ)・写しに渡す期間 (JST の `TIMESTAMPTZ`)・
+//! `dtakoEvents` / `dtakoEtags` に渡す query・404 / 非 2xx の扱い — を固定する。社内 MariaDB の往復は型に無い。
+//! root と同じ写し・同じ上流の応答を与えた突き合わせは `workers/kintai/pg/tests/fold_events_parity.rs` (実 DB)。
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -12,12 +13,14 @@ use std::task::{Context, Poll, Waker};
 use chrono::NaiveDate;
 use kintai_kosoku::alc_events::{AlcEventsGet, EventsPage};
 use kintai_kosoku::fold_flow::{month_anchors, BadMonth, DtakoMonthRead, FoldEventsIo};
-use kintai_logic::common::{mariadb_fail, Fail};
-use kintai_logic::fold_events::{events_search, read_events, AlcRpc, MariadbRun, WorkerFoldEvents};
-use kintai_logic::kosoku_reads::{all_events_sql, head_sqls, head_sqls_between};
+use kintai_kosoku::pushed_events::all_event_json;
+use kintai_kosoku::window::HeadPunch;
+use kintai_logic::common::Fail;
+use kintai_logic::fold_events::{
+    events_search, pushed_window, read_events, AlcRpc, PushedEventsRead, Span, WorkerFoldEvents,
+};
 use kintai_logic::unko_gaps::RpcResult;
-use kintai_mysql::response::Row;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// fake の往復は待たずに返すので、1 回 poll すれば終わる。
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -30,13 +33,6 @@ fn block_on<F: Future>(f: F) -> F::Output {
 
 fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
-}
-
-fn row(cells: &[Option<&str>]) -> Row {
-    cells
-        .iter()
-        .map(|c| c.map(|s| s.as_bytes().to_vec()))
-        .collect()
 }
 
 fn res(status: u16, body: &str) -> RpcResult {
@@ -79,26 +75,53 @@ impl AlcRpc for Alc<'_> {
     }
 }
 
-/// MariaDB の fake。流された SQL の本数を記録し、`sets` を返す。
-struct Db<'a> {
-    log: &'a Log,
-    sets: RefCell<Option<Result<Vec<Vec<Row>>, Fail>>>,
+/// 1 回だけ返す戻り値。
+type Once<T> = RefCell<Option<Result<T, Fail>>>;
+
+/// 写しの読みの fake。呼ばれた口と期間を記録し、口ごとに 1 回だけ返す。
+#[derive(Default)]
+struct Pushed<'a> {
+    log: Option<&'a Log>,
+    all: Once<Vec<Value>>,
+    runs: Once<Vec<(u64, String)>>,
+    punches: Once<Vec<HeadPunch>>,
 }
 
-impl MariadbRun for Db<'_> {
-    async fn run(&self, sqls: &[String]) -> Result<Vec<Vec<Row>>, Fail> {
-        self.log
-            .borrow_mut()
-            .push(format!("mariadb x{}", sqls.len()));
-        self.sets.borrow_mut().take().expect("MariaDB は 1 回")
+impl Pushed<'_> {
+    fn note(&self, what: &str, (from, to): Span) {
+        let line = format!("{what} {}..{}", from.to_rfc3339(), to.to_rfc3339());
+        self.log.unwrap().borrow_mut().push(line);
     }
 }
 
-fn db(log: &Log, sets: Result<Vec<Vec<Row>>, Fail>) -> Db<'_> {
-    Db {
-        log,
-        sets: RefCell::new(Some(sets)),
+impl PushedEventsRead for Pushed<'_> {
+    async fn pushed_all_events(&self, span: Span) -> Result<Vec<Value>, Fail> {
+        self.note("pushed all", span);
+        self.all.borrow_mut().take().expect("全員行は 1 回")
     }
+
+    async fn pushed_head_run_ends(&self, span: Span) -> Result<Vec<(u64, String)>, Fail> {
+        self.note("pushed runs", span);
+        self.runs.borrow_mut().take().expect("運行終了は 1 回")
+    }
+
+    async fn pushed_head_punches(&self, span: Span) -> Result<Vec<HeadPunch>, Fail> {
+        self.note("pushed punches", span);
+        self.punches.borrow_mut().take().expect("打刻の姿は 1 回")
+    }
+}
+
+fn pushed(log: &Log) -> Pushed<'_> {
+    Pushed {
+        log: Some(log),
+        ..Pushed::default()
+    }
+}
+
+fn pushed_all(log: &Log, all: Result<Vec<Value>, Fail>) -> Pushed<'_> {
+    let p = pushed(log);
+    *p.all.borrow_mut() = Some(all);
+    p
 }
 
 fn alc(log: &Log) -> Alc<'_> {
@@ -108,9 +131,16 @@ fn alc(log: &Log) -> Alc<'_> {
     }
 }
 
+/// 写しの全員行 (root の `PgKintaiEventsRepo` と同じ 5 キー)。
+fn copy_row(at: &str, driver: i64, source: &str, state: &str) -> Value {
+    all_event_json(at.into(), driver, source.into(), state.into())
+}
+
 const TODAY: NaiveDate = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
 const FROM: &str = "2026-06-01 00:00:00";
 const TO: &str = "2026-07-02 00:00:00";
+/// [`FROM`]・[`TO`] を JST の `TIMESTAMPTZ` にした期間 (写しに渡るもの)。
+const SPAN: &str = "2026-06-01T00:00:00+09:00..2026-07-02T00:00:00+09:00";
 
 fn events_body(driver: &str, start: &str, next: Option<&str>) -> String {
     json!({
@@ -127,10 +157,10 @@ fn events_body(driver: &str, start: &str, next: Option<&str>) -> String {
 
 // ── 全乗務員の行 ──
 
-/// **読みの順番**: alc のページング (chunk 1 の 2 ページ → chunk 2) を回しきってから MariaDB の全員行を 1 本。
+/// **読みの順番**: alc のページング (chunk 1 の 2 ページ → chunk 2) を回しきってから写しの全員行を 1 本。
 /// `dtakoEvents` の query は root の reqwest と同じ鍵・同じ順 (`after_driver_cd` は 2 ページ目から、値は urlencode)。
 #[test]
-fn all_events_reads_alc_pages_then_mariadb() {
+fn all_events_reads_alc_pages_then_the_pushed_copy() {
     let log = Log::default();
     let a = alc(&log);
     *a.events.borrow_mut() = vec![
@@ -141,38 +171,27 @@ fn all_events_reads_alc_pages_then_mariadb() {
         Ok(res(200, &events_body("1102", "2026/06/02 08:00:00", None))),
         Ok(res(200, &events_body("1103", "2026/07/01 08:00:00", None))),
     ];
-    let m = db(
+    let m = pushed_all(
         &log,
-        Ok(vec![vec![
-            row(&[
-                Some("2026-06-01 07:30:00"),
-                None,
-                Some("1101"),
-                Some("timecard"),
-                Some("始業"),
-            ]),
-            row(&[
-                Some("2026-06-01 08:00:00"),
-                None,
-                Some("1101"),
-                Some("dtako_events"),
-                Some("運行開始"),
-            ]),
-        ]]),
+        Ok(vec![
+            copy_row("2026-06-01 07:30:00", 1101, "timecard", "始業"),
+            copy_row("2026-06-01 08:00:00", 1101, "dtako", "運行開始"),
+        ]),
     );
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     let (rows, warnings) = block_on(w.all_events_between(FROM, TO)).unwrap();
     assert_eq!(
         *log.borrow(),
         vec![
-            "events?date_from=2026-05-30&date_to=2026-06-29&page_size=50",
-            "events?date_from=2026-05-30&date_to=2026-06-29&page_size=50&after_driver_cd=11+01",
-            "events?date_from=2026-06-30&date_to=2026-07-01&page_size=50",
-            "mariadb x1",
+            "events?date_from=2026-05-30&date_to=2026-06-29&page_size=50".to_string(),
+            "events?date_from=2026-05-30&date_to=2026-06-29&page_size=50&after_driver_cd=11+01"
+                .to_string(),
+            "events?date_from=2026-06-30&date_to=2026-07-01&page_size=50".to_string(),
+            format!("pushed all {SPAN}"),
         ]
     );
     let got: Vec<(i64, &str, &str)> = rows
@@ -189,46 +208,46 @@ fn all_events_reads_alc_pages_then_mariadb() {
         got,
         vec![
             (1101, "2026-06-01 07:30:00", "timecard"),
+            (1101, "2026-06-01 08:00:00", "dtako"),
             (1101, "2026-06-01 08:00:00", "dtako_events"),
             (1102, "2026-06-02 08:00:00", "dtako_events"),
             (1103, "2026-07-01 08:00:00", "dtako_events"),
-        ],
-        "MariaDB の dtako_events は借りない"
+        ]
     );
     let texts: Vec<&str> = warnings.iter().map(|w| w.text.as_str()).collect();
     assert_eq!(texts, vec!["w1101", "w1102", "w1103"]);
 }
 
-/// **生イベントの非 2xx は 404 を含めて全部 502** (root と同じ)。失敗したら MariaDB は読まない。
+/// **生イベントの非 2xx は 404 を含めて全部 502** (root と同じ)。失敗したら写しは読まない。
 #[test]
-fn all_events_fails_on_any_non_2xx_before_reading_mariadb() {
+fn all_events_fails_on_any_non_2xx_before_reading_the_copy() {
     for status in [404, 500, 302, 199] {
         let log = Log::default();
         let a = alc(&log);
         *a.events.borrow_mut() = vec![Ok(res(status, "nope"))];
-        let m = db(&log, Ok(vec![]));
+        let m = pushed(&log);
         let w = WorkerFoldEvents {
             alc: &a,
-            mariadb: &m,
+            pushed: &m,
             today: TODAY,
         };
         let err = block_on(w.all_events_between(FROM, TO)).unwrap_err();
         let want = format!("alc dtako-events status {status}: nope");
         assert_eq!(err, Fail::new(502, want));
-        assert_eq!(log.borrow().len(), 1, "MariaDB は読まない");
+        assert_eq!(log.borrow().len(), 1, "写しは読まない");
     }
 }
 
-/// RPC そのものの失敗 (binding が無い 503 など) はそのまま返す。MariaDB の失敗・本数違いも返す。
+/// RPC そのものの失敗 (binding が無い 503 など) と写しの読みの失敗はそのまま返す。
 #[test]
-fn all_events_passes_rpc_and_mariadb_failures_through() {
+fn all_events_passes_rpc_and_copy_failures_through() {
     let log = Log::default();
     let a = alc(&log);
     *a.events.borrow_mut() = vec![Err(Fail::new(503, "no binding"))];
-    let m = db(&log, Ok(vec![]));
+    let m = pushed(&log);
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     assert_eq!(
@@ -237,33 +256,14 @@ fn all_events_passes_rpc_and_mariadb_failures_through() {
     );
 
     let a = alc(&log);
-    let m = db(&log, Err(mariadb_fail("query:timeout")));
+    let boom = Fail::new(502, "kintai_events read failed: 57014");
+    let m = pushed_all(&log, Err(boom.clone()));
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
-    let err = block_on(w.all_events_between(FROM, TO));
-    assert_eq!(err, Err(mariadb_fail("query:timeout")));
-
-    let m = db(&log, Ok(vec![vec![], vec![]]));
-    let w = WorkerFoldEvents {
-        alc: &a,
-        mariadb: &m,
-        today: TODAY,
-    };
-    let err = block_on(w.all_events_between(FROM, TO));
-    assert_eq!(err, Err(mariadb_fail("rows:sets")));
-
-    // MariaDB の行が読めない (列数違い)
-    let m = db(&log, Ok(vec![vec![row(&[Some("x")])]]));
-    let w = WorkerFoldEvents {
-        alc: &a,
-        mariadb: &m,
-        today: TODAY,
-    };
-    let err = block_on(w.all_events_between(FROM, TO));
-    assert_eq!(err, Err(mariadb_fail("rows:shape")));
+    assert_eq!(block_on(w.all_events_between(FROM, TO)), Err(boom));
 }
 
 /// 期間が読めなければ往復の前に 502 (root の `bad range` と同じ文面)。壊れた本文は 502 (`parse`)。
@@ -271,10 +271,10 @@ fn all_events_passes_rpc_and_mariadb_failures_through() {
 fn all_events_rejects_bad_windows_and_bodies() {
     let log = Log::default();
     let a = alc(&log);
-    let m = db(&log, Ok(vec![]));
+    let m = pushed(&log);
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     let err = block_on(w.all_events_between("bad", TO)).unwrap_err();
@@ -295,6 +295,19 @@ fn all_events_rejects_bad_windows_and_bodies() {
     assert!(read_events(&res(204, "{}")).unwrap().drivers.is_empty());
 }
 
+/// 写しに渡す期間は JST の壁時計を +09:00 の `TIMESTAMPTZ` にしたもの (root の `jst_at`)。後ろが読めなくても 502。
+#[test]
+fn pushed_window_reads_both_ends_as_jst() {
+    let (from, to) = pushed_window(FROM, TO).unwrap();
+    assert_eq!(format!("{}..{}", from.to_rfc3339(), to.to_rfc3339()), SPAN);
+    let err = pushed_window(FROM, "2026-07-02").unwrap_err();
+    assert_eq!(err.status, 502);
+    assert!(
+        err.body.starts_with("bad range \"2026-07-02\": "),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn events_search_encodes_the_page_like_a_query_string() {
     let page = EventsPage {
@@ -308,16 +321,18 @@ fn events_search_encodes_the_page_like_a_query_string() {
 
 // ── 遡り起点 ──
 
-/// 遡り起点は MariaDB の 2 本だけ (alc は読まない)。窓は fold の `month_range` そのまま (`head_sqls(month)` と同じ SQL)。
+/// 遡り起点は写しの 2 本だけ (alc は読まない)。運行終了 → 打刻の姿の順で、窓は fold の `month_range` そのまま。
+/// 規則は root と同じ `month_head_anchors` (運行NO の先頭 12 桁が月初より前なら、その開始時刻まで遡る)。
 #[test]
-fn month_head_anchors_reads_the_two_head_sqls_from_mariadb() {
+fn month_head_anchors_reads_the_two_head_queries_from_the_copy() {
     let log = Log::default();
     let a = alc(&log);
-    let runs = vec![row(&[Some("1194"), Some("26053121394700000043241")])];
-    let m = db(&log, Ok(vec![runs, vec![]]));
+    let m = pushed(&log);
+    *m.runs.borrow_mut() = Some(Ok(vec![(1194, "26053121394700000043241".into())]));
+    *m.punches.borrow_mut() = Some(Ok(vec![]));
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     let got = block_on(month_anchors(&w, "2026-06")).unwrap();
@@ -325,10 +340,12 @@ fn month_head_anchors_reads_the_two_head_sqls_from_mariadb() {
         got.get(&1194).map(String::as_str),
         Some("2026-05-31 21:39:47")
     );
-    assert_eq!(*log.borrow(), vec!["mariadb x2"]);
     assert_eq!(
-        head_sqls_between(FROM, TO).unwrap(),
-        head_sqls("2026-06").unwrap()
+        *log.borrow(),
+        vec![
+            format!("pushed runs {SPAN}"),
+            format!("pushed punches {SPAN}")
+        ]
     );
 
     // 月が壊れていれば読む前に落とす (fold の BadMonth → 502)
@@ -343,38 +360,58 @@ fn month_head_anchors_passes_failures_through() {
     let a = alc(&log);
     let w = |m| WorkerFoldEvents {
         alc: &a,
-        mariadb: m,
+        pushed: m,
         today: TODAY,
     };
-    let m = db(&log, Err(mariadb_fail("connect:timeout")));
-    let err = block_on(w(&m).month_head_anchors(FROM, TO));
-    assert_eq!(err, Err(mariadb_fail("connect:timeout")));
-    let m = db(&log, Ok(vec![vec![]]));
+    let boom = Fail::new(502, "kintai_events read failed: closed");
+    let m = pushed(&log);
+    *m.runs.borrow_mut() = Some(Err(boom.clone()));
     assert_eq!(
         block_on(w(&m).month_head_anchors(FROM, TO)),
-        Err(mariadb_fail("rows:sets"))
+        Err(boom.clone())
     );
-    let m = db(&log, Ok(vec![]));
-    let err = block_on(w(&m).month_head_anchors("bad", TO));
-    assert_eq!(err, Err(mariadb_fail("bad_month")));
-    let err = block_on(w(&m).month_head_anchors(FROM, "bad"));
-    assert_eq!(err, Err(mariadb_fail("bad_month")));
-    let m = db(&log, Ok(vec![vec![row(&[None, Some("u")])], vec![]]));
-    assert_eq!(
-        block_on(w(&m).month_head_anchors(FROM, TO)),
-        Err(mariadb_fail("rows:null"))
-    );
+    let m = pushed(&log);
+    *m.runs.borrow_mut() = Some(Ok(vec![]));
+    *m.punches.borrow_mut() = Some(Err(boom.clone()));
+    assert_eq!(block_on(w(&m).month_head_anchors(FROM, TO)), Err(boom));
+
+    log.borrow_mut().clear();
+    let m = pushed(&log);
+    let err = block_on(w(&m).month_head_anchors("bad", TO)).unwrap_err();
+    assert!(err.body.starts_with("bad range \"bad\": "), "{err:?}");
+    let err = block_on(w(&m).month_head_anchors(FROM, "bad")).unwrap_err();
+    assert!(err.body.starts_with("bad range \"bad\": "), "{err:?}");
+    assert!(log.borrow().is_empty(), "期間が読めなければ写しは読まない");
 }
 
+/// 月初より前の打刻の姿からも遡る (始業で終わっていれば、その始業まで)。
 #[test]
-fn all_events_sql_binds_the_window() {
-    let sql = all_events_sql(FROM, TO).unwrap();
-    assert!(sql.contains("'2026-06-01 00:00:00'") && sql.contains("'2026-07-02 00:00:00'"));
+fn month_head_anchors_uses_the_punches_too() {
+    let log = Log::default();
+    let a = alc(&log);
+    let m = pushed(&log);
+    *m.runs.borrow_mut() = Some(Ok(vec![]));
+    *m.punches.borrow_mut() = Some(Ok(vec![HeadPunch {
+        driver: 1101,
+        first_state: Some("終業".into()),
+        last_start: Some("2026-05-31 20:00:00".into()),
+        last_end: Some("2026-05-30 18:00:00".into()),
+    }]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let got = block_on(w.month_head_anchors(FROM, TO)).unwrap();
+    assert_eq!(
+        got.get(&1101).map(String::as_str),
+        Some("2026-05-31 20:00:00")
+    );
 }
 
 // ── dtako の指紋 ──
 
-/// etags だけを読む (MariaDB も生イベントも読まない)。期間は `[min(since, 月初), 翌月初]`、指紋と warnings は共有 crate。
+/// etags だけを読む (写しも生イベントも読まない)。期間は `[min(since, 月初), 翌月初]`、指紋と warnings は共有 crate。
 #[test]
 fn dtako_month_read_reads_only_the_etags() {
     let log = Log::default();
@@ -384,10 +421,10 @@ fn dtako_month_read_reads_only_the_etags() {
         "warnings": [], "unsplit": [], "unsplit_total": 0,
     });
     *a.etags.borrow_mut() = Some(Ok(res(200, &body.to_string())));
-    let m = db(&log, Ok(vec![]));
+    let m = pushed(&log);
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     let read = block_on(w.dtako_month_read_since("2026-06", Some(d(2026, 5, 20)))).unwrap();
@@ -413,10 +450,10 @@ fn dtako_month_read_degrades_only_on_404() {
         let log = Log::default();
         let a = alc(&log);
         *a.etags.borrow_mut() = Some(r);
-        let m = db(&log, Ok(vec![]));
+        let m = pushed(&log);
         let w = WorkerFoldEvents {
             alc: &a,
-            mariadb: &m,
+            pushed: &m,
             today: TODAY,
         };
         block_on(w.dtako_month_read_since("2026-06", None))
@@ -440,10 +477,10 @@ fn dtako_month_read_degrades_only_on_404() {
 fn dtako_month_read_rejects_a_broken_month_before_any_request() {
     let log = Log::default();
     let a = alc(&log);
-    let m = db(&log, Ok(vec![]));
+    let m = pushed(&log);
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     let err = block_on(w.dtako_month_read_since("nope", None)).unwrap_err();
@@ -457,10 +494,10 @@ fn alc_events_get_passes_the_dates_through() {
     let log = Log::default();
     let a = alc(&log);
     *a.etags.borrow_mut() = Some(Ok(res(404, "")));
-    let m = db(&log, Ok(vec![]));
+    let m = pushed(&log);
     let w = WorkerFoldEvents {
         alc: &a,
-        mariadb: &m,
+        pushed: &m,
         today: TODAY,
     };
     assert!(block_on(w.etags(d(2026, 1, 2), d(2026, 1, 3)))
