@@ -37,6 +37,7 @@
 mod alc;
 mod cakephp;
 mod conn;
+mod fold_events;
 mod probe;
 mod reads;
 mod restraint;

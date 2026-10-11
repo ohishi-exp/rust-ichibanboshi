@@ -27,6 +27,13 @@ pub struct Fail {
     pub body: String,
 }
 
+/// fold の流れ (`FoldEventsIo::Error`) が求める表示。本文だけ (状態コードは応答の側に載る)。
+impl std::fmt::Display for Fail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.body)
+    }
+}
+
 impl Fail {
     pub fn new(status: u16, body: impl Into<String>) -> Self {
         Self {

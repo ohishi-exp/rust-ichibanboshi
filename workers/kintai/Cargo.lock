@@ -1510,10 +1510,12 @@ name = "kintai-pg"
 version = "0.1.0"
 dependencies = [
  "alc-worker-db",
+ "async-trait",
  "axum",
  "chrono",
  "kintai-kosoku",
  "kintai-logic",
+ "kintai-mysql",
  "rusqlite",
  "rust-ichibanboshi",
  "serde_json",

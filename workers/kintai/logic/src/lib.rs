@@ -16,6 +16,8 @@
 //! 社内 CakePHP への中継 (daily・pdf-json・autoload と ③ resetby-unko-no) の URL・multipart・応答の型は `cakephp`、
 //! autoload の検査・① ② ③ の段取り・応答・③ の材料を数える SQL は `dtako_autoload` (root の package も path 依存で使う)。
 //! 勤怠 Worker の daily・pdf-json・autoload の口の検査・応答・失敗の写像は `cakephp_relay`。
+//! fold の読み 3 本 (`FoldEventsIo`: 遡り起点・全乗務員の行・dtako の指紋) は `fold_events` (alc の RPC と MariaDB の往復は
+//! trait で受け取り、合流・ページング・指紋は共有 crate `kintai-kosoku` の `alc_events` を root と同じく使う)。
 //!
 //! root の src/ (Cloud Run 版・オンプレ版) からの写しで、対応表は `workers/kintai/README.md`。
 //! **撤去までは片方を直したらもう片方も直す。**
@@ -27,6 +29,7 @@ pub mod common;
 pub mod day_summaries;
 pub mod dtako_autoload;
 pub mod dtako_reads;
+pub mod fold_events;
 pub mod kosoku_reads;
 pub mod mariadb_reads;
 pub mod mariadb_rows;
