@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-exposure.sh の陰性対照。wrangler.toml を tomllib で読んだ dict を 1 か所ずつ崩して TOML に書き戻し、
-# (a)〜(e)・(g)〜(j) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# (a)〜(e)・(g)〜(k) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
 # 4 つ目の引数を渡した行は、出力にその文字列 (どの検査が落としたか) があることも確かめる。
 # 文字列の特定の表の直前に行を挿す作りにはしない (表の中身に紛れて別の表のキーになる — rust-alc-api#698)。
 # CI で check-exposure.sh の直後に走る。
@@ -207,6 +207,26 @@ PY
 KINTAI_WORKER_SRC="$tmp/src-write-only" expect 0 "(j) 拘束サマリの口が無いなら D1 が無くても通る" "$tmp/no-d1.toml"
 expect 1 "(j) 拘束サマリの口があるのに D1 が無い (同じ toml・実物の src)" "$tmp/no-d1.toml" \
   "d1_databases の KINTAI_RESTRAINT_DB が無い"
+# (k) alc の etags を読む RPC KINTAI_ALC_RPC は auth-worker の KintaiAlcEntrypoint で、トップレベルにだけ
+mutate 1 "(k) services を消す" 'del cfg["services"]' "services に KINTAI_ALC_RPC が 1 つだけ無い"
+mutate 1 "(k) KINTAI_ALC_RPC の binding 名を変える" 'cfg["services"][0]["binding"] = "ALC_RPC"' \
+  "services に KINTAI_ALC_RPC が 1 つだけ無い"
+mutate 1 "(k) KINTAI_ALC_RPC を 2 つ置く" 'cfg["services"].append(dict(cfg["services"][0]))' \
+  "services に KINTAI_ALC_RPC が 1 つだけ無い"
+mutate 1 "(k) service を変える" 'cfg["services"][0]["service"] = "other-worker"' \
+  "auth-worker の KintaiAlcEntrypoint を指していない"
+mutate 1 "(k) entrypoint を汎用の InternalEntrypoint にする" 'cfg["services"][0]["entrypoint"] = "InternalEntrypoint"' \
+  "auth-worker の KintaiAlcEntrypoint を指していない"
+mutate 1 "(k) entrypoint を変える" 'cfg["services"][0]["entrypoint"] = "KyuyoAuthEntrypoint"' \
+  "auth-worker の KintaiAlcEntrypoint を指していない"
+mutate 1 "(k) entrypoint を消す (default の fetch に繋がる)" 'del cfg["services"][0]["entrypoint"]' \
+  "auth-worker の KintaiAlcEntrypoint を指していない"
+mutate 1 "(k) services を env.staging へ動かす" \
+  'cfg["env"] = {"staging": {"services": cfg.pop("services")}}' "env.staging.services がある"
+mutate 1 "(k) トップレベルに残したまま env.staging にも置く" \
+  'cfg["env"] = {"staging": {"services": [dict(cfg["services"][0])]}}' "env.staging.services がある"
+mutate 1 "(k) env 以外の表の奥に services" 'cfg["observability"]["services"] = [dict(cfg["services"][0])]' \
+  "observability.services がある"
 # (f) は warning だけ: service_id を実値らしくしても、プレースホルダのままでも exit 0
 mutate 0 "(f) service_id を入れた (warning 無し)" \
   'cfg["vpc_services"][0]["service_id"] = "11111111-1111-1111-1111-111111111111"'

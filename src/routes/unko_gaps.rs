@@ -97,38 +97,36 @@
 //!
 //! Postgres 側 (自前クエリ 1 発) だけの実測は本ファイルの pg テスト
 //! (`tests/unko_gaps_pg_test.rs`) 参照。
-
-use std::collections::{HashMap, HashSet};
+//!
+//! ## 純粋部分は共有 crate (`kintai_logic::unko_gaps`)
+//!
+//! 判定・整形の核 (`build_gaps`・`drop_crew_suffix`・上限・応答の組み立て) と `month` の検査は勤怠 Worker
+//! (`workers/kintai`) と共有する (写さない。Refs #322)。ここに残るのは axum・sqlx・alc の etags の sink と
+//! `elapsed_ms` だけ。
 
 use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
-use chrono::Datelike;
-use serde::Deserialize;
+use kintai_logic::common::Fail;
+use kintai_logic::unko_gaps::{check_month, respond, Onprem, Window, DB_WHAT};
 
-use crate::kintai_http_repo::unko_no_start_date;
-use crate::kintai_push::{KintaiPgStore, JST_OFFSET_SECONDS, MONTH_OPERATIONS_SQL, PUSHED_SOURCES};
-use crate::kintai_repo::{month_range, DynKintaiEventsRepo};
-use crate::routes::kintai::is_valid_month;
+pub use kintai_logic::unko_gaps::{UnkoGapsQuery, MAX_UNKO_GAPS_DRIVERS, MAX_UNKO_GAPS_PER_DRIVER};
+
+use crate::kintai_push::{KintaiPgStore, MONTH_OPERATIONS_SQL, PUSHED_SOURCES};
+use crate::kintai_repo::DynKintaiEventsRepo;
 use crate::routes::kintai_timecard::{DynKintaiPgStore, ReadTenant};
-
-/// 応答に載せる乗務員数の上限 (`UnkoDiffDriverSplit` の `MAX_UNKO_DIFF_DRIVERS`
-/// と同じ思想 — 桁違いの入力が来たときに応答を膨らませない蓋)。
-pub const MAX_UNKO_GAPS_DRIVERS: usize = 300;
-
-/// 乗務員 1 人あたり (および `unknown_driver_unko_nos`) の運行NO 件数の上限。
-/// 実測 (2026-06) は候補 1 人あたり 1 件だが、同じ理由で蓋を置く。
-pub const MAX_UNKO_GAPS_PER_DRIVER: usize = 200;
-
-#[derive(Debug, Default, Deserialize)]
-pub struct UnkoGapsQuery {
-    pub month: Option<String>,
-    pub driver_cd: Option<i64>,
-}
 
 fn bad_request(msg: impl Into<String>) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, msg.into())
+}
+
+/// 共有 crate の失敗 (400 だけ) を axum の形に。
+fn from_fail(f: Fail) -> (StatusCode, String) {
+    (
+        StatusCode::from_u16(f.status).unwrap_or(StatusCode::BAD_REQUEST),
+        f.body,
+    )
 }
 
 /// [`crate::routes::stale_months`] と同じ文言・同じ形。
@@ -156,143 +154,8 @@ fn read_tenant_of(read: ReadTenant, pin: uuid::Uuid) -> Result<uuid::Uuid, (Stat
     ))
 }
 
-/// `crate::kintai_repo::month_range` が返す `"YYYY-MM-DD HH:MM:SS"` (JST 壁時計) を
-/// `DateTime<FixedOffset>` に。
-fn parse_jst(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()?;
-    let off = chrono::FixedOffset::east_opt(JST_OFFSET_SECONDS)?;
-    naive.and_local_timezone(off).single()
-}
-
-/// オンプレの `unko_no` から対象CD (末尾 1 文字) を落として運行NO (GCP と同じ
-/// 22 桁) にする。`kintai_http_repo::onprem_unko_no` と同じ規則 (`ONPREM_CREW_SUFFIX_LEN`
-/// = 1) だが、あちらは private + glob 内なので呼べない — ここで同じ 1 行を
-/// 再現する。規則そのものは固定値でドリフトの心配は無い。
-fn drop_crew_suffix(unko_no: &str) -> String {
-    let kept = unko_no.chars().count().saturating_sub(1);
-    if kept == 0 {
-        return unko_no.to_string();
-    }
-    let cut: usize = unko_no.chars().take(kept).map(char::len_utf8).sum();
-    unko_no[..cut].to_string()
-}
-
 fn db_err(e: sqlx::Error) -> (StatusCode, String) {
-    (
-        StatusCode::BAD_GATEWAY,
-        format!("kintai.kintai_events unko read failed: {e}"),
-    )
-}
-
-/// 1 乗務員ぶんの応答行。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DriverGaps {
-    driver_cd: String,
-    unko_nos: Vec<String>,
-    truncated: bool,
-}
-
-/// 乗務員CD 指定時の、その乗務員の対象月のオンプレ側の運行件数 (無ければ 0)。
-/// 指定なしは `None`。指定時は `also_in_month` の絞り込みが外れる ([`build_gaps`]) ので、
-/// 呼び出し側が「0 件 = 照らし合わせる相手が無い」を見分けるための材料として返す。
-fn onprem_count_for(
-    onprem_in_month: &HashMap<i64, usize>,
-    driver_cd: Option<i64>,
-) -> Option<usize> {
-    driver_cd.map(|cd| onprem_in_month.get(&cd).copied().unwrap_or(0))
-}
-
-fn cap_sorted(mut v: Vec<String>, max: usize) -> (Vec<String>, bool) {
-    v.sort_unstable();
-    let truncated = v.len() > max;
-    v.truncate(max);
-    (v, truncated)
-}
-
-/// I/O から切り離した判定・整形の核。**DB も alc も見ない** — 呼び出し側が
-/// 引いてきた材料だけを受け取り、gap の抽出・乗務員別への分割・
-/// `also_in_month` の絞り込み・上限の適用をやる。
-///
-/// `onprem_seen` は対象月の窓に在るオンプレの `unko_no` (対象CD 落とし済み、
-/// [`drop_crew_suffix`]) の集合、`onprem_in_month` は乗務員別の件数
-/// (どちらも [`MONTH_OPERATIONS_SQL`] の行から作る)。`gcp_driver_cds` は
-/// [`crate::kintai_http_repo::collected_etag_driver_cds`] の生の値
-/// (窓ぜんたい — 対象月に絞る前)。
-fn build_gaps(
-    year: i32,
-    month_num: u32,
-    onprem_seen: &HashSet<String>,
-    onprem_in_month: &HashMap<i64, usize>,
-    gcp_driver_cds: &HashMap<String, Vec<String>>,
-    driver_cd_filter: Option<i64>,
-) -> (Vec<DriverGaps>, bool, Vec<String>, bool) {
-    let mut by_driver: HashMap<String, Vec<String>> = HashMap::new();
-    let mut unknown_driver: Vec<String> = Vec::new();
-    for (unko_no, driver_cds) in gcp_driver_cds {
-        if onprem_seen.contains(unko_no.as_str()) {
-            continue; // 一致済み — 漏れではない
-        }
-        let Some(start) = unko_no_start_date(unko_no) else {
-            continue; // 開始日が読めない = 対象月かどうか判定できない (安全側で外す)
-        };
-        if start.year() != year || start.month() != month_num {
-            continue; // 対象月に始まった運行だけ (窓の外の運行を混ぜない)
-        }
-        if driver_cds.is_empty() {
-            unknown_driver.push(unko_no.clone());
-        } else {
-            for dcd in driver_cds {
-                by_driver
-                    .entry(dcd.clone())
-                    .or_default()
-                    .push(unko_no.clone());
-            }
-        }
-    }
-
-    let is_candidate = |cd: &str| -> bool {
-        match driver_cd_filter {
-            // 乗務員CD 指定時はその 1 人だけ (バケットは問わない — 呼び出し側は
-            // 既に候補と分かっている前提)
-            Some(want) => cd.trim().parse::<i64>() == Ok(want),
-            // 省略時は also_in_month (= 対象月にオンプレの運行も在る) の候補全員
-            None => cd
-                .trim()
-                .parse::<i64>()
-                .ok()
-                .and_then(|n| onprem_in_month.get(&n))
-                .is_some_and(|&n| n > 0),
-        }
-    };
-
-    let mut driver_rows: Vec<(String, Vec<String>)> = by_driver
-        .into_iter()
-        .filter(|(cd, _)| is_candidate(cd))
-        .collect();
-    driver_rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    let drivers_truncated = driver_rows.len() > MAX_UNKO_GAPS_DRIVERS;
-    driver_rows.truncate(MAX_UNKO_GAPS_DRIVERS);
-
-    let drivers: Vec<DriverGaps> = driver_rows
-        .into_iter()
-        .map(|(driver_cd, unko_nos)| {
-            let (unko_nos, truncated) = cap_sorted(unko_nos, MAX_UNKO_GAPS_PER_DRIVER);
-            DriverGaps {
-                driver_cd,
-                unko_nos,
-                truncated,
-            }
-        })
-        .collect();
-
-    let (unknown_driver, unknown_driver_truncated) =
-        cap_sorted(unknown_driver, MAX_UNKO_GAPS_PER_DRIVER);
-    (
-        drivers,
-        drivers_truncated,
-        unknown_driver,
-        unknown_driver_truncated,
-    )
+    (StatusCode::BAD_GATEWAY, format!("{DB_WHAT} failed: {e}"))
 }
 
 /// GET /api/kintai/unko-gaps?month=YYYY-MM&driver_cd=<i64> — 取り込み漏れ候補
@@ -305,51 +168,31 @@ pub async fn unko_gaps(
     Extension(read_tenant): Extension<ReadTenant>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let started = std::time::Instant::now();
-    let month = q
-        .month
-        .clone()
-        .ok_or_else(|| bad_request("month は必須です (YYYY-MM)"))?;
-    if !is_valid_month(&month) {
-        return Err(bad_request("month は YYYY-MM で指定してください"));
-    }
+    let month = check_month(q.month.clone()).map_err(from_fail)?;
     let st = store(&pg)?;
     let tenant = read_tenant_of(read_tenant, st.tenant_id())?;
-
-    let bad_month = || bad_request(format!("month が壊れています: {month}"));
-    let year: i32 = month
-        .get(..4)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(bad_month)?;
-    let month_num: u32 = month
-        .get(5..7)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(bad_month)?;
 
     // オンプレ側 (押し込み済み `kintai.kintai_events`)。窓は kintai_fold の
     // measure_unko_diff が使う month_range と同じにして、既存の onprem_in_month
     // の実測 (2026-06: 1445→5, 1740→10) と揃える。tenant_id は解決済みの読み
     // テナントを bind する (モジュール docs — self.tenant_id を使う既存メソッドは
     // 使わない)
-    let (from_s, to_s) = month_range(&month).ok_or_else(bad_month)?;
-    let from = parse_jst(&from_s).ok_or_else(bad_month)?;
-    let to = parse_jst(&to_s).ok_or_else(bad_month)?;
+    let bad_month = || bad_request(format!("month が壊れています: {month}"));
+    let window = Window::of(&month).ok_or_else(bad_month)?;
     use sqlx::Row;
     let rows = sqlx::query(MONTH_OPERATIONS_SQL)
         .bind(tenant)
-        .bind(from)
-        .bind(to)
+        .bind(window.from)
+        .bind(window.to)
         .bind(&PUSHED_SOURCES[..])
         .fetch_all(st.pool())
         .await
         .map_err(db_err)?;
-    let mut onprem_in_month: HashMap<i64, usize> = HashMap::new();
-    let mut onprem_seen: HashSet<String> = HashSet::new();
-    for r in &rows {
-        let driver_cd: i64 = r.get("driver_cd");
-        let unko_no: String = r.get("unko_no");
-        *onprem_in_month.entry(driver_cd).or_default() += 1;
-        onprem_seen.insert(drop_crew_suffix(&unko_no));
-    }
+    let pairs: Vec<(i64, String)> = rows
+        .iter()
+        .map(|r| (r.get("driver_cd"), r.get("unko_no")))
+        .collect();
+    let onprem = Onprem::from_rows(pairs.iter().map(|(d, u)| (*d, u.as_str())));
 
     // GCP 側の etags — 対象月だけの narrow window (モジュール docs 参照)。
     // `collected_etag_unko_nos` / `collected_etag_driver_cds` は
@@ -367,41 +210,13 @@ pub async fn unko_gaps(
         tracing::warn!(month = %month, error = %e, "kintai unko-gaps dtako digest failed");
     }
     let gcp_etags_available = gcp_unko_nos.is_some();
-    let driver_cds_available = !gcp_driver_cds.is_empty();
+    let gcp = gcp_etags_available.then_some(&gcp_driver_cds);
 
-    let (drivers, drivers_truncated, unknown_driver_unko_nos, unknown_driver_truncated) =
-        if gcp_etags_available {
-            build_gaps(
-                year,
-                month_num,
-                &onprem_seen,
-                &onprem_in_month,
-                &gcp_driver_cds,
-                q.driver_cd,
-            )
-        } else {
-            (Vec::new(), false, Vec::new(), false)
-        };
-
-    let n = drivers.len();
+    let mut body = respond(&month, &window, q.driver_cd, &onprem, gcp);
+    let n = body["drivers"].as_array().map_or(0, Vec::len);
     tracing::info!(n, gcp_etags_available, "kintai unko-gaps read");
-    Ok(Json(serde_json::json!({
-        "month": month,
-        "driver_cd": q.driver_cd,
-        "onprem_operations_in_month": onprem_count_for(&onprem_in_month, q.driver_cd),
-        "gcp_etags_available": gcp_etags_available,
-        "driver_cds_available": driver_cds_available,
-        "unko_no_digits": 22,
-        "drivers": drivers.iter().map(|d| serde_json::json!({
-            "driver_cd": d.driver_cd,
-            "unko_nos": d.unko_nos,
-            "truncated": d.truncated,
-        })).collect::<Vec<_>>(),
-        "drivers_truncated": drivers_truncated,
-        "unknown_driver_unko_nos": unknown_driver_unko_nos,
-        "unknown_driver_unko_nos_truncated": unknown_driver_truncated,
-        "elapsed_ms": started.elapsed().as_millis() as u64,
-    })))
+    body["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
+    Ok(Json(body))
 }
 
 #[cfg(test)]
@@ -502,222 +317,5 @@ mod tests {
         .expect_err("must fail on a malformed month");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("month"), "{msg}");
-    }
-
-    // ── drop_crew_suffix ────────────────────────────────────────────────────
-
-    #[test]
-    fn drop_crew_suffix_drops_only_the_last_character() {
-        assert_eq!(
-            drop_crew_suffix("26060610055500000023021"),
-            "2606061005550000002302"
-        );
-        assert_eq!(drop_crew_suffix(""), "");
-        assert_eq!(drop_crew_suffix("1"), "1");
-    }
-
-    // ── build_gaps (I/O から切り離した核) ────────────────────────────────────
-
-    fn gcp(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
-        pairs
-            .iter()
-            .map(|(u, ds)| (u.to_string(), ds.iter().map(|s| s.to_string()).collect()))
-            .collect()
-    }
-
-    /// 22 桁の GCP 側 `unko_no`。先頭 6 桁が `YYMMDD` (運行開始日)。
-    fn u(ymd: &str, seq: u32) -> String {
-        format!("{ymd}{seq:016}")
-    }
-
-    #[test]
-    fn a_gap_is_attributed_to_its_driver_when_onprem_has_that_month() {
-        let seen = HashSet::new(); // オンプレに何も無い = 一致するものが無い
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 5); // also_in_month の実測と同じ形 (onprem_in_month > 0)
-        let cds = gcp(&[(&u("260610", 1), &["1445"])]);
-
-        let (drivers, dt, unknown, ut) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(!dt && !ut);
-        assert!(unknown.is_empty());
-        assert_eq!(drivers.len(), 1, "{drivers:?}");
-        assert_eq!(drivers[0].driver_cd, "1445");
-        assert_eq!(drivers[0].unko_nos, vec![u("260610", 1)]);
-    }
-
-    #[test]
-    fn a_matched_unko_no_is_not_a_gap() {
-        let mut seen = HashSet::new();
-        let key = u("260610", 1);
-        seen.insert(key.clone()); // オンプレ側に (対象CD 落とし後) 同じ値がある
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 1);
-        let cds = gcp(&[(&key, &["1445"])]);
-
-        let (drivers, _, unknown, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(drivers.is_empty(), "{drivers:?}");
-        assert!(unknown.is_empty());
-    }
-
-    #[test]
-    fn a_driver_without_onprem_this_month_is_not_a_default_candidate() {
-        let seen = HashSet::new();
-        let in_month = HashMap::new(); // 9999 は対象月にオンプレの運行が無い
-        let cds = gcp(&[(&u("260615", 1), &["9999"])]);
-
-        let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(
-            drivers.is_empty(),
-            "省略時は also_in_month だけ: {drivers:?}"
-        );
-    }
-
-    #[test]
-    fn an_explicit_driver_cd_bypasses_the_also_in_month_bucket() {
-        let seen = HashSet::new();
-        let in_month = HashMap::new(); // 9999 は候補ではないが、明示指定なら返す
-        let cds = gcp(&[(&u("260615", 1), &["9999"])]);
-
-        let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, Some(9999));
-        assert_eq!(drivers.len(), 1, "{drivers:?}");
-        assert_eq!(drivers[0].driver_cd, "9999");
-    }
-
-    #[test]
-    fn onprem_count_is_reported_only_for_an_explicit_driver_cd() {
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 5);
-        // 指定なしは返さない (候補の絞り込みが効いているので要らない)
-        assert_eq!(onprem_count_for(&in_month, None), None);
-        assert_eq!(onprem_count_for(&in_month, Some(1445)), Some(5));
-        // オンプレ側に 1 件も無い乗務員は 0 (= 照らし合わせる相手が無い)
-        assert_eq!(onprem_count_for(&in_month, Some(1590)), Some(0));
-    }
-
-    #[test]
-    fn an_explicit_driver_cd_that_has_no_gap_returns_empty_not_an_error() {
-        let seen = HashSet::new();
-        let in_month = HashMap::new();
-        let cds = gcp(&[(&u("260615", 1), &["9999"])]);
-
-        let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, Some(1));
-        assert!(drivers.is_empty(), "{drivers:?}");
-    }
-
-    #[test]
-    fn a_gap_outside_the_target_month_is_excluded() {
-        let seen = HashSet::new();
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 3);
-        // 開始日が前月 (etags の窓は読取日で引くので前月以前の運行が混ざりうる —
-        // UnkoDiff::gcp_only_in_month の docs と同じ現象)
-        let cds = gcp(&[(&u("260531", 1), &["1445"])]);
-
-        let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(drivers.is_empty(), "対象月の外は数えない: {drivers:?}");
-    }
-
-    #[test]
-    fn an_unparseable_start_date_is_excluded_safely() {
-        let seen = HashSet::new();
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 1);
-        let cds = gcp(&[("not-a-date", &["1445"])]);
-
-        let (drivers, _, unknown, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(drivers.is_empty());
-        assert!(
-            unknown.is_empty(),
-            "判定できない = 安全側で外す。候補にも unknown にも出さない"
-        );
-    }
-
-    #[test]
-    fn driver_cds_empty_falls_into_unknown_driver_not_silently_dropped() {
-        let seen = HashSet::new();
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 1);
-        // alc が driver_cds を返さない環境 (前方互換フィールドの既定 = 空配列)
-        let cds = gcp(&[(&u("260610", 1), &[])]);
-
-        let (drivers, _, unknown, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(
-            drivers.is_empty(),
-            "乗務員が引けないので drivers には出ない"
-        );
-        assert_eq!(unknown, vec![u("260610", 1)], "空を候補無しに読ませない");
-    }
-
-    #[test]
-    fn a_two_crew_operation_attributes_the_gap_to_both_drivers() {
-        let seen = HashSet::new();
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 1);
-        in_month.insert(1740, 1);
-        let cds = gcp(&[(&u("260610", 1), &["1445", "1740"])]);
-
-        let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        let mut got: Vec<&str> = drivers.iter().map(|d| d.driver_cd.as_str()).collect();
-        got.sort_unstable();
-        assert_eq!(got, vec!["1445", "1740"]);
-    }
-
-    #[test]
-    fn driver_count_above_the_cap_is_truncated_and_flagged() {
-        let seen = HashSet::new();
-        let mut in_month = HashMap::new();
-        let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
-        for i in 0..(MAX_UNKO_GAPS_DRIVERS + 5) {
-            let cd = (2000 + i as i64).to_string();
-            in_month.insert(2000 + i as i64, 1);
-            pairs.push((u("260610", i as u32), vec![cd]));
-        }
-        let cds: HashMap<String, Vec<String>> = pairs.into_iter().collect();
-
-        let (drivers, truncated, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(truncated);
-        assert_eq!(drivers.len(), MAX_UNKO_GAPS_DRIVERS);
-    }
-
-    #[test]
-    fn unko_no_count_above_the_cap_is_truncated_and_flagged_per_driver() {
-        let seen = HashSet::new();
-        let mut in_month = HashMap::new();
-        in_month.insert(1445, 1);
-        let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
-        for i in 0..(MAX_UNKO_GAPS_PER_DRIVER + 5) {
-            pairs.push((u("260610", i as u32), vec!["1445".to_string()]));
-        }
-        let cds: HashMap<String, Vec<String>> = pairs.into_iter().collect();
-
-        let (drivers, _, _, _) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert_eq!(drivers.len(), 1);
-        assert!(drivers[0].truncated);
-        assert_eq!(drivers[0].unko_nos.len(), MAX_UNKO_GAPS_PER_DRIVER);
-    }
-
-    #[test]
-    fn unknown_driver_count_above_the_cap_is_truncated_and_flagged() {
-        let seen = HashSet::new();
-        let in_month = HashMap::new();
-        let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
-        for i in 0..(MAX_UNKO_GAPS_PER_DRIVER + 5) {
-            pairs.push((u("260610", i as u32), Vec::new()));
-        }
-        let cds: HashMap<String, Vec<String>> = pairs.into_iter().collect();
-
-        let (_, _, unknown, truncated) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(truncated);
-        assert_eq!(unknown.len(), MAX_UNKO_GAPS_PER_DRIVER);
-    }
-
-    #[test]
-    fn empty_gcp_data_yields_no_drivers_and_no_unknown() {
-        let seen = HashSet::new();
-        let in_month = HashMap::new();
-        let cds = HashMap::new();
-        let (drivers, dt, unknown, ut) = build_gaps(2026, 6, &seen, &in_month, &cds, None);
-        assert!(drivers.is_empty() && !dt);
-        assert!(unknown.is_empty() && !ut);
     }
 }

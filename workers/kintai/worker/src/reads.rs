@@ -15,7 +15,7 @@ use kintai_logic::common::{
     db_fail, no_db, no_write_db, preflight, write_preflight, Fail, HYPERDRIVE_BINDING, TENANT_VAR,
 };
 use kintai_logic::{
-    change_log, day_summaries, shift_days, shift_overlaps, timecard_write, wage_range,
+    change_log, day_summaries, shift_days, shift_overlaps, timecard_write, unko_gaps, wage_range,
 };
 use tokio_postgres::{Error as PgError, Row};
 use uuid::Uuid;
@@ -39,6 +39,7 @@ pub(crate) async fn serve(read: Read, query: &str, env: &Env) -> Result<serde_js
         Read::ChangeLog => change_log(query, env).await,
         Read::WageRange => wage_range(query, env).await,
         Read::Signatures => signatures(query, env).await,
+        Read::UnkoGaps => unko_gaps(query, env).await,
     }
 }
 
@@ -221,4 +222,48 @@ async fn signatures(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
         .await
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
     Ok(signatures_respond(&req, &sigs))
+}
+
+/// `GET /api/kintai/unko-gaps` (root の `src/routes/unko_gaps.rs` と同じ応答。`elapsed_ms` は付けない)。
+/// 検査 (400) → binding (503) → テナント (503) → connect (502) → `MONTH_OPERATIONS_SQL` (502) → auth-worker の RPC (`KintaiAlcEntrypoint.dtakoEtags`) で
+/// alc の etags (binding が無い 503・404 は `gcp_etags_available: false`・他の失敗は 502) → 応答。順は root と同じ。
+/// RPC は JS の値の await なので transaction の外で打つ。
+async fn unko_gaps(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+    use unko_gaps::{
+        etags_search, parse, read_etags, respond, Binds, Onprem, Window, DB_WHAT,
+        MONTH_OPERATIONS_SQL,
+    };
+    let req = parse(query)?;
+    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    // parse が通した月では常に Some (root と同じ 400)
+    let bad_month = || Fail::new(400, format!("month が壊れています: {}", req.month));
+    let window = Window::of(&req.month).ok_or_else(bad_month)?;
+    let binds = Binds::new(tenant, &window);
+    let rows = pg
+        .tenant_tx(tenant, move |tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_typed(MONTH_OPERATIONS_SQL, &binds.params())
+                    .await?;
+                let to_row = |r: &Row| -> Result<(i64, String), PgError> {
+                    Ok((r.try_get("driver_cd")?, r.try_get("unko_no")?))
+                };
+                rows.iter()
+                    .map(to_row)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Out)
+            })
+        })
+        .await
+        .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
+    let onprem = Onprem::from_rows(rows.0.iter().map(|(d, u)| (*d, u.as_str())));
+    let search = etags_search(&req.month).ok_or_else(bad_month)?;
+    let gcp = read_etags(&crate::alc::fetch_etags(env, &search).await?)?;
+    Ok(respond(
+        &req.month,
+        &window,
+        req.driver_cd,
+        &onprem,
+        gcp.as_ref(),
+    ))
 }

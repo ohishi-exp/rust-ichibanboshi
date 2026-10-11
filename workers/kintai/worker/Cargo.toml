@@ -25,6 +25,8 @@ kintai-mysql = { path = "../mysql" }
 kintai-pg = { path = "../pg" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# auth-worker の RPC (KintaiAlcEntrypoint.dtakoEtags) の戻りを JS の値から読む (unko-gaps の alc の etags)
+serde-wasm-bindgen = "0.6"
 # worker::Socket は tokio の AsyncRead/Write を持つ (kintai-mysql は I/O を持たないので compat は要らない)
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 # Row と Error の型だけ (接続は alc-worker-db)。jsonb・timestamptz・uuid を読む feature (kit と同じ 0.7 に解決する)

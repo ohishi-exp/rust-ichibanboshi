@@ -20,7 +20,9 @@
 #   (j) Worker のソースに拘束サマリの口 (`Route::Restraint(`) があるなら、トップレベルの d1_databases に KINTAI_RESTRAINT_DB
 #       (database_name = ichibanboshi-kintai-restraint・migrations_dir = "migrations") がある。d1_databases はトップレベル以外
 #       (env.* を含む表の奥) のどこにも置かない (本番の D1 へ届く binding をトップレベルの外へ漏らさない)
-# (a)〜(e)・(g)〜(j) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
+#   (k) トップレベルの services に KINTAI_ALC_RPC が 1 つだけあり、auth-worker の KintaiAlcEntrypoint を指す (unko-gaps が alc の
+#       etags を読む RPC。workers/kyuyo の (h) と同じ形)。services はトップレベル以外 (env.* を含む表の奥) のどこにも置かない
+# (a)〜(e)・(g)〜(k) が 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/kintai/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/kintai/worker/wrangler.toml)
 set -euo pipefail
@@ -195,9 +197,33 @@ def nested_d1(node, prefix=""):
 for name in nested_d1(cfg):
     err(f"{name} がある (d1_databases はトップレベルにだけ置く)")
 
+# (k) alc の etags を読む RPC KINTAI_ALC_RPC は auth-worker の KintaiAlcEntrypoint (トップレベル。汎用の InternalEntrypoint にしない)。services はトップレベル以外に置かない
+svcs = cfg.get("services")
+alc = [v for v in svcs if isinstance(v, dict) and v.get("binding") == "KINTAI_ALC_RPC"] if isinstance(svcs, list) else []
+if len(alc) != 1:
+    err("トップレベルの services に KINTAI_ALC_RPC が 1 つだけ無い (unko-gaps が alc の etags を読む RPC)")
+elif alc[0].get("service") != "auth-worker" or alc[0].get("entrypoint") != "KintaiAlcEntrypoint":
+    err("services の KINTAI_ALC_RPC が auth-worker の KintaiAlcEntrypoint を指していない (RPC の差し替え)")
+
+
+def nested_services(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            name = f"{prefix}.{k}" if prefix else k
+            if k == "services" and prefix:
+                yield name
+            yield from nested_services(v, name)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from nested_services(v, f"{prefix}[{i}]")
+
+
+for name in nested_services(cfg):
+    err(f"{name} がある (services はトップレベルにだけ置く)")
+
 if errors:
     sys.exit(1)
 write_note = "・書き込みの口の KINTAI_WRITE_TOKEN あり" if has_write else ""
 write_note += "・拘束サマリの D1 はトップレベル" if has_restraint else ""
-print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services と hyperdrive はトップレベル・LOCAL_* 無し{write_note}")
+print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・vpc_services・hyperdrive・services はトップレベル・LOCAL_* 無し{write_note}")
 PY
