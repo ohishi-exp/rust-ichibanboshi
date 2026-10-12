@@ -346,6 +346,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "vpc-tds-logic",
 ]
 
 [[package]]
@@ -353,7 +354,6 @@ name = "kyuyo-worker"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "futures-util",
  "js-sys",
  "kyuyo-logic",
  "send_wrapper",
@@ -361,11 +361,10 @@ dependencies = [
  "serde-wasm-bindgen",
  "tiberius",
  "tokio",
- "tokio-util",
+ "vpc-tds",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",
- "worker-sys",
 ]
 
 [[package]]
@@ -788,6 +787,28 @@ checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "vpc-tds"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "tiberius",
+ "tokio",
+ "tokio-util",
+ "vpc-tds-logic",
+ "wasm-bindgen",
+ "worker",
+ "worker-sys",
+]
+
+[[package]]
+name = "vpc-tds-logic"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

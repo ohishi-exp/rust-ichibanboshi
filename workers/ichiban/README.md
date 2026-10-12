@@ -62,11 +62,11 @@ tiberius は `EncryptionLevel::NotSupported`・`database("CAPE#01")`。`port` / 
 領域の子はこの 3 つと `logic/tests/`・`coverage_100.toml` の自分の行だけを触る。空の `logic/src/<領域>.rs` は実行行 0 なので、中身が入るまで gate に登録しない。
 
 `worker/src/`: `lib.rs` (fetch) / `routes/mod.rs` (経路の振り分けと 7 本の本体。1 リクエスト 1 接続) / `routes/<領域>.rs` / `rows/mod.rs` (`tiberius::Row` → logic の型。
-旧オンプレ版の `src/repo.rs` の `decode_cp932`・`get_i64`・`get_f64`・`get_i32`・`rows_to_*` を列番号まで同じに写したもの) / `rows/<領域>.rs` / `repo.rs` (資格情報・ログイン) /
-`transport.rs` (socket) / `tcp.rs` (VPC の `connect()` extern) / `probe_logic.rs` (経路・stage・応答・資格情報の検証)。
+旧オンプレ版の `src/repo.rs` の `decode_cp932`・`get_i64`・`get_f64`・`get_i32`・`rows_to_*` を列番号まで同じに写したもの) / `rows/<領域>.rs` / `repo.rs` (繋ぎ先の指定。資格情報・TCP・ログインの本体は共有 crate `workers/shared/vpc-tds`) /
+`probe_logic.rs` (経路・応答の写像。stage と失敗の種類は `vpc-tds` のもの)。
 `routes/mod.rs` の `fetch_rows` は 1 本流すごとに接続し直す。`fetch_rows_many` は 1 接続で複数の (SQL, bind) を順に流して結果セットを同じ順で返す
 (1 リクエストで 2〜3 本流す口用。bind が空なら `simple_query`、あれば `query` の規則は同じ)。
-接続・経路・応答の部品は `workers/kyuyo` から**意図して写している** (特に公開範囲の検査スクリプト 2 本は kyuyo と片方だけ直さないこと)。独立した workspace (repo ルートの package からは参照されない)。
+経路・応答の部品は `workers/kyuyo` から**意図して写している** (接続の部品は `workers/shared` に畳んだ) (特に公開範囲の検査スクリプト 2 本は kyuyo と片方だけ直さないこと)。独立した workspace (repo ルートの package からは参照されない)。
 
 ## ローカル検証
 

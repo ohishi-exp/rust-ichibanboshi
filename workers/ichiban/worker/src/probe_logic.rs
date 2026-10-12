@@ -1,7 +1,7 @@
-//! 経路判定・失敗の stage と応答の写像・資格情報 JSON の検証 (純粋ロジック)。`POST /probe` と管理画面の GET 6 本で共用する。
-//! workers/kyuyo の `logic/src/lib.rs` (kyuyo-logic) から要る分だけを写している (path 依存は作らない)。
+//! 経路判定・失敗の応答の写像 (純粋ロジック)。`POST /probe` と管理画面の GET の口で共用する。
+//! 失敗の stage と種類 (`Stage`・`ErrKind`・`DbError`) は共有 crate `vpc-tds` (workers/shared) のものを使う。
 
-use serde::Deserialize;
+pub(crate) use vpc_tds::{DbError, ErrKind, Stage};
 
 /// 経路判定の結果。path とクエリはオンプレ版 (repo ルートの `src/routes/`) と同じ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,77 +130,6 @@ impl Route {
     }
 }
 
-/// どこで失敗したか。応答とログに出すのはこの名前だけ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Stage {
-    /// 資格情報の JSON が読めない・キー欠け・空
-    Secret,
-    /// TCP が開けない、または上限時間内にログインまで終わらない
-    Connect,
-    /// TDS のログインが拒否された
-    Login,
-    /// クエリが失敗した・時間切れ (`/probe`・`/health` は 1 が返らないときも)
-    Query,
-}
-
-impl Stage {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Stage::Secret => "secret",
-            Stage::Connect => "connect",
-            Stage::Login => "login",
-            Stage::Query => "query",
-        }
-    }
-}
-
-/// 失敗の種類。ログ 1 行に出すのはこの分類だけで、エラーの本文 (ホスト・ポート・ユーザー名を含みうる) は持たない。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ErrKind {
-    /// 上限時間内に終わらない
-    Timeout,
-    /// VPC binding からの Socket 取得・connect の失敗
-    Transport,
-    /// I/O エラー。`std::io::ErrorKind` の名前だけ (例 "Other"、"ConnectionReset")
-    Io(String),
-    /// SQL Server が返したエラー (番号・クラス・状態だけ)
-    Server { code: u32, class: u8, state: u8 },
-    /// TDS のプロトコル違反
-    Protocol,
-    /// 文字コードの不一致
-    Encoding,
-    /// TLS のハンドシェイク失敗
-    Tls,
-    /// サーバが別アドレスへの接続を要求した
-    Routing,
-    /// 上のどれでもない
-    Other,
-}
-
-impl ErrKind {
-    /// ログ用の短い名前 (`io:Other`、`server:18456/14/1` など)。
-    pub(crate) fn label(&self) -> String {
-        match self {
-            ErrKind::Timeout => "timeout".to_string(),
-            ErrKind::Transport => "transport".to_string(),
-            ErrKind::Io(name) => format!("io:{name}"),
-            ErrKind::Server { code, class, state } => format!("server:{code}/{class}/{state}"),
-            ErrKind::Protocol => "protocol".to_string(),
-            ErrKind::Encoding => "encoding".to_string(),
-            ErrKind::Tls => "tls".to_string(),
-            ErrKind::Routing => "routing".to_string(),
-            ErrKind::Other => "other".to_string(),
-        }
-    }
-}
-
-/// 接続の失敗 (stage と種類だけ。本文は持たない)。
-#[derive(Debug)]
-pub(crate) struct DbError {
-    pub(crate) stage: Stage,
-    pub(crate) kind: ErrKind,
-}
-
 /// 口の失敗。応答にはこの分類だけを写す (エラーの本文は持たない)。
 #[derive(Debug)]
 pub(crate) enum Failure {
@@ -260,21 +189,4 @@ pub(crate) fn reply_for(outcome: Result<String, Failure>) -> Reply {
             ),
         },
     }
-}
-
-/// SQL Server 認証の資格情報 (Secrets Store の JSON `{"user":…,"pass":…}`)。
-/// `Debug` を持たせない (うっかりログに出さない)。
-#[derive(Deserialize)]
-pub(crate) struct Creds {
-    pub(crate) user: String,
-    pub(crate) pass: String,
-}
-
-/// 資格情報の JSON を検証する。JSON が読めない・キー欠け・文字列でない・空は `Err(Stage::Secret)`。
-pub(crate) fn parse_creds(json: &str) -> Result<Creds, Stage> {
-    let creds: Creds = serde_json::from_str(json).map_err(|_| Stage::Secret)?;
-    if creds.user.is_empty() || creds.pass.is_empty() {
-        return Err(Stage::Secret);
-    }
-    Ok(creds)
 }

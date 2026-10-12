@@ -14,6 +14,7 @@ on:
     tags: ['worker-kyuyo-v*']
     paths:
       - 'workers/kyuyo/**'
+      - 'workers/shared/**'
       - '.github/workflows/worker-kyuyo.yml'
 
 permissions:

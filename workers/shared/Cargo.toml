@@ -1,0 +1,10 @@
+# Workers VPC の TCP で SQL Server (TDS) に繋ぐ部品 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# workers/ichiban・workers/kyuyo が path 依存で使う。repo ルートとも各 Worker とも独立した workspace。
+[workspace]
+members = ["vpc-tds-logic", "vpc-tds"]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

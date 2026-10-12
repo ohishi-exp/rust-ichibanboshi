@@ -18,8 +18,6 @@ mod repo;
 mod routes;
 mod state;
 mod store;
-mod tcp;
-mod transport;
 
 use kyuyo_logic::auth::{bearer_token, decide, server_error};
 use kyuyo_logic::{reply_for_route, route, Reply, Route};
@@ -60,13 +58,4 @@ pub(crate) fn respond(reply: Reply) -> worker::Result<Response> {
     Ok(Response::ok(reply.body)?
         .with_status(reply.status)
         .with_headers(headers))
-}
-
-/// secret / var の文字列 (空は無いものとして扱う)。`.dev.vars` はローカルでは var として見える。
-pub(crate) fn text(env: &Env, name: &str) -> Option<String> {
-    env.secret(name)
-        .map(|s| s.to_string())
-        .or_else(|_| env.var(name).map(|v| v.to_string()))
-        .ok()
-        .filter(|s| !s.is_empty())
 }
