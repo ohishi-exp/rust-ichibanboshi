@@ -1,0 +1,21 @@
+# 担当者別売上 (/api/uriage/*) の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# 担当者別の集計 (PHP の写経)・SQL Server の SQL と列の読み方・raw ndjson と fingerprint・CakePHP の応答の型・口の型。
+# tiberius・worker・axum・reqwest・rusqlite に依存しないので native で cargo test でき、wasm32 でも build できる。
+# オンプレ版 (repo ルートの package) も path 依存で使う (写さない)。
+[package]
+name = "uriage-logic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# alloc: NaiveDate::format().to_string() に要る。clock は使わない (時刻は引数で受ける)
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# raw ndjson の gzip。rust_backend (miniz_oxide) は wasm32 でも build できる
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# 担当者振替の備考2 パース (PHP preg_match /(.+)→(.+)/u 写経)
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# fingerprint (raw ndjson の sha256)
+sha2 = "0.10"

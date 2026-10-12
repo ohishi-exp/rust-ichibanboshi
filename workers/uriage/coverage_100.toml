@@ -1,0 +1,37 @@
+# workers/uriage の 100% 行カバレッジ登録簿 (Refs #322)。
+#
+# 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
+# coverage_100.toml と同じ)。workers/uriage は別 workspace なので計測は worker-uriage.yml が取る:
+#
+#   cargo llvm-cov --manifest-path workers/uriage/Cargo.toml -p uriage-logic --text > cov.txt
+#   bash scripts/check_coverage_100.sh --config workers/uriage/coverage_100.toml --use-cache cov.txt
+#
+# uriage-logic は root の src/routes/uriage.rs・src/repo.rs・src/cakephp.rs・src/sqlite.rs から移した売上の純粋部分
+# (オンプレ版も path 依存で使う)。lib.rs は mod 宣言だけ (実行行 0) なので登録しない。
+#
+# compute.rs (担当者振替の PHP の写経・日次と取引先別の集計) は 1 行だけ到達不能で 100% にならないので登録しない:
+# compute_person_sum の B6 の `if !(備考2 == "表示のみ" && 請求K == 1) { … }` の閉じ括弧 (偽側)。「表示のみ AND 請求K != 2」は
+# 直前の B4 が必ず取るので、B6 で条件が偽になる入力が無い。写経はリファクタ禁止なので形を変えずに外す
+# (それ以外の 366 行は通っている。テストは logic/tests/compute.rs (PHP の 17 ケース + 全分岐) と単体テスト)
+
+# SQL Server の SQL の組み立てと列 → UriageRow。SQL の文字列は logic/tests/golden.rs が sha256 で固定
+[[files]]
+path = "workers/uriage/logic/src/sqlserver.rs"
+
+# raw ndjson・fingerprint・gzip・R2 の key。fingerprint は logic/tests/golden.rs がバイト列で固定
+[[files]]
+path = "workers/uriage/logic/src/raw.rs"
+
+[[files]]
+path = "workers/uriage/logic/src/period.rs"
+
+[[files]]
+path = "workers/uriage/logic/src/verify.rs"
+
+# CakePHP の応答の型と営業所の引き当て
+[[files]]
+path = "workers/uriage/logic/src/cakephp.rs"
+
+# 口の Query と応答の型・r2/pending の verify gate・verify-debug の行
+[[files]]
+path = "workers/uriage/logic/src/api.rs"

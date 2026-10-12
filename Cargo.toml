@@ -38,8 +38,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
-# 担当者振替の備考2 パース (PHP preg_match /(.+)→(.+)/u 写経用、routes/uriage.rs)
-regex = "1"
 # Phase 2 担当者別売上 summary local store (sqlite.rs)。bundled で OS の libsqlite 不要
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Phase 2 CakePHP masters / editable-months HTTP pull (社内 LAN、token 不要)
@@ -60,6 +58,9 @@ kintai-dtako = { path = "workers/kintai/dtako" }
 # Supabase の勤怠スキーマを読み書きする口の純粋部分 (変更履歴・賃金スナップショットの SQL と bind の束。勤怠 Worker と
 # 共有、Refs #322)。build.rs のversion の etag の glob の外。postgres-types 等がオンプレ版にも入るのは許容
 kintai-logic = { path = "workers/kintai/logic" }
+# 担当者別売上 (/api/uriage/*) の純粋部分 (集計・SQL Server の SQL・raw ndjson と fingerprint・CakePHP の応答の型・口の型)。
+# 売上 Worker と共有 (写さない、Refs #322)
+uriage-logic = { path = "workers/uriage/logic" }
 
 # RDP 中継用。ironrdp は RDP の PDU 定義をそのまま借りる (自前で組み立て直さない)。
 # rustls は既定の aws-lc-rs ではなく ring を明示する — musl static build を維持するため

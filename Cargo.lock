@@ -2396,7 +2396,6 @@ dependencies = [
  "kintai-kosoku",
  "kintai-logic",
  "mysql_async",
- "regex",
  "reqwest",
  "rsa",
  "rusqlite",
@@ -2414,6 +2413,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uriage-logic",
  "uuid",
  "wiremock",
 ]
@@ -3515,6 +3515,18 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uriage-logic"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flate2",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "url"
