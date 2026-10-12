@@ -427,6 +427,7 @@ fn binds(s: &Stmt) -> Vec<SqlValue> {
         .map(|b| match b {
             Bind::Text(t) => SqlValue::Text(t.clone()),
             Bind::Int(i) => SqlValue::Integer(*i),
+            Bind::Null => SqlValue::Null,
         })
         .collect()
 }

@@ -51,3 +51,7 @@ path = "workers/uriage/logic/src/recalc.rs"
 # 書き込みの口の token の照合 (workers/kintai/logic/src/write_auth.rs の写し)
 [[files]]
 path = "workers/uriage/logic/src/write_auth.rs"
+
+# admin/delete・admin/rebuild の文 (D1 の DELETE)・応答。logic/tests/verify_admin.rs が SQLite に流して固定
+[[files]]
+path = "workers/uriage/logic/src/admin.rs"

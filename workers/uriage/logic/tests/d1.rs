@@ -46,6 +46,7 @@ fn raw(conn: &Connection, s: &Stmt, num: Num) -> Vec<Vec<Value>> {
         .map(|b| match b {
             Bind::Text(t) => rusqlite::types::Value::Text(t.clone()),
             Bind::Int(i) => rusqlite::types::Value::Integer(*i),
+            Bind::Null => rusqlite::types::Value::Null,
         })
         .collect();
     let mut rows = st.query(params_from_iter(binds)).unwrap();
@@ -187,13 +188,37 @@ fn routes_and_methods() {
     assert_eq!(route("POST", "/api/uriage/recalc"), Route::Recalc);
     assert_eq!(route("GET", "/api/uriage/recalc"), Route::MethodNotAllowed);
     assert_eq!(route("PUT", "/api/uriage/recalc"), Route::MethodNotAllowed);
-    // 書き込みの口 (次の PR) と移さない口は 404
+    // verify・admin は POST だけ、verify-debug は GET だけ
+    assert_eq!(route("POST", "/api/uriage/verify"), Route::Verify);
+    assert_eq!(route("GET", "/api/uriage/verify"), Route::MethodNotAllowed);
+    assert_eq!(route("GET", "/api/uriage/verify-debug"), Route::VerifyDebug);
+    assert_eq!(
+        route("POST", "/api/uriage/verify-debug"),
+        Route::MethodNotAllowed
+    );
+    assert_eq!(
+        route("POST", "/api/uriage/admin/delete"),
+        Route::AdminDelete
+    );
+    assert_eq!(
+        route("GET", "/api/uriage/admin/delete"),
+        Route::MethodNotAllowed
+    );
+    assert_eq!(
+        route("POST", "/api/uriage/admin/rebuild"),
+        Route::AdminRebuild
+    );
+    assert_eq!(
+        route("PUT", "/api/uriage/admin/rebuild"),
+        Route::MethodNotAllowed
+    );
+    // 移さない口は 404
     for path in [
         "/api/uriage/recalc/",
-        "/api/uriage/verify",
-        "/api/uriage/verify-debug",
-        "/api/uriage/admin/delete",
-        "/api/uriage/admin/rebuild",
+        "/api/uriage/verify/",
+        "/api/uriage/admin",
+        "/api/uriage/admin/",
+        "/api/uriage/admin/other",
         "/api/uriage/by-person",
         "/api/uriage/raw/2026-05/1",
         "/api/uriage/raw/2026-05/1/ack",

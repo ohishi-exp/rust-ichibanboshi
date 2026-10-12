@@ -126,6 +126,16 @@ pub fn masters_path(date: &str) -> String {
 
 const MASTERS_PATH: &str = "/uriage-jyuchu-display/masters-json";
 
+/// `/uriage-jyuchu-display/print-json?id=N&date=YYYY-MM-DD[&cal=cal]` (src/cakephp.rs の `fetch_print_json` の写し)。
+/// `cal=true` (別営業所を合算。PHP の既定) なら cal を送らず、`false` のときだけ `&cal=cal` を付ける。
+pub fn print_json_path(id: i64, date: &str, cal: bool) -> String {
+    let date = urlencode(date);
+    let suffix = if cal { "" } else { "&cal=cal" };
+    format!("{PRINT_JSON_PATH}?id={id}&date={date}{suffix}")
+}
+
+const PRINT_JSON_PATH: &str = "/uriage-jyuchu-display/print-json";
+
 /// `base_url` (末尾の `/` は落とす) に相対パスを足す。
 pub fn join(base_url: &str, path: &str) -> String {
     format!("{}{path}", base_url.trim_end_matches('/'))
@@ -333,6 +343,24 @@ mod tests {
             "http://h/uriage-jyuchu-display/masters-json?date=2026-06-30"
         );
         assert_eq!(urlencode("a b+~"), "a%20b%2B~");
+    }
+
+    #[test]
+    fn print_json_path_matches_the_onprem_url() {
+        // cal=true は cal を送らない。false のときだけ `&cal=cal`
+        assert_eq!(
+            print_json_path(1, "2026-06-30", true),
+            "/uriage-jyuchu-display/print-json?id=1&date=2026-06-30"
+        );
+        assert_eq!(
+            print_json_path(12, "2026-06-30", false),
+            "/uriage-jyuchu-display/print-json?id=12&date=2026-06-30&cal=cal"
+        );
+        let url = join(VPC_ORIGIN, &print_json_path(9, "2026 06", true));
+        assert_eq!(
+            url,
+            "http://localhost:120/uriage-jyuchu-display/print-json?id=9&date=2026%2006"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tiberius::numeric::Numeric;
 use tiberius::Row;
 use uriage_logic::compute::UriageRow;
-use uriage_logic::routes::sql_kind;
+use uriage_logic::routes::{sql_kind, Reply};
 use uriage_logic::sqlserver::{uriage_row, Cells};
 use vpc_tds::{kind_of, timeout, Conn, DbError, ErrKind, Stage, Target};
 use worker::Env;
@@ -29,6 +29,15 @@ pub(crate) const TARGET: Target = Target {
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// `/probe` の `SELECT 1` の上限。
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// SQL Server の binding があるか (無ければ 503 `binding:<名前>`)。ローカル検証 (`LOCAL_SQL_ADDR`) は VPC を迂回するので問わない。
+pub(crate) fn require(env: &Env) -> Result<(), Reply> {
+    let local = vpc_tds::text(env, TARGET.local_addr_var).is_some();
+    if !local && crate::cakephp::binding(env, TARGET.binding).is_none() {
+        return Err(Reply::missing(TARGET.binding));
+    }
+    Ok(())
+}
 
 /// 失敗の `kind` (`<段>:<種類>`)。
 pub(crate) fn label(e: &DbError) -> String {

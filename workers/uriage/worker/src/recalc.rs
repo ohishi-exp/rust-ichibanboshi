@@ -28,16 +28,19 @@ use worker::{
 
 use crate::cakephp;
 use crate::sql;
-use crate::{parse_query, prepared, run};
+use crate::{parse_query, prepared, query_string, run};
+
+/// 書き込みの口の認可 (recalc・verify・admin 共通)。token が無い・違う = 403、secret が読めない = 503。
+pub(crate) async fn authorize_request(req: &Request, env: &Env) -> Result<(), Reply> {
+    let token = req.headers().get(WRITE_TOKEN_HEADER).ok().flatten();
+    authorize(load_token(env).await.as_deref(), token.as_deref())
+}
 
 pub(crate) async fn serve(req: &Request, env: &Env) -> Reply {
-    let token = req.headers().get(WRITE_TOKEN_HEADER).ok().flatten();
-    if let Err(reply) = authorize(load_token(env).await.as_deref(), token.as_deref()) {
+    if let Err(reply) = authorize_request(req, env).await {
         return reply;
     }
-    let query = req.url().ok();
-    let query = query.as_ref().and_then(|u| u.query()).unwrap_or_default();
-    let q: RecalcQuery = match parse_query(query) {
+    let q: RecalcQuery = match parse_query(&query_string(req)) {
         Ok(q) => q,
         Err(reply) => return reply,
     };
@@ -67,11 +70,7 @@ fn bindings(env: &Env) -> Result<Io, Reply> {
         .map_err(|_| Reply::missing(R2_BINDING))?;
     let missing = || Reply::missing(CAKEPHP_VPC_BINDING);
     let cakephp = cakephp::fetcher(env).ok_or_else(missing)?;
-    // ローカル検証 (LOCAL_SQL_ADDR) は VPC を迂回するので binding を問わない
-    let local = vpc_tds::text(env, sql::TARGET.local_addr_var).is_some();
-    if !local && cakephp::binding(env, sql::TARGET.binding).is_none() {
-        return Err(Reply::missing(sql::TARGET.binding));
-    }
+    sql::require(env)?;
     Ok(Io { db, r2, cakephp })
 }
 
@@ -212,7 +211,7 @@ async fn put_raw(r2: &R2, bucket: &Bucket, at: &str) -> Result<(), &'static str>
 }
 
 /// 書き込みの 1 文。
-async fn write(db: &D1Database, s: &Stmt) -> worker::Result<()> {
+pub(crate) async fn write(db: &D1Database, s: &Stmt) -> worker::Result<()> {
     prepared(db, s)?.run().await?;
     Ok(())
 }

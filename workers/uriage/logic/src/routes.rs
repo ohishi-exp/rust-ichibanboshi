@@ -1,8 +1,8 @@
 //! 売上 Worker の経路の判定と応答の形 (Refs ohishi-exp/rust-ichibanboshi#322)。
 //!
 //! 口は `GET /health` (D1 に `SELECT 1`)・`POST /probe` (D1・SQL Server・CakePHP)・読みの口 6 本・書き込みの口
-//! `POST /api/uriage/recalc` (path はオンプレ版と同じ)。verify・verify-debug・admin は次の PR で足す。それまで
-//! (と、移さない by-person・raw・ack) は 404。
+//! `POST /api/uriage/recalc`・`POST /api/uriage/verify`・`POST /api/uriage/admin/{delete,rebuild}` (path はオンプレ版と同じ)
+//! と、書かない `GET /api/uriage/verify-debug` (認可なし)。移さない by-person・raw・ack は 404。
 //!
 //! 応答の本文:
 //! - 成功はオンプレ版と同じ JSON
@@ -22,6 +22,14 @@ pub enum Route {
     Read(ReadRoute),
     /// `POST /api/uriage/recalc` (書き込みの口。token 必須)
     Recalc,
+    /// `POST /api/uriage/verify` (D1 の verify_jobs に書く。token 必須)
+    Verify,
+    /// `GET /api/uriage/verify-debug` (書かない。認可なし)
+    VerifyDebug,
+    /// `POST /api/uriage/admin/delete` (token 必須)
+    AdminDelete,
+    /// `POST /api/uriage/admin/rebuild` (token 必須)
+    AdminRebuild,
     NotFound,
     MethodNotAllowed,
 }
@@ -57,6 +65,10 @@ pub fn route(method: &str, path: &str) -> Route {
         "/health" => ("GET", Route::Health),
         "/probe" => ("POST", Route::Probe),
         "/api/uriage/recalc" => ("POST", Route::Recalc),
+        "/api/uriage/verify" => ("POST", Route::Verify),
+        "/api/uriage/verify-debug" => ("GET", Route::VerifyDebug),
+        "/api/uriage/admin/delete" => ("POST", Route::AdminDelete),
+        "/api/uriage/admin/rebuild" => ("POST", Route::AdminRebuild),
         _ => match path.strip_prefix("/api/uriage/").and_then(read_route) {
             Some(r) => ("GET", Route::Read(r)),
             None => return Route::NotFound,

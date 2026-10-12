@@ -11,8 +11,9 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use serde::de::DeserializeOwned;
 use uriage_logic::cakephp::{
-    join, masters_path, read_json, CakephpError, EditableMonthsResponse, MastersResponse,
-    CAKEPHP_VPC_BINDING, EDITABLE_MONTHS_PATH, TIMEOUT_SECS, VPC_ORIGIN,
+    join, masters_path, print_json_path, read_json, CakephpError, EditableMonthsResponse,
+    MastersResponse, PrintJsonResponse, CAKEPHP_VPC_BINDING, EDITABLE_MONTHS_PATH, TIMEOUT_SECS,
+    VPC_ORIGIN,
 };
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::{js_sys, Delay, Env, Fetcher, Method, RequestInit, RequestRedirect};
@@ -62,6 +63,16 @@ async fn get<T: DeserializeOwned>(vpc: &Fetcher, path: &str) -> Result<T, Cakeph
 /// `/uriage-jyuchu-display/editable-months`
 pub(crate) async fn editable_months(vpc: &Fetcher) -> Result<EditableMonthsResponse, CakephpError> {
     get(vpc, EDITABLE_MONTHS_PATH).await
+}
+
+/// `/uriage-jyuchu-display/print-json?id=N&date=YYYY-MM-DD[&cal=cal]` (検証用の PHP の `$sum`)
+pub(crate) async fn print_json(
+    vpc: &Fetcher,
+    id: i64,
+    date: &str,
+    cal: bool,
+) -> Result<PrintJsonResponse, CakephpError> {
+    get(vpc, &print_json_path(id, date, cal)).await
 }
 
 /// `/uriage-jyuchu-display/masters-json?date=YYYY-MM-DD` (月末日)

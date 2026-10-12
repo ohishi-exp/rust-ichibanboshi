@@ -6,17 +6,20 @@
 //! - `GET /api/uriage/{daily,person-monthly-totals,person-partner-totals,r2/pending,recalc-jobs,verify-history}` —
 //!   path・Query・応答の JSON はオンプレ版と同じ。SQL・検査・行の読み取り・応答の組み立ては uriage-logic の `d1`
 //! - `POST /api/uriage/recalc` — 書き込みの口 ([`recalc`])。token `X-Uriage-Write-Token` 必須
-//!
-//! verify・verify-debug・admin は次の PR。それまで 404。
+//! - `POST /api/uriage/verify` — PHP の `$sum` との突き合わせ ([`verify`])。D1 の verify_jobs に書くので token 必須
+//! - `GET /api/uriage/verify-debug` — 同じ集計を行ごとの判定付きで返す ([`verify`])。書かない・認可なし
+//! - `POST /api/uriage/admin/{delete,rebuild}` — D1 の掃除 ([`admin`])。token 必須。rebuild は DROP せず 4 表を DELETE
 //!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。読みの口は認可なし (一番星 Worker・
 //! 勤怠 Worker の読みの口と同じ。関門は呼び手の側)。書き込みの口は Worker が共有 secret を照合する。
 //! 失敗: D1 の binding が無い = 503、D1 の失敗 = 500 (オンプレ版の LocalStore と同じ status)、SQL Server・CakePHP = 502。
 //! 本文は段と種別だけ (D1・SQL Server・CakePHP の message は応答にもログにも出さない)。
 
+mod admin;
 mod cakephp;
 mod recalc;
 mod sql;
+mod verify;
 
 use serde::de::DeserializeOwned;
 use uriage_logic::cakephp::CAKEPHP_VPC_BINDING;
@@ -44,6 +47,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response
             (r.name(), read(&env, r, &query).await)
         }
         Route::Recalc => ("recalc", recalc::serve(&req, &env).await),
+        Route::Verify => ("verify", verify::serve(&req, &env).await),
+        Route::VerifyDebug => ("verify-debug", verify::serve_debug(&req, &env).await),
+        Route::AdminDelete => ("admin/delete", admin::delete(&req, &env).await),
+        Route::AdminRebuild => ("admin/rebuild", admin::rebuild(&req, &env).await),
         // 経路判定 (`Reply::for_route`) で先に返している
         Route::NotFound | Route::MethodNotAllowed => ("-", Reply::bare(404)),
     };
@@ -156,6 +163,15 @@ pub(crate) fn parse_query<T: DeserializeOwned>(query: &str) -> Result<T, Reply> 
         .map_err(|e| Reply::text(400, format!("Failed to deserialize query string: {e}")))
 }
 
+/// クエリ文字列の全体 (無ければ空)。
+pub(crate) fn query_string(req: &Request) -> String {
+    let url = req.url().ok();
+    url.as_ref()
+        .and_then(|u| u.query())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn binding(env: &Env) -> Result<D1Database, Reply> {
     env.d1(D1_BINDING).map_err(|_| Reply::no_binding())
 }
@@ -179,5 +195,6 @@ fn js_value(b: &Bind) -> JsValue {
         Bind::Text(s) => JsValue::from_str(s),
         // D1 は BigInt を受けない。値は営業所 id と cal の 0 / 1 だけ
         Bind::Int(i) => JsValue::from_f64(*i as f64),
+        Bind::Null => JsValue::NULL,
     }
 }

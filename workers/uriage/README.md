@@ -2,8 +2,8 @@
 
 Refs ohishi-exp/rust-ichibanboshi#322。オンプレ版 rust の売上の口を Cloudflare Worker `ichibanboshi-uriage` に移す。
 純粋部分の crate `uriage-logic` (`logic/`、オンプレ版も path 依存で使う) と Worker の crate `uriage-worker` (`worker/`)。
-**いまの Worker は D1 を読む口 6 本と書き込みの口 `POST /api/uriage/recalc`** (下記)。verify・verify-debug・admin は次の PR で足す
-(この PR の CakePHP・TDS・token・D1 の部品を使う)。
+**いまの Worker は D1 を読む口 6 本と、`POST /api/uriage/recalc`・`POST /api/uriage/verify`・`GET /api/uriage/verify-debug`・
+`POST /api/uriage/admin/{delete,rebuild}`** (下記)。by-person・raw・ack は移さない (404)。
 
 ## uriage-logic
 
@@ -40,8 +40,14 @@ Service Binding 専用 (route・workers.dev・preview 無し)。読みの口は�
 | `GET /health` | `SELECT 1` | `{"status":"ok"}` |
 | `POST /probe` | `SELECT 1` → SQL Server にログインして `SELECT 1` → CakePHP の editable-months | `{"ok":true,"d1":"ok","sqlserver":"ok","cakephp":"ok"}` (最初に落ちた段の失敗を返す) |
 | `POST /api/uriage/recalc` (`month`・`eigyosho_id` 任意。header `X-Uriage-Write-Token` 必須) | bucket ごとに SELECT 1 + batch 9 + (put 後) UPDATE 1 | オンプレ版と同じ `{source_table, months, editable_months_count, calculated_at, jobs}` |
+| `POST /api/uriage/verify?id=&date=&cal=` (header `X-Uriage-Write-Token` 必須) | masters → (bumon 空は skipped) → print-json → SQL Server 1 本 (単日) → verify_jobs の UPSERT 1 | オンプレ版と同じ `{office_id, date, cal, php_sum, rust_sum, diff, ok, row_count, elapsed_ms, skipped_reason?}` |
+| `GET /api/uriage/verify-debug?id=&date=&cal=` (認可なし・書かない) | masters → print-json → SQL Server 1 本 | オンプレ版と同じ `{office_id, date, cal, bumon, persons, other, rows, php_sum, rust_sum, diff}` |
+| `POST /api/uriage/admin/delete?month=&eigyosho_id=` (token 必須) | 1 batch の DELETE 3 (日次・取引先別・recalc_jobs。verify_jobs は消さない) | `{month, eigyosho_id, daily_deleted, jobs_deleted}`。month が空は本文なしの 400 |
+| `POST /api/uriage/admin/rebuild` (token 必須) | 1 batch の DELETE 4 (VIEW は残す) | `{rebuilt_at}` |
 
-読みの口の検査の順は **Query → 入力 (400) → binding (503) → D1 (500)**。
+読みの口の検査の順は **Query → 入力 (400) → binding (503) → D1 (500)**。書き込みの口は **認可 (403 / 503) → 入力 → binding → I/O**。
+verify・verify-debug の bumon が空の営業所は、verify は検証せず 200 + `skipped_reason: "no_bumon"` (verify_jobs にも ok = 1 で記録。
+無いと r2_pending が埋まらない)。verify-debug は止めずに集計して返す。verify_jobs の UPSERT の失敗は握りつぶす (応答は返す)。
 
 ### recalc
 
@@ -65,7 +71,12 @@ job (month × 営業所、直列) ごとに SQL Server 1 本 → 集計 → D1 �
 | 置き場が無い | `[sqlite] path` が空 = 503 (本文なし) | `URIAGE_DB` の binding が無い = 503 `{"ok":false,"stage":"binding","kind":"missing"}` |
 | 置き場の失敗 | 500 (daily 等は本文なし、recalc-jobs・verify-history は失敗の文言入りの平文) | 500 `{"ok":false,"stage":"bind\|query\|rows","kind":"failed\|malformed"}` (D1 の message は出さない) |
 | recalc-jobs・verify-history で置き場が無い | 500 (Disabled も 500 になっていた) | 503 (上と同じ) |
-| 404 / 405 | axum の既定 (本文なし) | `{"ok":false}`。verify・verify-debug・admin・`by-person`・`raw`・`ack` はこの段では 404 |
+| 404 / 405 | axum の既定 (本文なし) | `{"ok":false}`。`by-person`・`raw`・`ack` は移さないので 404 |
+| verify の method | GET | **POST** + header `X-Uriage-Write-Token` (D1 に書くため。GET は 405)。Query (`id`・`date`・`cal`) は同じ |
+| verify の失敗の本文 | 生の文言 (`CakePHP status 500: …`・`SQL Server fetch failed (status=N)`) | `stage:kind` だけ (`cakephp:status:500`・`sqlserver:login:…`・`cakephp:sum`)。date 不正 (400)・営業所なし (404) は同じ平文 |
+| verify の SQL Server の失敗 | 接続 = 503、クエリ = 500 (本文は固定の文言) | 同じ status。本文は `{"ok":false,"stage":"sqlserver","kind":"<段>:<種類>"}` |
+| admin の method | POST (認可なし) | POST + token |
+| admin/rebuild | 全 table・VIEW を DROP → 再 migrate | **DROP しない。4 表 (日次・取引先別・recalc_jobs・verify_jobs) を DELETE する** (VIEW・schema は残る) |
 | 修復 | 起動のたびに VIEW を作り直し、列の後付けと修復の UPDATE 2 本を流す | 持たない (表は migration で 1 回だけ。移送するデータは修復した後の形で入れる) |
 | recalc の raw | disk に書き、nuxt の r2-sync が `raw` / `ack` で R2 に運ぶ | recalc が R2 に put し、同じリクエストで `r2_synced` にする |
 | recalc の失敗の error | 生の文言 (`sqlserver: QueryError(…)` 等) | `stage:kind` だけ |
