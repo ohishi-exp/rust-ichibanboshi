@@ -11,6 +11,7 @@ on:
     branches: [main]
     paths:
       - 'workers/ichiban/**'
+      - 'workers/shared/**'
       - '.github/workflows/worker-ichiban.yml'
   push:
     branches: [main]
@@ -18,6 +19,7 @@ on:
     tags: ['worker-ichiban-v*']
     paths:
       - 'workers/ichiban/**'
+      - 'workers/shared/**'
       - '.github/workflows/worker-ichiban.yml'
 
 permissions:

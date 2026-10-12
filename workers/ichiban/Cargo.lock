@@ -234,17 +234,13 @@ name = "ichiban-worker"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "futures-util",
  "ichiban-logic",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "tiberius",
- "tokio",
- "tokio-util",
- "wasm-bindgen",
+ "vpc-tds",
  "worker",
- "worker-sys",
 ]
 
 [[package]]
@@ -782,6 +778,28 @@ checksum = "97277d36b9c3ace13e58fa6e753f8b0bbbf302a18dd193240d70f9e29681059a"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "vpc-tds"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "tiberius",
+ "tokio",
+ "tokio-util",
+ "vpc-tds-logic",
+ "wasm-bindgen",
+ "worker",
+ "worker-sys",
+]
+
+[[package]]
+name = "vpc-tds-logic"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
