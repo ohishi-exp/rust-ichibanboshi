@@ -80,6 +80,83 @@ pub fn office_lookup(masters: &MastersResponse, eigyosho_id: i64) -> Option<&Off
     masters.offices.get(&eigyosho_id.to_string())
 }
 
+// ── 売上 Worker が Workers VPC (HTTP) で CakePHP を叩くときの部品 ──
+// 定数は workers/kintai/logic/src/cakephp_relay.rs、join・urlencode・is_success は workers/kintai/logic/src/cakephp.rs の写し
+// (別 workspace なので依存しない)。path はオンプレ版 (root の src/cakephp.rs) の fetch_masters・fetch_editable_months と同じ
+
+/// CakePHP への口 (Workers VPC の VPC Service、HTTP)。wrangler.toml のトップレベルにだけ置く。
+pub const CAKEPHP_VPC_BINDING: &str = "URIAGE_CAKEPHP_VPC";
+
+/// fetch の URL の origin。宛先の host:port は VPC Service の側で決まる (社内のホスト名は書かない)。**`Host` は CakePHP に
+/// 届き、CakePHP は `Host` で応答を変える** — `localhost` (port は VPC Service と同じ 120) なら JSON を返す (勤怠 Worker で実測)。
+pub const VPC_ORIGIN: &str = "http://localhost:120";
+
+/// 待ちの上限 (秒)。オンプレ版の `[cakephp] timeout_secs` の既定と同じ。
+pub const TIMEOUT_SECS: u64 = 30;
+
+/// `/uriage-jyuchu-display/editable-months`
+pub const EDITABLE_MONTHS_PATH: &str = "/uriage-jyuchu-display/editable-months";
+
+/// `/uriage-jyuchu-display/masters-json?date=YYYY-MM-DD`
+pub fn masters_path(date: &str) -> String {
+    let date = urlencode(date);
+    format!("{MASTERS_PATH}?date={date}")
+}
+
+const MASTERS_PATH: &str = "/uriage-jyuchu-display/masters-json";
+
+/// `base_url` (末尾の `/` は落とす) に相対パスを足す。
+pub fn join(base_url: &str, path: &str) -> String {
+    format!("{}{path}", base_url.trim_end_matches('/'))
+}
+
+/// クエリの値の escape (オンプレ版が送る URL と同じにする)。
+pub fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "%20".to_string(),
+            _ => format!("%{:02X}", c as u32),
+        })
+        .collect()
+}
+
+/// CakePHP の失敗の種類 (宛先・本文は持たない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CakephpError {
+    /// 届かない (fetch の失敗)
+    Request,
+    /// 待ちを打ち切った
+    Timeout,
+    /// 2xx でない (3xx も。fetch は redirect を追わない)
+    Status(u16),
+    /// 2xx の本文が読めない
+    Json,
+}
+
+impl CakephpError {
+    /// 応答の `kind`・job の error に出す名前 (`request`・`timeout`・`status:500`・`json`)。
+    pub fn label(&self) -> String {
+        match self {
+            Self::Request => "request".to_string(),
+            Self::Timeout => "timeout".to_string(),
+            Self::Status(s) => format!("status:{s}"),
+            Self::Json => "json".to_string(),
+        }
+    }
+}
+
+/// 応答 (status・本文) を型に読む。2xx 以外は `Status` (オンプレ版の reqwest の `is_success` と同じ範囲)。
+pub fn read_json<T: serde::de::DeserializeOwned>(
+    status: u16,
+    body: &[u8],
+) -> Result<T, CakephpError> {
+    if !(200..300).contains(&status) {
+        return Err(CakephpError::Status(status));
+    }
+    serde_json::from_slice(body).map_err(|_| CakephpError::Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +265,42 @@ mod tests {
         assert_eq!(office_lookup(&masters, 1).unwrap().display_name, "本社");
         assert_eq!(office_lookup(&masters, 9).unwrap().display_name, "宮崎");
         assert!(office_lookup(&masters, 7).is_none());
+    }
+
+    #[test]
+    fn paths_match_the_onprem_urls() {
+        let base = join(VPC_ORIGIN, EDITABLE_MONTHS_PATH);
+        assert_eq!(
+            base,
+            "http://localhost:120/uriage-jyuchu-display/editable-months"
+        );
+        let masters = join("http://h/", &masters_path("2026-06-30"));
+        assert_eq!(
+            masters,
+            "http://h/uriage-jyuchu-display/masters-json?date=2026-06-30"
+        );
+        assert_eq!(urlencode("a b+~"), "a%20b%2B~");
+    }
+
+    #[test]
+    fn read_json_maps_status_and_parse_failures() {
+        let ok: Result<EditableMonthsResponse, _> = read_json(
+            200,
+            br#"{"operation_month":"2026-07","editable_months_count":1,"editable_months":["2026-07"]}"#,
+        );
+        assert_eq!(ok.unwrap().editable_months, vec!["2026-07"]);
+        let redirect = read_json::<EditableMonthsResponse>(302, b"{}").unwrap_err();
+        assert_eq!(redirect, CakephpError::Status(302));
+        let html = read_json::<EditableMonthsResponse>(200, b"<html>").unwrap_err();
+        assert_eq!(html, CakephpError::Json);
+        let low = read_json::<EditableMonthsResponse>(199, b"{}").unwrap_err();
+        assert_eq!(low.label(), "status:199");
+        let labels = [
+            CakephpError::Request,
+            CakephpError::Timeout,
+            CakephpError::Json,
+        ];
+        let labels: Vec<String> = labels.iter().map(CakephpError::label).collect();
+        assert_eq!(labels, ["request", "timeout", "json"]);
     }
 }

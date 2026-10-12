@@ -1,7 +1,8 @@
 //! 売上 Worker の経路の判定と応答の形 (Refs ohishi-exp/rust-ichibanboshi#322)。
 //!
-//! 口はこの段では `GET /health`・`POST /probe` (D1 に `SELECT 1`) と、読みの口 6 本 (path はオンプレ版と同じ)。
-//! 書き込みの口 (recalc・verify・verify-debug・admin) は次の PR で足す。それまで (と、移さない by-person・raw・ack) は 404。
+//! 口は `GET /health` (D1 に `SELECT 1`)・`POST /probe` (D1・SQL Server・CakePHP)・読みの口 6 本・書き込みの口
+//! `POST /api/uriage/recalc` (path はオンプレ版と同じ)。verify・verify-debug・admin は次の PR で足す。それまで
+//! (と、移さない by-person・raw・ack) は 404。
 //!
 //! 応答の本文:
 //! - 成功はオンプレ版と同じ JSON
@@ -9,6 +10,7 @@
 //! - 404 / 405 は `{"ok":false}`
 //! - D1 までの失敗は `{"ok":false,"stage":…,"kind":…}` だけ (D1 の message は出さない)。binding が無い = 503、D1 の失敗 = 500
 //!   (オンプレ版の LocalStore と同じ status)
+//! - recalc・probe の SQL Server・CakePHP の失敗も同じ形 (502)。D1 以外の binding が無いのは 503 `binding:<binding 名>`
 
 use serde::Serialize;
 
@@ -18,6 +20,8 @@ pub enum Route {
     Health,
     Probe,
     Read(ReadRoute),
+    /// `POST /api/uriage/recalc` (書き込みの口。token 必須)
+    Recalc,
     NotFound,
     MethodNotAllowed,
 }
@@ -52,6 +56,7 @@ pub fn route(method: &str, path: &str) -> Route {
     let (want, found) = match path {
         "/health" => ("GET", Route::Health),
         "/probe" => ("POST", Route::Probe),
+        "/api/uriage/recalc" => ("POST", Route::Recalc),
         _ => match path.strip_prefix("/api/uriage/").and_then(read_route) {
             Some(r) => ("GET", Route::Read(r)),
             None => return Route::NotFound,
@@ -151,6 +156,16 @@ impl Reply {
         Self::failure(500, stage, "failed")
     }
 
+    /// D1 以外の binding (VPC・R2・Secrets Store) が無い (503 `binding:<binding 名>`)。
+    pub fn missing(binding: &str) -> Self {
+        Self::failure(503, "binding", binding)
+    }
+
+    /// SQL Server・CakePHP までの失敗 (502)。
+    pub fn upstream(stage: &str, kind: &str) -> Self {
+        Self::failure(502, stage, kind)
+    }
+
     fn json(status: u16, body: String) -> Self {
         Self {
             status,
@@ -163,5 +178,10 @@ impl Reply {
 /// `GET /health` の本文。
 pub const HEALTH_BODY: &str = r#"{"status":"ok"}"#;
 
-/// `POST /probe` の本文 (この段では D1 だけ。SQL Server・CakePHP・R2 は次の PR で足す)。
-pub const PROBE_BODY: &str = r#"{"ok":true,"d1":"ok"}"#;
+/// `POST /probe` の本文 (D1 の `SELECT 1`・SQL Server にログインして `SELECT 1`・CakePHP の editable-months が全部通った)。
+pub const PROBE_BODY: &str = r#"{"ok":true,"d1":"ok","sqlserver":"ok","cakephp":"ok"}"#;
+
+/// SQL Server の失敗の `kind` (`<段>:<種類>`。例 `login:server:18456/14/1`)。recalc の job の error は頭に `sqlserver:` を付ける。
+pub fn sql_kind(stage: &str, kind: &str) -> String {
+    format!("{stage}:{kind}")
+}

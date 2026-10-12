@@ -1,12 +1,15 @@
 # ichibanboshi-uriage: 担当者別売上 (/api/uriage/*) の Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
-# Service Binding 専用。この段の口は GET /health・POST /probe (D1) と、D1 を読む GET /api/uriage/* の 6 本。
+# Service Binding 専用。口は GET /health (D1)・POST /probe (D1・SQL Server・CakePHP)・D1 を読む GET /api/uriage/* の 6 本・
+# 書き込みの口 POST /api/uriage/recalc (token 必須。SQL Server と CakePHP を読み、D1 に書き、raw を R2 に置く)。
 # 本番へはタグ worker-uriage-v* の push で deploy する (.github/workflows/worker-uriage.yml)。
 #
 # ★ 外から届く口を持たない:
 #   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)
-#   - 読みの口は認可なし (一番星 Worker・勤怠 Worker の読みの口と同じ。関門は呼び手の側)
+#   - 読みの口は認可なし (一番星 Worker・勤怠 Worker の読みの口と同じ。関門は呼び手の側)。書き込みの口 (recalc) は
+#     ヘッダー X-Uriage-Write-Token を URIAGE_WRITE_TOKEN と照合する (無い・違う = 403、secret が読めない = 503)
 #   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
-#   - D1 の binding はトップレベルにだけ置く。services (他の Worker への binding) は持たない
+#   - D1・R2・vpc_services・secrets_store_secrets はトップレベルにだけ置く。services (他の Worker への binding) は持たない
+#   - VPC / Secrets Store を迂回する LOCAL_* の var は vars に置かない (ローカルの .dev.vars 専用)
 #   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
 name = "ichibanboshi-uriage"
@@ -17,6 +20,10 @@ preview_urls = false
 
 [build]
 command = "worker-build --release"
+
+# recalc は 1 リクエストで job (month × 営業所) を最大 12 本、直列に回す (集計・gzip・sha256 の CPU)
+[limits]
+cpu_ms = 60000
 
 # Workers Logs (ログは口・status・失敗の段と種別・所要ミリ秒だけ)
 [observability]
@@ -34,3 +41,36 @@ binding = "URIAGE_DB"
 database_name = "ichibanboshi-uriage"
 database_id = "21b8491c-8605-4e24-a49f-9679db4b66aa"
 migrations_dir = "migrations"
+
+# raw ndjson.gz (key uriage/{month}/eigyosho-{id}.ndjson.gz) の置き場。recalc が bucket ごとに置く
+[[r2_buckets]]
+binding = "URIAGE_R2"
+bucket_name = "ichibanboshi-uriage"
+
+# SQL Server への口 (TCP)。一番星 Worker の ICHIBAN_VPC と同じ VPC Service `ichibanboshi-ichiban-sql` (宛先の Tunnel・host:port は
+# VPC Service 側に閉じる。コードの connect() の宛先は名目)。service_id は資格情報でも宛先でもない
+[[vpc_services]]
+binding = "URIAGE_SQL_VPC"
+service_id = "01a1205d-911c-7801-b60f-9dbc13dadaaf"
+remote = true
+
+# 社内 CakePHP (nginx) への口 (HTTP)。勤怠 Worker の KINTAI_CAKEPHP_VPC と同じ VPC Service `ichibanboshi-kintai-cakephp`。
+# recalc が editable-months と masters-json を GET する (3xx は追わない)。/probe も editable-months を GET する
+[[vpc_services]]
+binding = "URIAGE_CAKEPHP_VPC"
+service_id = "01a12419-6924-7d63-9335-4693e124fc9e"
+remote = true
+
+# SQL Server の資格情報 (一番星 Worker と同じ secret。SELECT のみ。JSON のキー user/pass)。
+# store_id は Secrets Store の id、secret_name は secret 名 (どちらも値そのものではない)
+[[secrets_store_secrets]]
+binding = "ICHIBAN_SQL"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "ICHIBAN_SQL"
+
+# 書き込みの口 (POST /api/uriage/recalc) の共有 secret。ヘッダー X-Uriage-Write-Token をこの値と定数時間で照合する。
+# 同じ store (値は repo に書かない)
+[[secrets_store_secrets]]
+binding = "URIAGE_WRITE_TOKEN"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "URIAGE_WRITE_TOKEN"
