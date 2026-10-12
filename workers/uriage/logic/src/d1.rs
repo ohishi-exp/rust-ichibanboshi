@@ -6,7 +6,7 @@
 //! - **結果の行の読み取り** ([`respond`]): D1 の `raw()` (列の並びの配列。数は JS の number) を受けて、オンプレ版と同じ
 //!   応答の型に詰めて直列化する。読めなければ 500 (`rows:malformed`)
 //!
-//! 書き込みの文: recalc は [`crate::recalc`]。verify・admin は次の PR で足す。
+//! 書き込みの文: recalc は [`crate::recalc`]、verify_jobs の UPSERT は [`crate::verify`]、admin の DELETE は [`crate::admin`]。
 
 use serde_json::Value;
 
@@ -122,6 +122,8 @@ const VERIFY_HISTORY_REQUIRED: &str = "from と to は必須 (YYYY-MM-DD)";
 pub enum Bind {
     Text(String),
     Int(i64),
+    /// SQL の NULL (verify_jobs の `skipped_reason`・`diff_json`)
+    Null,
 }
 
 /// D1 に流す 1 文。

@@ -1,8 +1,10 @@
 # 売上 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。
 # 口は GET /health・POST /probe (D1・SQL Server・CakePHP)、D1 (binding URIAGE_DB) を読む GET /api/uriage/* の 6 本
 # (daily・person-monthly-totals・person-partner-totals・r2/pending・recalc-jobs・verify-history)、書き込みの口 POST /api/uriage/recalc
-# (token 必須。CakePHP を Workers VPC の HTTP で、SQL Server を Workers VPC の TCP で読み、D1 に書いて raw を R2 に置く)。
-# SQL・検査・行の読み取り・応答・段取りは uriage-logic (オンプレ版と同じ文・同じ応答の型)。verify・admin は次の PR。
+# (token 必須。CakePHP を Workers VPC の HTTP で、SQL Server を Workers VPC の TCP で読み、D1 に書いて raw を R2 に置く)、
+# POST /api/uriage/verify (token 必須。verify_jobs に書く)・GET /api/uriage/verify-debug (書かない)・
+# POST /api/uriage/admin/{delete,rebuild} (token 必須。D1 の掃除)。
+# SQL・検査・行の読み取り・応答・段取りは uriage-logic (オンプレ版と同じ文・同じ応答の型)。
 # tiberius の rustls feature と bb8-tiberius は wasm32 で落ちる (getrandom / mio / rustls-native-certs) ので入れない。
 [package]
 name = "uriage-worker"
