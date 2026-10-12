@@ -1,0 +1,36 @@
+# ichibanboshi-uriage: 担当者別売上 (/api/uriage/*) の Worker (Refs ohishi-exp/rust-ichibanboshi#322)。
+# Service Binding 専用。この段の口は GET /health・POST /probe (D1) と、D1 を読む GET /api/uriage/* の 6 本。
+# 本番へはタグ worker-uriage-v* の push で deploy する (.github/workflows/worker-uriage.yml)。
+#
+# ★ 外から届く口を持たない:
+#   - fetch は Service Binding からだけ届く (route・workers.dev・preview なし)
+#   - 読みの口は認可なし (一番星 Worker・勤怠 Worker の読みの口と同じ。関門は呼び手の側)
+#   - workers_dev = false / preview_urls = false、route / routes を書かない、env を作らない
+#   - D1 の binding はトップレベルにだけ置く。services (他の Worker への binding) は持たない
+#   scripts/check-exposure.sh が CI で毎回これを検査する (陰性対照は scripts/check-exposure-test.sh)。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。
+name = "ichibanboshi-uriage"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "worker-build --release"
+
+# Workers Logs (ログは口・status・失敗の段と種別・所要ミリ秒だけ)
+[observability]
+enabled = true
+
+# 版の元 (workers/ichiban と同じ)
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# 担当者別売上の D1 (apac)。表の定義の正本は migrations/0001_uriage.sql。本番 D1 への適用は人が手で打つ
+# (npx wrangler d1 migrations apply URIAGE_DB --remote)。deploy job は未適用が 0 件であることだけを確かめる。
+# database_id は D1 の id (資格情報でも宛先でもない)
+[[d1_databases]]
+binding = "URIAGE_DB"
+database_name = "ichibanboshi-uriage"
+database_id = "21b8491c-8605-4e24-a49f-9679db4b66aa"
+migrations_dir = "migrations"

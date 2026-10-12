@@ -1,1 +1,6 @@
 target/
+worker/build/
+# wrangler dev / d1 --local の作業場所 (local D1 を含む)。commit しない
+worker/.wrangler/
+.dev.vars
+.dev.vars.*

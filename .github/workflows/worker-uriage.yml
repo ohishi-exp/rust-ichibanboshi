@@ -1,8 +1,11 @@
 name: worker-uriage
 
-# workers/uriage (担当者別売上の Worker 化、Refs #322)。いまは純粋部分の crate uriage-logic だけ (Worker の crate・deploy は次の PR)。
-#   - pull_request / main への push → logic の test と 100% gate、wasm32 で build できること・clippy、root の Cargo.lock の鮮度
-# (この経路は secret も token も使わない)
+# workers/uriage (担当者別売上の Worker `ichibanboshi-uriage`、Refs #322)。
+#   - pull_request / main への push → logic の test と 100% gate、Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run・
+#     local D1 への migration の適用、root の Cargo.lock の鮮度 (この経路は secret も token も使わない)
+#   - タグ worker-uriage-v*            → 本番の D1 に未適用の migration が無いことを確かめてから本番へ deploy
+# merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。本番 D1 への migration の適用は人が手で打つ。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。wrangler の出力はファイルに取り、mask してから伏せて出す。
 # root (オンプレ版) も uriage-logic に path 依存するので、root の売上の口 (src/routes/uriage.rs 等) を変えたときも走らせる。
 on:
   pull_request:
@@ -18,6 +21,8 @@ on:
       - 'Cargo.lock'
   push:
     branches: [main]
+    # タグの push には paths が効かない (タグは常に走る)
+    tags: ['worker-uriage-v*']
     paths:
       - 'workers/uriage/**'
       - '.github/workflows/worker-uriage.yml'
@@ -33,16 +38,22 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # workers/ichiban・workers/kintai と揃える
+  WRANGLER_VERSION: 4.144.0
 
 jobs:
-  logic:
-    name: Logic test + 100% gate + wasm32 build + clippy
+  worker:
+    name: Logic test + 100% gate + Worker build + clippy + exposure + wrangler dry-run + local D1
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: workers/uriage
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -67,7 +78,8 @@ jobs:
           workspaces: workers/uriage -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # SQL の文字列と ndjson・fingerprint のゴールデン (logic/tests/golden.rs) を含む
+      # SQL の文字列と ndjson・fingerprint のゴールデン (logic/tests/golden.rs) と、D1 の読みの口 6 本の応答の固定
+      # (logic/tests/d1.rs。native の SQLite に migration と固定の入力を流す。オンプレ版と一致させた期待値) を含む
       - name: Test (uriage-logic)
         working-directory: .
         run: cargo test --locked --manifest-path workers/uriage/Cargo.toml -p uriage-logic
@@ -83,7 +95,7 @@ jobs:
           cargo llvm-cov --locked --manifest-path workers/uriage/Cargo.toml -p uriage-logic --text > "$cov"
           bash scripts/check_coverage_100.sh --config workers/uriage/coverage_100.toml --use-cache "$cov"
 
-      # Worker (次の PR) が wasm32 で使えること (tiberius・tokio・clock に依存していないこと)
+      # Worker と logic が wasm32 で build できること (logic が tiberius・tokio・clock に依存していないこと)
       - name: Build (wasm32-unknown-unknown)
         run: cargo build --locked --target wasm32-unknown-unknown
 
@@ -92,3 +104,113 @@ jobs:
 
       - name: Clippy (native、テスト込み)
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      # wrangler.toml の [build] command と同じ版
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      - name: worker-build --release
+        working-directory: workers/uriage/worker
+        run: worker-build --release
+
+      - name: Exposure check
+        run: bash scripts/check-exposure.sh worker/wrangler.toml
+
+      - name: Exposure check (negative control)
+        run: bash scripts/check-exposure-test.sh worker/wrangler.toml
+
+      # secret も token も要らない (build と設定の検証だけ)
+      - name: wrangler deploy --dry-run
+        working-directory: workers/uriage/worker
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
+
+      # 売上の D1 の migration (worker/migrations、表の定義の正本) が D1 の SQLite で当たること。
+      # 当てる先は runner の中の local D1 だけ (token も本番の D1 も使わない)。当てた後に未適用が 0 件になること
+      - name: D1 migration (local) applies
+        working-directory: workers/uriage/worker
+        run: |
+          npx -y "wrangler@${WRANGLER_VERSION}" d1 migrations apply URIAGE_DB --local
+          out="$(npx -y "wrangler@${WRANGLER_VERSION}" d1 migrations list URIAGE_DB --local 2>&1)"
+          echo "$out"
+          if ! grep -q 'No migrations to apply' <<<"$out"; then
+            echo "::error::local D1 に migration を当てた後も未適用が残っている"
+            exit 1
+          fi
+
+  deploy:
+    name: deploy production
+    needs: [worker]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/worker-uriage-v')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: uriage-deploy-production
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: workers/uriage/worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          # build の job とデプロイの job で同じキャッシュを使う (既定のキーは job 名を含み、デプロイから引けない)
+          # 保存は worker の job に任せ、ここは復元だけ
+          shared-key: uriage-worker
+          workspaces: workers/uriage -> target
+          save-if: false
+
+      - run: cargo install -q worker-build@0.8.7 --locked
+
+      # 売上の D1 (URIAGE_DB) の migration は CI では当てない (本番への適用は人が手で打つ。org の token に D1:Edit が無いと
+      # タグ deploy が全部止まるため。workers/kintai と同じ)。ここでは未適用が 0 件であることだけを確かめ、1 件でも残っていれば
+      # deploy しない (表の無い D1 に新しいコードを出さない)。出力は deploy と同じく伏せてから出す
+      - name: D1 migrations are all applied (remote)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/d1-migrations.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" d1 migrations list URIAGE_DB --remote >"$log" 2>&1 || status=$?
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          if [ "$status" != 0 ]; then
+            echo "::error::wrangler d1 migrations list --remote が失敗した (token に D1 の読み取り権限があるか確かめる)"
+            exit "$status"
+          fi
+          if ! grep -q 'No migrations to apply' "$log"; then
+            echo "::error::本番の D1 (URIAGE_DB) に未適用の migration がある。先に人が wrangler d1 migrations apply URIAGE_DB --remote を打つ"
+            exit 1
+          fi
+
+      # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す (ログファイルそのものは出さない)。
+      #   - 32 桁の hex (account ID): ::add-mask:: + <account> に置換
+      # token は org の secret CLOUDFLARE_API_TOKEN (repo 単位の secret は作らない)
+      - name: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy \
+            --tag "$GITHUB_REF_NAME" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::本番に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi

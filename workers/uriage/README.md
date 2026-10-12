@@ -1,7 +1,9 @@
 # workers/uriage — 担当者別売上 (`/api/uriage/*`) の Worker 化
 
-Refs ohishi-exp/rust-ichibanboshi#322。オンプレ版 rust の売上の口を Cloudflare Worker に移す。
-**いまは純粋部分の crate `uriage-logic` (`logic/`) だけ**。Worker の crate・D1・R2・口は次の PR で足す。
+Refs ohishi-exp/rust-ichibanboshi#322。オンプレ版 rust の売上の口を Cloudflare Worker `ichibanboshi-uriage` に移す。
+純粋部分の crate `uriage-logic` (`logic/`、オンプレ版も path 依存で使う) と Worker の crate `uriage-worker` (`worker/`)。
+**いまの Worker は D1 を読む口だけ** (下記)。書き込みの口 (recalc・verify・verify-debug・admin)・SQL Server・CakePHP・R2・token・
+データの移送は次の PR で足す。
 
 ## uriage-logic
 
@@ -17,12 +19,77 @@ root は path 依存で `pub use` する (写さない)。tiberius・worker・ax
 | `verify.rs` | PHP `print-json.sum` の読み方と PHP / Rust の差分 |
 | `cakephp.rs` | 社内 CakePHP (`masters-json`・`editable-months`・`print-json`) の応答の型 (path の組み立てと通信は呼び手) |
 | `api.rs` | 口の Query と応答の型・store から読んだ行の型・r2/pending の verify gate |
+| `d1.rs` | D1 の表の定義 (`SCHEMA_SQL` = `worker/migrations/0001_uriage.sql`)・読みの口 6 本の SELECT (オンプレ版の rusqlite の文と同じ文字列)・入力の検査 (400)・`raw()` の行の読み取り・応答の組み立て |
+| `routes.rs` | Worker の経路の判定 (404 / 405) と応答の形 (`Reply`、失敗の本文) |
+
+## Worker の口 (この段)
+
+Service Binding 専用 (route・workers.dev・preview 無し)。読みの口は認可なし (一番星 Worker・勤怠 Worker の読みの口と同じ。関門は呼び手の側)。
+**path・Query・応答の JSON (キーの順まで) と 400 はオンプレ版と同じ。**
+
+| 口 | D1 に流す文 | 応答 |
+|---|---|---|
+| `GET /api/uriage/daily` (`month`・`eigyosho_id`・`cal`) | 1 文 | `{month, eigyosho_id, cal, rows}` |
+| `GET /api/uriage/person-monthly-totals` (`from`・`to`・`cal`) | 1 文 | `{from, to, cal, rows}` |
+| `GET /api/uriage/person-partner-totals` (`person`・`from`・`to`・`cal`) | 2 文 (得意先・傭車先) | `{person, from, to, cal, customers, subcontractors}` |
+| `GET /api/uriage/r2/pending` (`from`・`to` 任意) | 1 文 | `{count, items}` (verify gate 付き) |
+| `GET /api/uriage/recalc-jobs` (`from`・`to` 任意) | 1 文 | `{from, to, count, jobs}` |
+| `GET /api/uriage/verify-history` (`from`・`to`・`eigyosho_id` 任意) | 1 文 | `{from, to, eigyosho_id, count, rows}` |
+| `GET /health` | `SELECT 1` | `{"status":"ok"}` |
+| `POST /probe` | `SELECT 1` (この段は D1 だけ) | `{"ok":true,"d1":"ok"}` |
+
+検査の順は **Query → 入力 (400) → binding (503) → D1 (500)**。
+
+### オンプレ版との違い
+
+| | オンプレ版 (SQLite の `LocalStore`) | Worker (D1) |
+|---|---|---|
+| 置き場が無い | `[sqlite] path` が空 = 503 (本文なし) | `URIAGE_DB` の binding が無い = 503 `{"ok":false,"stage":"binding","kind":"missing"}` |
+| 置き場の失敗 | 500 (daily 等は本文なし、recalc-jobs・verify-history は失敗の文言入りの平文) | 500 `{"ok":false,"stage":"bind\|query\|rows","kind":"failed\|malformed"}` (D1 の message は出さない) |
+| recalc-jobs・verify-history で置き場が無い | 500 (Disabled も 500 になっていた) | 503 (上と同じ) |
+| 404 / 405 | axum の既定 (本文なし) | `{"ok":false}`。書き込みの口・`by-person`・`raw`・`ack` はこの段では 404 |
+| 修復 | 起動のたびに VIEW を作り直し、列の後付けと修復の UPDATE 2 本を流す | 持たない (表は migration で 1 回だけ。移送するデータは修復した後の形で入れる) |
+
+**確かめ方**: `logic/tests/d1.rs` が native の SQLite に migration と固定の入力 (`logic/tests/fixtures/d1_fixture.sql`) を流し、
+固定の要求の列 (`d1_requests.txt`、27 本。成功・空・400 の 3 種) を Worker と同じ順・同じ部品で流した応答 (status・content-type・本文) が
+`d1_expected.txt` と一致することを確かめる。期待値はオンプレ版 (root の axum の handler + `LocalStore`) に同じ行と要求を与えて得たもので、
+Worker (`worker-build` → `wrangler dev --local` + local D1) を同じ要求で叩いた応答とも一致した。root は売上の撤去で消えるので、比べる相手を外して値を固定している
+(`workers/kintai/pg/tests/restraint_d1_parity.rs` と同じ形)。D1 は数を JS の number で返すので、整数を浮動小数で渡しても同じ応答になることも見る。
+
+## binding (`worker/wrangler.toml`)
+
+- `URIAGE_DB` — D1 `ichibanboshi-uriage` (apac。`migrations_dir = "migrations"`)。**トップレベルにだけ置く**。無ければ全部の口が 503
+- `CF_VERSION_METADATA` — 版の元
+- 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / d1_databases はトップレベル以外に無い / services を持たない。
+  `scripts/check-exposure.sh` が CI で検査し、`scripts/check-exposure-test.sh` が陰性対照
+
+## D1 の migration
+
+- 表の定義の正本は `worker/migrations/0001_uriage.sql` (4 表・index・VIEW 3 本。オンプレ版の `src/sqlite.rs` の migrate と同じ定義で、後付けの列は表の中に並べた)。
+  **適用済みの migration は変えない** (表を変えるなら `0002_*.sql` を足す)
+- **本番 D1 への適用は人が手で打つ**: `cd workers/uriage/worker && npx wrangler d1 migrations apply URIAGE_DB --remote`。
+  deploy job は `wrangler d1 migrations list --remote` で未適用が 0 件であることだけを確かめ、残っていれば deploy しない。PR の job は runner の中の local D1 に当てる
+
+## ローカル検証
+
+```
+cd workers/uriage/worker && worker-build --release
+npx wrangler d1 migrations apply URIAGE_DB --local --persist-to <dir>
+npx wrangler d1 execute URIAGE_DB --local --persist-to <dir> --file ../logic/tests/fixtures/d1_fixture.sql
+npx wrangler dev --local --persist-to <dir>
+```
+
+## 本番 deploy
+
+タグ `worker-uriage-v*` の push で `.github/workflows/worker-uriage.yml` の deploy job が `wrangler deploy --tag <タグ> --message <git SHA>`
+を打つ (org の secret `CLOUDFLARE_API_TOKEN`)。main への merge では本番に出ない。
 
 ## 変えてはいけないもの
 
 - **SQL の文字列** — `logic/tests/golden.rs` が代表的な入力の sha256 を固定している
 - **raw ndjson のバイト列と fingerprint** — 同じく固定。オンプレ版が `recalc_jobs` に記録した fingerprint と
   Worker の再計算が一致しないと、全 bucket が「変化あり」になる
+- **D1 の読みの文** — オンプレ版の rusqlite の文と同じ文字列 (`d1.rs`)。行は列の番号で読む (`raw()`)
 - **`uriage_rows_sql` の呼び方の順序** — 部門が空かは接続の前、`None` (英数字に絞って空) は接続の後に見る
 
 ## 試験と gate
@@ -32,6 +99,7 @@ cargo test --manifest-path workers/uriage/Cargo.toml -p uriage-logic
 cargo llvm-cov --manifest-path workers/uriage/Cargo.toml -p uriage-logic --text > cov.txt
 bash scripts/check_coverage_100.sh --config workers/uriage/coverage_100.toml --use-cache cov.txt
 cargo build --manifest-path workers/uriage/Cargo.toml --target wasm32-unknown-unknown
+bash workers/uriage/scripts/check-exposure.sh && (cd workers/uriage && bash scripts/check-exposure-test.sh)
 ```
 
 CI は `.github/workflows/worker-uriage.yml`。`compute.rs` は到達不能な 1 行があるので登録簿に載せない (理由は

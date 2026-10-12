@@ -1,9 +1,9 @@
 # 担当者別売上 (uriage) の Worker 化 (Refs ohishi-exp/rust-ichibanboshi#322)。logic は売上の純粋部分
-# (担当者別の集計・SQL Server の SQL・ndjson と fingerprint・CakePHP の応答の型・口の型)。repo ルートの package
-# (オンプレ版) も path 依存で使う共有 crate。Worker の crate は次の PR で members に足す。
+# (担当者別の集計・SQL Server の SQL・ndjson と fingerprint・CakePHP の応答の型・口の型・D1 の文)。repo ルートの package
+# (オンプレ版) も path 依存で使う共有 crate。worker は Worker `ichibanboshi-uriage` (wasm32 の cdylib)。
 # repo ルートの package とも workers/ichiban・workers/kintai・workers/kyuyo とも独立した workspace。
 [workspace]
-members = ["logic"]
+members = ["logic", "worker"]
 resolver = "2"
 
 [profile.release]

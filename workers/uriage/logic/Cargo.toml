@@ -19,3 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # fingerprint (raw ndjson の sha256)
 sha2 = "0.10"
+
+[dev-dependencies]
+# D1 の文を native の SQLite で流す (tests/d1.rs。D1 は SQLite)。root と同じ版・bundled
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Worker と同じ Query の読み方 (axum の Query と同じ: serde_urlencoded + serde_path_to_error) を tests/d1.rs で再現する
+form_urlencoded = "1"
+serde_path_to_error = "0.1"
+serde_urlencoded = "0.7"
