@@ -6,6 +6,8 @@
 //!   fingerprint と Worker の再計算が一致しないと、全 bucket が「変化あり」になる
 //!
 //! **ここの期待値は書き換えない。** 落ちたら SQL か fingerprint が変わっている (= 移送したデータと食い違う)。
+//! 例外: SQL の sha256 は、最外殻の ORDER BY を出力列で全順序にした変更 (Refs #322 #88-3、同点の並びが
+//! 実行ごとに入れ替わって fingerprint が揺れていた) で 1 度だけ取り直した。行の中身は変わらない。
 
 use sha2::{Digest, Sha256};
 use uriage_logic::compute::UriageRow;
@@ -27,33 +29,33 @@ fn sql_is_byte_identical_to_the_onprem_version() {
         (
             &["010"],
             &[],
-            "b674b1a6b19c1f2f9d8672615769931894f473765993c4d98694abbd3cc156e8",
+            "c8319e37f856d25839f8f12a7966491f3cc2816bacebf0100d05a511f616330b",
         ),
         (
             &["010"],
             &[1499],
-            "89285b659047665d13e3698f4a219292390c4cadd1ff2ac036602ad11e51d4b3",
+            "11f62af6d6d94f6b4aaab0d0a86186e06b580af26da384ca52ed717d6dc7f44a",
         ),
         (
             &["010", "011", "030"],
             &[1499],
-            "d913be2f08d43b6b50263942898656e3c6a809edb5935984146db650cf8e57ad",
+            "0b7df079e55e1fc74dbc37469f8f5f74afb16fbc858cf9146f1ee2815d43929e",
         ),
         (
             &["010", "011", "030"],
             &[1499, 1180, -3, i32::MAX],
-            "767692c534cb455f854f8fd61712b6bdbfbbfe8ab52d4379117492dec03729f6",
+            "0d859eae4ca5477ed76f6f357ab3dd85a6b2fa9ffbd8b28bd2a9c30d2d30deb0",
         ),
         // 英数字と `_` 以外を含む部門は落とす (空文字も)。残った "ab_C" だけで組む
         (
             &["x-1", "", "ab_C", "0 1"],
             &[1499],
-            "202ba32f29a9c34eae7b8bd520a4c6be1185f40b06a4ae48e54f8afc81b6088e",
+            "341e0d40b7becbeffd8bb03b27e2ad4745f4c3d8f35136ea1702f7065e300191",
         ),
         (
             &["Z9", "_"],
             &[1499, 1180, -3, i32::MAX],
-            "c2e05c4e16142e58096b5ca291ac5f5edc0a4694805fdc091918abedb9e1537d",
+            "469d84fbd995ac661f5bbde5fa81b35ccf8bdddf6bd8ebdd5eb58d81652e9020",
         ),
     ];
     for (bumon, persons, want) in cases {
@@ -84,7 +86,44 @@ fn sql_shape() {
     assert!(q.contains("IN (NULL)"));
     assert!(q.contains("[受注部門] IN ('010','011')"));
     assert!(q.contains("[運行年月日] >= @P1 AND [運行年月日] <= @P2"));
-    assert!(q.ends_with("ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC"));
+    assert!(q.contains("ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC, [横横] ASC,"));
+}
+
+#[test]
+fn sql_order_by_is_a_total_order_over_the_output_columns() {
+    // 表示順の 3 列の後ろに、SELECT の別名を select_cols の並びで全部足す (同点を実行ごとに入れ替えない)
+    let q = uriage_rows_sql(&s(&["010"]), &[1499]).unwrap();
+    let order_by = &q[q.rfind("ORDER BY").unwrap()..];
+    let cols = [
+        "t.[運行年月日]",
+        "t.[管理C]",
+        "t.[LC]",
+        "[横横]",
+        "[請求K]",
+        "[備考2]",
+        "[入力担当C]",
+        "[稼動部門]",
+        "[金額]",
+        "[値引]",
+        "[割増]",
+        "[実費]",
+        "[傭車金額]",
+        "[傭車値引]",
+        "[傭車割増]",
+        "[傭車実費]",
+        "[社員R]",
+        "[傭車先C]",
+        "[売上年月日]",
+        "[得意先複合キー]",
+        "[得意先N]",
+        "[傭車先複合キー]",
+        "[傭車先N]",
+    ];
+    let want = format!("ORDER BY {}", cols.map(|c| format!("{c} ASC")).join(", "));
+    assert_eq!(
+        order_by.split_whitespace().collect::<Vec<_>>().join(" "),
+        want
+    );
 }
 
 /// 架空の 2 行 (エスケープの要る文字・全角空白・負数を含む)。

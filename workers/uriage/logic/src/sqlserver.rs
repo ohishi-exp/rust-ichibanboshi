@@ -81,6 +81,7 @@ pub fn uriage_rows_sql(bumon_codes: &[String], persons_id_list: &[i32]) -> Optio
     // - 社員R は **TOP 1 スカラサブクエリ** で引く (社員ﾏｽﾀ 複数行/社員C による
     //   JOIN ファンアウト防止)
     // - 順序は print テンプレ表示順 (運行年月日 ASC, 管理C ASC, LC ASC)
+    //   同点は出力列で割って全順序にする (fingerprint を揺らさないため)
     // - 請求K / 入力担当C は varchar の可能性あり `TRY_CAST(... AS INT)` で int 化
     // - 共通 WHERE 句を repeat する代わりに subquery を inline で書き、外側で
     //   ORDER BY する形 (UNION ALL は ORDER BY を最外殻に置く制約があるため)
@@ -109,6 +110,15 @@ pub fn uriage_rows_sql(bumon_codes: &[String], persons_id_list: &[i32]) -> Optio
                  ISNULL((SELECT TOP 1 y.[傭車先N] FROM [傭車先ﾏｽﾀ] y \
                    WHERE y.[傭車先C] = t.[傭車先C] AND y.[傭車先H] = t.[傭車先H]), '') AS [傭車先N], \
                  t.[管理C] AS [管理C], t.[LC] AS [LC]";
+
+    // 最外殻の ORDER BY。表示順の 3 列の後ろに SELECT の別名を select_cols の並びで全部足す
+    let order_by = "\
+                 ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC, \
+                 [横横] ASC, [請求K] ASC, [備考2] ASC, [入力担当C] ASC, [稼動部門] ASC, \
+                 [金額] ASC, [値引] ASC, [割増] ASC, [実費] ASC, \
+                 [傭車金額] ASC, [傭車値引] ASC, [傭車割増] ASC, [傭車実費] ASC, \
+                 [社員R] ASC, [傭車先C] ASC, [売上年月日] ASC, \
+                 [得意先複合キー] ASC, [得意先N] ASC, [傭車先複合キー] ASC, [傭車先N] ASC";
 
     // 各 case 共通の WHERE 述語 (日付・品名・日報K・請求K・備考2 系)
     let common_where = "\
@@ -173,7 +183,7 @@ pub fn uriage_rows_sql(bumon_codes: &[String], persons_id_list: &[i32]) -> Optio
                  UNION ALL {case_with_bumon} \
                  UNION ALL {case_from_other} \
              ) AS t \
-             ORDER BY t.[運行年月日] ASC, t.[管理C] ASC, t.[LC] ASC"
+             {order_by}"
     );
     Some(query)
 }
