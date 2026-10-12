@@ -1,5 +1,5 @@
-use rust_ichibanboshi::config::{AppArgs, Config, RestraintRoundingToml};
-use rust_ichibanboshi::kosoku::RestraintRounding;
+use clap::Parser;
+use rust_ichibanboshi::config::{AppArgs, Config};
 use std::io::Write;
 
 /// exe 隣接 `ichibanboshi.toml` を書くテストと、default locations を読むテストの
@@ -22,12 +22,6 @@ fn test_config_defaults_from_empty_toml() {
         config.cors.allowed_origins,
         vec!["https://ichibanboshi.mtamaramu.com"]
     );
-    // 畳んだ勤怠の書き先 (#205 の 04〜06) は宣言するまで無効
-    assert!(!config.kintai_push.enabled);
-    assert!(config.kintai_push.database_url.is_empty());
-    assert!(config.kintai_push.tenant_id.is_empty());
-    assert_eq!(config.kintai_push.connect_timeout_secs, 30);
-    assert_eq!(config.kintai_push.statement_timeout_secs, 300);
 }
 
 #[test]
@@ -322,330 +316,116 @@ allowed_emails = ["keiri@example.com"]
 }
 
 // ══════════════════════════════════════════════════════════════
-// [mariadb] (勤怠の生イベント直読み、Refs #116)
+// 撤去済みの勤怠の節 (Refs #322)
 // ══════════════════════════════════════════════════════════════
 
-#[test]
-fn test_mariadb_config_defaults_fail_closed() {
-    let config: Config = toml::from_str("").unwrap();
-    // 接続先は同一ホストの docker `db` コンテナ (loopback 1 hop)
-    assert_eq!(config.mariadb.host, "127.0.0.1");
-    assert_eq!(config.mariadb.port, 3306);
-    assert_eq!(config.mariadb.user, "kintai_reader");
-    assert!(config.mariadb.password.is_empty());
-    assert!(config.mariadb.database.is_empty());
-    // 未設定は無効 (fail-closed — /api/kintai/events が 503)
-    assert!(!config.mariadb.enabled());
-}
+/// オンプレの `ichibanboshi.toml` の形。勤怠をオンプレ版から撤去した後も、ここに残った
+/// 勤怠の節 (`[mariadb]` `[kintai_events]` `[kintai_push]` `[kosoku]` `[restraint]`
+/// `[dtako_day_links]`、`[cakephp] sqlite_path`) と旧 `[auth]` `[kyuyo]` はそのまま残る。
+/// merge でそのまま deploy され巻き戻しが無いので、**読めずに起動が落ちると売上ごと止まる**。
+/// 値は撤去前の型では弾かれていたもの (`restraint_rounding = "nearest"`、6543 の URL) も混ぜてある —
+/// 節の中身を一切解釈しないことの固定。
+const ONPREM_TOML: &str = r#"
+port = 3100
+bind_addr = "0.0.0.0"
 
-#[test]
-fn test_mariadb_config_enabled() {
-    let toml_str = r#"
+[database]
+host = "sql.example"
+instance = "softec"
+database = "CAPE#01"
+user = "reader"
+password = "db-pass"
+trust_server_certificate = true
+
+[auth]
+jwt_secret = "legacy"
+
+[cors]
+allowed_origins = ["https://a.example", "http://localhost:3000"]
+
+[cakephp]
+base_url = "http://127.0.0.1:120"
+timeout_secs = 20
+sqlite_path = "/opt/ichibanboshi/kintai_local.sqlite"
+
+[kyuyo]
+host = "kyuyo-pc.example"
+password = "secret"
+
 [mariadb]
 host = "127.0.0.1"
 port = 3306
 user = "kintai_reader"
-password = "secret"
-database = "ohishi"
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
-    assert!(config.mariadb.enabled());
-    assert_eq!(config.mariadb.database, "ohishi");
-}
+password = "maria-pass"
+database = "cake"
 
-#[test]
-fn test_mariadb_config_partial_is_disabled() {
-    // password 無し / database 無しはいずれも無効
-    let config: Config = toml::from_str("[mariadb]\ndatabase = \"ohishi\"\n").unwrap();
-    assert!(!config.mariadb.enabled());
-    let config: Config = toml::from_str("[mariadb]\npassword = \"secret\"\n").unwrap();
-    assert!(!config.mariadb.enabled());
-    // host を空にすれば明示的に無効化できる
-    let config: Config =
-        toml::from_str("[mariadb]\nhost = \"\"\npassword = \"s\"\ndatabase = \"d\"\n").unwrap();
-    assert!(!config.mariadb.enabled());
-}
+[dtako_day_links]
+ryohi_base_url = "http://nginx.example"
+dtako_base_url = "https://dtako.example"
 
-// ══════════════════════════════════════════════════════════════
-// [kintai_push] (畳んだ勤怠の書き先、Refs #205 実装計画 04〜06)
-// ══════════════════════════════════════════════════════════════
+[restraint]
+sqlite_path = "/opt/ichibanboshi/restraint_local.sqlite"
 
-/// `[kintai_push]` だけを書いた TOML を組み立てる補助。
-fn push_config(body: &str) -> Config {
-    toml::from_str(&format!("[kintai_push]\n{body}")).unwrap()
-}
-
-#[test]
-fn test_kintai_push_disabled_requires_nothing() {
-    // 宣言していない = 何も書きに行かないので、接続先も tenant_id も要らない。
-    let config: Config = toml::from_str("").unwrap();
-    config.kintai_push.validate("").unwrap();
-    // 揃っていない値が残っていても、無効なら起動を止めない
-    let config = push_config("enabled = false\ndatabase_url = \"\"\ntenant_id = \"\"\n");
-    config
-        .kintai_push
-        .validate("11111111-2222-3333-4444-555555555555")
-        .unwrap();
-}
-
-#[test]
-fn test_kintai_push_enabled_without_database_url_fails_startup() {
-    // 「使うと宣言したのに書き先が無い」を黙って既定へ落とさない
-    // ([database] enabled と同じ流儀)。
-    let config = push_config("enabled = true\n");
-    let err = config.kintai_push.validate("").unwrap_err();
-    assert!(err.contains("database_url"), "{err}");
-
-    // 空白だけも「無い」扱い
-    let config = push_config("enabled = true\ndatabase_url = \"   \"\n");
-    let err = config.kintai_push.validate("").unwrap_err();
-    assert!(err.contains("database_url"), "{err}");
-}
-
-#[test]
-fn test_kintai_push_transaction_pooler_fails_startup() {
-    // transaction mode (6543) は prepared statement の扱いが sqlx の既定と噛み合わない。
-    // 繋がってしまうので、実行時に散発的に壊れる前に起動で止める。
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:6543/postgres\"
-tenant_id = \"11111111-2222-3333-4444-555555555555\"
-",
-    );
-    let err = config.kintai_push.validate("").unwrap_err();
-    assert!(err.contains("6543") || err.contains("session"), "{err}");
-}
-
-#[test]
-fn test_kintai_push_enabled_without_tenant_id_starts() {
-    // tenant_id は任意 — 打刻の受け口が X-Tenant-ID で名乗らせる。ここで必須に
-    // すると relay が KV で持っている値を設定にも写すことになり二重管理になる
-    // (CLI の push/recalc/sync はヘッダを持たないので main.rs 側で弾く)。
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
-",
-    );
-    config.kintai_push.validate("").unwrap();
-
-    // 空白だけも「書いていない」扱い ([kintai_events] との照合まで飛ばす)
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
-tenant_id = \"   \"
-",
-    );
-    config
-        .kintai_push
-        .validate("11111111-2222-3333-4444-555555555555")
-        .unwrap();
-}
-
-#[test]
-fn test_kintai_push_tenant_id_must_be_a_uuid() {
-    // alc_api.tenants.id をそのまま使う (新規採番しない) ので UUID 以外は打ち間違い。
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
-tenant_id = \"ichibanboshi\"
-",
-    );
-    let err = config.kintai_push.validate("").unwrap_err();
-    assert!(err.contains("UUID"), "{err}");
-}
-
-#[test]
-fn test_kintai_push_tenant_id_must_match_kintai_events() {
-    // テナントが 2 つの値に割れると、読み (alc) と書き (kintai) が別テナントを指す。
-    // RLS が静かに全件遮断するか、別テナントへ書く。
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
-tenant_id = \"11111111-2222-3333-4444-555555555555\"
-",
-    );
-    let err = config
-        .kintai_push
-        .validate("99999999-8888-7777-6666-555555555555")
-        .unwrap_err();
-    assert!(err.contains("match"), "{err}");
-}
-
-#[test]
-fn test_kintai_push_tenant_id_matching_is_case_insensitive() {
-    // UUID の大文字小文字は同じ値。表記揺れで起動を落とさない。
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
-tenant_id = \"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\"
-",
-    );
-    config
-        .kintai_push
-        .validate("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-        .unwrap();
-}
-
-#[test]
-fn test_kintai_push_skips_matching_when_events_tenant_is_empty() {
-    // [kintai_events] が MariaDB 直読み (= tenant_id 空) のオンプレでも push はできる。
-    let config = push_config(
-        "enabled = true
-database_url = \"postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres\"
-tenant_id = \"11111111-2222-3333-4444-555555555555\"
-",
-    );
-    config.kintai_push.validate("").unwrap();
-    // 空白だけの [kintai_events] tenant_id も「未設定」扱い
-    config.kintai_push.validate("  ").unwrap();
-}
-
-#[test]
-fn test_kintai_push_fully_configured_is_ok() {
-    let toml_str = r#"
 [kintai_events]
-source = "http"
-base_url = "https://alc.example"
-tenant_id = "11111111-2222-3333-4444-555555555555"
+source = "mariadb"
+timeout_secs = "not-a-number"
 
 [kintai_push]
 enabled = true
-database_url = "postgres://kintai_writer:pw@aws-0.pooler.supabase.com:5432/postgres"
-tenant_id = "11111111-2222-3333-4444-555555555555"
-connect_timeout_secs = 10
-statement_timeout_secs = 900
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
-    assert!(config.kintai_push.enabled);
-    assert_eq!(config.kintai_push.connect_timeout_secs, 10);
-    assert_eq!(config.kintai_push.statement_timeout_secs, 900);
-    config.kintai_events.validate().unwrap();
-    config
-        .kintai_push
-        .validate(&config.kintai_events.tenant_id)
-        .unwrap();
-    // Debug / Clone を通しておく
-    let cloned = config.kintai_push.clone();
-    assert!(format!("{cloned:?}").contains("kintai_writer"));
-}
+database_url = "postgres://w:pw@pooler.example:6543/postgres"
 
-#[test]
-fn test_kosoku_config_defaults() {
-    let config: Config = toml::from_str("").unwrap();
-    // 就業規則どおり — 所定 7.5h / 法定 8h / 休憩は 10 分以上 (Refs #118)
-    assert_eq!(config.kosoku.break_threshold_minutes, 10);
-    assert_eq!(config.kosoku.prescribed_minutes, 450);
-    assert_eq!(config.kosoku.legal_minutes, 480);
-}
-
-#[test]
-fn test_kosoku_config_override() {
-    let toml_str = r#"
 [kosoku]
-break_threshold_minutes = 5
-prescribed_minutes = 480
-legal_minutes = 480
+break_threshold_minutes = 10
+restraint_rounding = "nearest"
 "#;
-    let config: Config = toml::from_str(toml_str).unwrap();
-    assert_eq!(config.kosoku.break_threshold_minutes, 5);
-    assert_eq!(config.kosoku.prescribed_minutes, 480);
-    // 所定 = 法定 なら法定内残業は生じない
-    assert_eq!(config.kosoku.legal_minutes, 480);
+
+fn assert_onprem_values(config: &Config) {
+    assert_eq!(config.port, 3100);
+    assert_eq!(config.bind_addr, "0.0.0.0");
+    assert!(config.database.enabled);
+    assert_eq!(config.database.host, "sql.example");
+    assert_eq!(config.database.password, "db-pass");
+    assert_eq!(config.cors.allowed_origins.len(), 2);
+    assert_eq!(config.cakephp.base_url, "http://127.0.0.1:120");
+    assert_eq!(config.cakephp.timeout_secs, 20);
+    // 売上の置き場は省略時の既定のまま
+    assert_eq!(config.sqlite.path, "/opt/ichibanboshi/state.db");
+    assert_eq!(config.raw.dir, "/opt/ichibanboshi/raw");
 }
 
 #[test]
-fn test_kosoku_config_partial_keeps_other_defaults() {
-    let config: Config = toml::from_str("[kosoku]\nbreak_threshold_minutes = 15\n").unwrap();
-    assert_eq!(config.kosoku.break_threshold_minutes, 15);
-    assert_eq!(config.kosoku.prescribed_minutes, 450);
-    assert_eq!(config.kosoku.legal_minutes, 480);
-    // Debug / Clone を通しておく
-    let c = config.kosoku.clone();
-    assert!(format!("{c:?}").contains("15"));
+fn test_onprem_toml_with_removed_kintai_sections_still_parses() {
+    let config: Config = toml::from_str(ONPREM_TOML).unwrap();
+    assert_onprem_values(&config);
 }
 
 #[test]
-fn test_restraint_rounding_defaults_to_the_paper_rule() {
-    // 既定は紙のタイムカード表と同じ「区分ごとの切り捨て」(Refs #182)
-    let config: Config = toml::from_str("").unwrap();
-    assert_eq!(
-        config.kosoku.restraint_rounding,
-        RestraintRoundingToml::PaperPerSegment
-    );
-    assert_eq!(
-        RestraintRounding::from(config.kosoku.restraint_rounding),
-        RestraintRounding::PaperPerSegment
-    );
-}
+fn test_onprem_startup_path_reads_the_kintai_era_toml() {
+    // 起動と同じ経路: systemd の ExecStart の引数 (`--console --config <path>`) を clap に通し、
+    // ファイルから読んで env の上書きまで掛ける
+    let _g = EXE_TOML_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("ichibanboshi_onprem_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ichibanboshi.toml");
+    std::fs::write(&path, ONPREM_TOML).unwrap();
 
-#[test]
-fn test_restraint_rounding_accepts_paper_per_segment_explicitly() {
-    let config: Config = toml::from_str(
-        "[kosoku]
-restraint_rounding = \"paper_per_segment\"
-",
-    )
+    let args = AppArgs::try_parse_from([
+        "ichibanboshi",
+        "--console",
+        "--config",
+        path.to_str().unwrap(),
+    ])
     .unwrap();
-    assert_eq!(
-        config.kosoku.restraint_rounding,
-        RestraintRoundingToml::PaperPerSegment
-    );
+    assert!(args.console);
+    let config = Config::from_args_and_file(&args).unwrap();
+    assert_onprem_values(&config);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn test_restraint_rounding_can_go_back_to_floor_endpoints() {
-    // 従来の丸めに TOML だけで戻せる (再デプロイのみ、コード変更不要)
-    let config: Config = toml::from_str(
-        "[kosoku]
-restraint_rounding = \"floor_endpoints\"
-",
-    )
-    .unwrap();
-    assert_eq!(
-        config.kosoku.restraint_rounding,
-        RestraintRoundingToml::FloorEndpoints
-    );
-    assert_eq!(
-        RestraintRounding::from(config.kosoku.restraint_rounding),
-        RestraintRounding::FloorEndpoints
-    );
-    // 他の値は既定のまま
-    assert_eq!(config.kosoku.break_threshold_minutes, 10);
-}
-
-#[test]
-fn test_restraint_rounding_can_go_back_to_truncate_elapsed() {
-    // #182 の「従来方式」に TOML だけで戻せる (再デプロイのみ、コード変更不要)
-    let config: Config = toml::from_str(
-        "[kosoku]
-restraint_rounding = \"truncate_elapsed\"
-",
-    )
-    .unwrap();
-    assert_eq!(
-        config.kosoku.restraint_rounding,
-        RestraintRoundingToml::TruncateElapsed
-    );
-    assert_eq!(
-        RestraintRounding::from(config.kosoku.restraint_rounding),
-        RestraintRounding::TruncateElapsed
-    );
-    // Debug / Clone / Copy を通しておく
-    let c = config.kosoku.restraint_rounding;
-    assert!(format!("{c:?}").contains("TruncateElapsed"));
-}
-
-#[test]
-fn test_restraint_rounding_rejects_an_unknown_value() {
-    // 綴り間違いを黙って既定に落とさない (丸めは金額に効くので fail-loud)
-    let err = toml::from_str::<Config>(
-        "[kosoku]
-restraint_rounding = \"nearest\"
-",
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("unknown variant"),
-        "unexpected error: {err}"
-    );
+fn test_removed_batch_subcommands_are_rejected() {
+    // push / recalc / sync は撤去した。誤って呼ばれても HTTP サーバーとしては起動しない
+    let err = AppArgs::try_parse_from(["ichibanboshi", "sync", "--month", "2026-07"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }

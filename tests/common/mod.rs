@@ -167,11 +167,7 @@ pub fn disabled_cakephp() -> Arc<CakephpClient> {
 /// 意味を変えないため。GCP 側の形 (`sqlserver = false`) は
 /// `tests/health_backends_test.rs` が明示的に組む。
 pub fn health_state() -> routes::health::HealthState {
-    routes::health::HealthState {
-        sqlserver: true,
-        mariadb: false,
-        kintai_events: "disabled",
-    }
+    routes::health::HealthState { sqlserver: true }
 }
 
 pub fn build_app(repo: DynRepo) -> Router {

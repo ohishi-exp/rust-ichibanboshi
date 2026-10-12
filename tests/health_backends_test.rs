@@ -42,19 +42,14 @@ async fn get_health(repo: DynRepo, state: HealthState) -> (StatusCode, String) {
 #[tokio::test]
 async fn test_health_reports_onprem_shape() {
     // オンプレ: SQL Server を宣言 → 毎回 SELECT 1 を打ち、成功なら "ok"
-    let (status, body) = get_health(
-        common::mock_repo(),
-        HealthState {
-            sqlserver: true,
-            mariadb: true,
-            kintai_events: "mariadb",
-        },
-    )
-    .await;
+    let (status, body) = get_health(common::mock_repo(), HealthState { sqlserver: true }).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("\"sqlserver\":\"ok\""), "{body}");
-    assert!(body.contains("\"mariadb\":\"declared\""), "{body}");
-    assert!(body.contains("\"kintai_events\":\"mariadb\""), "{body}");
+    // 勤怠の読み先 (mariadb・kintai_events) は撤去した (Refs #322)。backends は sqlserver だけ
+    assert!(
+        body.contains("\"backends\":{\"sqlserver\":\"ok\"}"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -62,47 +57,24 @@ async fn test_health_reports_gcp_shape_without_touching_sqlserver() {
     // GCP: SQL Server を宣言していない → repo に触らず 200。
     // repo は必ず失敗する error_repo を渡してあるので、200 が返る事実自体が
     // 「SQL Server を一切叩いていない」ことの証明になる。
-    let (status, body) = get_health(
-        common::error_repo(),
-        HealthState {
-            sqlserver: false,
-            mariadb: false,
-            kintai_events: "http",
-        },
-    )
-    .await;
+    let (status, body) = get_health(common::error_repo(), HealthState { sqlserver: false }).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"sqlserver\":\"disabled\""), "{body}");
-    assert!(body.contains("\"mariadb\":\"disabled\""), "{body}");
-    // GCP の形では生イベントを HTTP (rust-alc-api) から読む
-    assert!(body.contains("\"kintai_events\":\"http\""), "{body}");
+    assert!(
+        body.contains("\"backends\":{\"sqlserver\":\"disabled\"}"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
 async fn test_health_declared_sqlserver_down_is_still_503() {
     // 宣言したのに落ちている = 従来どおり 503。degraded を黙って 200 にしない。
-    let (status, _body) = get_health(
-        common::error_repo(),
-        HealthState {
-            sqlserver: true,
-            mariadb: false,
-            kintai_events: "disabled",
-        },
-    )
-    .await;
+    let (status, _body) = get_health(common::error_repo(), HealthState { sqlserver: true }).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
 async fn test_health_query_error_on_declared_sqlserver_is_503() {
-    let (status, _body) = get_health(
-        common::query_error_repo(),
-        HealthState {
-            sqlserver: true,
-            mariadb: false,
-            kintai_events: "disabled",
-        },
-    )
-    .await;
+    let (status, _body) =
+        get_health(common::query_error_repo(), HealthState { sqlserver: true }).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }

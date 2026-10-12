@@ -1,17 +1,2 @@
-pub mod change_log;
-pub mod dtako_autoload;
-pub mod dtako_day;
-pub mod dtako_worktime;
 pub mod health;
-pub mod kintai;
-pub mod kintai_day_summaries;
-pub mod kintai_recalc;
-pub mod kintai_timecard;
-pub mod kintai_version;
-pub mod restraint;
-pub mod shift_days;
-pub mod shift_overlaps;
-pub mod stale_months;
-pub mod unko_gaps;
 pub mod uriage;
-pub mod wage_snapshot;

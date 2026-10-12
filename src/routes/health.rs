@@ -14,27 +14,9 @@ use crate::repo::{DynRepo, RepoError};
 /// - `sqlserver`: `[database] enabled`。**宣言したら起動時に接続を検証済み**
 ///   (繋がらなければそもそも起動していない、`db::create_pool` 参照) なので、
 ///   `/health` では毎回 `health_check()` で継続的な生死だけを見る。
-/// - `mariadb`: 設定が揃っているか (`MariadbConfig::enabled()`)。こちらは pool が
-///   lazy で起動時検証をしないため、`"declared"` は「使うと宣言した」までしか
-///   意味しない。
-/// - `kintai_events`: 生イベントを**どこから読んでいるか** (`"mariadb"` / `"http"` /
-///   `"disabled"`、Refs #205 実装計画 02)。同じバイナリで読み先が変わるので、
-///   宣言だけでなく**採用された経路**を出す — 読み先を間違えたときの壊れ方は
-///   「遅い」ではなく「静かに違う数字を返す」ため、外から判別できる必要がある。
 #[derive(Debug, Clone, Copy)]
 pub struct HealthState {
     pub sqlserver: bool,
-    pub mariadb: bool,
-    /// 生イベントの読み先 (`crate::server` が実際に挿した実装の名前)。
-    pub kintai_events: &'static str,
-}
-
-fn declared(v: bool) -> &'static str {
-    if v {
-        "declared"
-    } else {
-        "disabled"
-    }
 }
 
 /// GET /health — 宣言したバックエンドの状態 + build 情報 (commit / built_at) を返す
@@ -67,12 +49,9 @@ pub async fn health(
             env!("BUILD_SHA"),
             "\",\"built_at\":\"",
             env!("BUILD_TIME"),
-            "\",\"backends\":{{\"sqlserver\":\"{}\",\"mariadb\":\"{}\",",
-            "\"kintai_events\":\"{}\"}}}}"
+            "\",\"backends\":{{\"sqlserver\":\"{}\"}}}}"
         ),
-        sqlserver,
-        declared(state.mariadb),
-        state.kintai_events
+        sqlserver
     );
     Ok(([(header::CONTENT_TYPE, "application/json")], body))
 }

@@ -100,8 +100,7 @@ impl LocalStore {
     /// 置き場を持たない instance の宣言 (`[sqlite] path` が空)。
     ///
     /// **file を作らない。** 起動は通し、`/api/uriage/*` など この store を要る口だけが
-    /// 503 になる — Cloud Run の instance は打刻の受け口を出す必要があるので、
-    /// 起動ごと失敗させると kintai まで巻き添えになる。
+    /// 503 になる — 起動ごと失敗させると `/health` など store を要らない口まで巻き添えになる。
     pub fn disabled() -> Self {
         Self { conn: None }
     }

@@ -42,21 +42,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Phase 2 CakePHP masters / editable-months HTTP pull (社内 LAN、token 不要)
 # rustls-tls で openssl 依存を回避 (musl static build を維持)
-# multipart: csvdata.zip を POST /dtako-events/autoload へ multipart/form-data で
-# 中継するため (Refs #205 の 58 / #274)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 # Phase 2 raw NDJSON.gz 出力
 flate2 = "1"
-# Phase 2 fingerprint (raw rows sha256 — recalc skip 判定 + R2 sync 必要性判定)
-sha2 = "0.10"
-mysql_async = { version = "0.37.0", default-features = false, features = ["minimal-rust"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
-# 勤怠の拘束・休息の純粋ロジックと社内 MariaDB の SQL (勤怠 Worker と共有、Refs #322)
-kintai-kosoku = { path = "workers/kintai/kosoku" }
-# day-events と dtako/worktime の純粋部分 (勤怠 Worker と共有。build.rs のversion の etag の glob の外、Refs #322)
-kintai-dtako = { path = "workers/kintai/dtako" }
-# Supabase の勤怠スキーマを読み書きする口の純粋部分 (変更履歴・賃金スナップショットの SQL と bind の束。勤怠 Worker と
-# 共有、Refs #322)。build.rs のversion の etag の glob の外。postgres-types 等がオンプレ版にも入るのは許容
+# CakePHP の口のエラーの種別・URL の escape・非 2xx の読み方 (cakephp.rs、勤怠 Worker と共有、Refs #322)。
+# 勤怠の口はオンプレ版から撤去したが、売上の CakePHP client がこの部品を使う。postgres-types 等が入るのは許容
 kintai-logic = { path = "workers/kintai/logic" }
 # 担当者別売上 (/api/uriage/*) の純粋部分 (集計・SQL Server の SQL・raw ndjson と fingerprint・CakePHP の応答の型・口の型)。
 # 売上 Worker と共有 (写さない、Refs #322)
@@ -64,7 +54,7 @@ uriage-logic = { path = "workers/uriage/logic" }
 
 # RDP 中継用。ironrdp は RDP の PDU 定義をそのまま借りる (自前で組み立て直さない)。
 # rustls は既定の aws-lc-rs ではなく ring を明示する — musl static build を維持するため
-# (既存の reqwest / sqlx / tiberius も rustls-tls で openssl を避けている)。
+# (既存の reqwest / tiberius も rustls-tls で openssl を避けている)。
 ironrdp-core = "0.2"
 ironrdp-pdu = "0.9"
 ironrdp-rdcleanpath = "0.2"
@@ -74,10 +64,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # ring 実装なので openssl を引き込まない。先例は rust-alc-api の
 # crates/alc-core/src/auth_google.rs (Google OIDC を同じ形で検証、100% 登録済み)
 jsonwebtoken = "9"
-
-[build-dependencies]
-# build.rs の KINTAI_OUTPUT_SHA (出力に効くコードの内容ハッシュ。version の etag と記録用の code_sha、Refs #191 / #322)
-sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
