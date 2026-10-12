@@ -1,0 +1,17 @@
+# workers/shared の 100% 行カバレッジ登録簿 (Refs #322)。
+#
+# 判定は repo ルートの scripts/check_coverage_100.sh を共用する (書式・規則は repo ルートの
+# coverage_100.toml と同じ)。workers/shared は別 workspace なので計測は shared-vpc-tds.yml が取る:
+#
+#   cargo llvm-cov --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic --text > cov.txt
+#   bash scripts/check_coverage_100.sh --config workers/shared/coverage_100.toml --use-cache cov.txt
+#
+# vpc-tds (wasm32 専用。Workers VPC の socket と tiberius のログイン) は native で計測できないので登録しない。
+
+# 失敗の stage と種類 (旧 workers/kyuyo/logic/src/lib.rs と workers/ichiban/worker/src/probe_logic.rs の写し)
+[[files]]
+path = "workers/shared/vpc-tds-logic/src/lib.rs"
+
+# 資格情報 JSON の検証・host:port の分解
+[[files]]
+path = "workers/shared/vpc-tds-logic/src/config.rs"

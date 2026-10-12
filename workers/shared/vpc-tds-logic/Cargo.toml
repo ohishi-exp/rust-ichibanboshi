@@ -1,0 +1,11 @@
+# vpc-tds の純粋部分: 失敗の stage と種類・資格情報 JSON の検証・host:port の分解 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# worker・tiberius・wasm-bindgen に依存しないので native で cargo test できる。
+[package]
+name = "vpc-tds-logic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,64 @@
+name: shared-vpc-tds
+
+# workers/shared (Workers VPC → SQL Server の TDS 接続の共有 crate、Refs #322)。
+#   - pull_request / main への push → vpc-tds-logic の test と 100% gate、vpc-tds の build・clippy (wasm32)
+# deploy は無い (使い手の worker-ichiban.yml / worker-kyuyo.yml がタグで出す。両方の paths に workers/shared/** がある)。
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'workers/shared/**'
+      - '.github/workflows/shared-vpc-tds.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'workers/shared/**'
+      - '.github/workflows/shared-vpc-tds.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  shared:
+    name: Logic test + coverage gate + wasm build + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: shared-vpc-tds
+          workspaces: workers/shared -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test (vpc-tds-logic)
+        run: cargo test --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # 行カバレッジ 100% gate (登録簿 workers/shared/coverage_100.toml)。判定は repo ルートの
+      # check_coverage_100.sh を共用する
+      - name: Coverage 100% gate (vpc-tds-logic)
+        run: |
+          cov="$RUNNER_TEMP/vpc-tds-logic-cov.txt"
+          cargo llvm-cov --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic --text > "$cov"
+          bash scripts/check_coverage_100.sh --config workers/shared/coverage_100.toml --use-cache "$cov"
+
+      - name: Build (vpc-tds, wasm32-unknown-unknown)
+        run: cargo build --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds --target wasm32-unknown-unknown
+
+      - name: Clippy (wasm32-unknown-unknown)
+        run: cargo clippy --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Clippy (vpc-tds-logic, native)
+        run: cargo clippy --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic --all-targets -- -D warnings
