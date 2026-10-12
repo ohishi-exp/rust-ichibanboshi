@@ -2,8 +2,9 @@ name: worker-kintai
 
 # workers/kintai (勤怠の読み出し Worker・自作の MySQL コーデック・Supabase を読む口の純粋部分、Refs #322)。
 #   - pull_request / main への push → kintai-mysql・kintai-logic・kintai-kosoku・kintai-dtako の test と 100% gate、Worker の build・clippy・
-#     公開範囲の検査・wrangler deploy --dry-run。pg-parity job で、Supabase への書き込み部品 (kintai-pg) と root の Cloud Run 版
-#     (sqlx) に同じ入力を与えて書いた後の表を比べる (postgres service。ci.yml の kintai migration + RLS job と同じ形)
+#     公開範囲の検査・wrangler deploy --dry-run。pg-parity job で、Supabase への書き込み部品 (kintai-pg) に固定の入力を与えて
+#     応答と書いた後の表の中身が固定した期待値になることを確かめる (postgres service。ci.yml の kintai migration + RLS job と
+#     同じ形。job id の pg-parity は、比較の相手 (root) を外す前の名前を残している)
 #     (この経路は secret も token も使わない)
 #     拘束サマリの D1 の migration を runner の中の local D1 に当てて確かめる (本番の D1 には触らない)。
 #   - タグ worker-kintai-v*            → 本番へ deploy (wrangler.toml のトップレベル。env は持たない)。その前に本番の D1 に
@@ -18,16 +19,8 @@ on:
     paths:
       - 'workers/kintai/**'
       - '.github/workflows/worker-kintai.yml'
-      # pg-parity が比べる相手 (root の書き込みの経路と、両方が流す migration)
-      - 'src/kintai_push.rs'
-      - 'src/change_log.rs'
-      - 'src/wage_snapshot.rs'
-      - 'src/routes/kintai_timecard.rs'
-      - 'src/routes/wage_snapshot.rs'
+      # pg-parity が実 DB に当てる Supabase の migration (tests/common/mod.rs が読む)
       - 'migrations/**'
-      # restraint_d1_parity が比べる相手 (オンプレ版の拘束サマリの口と SQLite の store)
-      - 'src/routes/restraint.rs'
-      - 'src/restraint_store.rs'
   push:
     branches: [main]
     # タグの push には paths が効かない (タグは常に走る)
@@ -35,14 +28,7 @@ on:
     paths:
       - 'workers/kintai/**'
       - '.github/workflows/worker-kintai.yml'
-      - 'src/kintai_push.rs'
-      - 'src/change_log.rs'
-      - 'src/wage_snapshot.rs'
-      - 'src/routes/kintai_timecard.rs'
-      - 'src/routes/wage_snapshot.rs'
       - 'migrations/**'
-      - 'src/routes/restraint.rs'
-      - 'src/restraint_store.rs'
 
 permissions:
   contents: read
@@ -143,12 +129,13 @@ jobs:
             exit 1
           fi
 
-  # Supabase への書き込み: Worker の部品 (kintai-pg、tokio-postgres の query_typed / execute_typed) と root の Cloud Run 版
-  # (sqlx) に同じ入力を与え、kintai.kintai_events・event_changes・wage_snapshot の中身と応答が一致すること
-  # (tests/root_parity.rs。KINTAI_TEST_DATABASE_URL が無ければ失敗する)。入力の検査が root の axum の handler と同じ
-  # status・本文になること (tests/axum_parity.rs、DB 不要)。root の crate を dev-dependency で build するので別 job
+  # Supabase への書き込み: Worker の部品 (kintai-pg、tokio-postgres の query_typed / execute_typed) に固定の入力を与え、
+  # kintai.kintai_events・event_changes・wage_snapshot の中身と応答が固定した期待値になること
+  # (tests/root_parity.rs。KINTAI_TEST_DATABASE_URL が無ければ失敗する)。fold の書き込み・読みは往復と件数・固定値
+  # (tests/fold_store_parity.rs・window_parity.rs・fold_events_parity.rs)。入力の検査の status・本文 (tests/axum_parity.rs) と
+  # 拘束サマリの D1 の SQL (tests/restraint_d1_parity.rs) は DB 不要。postgres service が要るので worker job とは別 job
   pg-parity:
-    name: kintai-pg (Worker の書き込み) vs root (sqlx) on postgres
+    name: kintai-pg (Worker の書き込み) on postgres
     runs-on: ubuntu-latest
     services:
       postgres:

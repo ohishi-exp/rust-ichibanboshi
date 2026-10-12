@@ -23,17 +23,13 @@ uuid = "1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 
-# tests/root_parity.rs: root (Cloud Run 版) の sqlx の経路と、ここの経路に同じ入力を与えて、書いた後の表の中身を比べる
+# tests/*_parity.rs: 固定の入力に対する応答と書いた後の表の中身が、固定した期待値になることを確かめる
 # (CI の postgres。KINTAI_TEST_DATABASE_URL が無ければ失敗する)。dev-dependency なので wasm のビルドには入らない
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-axum = "0.8"
-rust-ichibanboshi = { path = "../../.." }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
-# tests/restraint_d1_parity.rs: D1 と同じ SQL の束を native の SQLite で流す (root のオンプレ版と同じ版)
-rusqlite = "0.32"
-# tests/axum_parity.rs: root の handler を `oneshot` で叩く (DB 不要)
-tower = { version = "0.5", features = ["util"] }
-# テナントを経路・テストごとに新しく作る
+# tests/restraint_d1_parity.rs: D1 と同じ SQL の束を native の SQLite で流す
+rusqlite = { version = "0.32", features = ["bundled"] }
+# テナントをテストごとに新しく作る
 uuid = { version = "1", features = ["v4"] }

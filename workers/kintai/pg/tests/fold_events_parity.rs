@@ -1,37 +1,31 @@
-//! fold の読み (`FoldEventsIo`) の root (本番の Cloud Run 版の構成 = `HttpKintaiEventsRepo` が alc を reqwest で読み、fallback の
-//! `PgKintaiEventsRepo` が relay の送った写し `kintai.kintai_events` を読んで合流する) と勤怠 Worker
-//! (`kintai_logic::fold_events::WorkerFoldEvents`、auth-worker の RPC と kintai-pg の `FoldStore` の写しの読み) に、
-//! **同じ写し (実 DB) と同じ上流の応答**を与えて、上流に投げた要求の並びと戻り値が一致することを確かめる (Refs #322)。
+//! fold の読み (`FoldEventsIo`) の勤怠 Worker 実装 (`kintai_logic::fold_events::WorkerFoldEvents`、auth-worker の RPC と
+//! kintai-pg の `FoldStore` の写しの読み) に、**固定の写し (実 DB) と固定の上流の応答**を与えて、上流に投げた要求の並びと
+//! 戻り値が固定した期待値になることを確かめる (Refs #322)。
 //!
-//! 合流・ページング・指紋・入力の欠けの検知は両方とも共有 crate (`kintai_kosoku::alc_events`)、写しの SQL と行の形も共有 crate
-//! (`kintai_kosoku::pushed_events`) を通るので、ここで突き合わせるのは差の出る所 — 往復の実装 (query の鍵と順・31 日 chunk ×
-//! keyset のページング・404 / 非 2xx の扱い)、写しの bind (テナント・JST の期間・`PUSHED_SOURCES`)・行の読み取り、alc の行と写しの
-//! 行の合流の順番、遡り起点。root 側の上流は同じプロセスの axum (tokio の上の HTTP)、Worker 側は fake の RPC。
+//! 期待値は、root の Cloud Run 版の構成 (`HttpKintaiEventsRepo` が alc を reqwest で読み、fallback の `PgKintaiEventsRepo` が
+//! 写し `kintai.kintai_events` を読んで合流する) に同じ写し・同じ上流の応答を与えて一致していた値。ファイル名の
+//! `fold_events_parity` は、比較の相手を外す前の名前を残している。
+//!
+//! 合流・ページング・指紋・入力の欠けの検知は共有 crate (`kintai_kosoku::alc_events`)、写しの SQL と行の形も共有 crate
+//! (`kintai_kosoku::pushed_events`) を通るので、ここで確かめるのは差の出る所 — 往復の実装 (query の鍵と順・31 日 chunk ×
+//! keyset のページング・404 / 非 2xx の扱い)、写しの bind (テナント・JST の期間・`PUSHED_SOURCES`)・行の読み取り、alc の行と
+//! 写しの行の合流の順番、遡り起点。上流は fake の RPC。
 //!
 //! `KINTAI_TEST_DATABASE_URL` が無ければ**失敗する** (skip して緑にしない)。CI は worker-kintai.yml の `pg-parity` job。
-//! この crate に置くのは、repo ルートの package を dev-dependency に持つのがここだけだから。
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use alc_worker_db::PgClient;
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::routing::get;
-use axum::Router;
 use chrono::NaiveDate;
 use common::{database_url, ensure_schema};
 use kintai_kosoku::fold_flow::FoldEventsIo;
+use kintai_kosoku::kintai_push::jst_at;
 use kintai_logic::common::Fail;
 use kintai_logic::fold_events::{AlcRpc, PushedEventsRead, WorkerFoldEvents};
 use kintai_logic::unko_gaps::RpcResult;
 use kintai_pg::FoldStore;
-use rust_ichibanboshi::config::{KintaiEventsConfig, KintaiEventsSource};
-use rust_ichibanboshi::kintai_http_repo::HttpKintaiEventsRepo;
-use rust_ichibanboshi::kintai_pg_repo::PgKintaiEventsRepo;
-use rust_ichibanboshi::kintai_push::{jst_at, KintaiPgStore};
-use rust_ichibanboshi::kintai_repo::DynKintaiEventsRepo;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -215,9 +209,8 @@ async fn seed(pool: &sqlx::PgPool, tenant: Uuid, rows: &[CopyRow]) {
     }
 }
 
-/// 写しを入れた DB と、root (sqlx の pool) / Worker (tokio-postgres の 1 接続) の両方の読み口。
+/// 写しを入れた DB のテナント (seed は sqlx。Worker の読みは `worker_store` の tokio-postgres の 1 接続)。
 struct Db {
-    pool: sqlx::PgPool,
     tenant: Uuid,
 }
 
@@ -232,7 +225,7 @@ async fn db() -> Db {
     let (tenant, other) = (Uuid::new_v4(), Uuid::new_v4());
     seed(&pool, tenant, &COPY).await;
     seed(&pool, other, &OTHER).await;
-    Db { pool, tenant }
+    Db { tenant }
 }
 
 /// Worker の写しの読み (`FoldStore`、tokio-postgres の 1 接続)。
@@ -244,63 +237,6 @@ async fn worker_store(tenant: Uuid) -> FoldStore {
         let _ = conn.await;
     });
     FoldStore::new(PgClient::new(client), tenant)
-}
-
-// ── root 側: 同じプロセスの axum を alc に見立て、fallback に写しの Pg を挿す (本番の Cloud Run 版の構成) ──
-
-#[derive(Clone)]
-struct Upstream {
-    mode: Mode,
-    seen: Arc<Mutex<Seen>>,
-}
-
-fn answer(up: &Upstream, path: &'static str, q: Vec<(String, String)>) -> (StatusCode, String) {
-    let (status, body) = upstream(up.mode, path, &q);
-    up.seen.lock().unwrap().push((path, q));
-    (StatusCode::from_u16(status).unwrap(), body)
-}
-
-async fn events(
-    State(up): State<Upstream>,
-    Query(q): Query<Vec<(String, String)>>,
-) -> (StatusCode, String) {
-    answer(&up, "events", q)
-}
-
-async fn etags(
-    State(up): State<Upstream>,
-    Query(q): Query<Vec<(String, String)>>,
-) -> (StatusCode, String) {
-    answer(&up, "etags", q)
-}
-
-async fn root_repo(mode: Mode, db: &Db) -> (DynKintaiEventsRepo, Arc<Mutex<Seen>>) {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route("/api/dtako/events", get(events))
-        .route("/api/dtako/events/etags", get(etags))
-        .with_state(Upstream {
-            mode,
-            seen: seen.clone(),
-        });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let cfg = KintaiEventsConfig {
-        source: KintaiEventsSource::Http,
-        base_url: format!("http://{addr}"),
-        tenant_id: db.tenant.to_string(),
-        timeout_secs: 10,
-        auth_token: String::new(),
-        auth_token_command: String::new(),
-        auth_token_metadata: false,
-        auth_token_ttl_secs: 900,
-    };
-    // 書き先の pin は GCP では空 (nil)。読みのテナントは `[kintai_events] tenant_id` (server.rs と同じ組み方)
-    let store = Arc::new(KintaiPgStore::from_pool(db.pool.clone(), Uuid::nil()));
-    let fb: DynKintaiEventsRepo = Arc::new(PgKintaiEventsRepo::new(store, db.tenant));
-    let repo: DynKintaiEventsRepo = Arc::new(HttpKintaiEventsRepo::new(&cfg, Some(fb)).unwrap());
-    (repo, seen)
 }
 
 // ── Worker 側: fake の RPC ─────────────────────────────────────────────────
@@ -351,150 +287,227 @@ const TODAY: NaiveDate = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
 const FROM: &str = "2026-06-01 00:00:00";
 const TO: &str = "2026-07-02 00:00:00";
 
-// ── 突き合わせ ───────────────────────────────────────────────────────────
+// ── 固定した期待値との突き合わせ ─────────────────────────────────────────
 
-/// 全乗務員の行: 上流への要求の並び (chunk × ページ、query の鍵と順) と、alc の行と写しの行を合流した結果・warnings が一致する。
+fn worker_events<'a>(
+    alc: &'a FakeAlc,
+    store: &'a FoldStore,
+) -> WorkerFoldEvents<'a, FakeAlc, FoldStore> {
+    WorkerFoldEvents {
+        alc,
+        pushed: store,
+        today: TODAY,
+    }
+}
+
+/// 全乗務員の行: 上流への要求の並び (chunk × ページ、query の鍵と順) と、alc の行と写しの行を合流した結果・warnings。
 /// 写しから入るのは `PUSHED_SOURCES` (timecard・dtako) で窓の中の、テナント T の行だけ。
 #[tokio::test]
-async fn all_events_between_reads_the_copy_and_merges_like_root() {
+async fn all_events_between_reads_the_copy_and_merges() {
     let db = db().await;
-    let (root, root_seen) = root_repo(Mode::Normal, &db).await;
-    let (root_rows, root_warnings) = FoldEventsIo::all_events_between(&*root, FROM, TO)
+    let alc = fake_alc(Mode::Normal);
+    let store = worker_store(db.tenant).await;
+    let (rows, warnings) = worker_events(&alc, &store)
+        .all_events_between(FROM, TO)
         .await
         .unwrap();
 
-    let alc = fake_alc(Mode::Normal);
-    let store = worker_store(db.tenant).await;
-    let worker = WorkerFoldEvents {
-        alc: &alc,
-        pushed: &store,
-        today: TODAY,
-    };
-    let (rows, warnings) = worker.all_events_between(FROM, TO).await.unwrap();
-
-    let root_seen = root_seen.lock().unwrap().clone();
-    assert_eq!(
-        root_seen.len(),
-        3,
-        "2 chunk × (2 + 1) ページ: {root_seen:?}"
-    );
-    assert_eq!(*alc.seen.lock().unwrap(), root_seen);
-    assert_eq!(rows, root_rows);
-    assert_eq!(warnings, root_warnings);
-    // 写しの行の形 (5 キー・end_datetime は null)
-    let copy: Vec<&Value> = rows
+    // 2 chunk × (2 + 1) ページ (1 本目の chunk は 2 ページ目に `after_driver_cd` が付く)
+    let log = alc.seen.lock().unwrap();
+    let seen: Vec<(&str, Vec<(&str, &str)>)> = log
         .iter()
-        .filter(|r| r["source"] != "dtako_events")
-        .collect();
-    let got: Vec<(i64, &str, &str, &str)> = copy
-        .iter()
-        .map(|r| {
-            assert_eq!(r.as_object().unwrap().len(), 5, "{r}");
-            assert!(r["end_datetime"].is_null(), "{r}");
+        .map(|(path, q)| {
             (
-                r["driver_id"].as_i64().unwrap(),
-                r["datetime"].as_str().unwrap(),
-                r["source"].as_str().unwrap(),
-                r["state"].as_str().unwrap(),
+                *path,
+                q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
             )
         })
         .collect();
     assert_eq!(
-        got,
+        seen,
         vec![
-            (1101, "2026-06-01 07:30:00", "timecard", "始業"),
-            (1101, "2026-06-01 08:00:00", "dtako", "運行開始"),
-            (1101, "2026-06-01 12:00:00", "dtako", "休息開始"),
-            (1102, "2026-06-15 18:00:00", "dtako", "運行終了"),
-            (1104, "2026-06-01 05:00:00", "dtako", "運行終了"),
-            (1105, "2026-06-01 06:00:00", "timecard", "終業"),
-            (1105, "2026-06-01 09:00:00", "timecard", "始業"),
-        ],
-        "alc_app・窓の外・別テナントの行は入らない"
+            (
+                "events",
+                vec![
+                    ("date_from", "2026-05-30"),
+                    ("date_to", "2026-06-29"),
+                    ("page_size", "50")
+                ]
+            ),
+            (
+                "events",
+                vec![
+                    ("date_from", "2026-05-30"),
+                    ("date_to", "2026-06-29"),
+                    ("page_size", "50"),
+                    ("after_driver_cd", "1101")
+                ]
+            ),
+            (
+                "events",
+                vec![
+                    ("date_from", "2026-06-30"),
+                    ("date_to", "2026-07-01"),
+                    ("page_size", "50")
+                ]
+            ),
+        ]
     );
-    assert_eq!(warnings.len(), 2);
+    // 写しから入るのは source が timecard・dtako の行 (窓の中・テナント T) だけ。`alc_app`・窓の外・別テナントは入らない
+    let row = |at: &str, driver: i64, end: Option<&str>, source: &str, state: &str| {
+        json!({"datetime": at, "driver_id": driver, "end_datetime": end,
+               "source": source, "state": state})
+    };
+    assert_eq!(
+        rows,
+        vec![
+            row(
+                "2026-05-31 20:00:00",
+                1101,
+                Some("2026-06-01 06:00:00"),
+                "dtako_events",
+                "休息"
+            ),
+            row("2026-06-01 07:30:00", 1101, None, "timecard", "始業"),
+            row("2026-06-01 08:00:00", 1101, None, "dtako", "運行開始"),
+            row(
+                "2026-06-01 08:00:00",
+                1101,
+                None,
+                "dtako_events",
+                "運行開始"
+            ),
+            row("2026-06-01 12:00:00", 1101, None, "dtako", "休息開始"),
+            row(
+                "2026-06-01 12:00:00",
+                1101,
+                Some("2026-06-01 13:00:00"),
+                "dtako_events",
+                "休憩"
+            ),
+            row(
+                "2026-06-15 09:00:00",
+                1102,
+                None,
+                "dtako_events",
+                "運行開始"
+            ),
+            row("2026-06-15 18:00:00", 1102, None, "dtako", "運行終了"),
+            row(
+                "2026-07-01 08:00:00",
+                1103,
+                None,
+                "dtako_events",
+                "運行開始"
+            ),
+            row("2026-06-01 05:00:00", 1104, None, "dtako", "運行終了"),
+            row("2026-06-01 06:00:00", 1105, None, "timecard", "終業"),
+            row("2026-06-01 09:00:00", 1105, None, "timecard", "始業"),
+        ]
+    );
+    let warnings: Vec<(&str, bool)> = warnings
+        .iter()
+        .map(|w| (w.text.as_str(), w.blocks_seal))
+        .collect();
+    assert_eq!(
+        warnings,
+        vec![
+            ("NoSuchKey: 1/KUDGIVT.csv", true),
+            ("NoSuchKey: 2/KUDGIVT.csv", true)
+        ]
+    );
 }
 
-/// 遡り起点: 写しの運行終了 (月初より前に始まった運行) と打刻の姿から、root と同じ起点になる。別テナントは混ざらない。
+/// 遡り起点: 写しの運行終了 (月初より前に始まった運行) と打刻の姿から起点が決まる。別テナントは混ざらない。
 #[tokio::test]
-async fn month_head_anchors_read_the_copy_like_root() {
+async fn month_head_anchors_read_the_copy() {
     let db = db().await;
-    let (root, root_seen) = root_repo(Mode::Normal, &db).await;
-    let want = FoldEventsIo::month_head_anchors(&*root, FROM, TO)
+    let alc = fake_alc(Mode::Normal);
+    let store = worker_store(db.tenant).await;
+    let got = worker_events(&alc, &store)
+        .month_head_anchors(FROM, TO)
         .await
         .unwrap();
 
-    let alc = fake_alc(Mode::Normal);
-    let store = worker_store(db.tenant).await;
-    let worker = WorkerFoldEvents {
-        alc: &alc,
-        pushed: &store,
-        today: TODAY,
-    };
-    let got = worker.month_head_anchors(FROM, TO).await.unwrap();
-
-    assert_eq!(got, want);
     let pairs: Vec<(u64, &str)> = got.iter().map(|(k, v)| (*k, v.as_str())).collect();
     assert_eq!(
         pairs,
         vec![(1104, "2026-05-31 20:00:00"), (1105, "2026-05-31 22:00:00")]
     );
-    assert!(root_seen.lock().unwrap().is_empty(), "alc は読まない");
     assert!(alc.seen.lock().unwrap().is_empty(), "alc は読まない");
 }
 
-/// dtako の指紋: etags の期間 (遡り起点まで下げる)・指紋・控え・warnings の分類が一致する (写しは読まない)。
+/// dtako の指紋: etags の期間 (遡り起点まで下げる)・指紋・控え・warnings の分類 (写しは読まない)。
 #[tokio::test]
-async fn dtako_month_read_matches_root() {
+async fn dtako_month_read_is_fixed() {
     let db = db().await;
     let since = Some(NaiveDate::from_ymd_opt(2026, 5, 20).unwrap());
-    let (root, root_seen) = root_repo(Mode::Normal, &db).await;
-    let want = FoldEventsIo::dtako_month_read_since(&*root, "2026-06", since)
-        .await
-        .unwrap();
-
     let alc = fake_alc(Mode::Normal);
     let store = worker_store(db.tenant).await;
-    let worker = WorkerFoldEvents {
-        alc: &alc,
-        pushed: &store,
-        today: TODAY,
-    };
-    let got = worker
+    let got = worker_events(&alc, &store)
         .dtako_month_read_since("2026-06", since)
         .await
         .unwrap();
 
-    assert_eq!(*alc.seen.lock().unwrap(), *root_seen.lock().unwrap());
-    let q = &alc.seen.lock().unwrap()[0].1;
-    assert_eq!(query_value(q, "date_from"), Some("2026-05-20"));
-    assert_eq!(query_value(q, "date_to"), Some("2026-07-01"));
-    assert_eq!(got, want);
-    assert!(got.digest.is_some());
-    let kinds: Vec<bool> = got.warnings.iter().map(|w| w.blocks_seal).collect();
-    assert_eq!(kinds, vec![true, true, false], "{:?}", got.warnings);
+    let seen = alc.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].0, "etags");
+    assert_eq!(query_value(&seen[0].1, "date_from"), Some("2026-05-20"));
+    assert_eq!(query_value(&seen[0].1, "date_to"), Some("2026-07-01"));
+    assert_eq!(
+        got.digest.as_deref(),
+        Some("b0f49f7ec23b970130516b004f420d4e29307ebbc352fc183b2697bb6c5e01da")
+    );
+    let etags = got.etags.as_ref().expect("etags");
+    assert_eq!(etags.unsplit_total, 1);
+    assert_eq!(etags.unsplit.len(), 1);
+    assert_eq!(etags.unsplit[0].unko_no, "26061509000000000011022");
+    assert_eq!(etags.unsplit[0].driver_cd, "1102");
+    assert_eq!(etags.unsplit[0].reading_date, "2026-06-16");
+    let mut unko_nos: Vec<&str> = etags.unko_nos.iter().map(String::as_str).collect();
+    unko_nos.sort();
+    assert_eq!(
+        unko_nos,
+        vec![
+            "26052008000000000011044",
+            "26060108000000000011011",
+            "26061509000000000011022"
+        ]
+    );
+    assert_eq!(
+        etags.driver_cds["26060108000000000011011"],
+        vec!["1101", "1102"]
+    );
+    let warnings: Vec<(&str, bool)> = got
+        .warnings
+        .iter()
+        .map(|w| (w.text.as_str(), w.blocks_seal))
+        .collect();
+    let span = "n=3 etag無=1 2026-05-20..2026-06-15 期待=2026-07-01 対象=2名";
+    let (missing, gap) = (
+        format!("dtako 入力欠け: R2 に CSV の無い運行 1 件 ({span})"),
+        format!("dtako 末尾ギャップ: 乗務員2名の末尾が30日超 ({span})"),
+    );
+    assert_eq!(
+        warnings,
+        vec![
+            ("etags warning", true),
+            (missing.as_str(), true),
+            (gap.as_str(), false)
+        ]
+    );
 }
 
-/// 404: 生イベントは両方とも失敗 (口が無いのは「読めない」)、etags は両方とも「口なし」(指紋 `None`)。
+/// 404: 生イベントは失敗 (口が無いのは「読めない」)、etags は「口なし」(指紋 `None`)。
 #[tokio::test]
-async fn not_found_is_handled_like_root() {
+async fn not_found_is_handled() {
     let db = db().await;
     let store = worker_store(db.tenant).await;
-    let (root, _) = root_repo(Mode::EventsStatus(404), &db).await;
-    let root_err = FoldEventsIo::all_events_between(&*root, FROM, TO)
+    let alc = fake_alc(Mode::EventsStatus(404));
+    let err = worker_events(&alc, &store)
+        .all_events_between(FROM, TO)
         .await
         .unwrap_err();
-    let alc = fake_alc(Mode::EventsStatus(404));
-    let worker = WorkerFoldEvents {
-        alc: &alc,
-        pushed: &store,
-        today: TODAY,
-    };
-    let err = worker.all_events_between(FROM, TO).await.unwrap_err();
-    assert!(
-        root_err.to_string().contains("alc dtako-events status 404"),
-        "{root_err}"
-    );
     assert!(
         err.body
             .starts_with("alc dtako-events status 404: events down"),
@@ -502,60 +515,34 @@ async fn not_found_is_handled_like_root() {
     );
     assert_eq!(err.status, 502);
 
-    let (root, _) = root_repo(Mode::EtagsStatus(404), &db).await;
-    let want = FoldEventsIo::dtako_month_read_since(&*root, "2026-06", None)
-        .await
-        .unwrap();
     let alc = fake_alc(Mode::EtagsStatus(404));
-    let worker = WorkerFoldEvents {
-        alc: &alc,
-        pushed: &store,
-        today: TODAY,
-    };
-    let got = worker
+    let got = worker_events(&alc, &store)
         .dtako_month_read_since("2026-06", None)
         .await
         .unwrap();
-    assert_eq!(got, want);
     assert_eq!(got.digest, None);
+    assert_eq!(got.etags, None);
+    assert!(got.warnings.is_empty(), "{:?}", got.warnings);
 }
 
-/// 404 以外の非 2xx: どちらの口も両方とも失敗 (`None` に潰さない)。
+/// 404 以外の非 2xx: どちらの口も失敗 (`None` に潰さない)。
 #[tokio::test]
-async fn other_non_2xx_fail_like_root() {
+async fn other_non_2xx_fail() {
     let db = db().await;
     let store = worker_store(db.tenant).await;
     for (mode, word) in [
         (Mode::EventsStatus(500), "alc dtako-events status 500"),
         (Mode::EtagsStatus(503), "alc dtako-etags status 503"),
     ] {
-        let (root, _) = root_repo(mode, &db).await;
         let alc = fake_alc(mode);
-        let worker = WorkerFoldEvents {
-            alc: &alc,
-            pushed: &store,
-            today: TODAY,
+        let worker = worker_events(&alc, &store);
+        let err = match mode {
+            Mode::EventsStatus(_) => worker.all_events_between(FROM, TO).await.unwrap_err(),
+            _ => worker
+                .dtako_month_read_since("2026-06", None)
+                .await
+                .unwrap_err(),
         };
-        let (root_err, err) = match mode {
-            Mode::EventsStatus(_) => (
-                FoldEventsIo::all_events_between(&*root, FROM, TO)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                worker.all_events_between(FROM, TO).await.unwrap_err(),
-            ),
-            _ => (
-                FoldEventsIo::dtako_month_read_since(&*root, "2026-06", None)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                worker
-                    .dtako_month_read_since("2026-06", None)
-                    .await
-                    .unwrap_err(),
-            ),
-        };
-        assert!(root_err.contains(word), "{root_err}");
         assert!(err.body.starts_with(word), "{err:?}");
         assert_eq!(err.status, 502);
     }
