@@ -1,7 +1,8 @@
 //! 打刻の置き換え `TimecardWindowIo` の Worker 実装 (`kintai_pg::FoldStore`、tokio-postgres の `tenant_tx` + `query_typed` /
-//! `execute_typed`) と root の `KintaiPgStore` (sqlx) に**同じ窓**を与え、`apply_timecard_window` の応答・書いた後の表
-//! (`kintai.kintai_events`・`event_changes`)・`stored_window_signatures` の戻りが一致することを実 Postgres で確かめる
-//! (Refs #322、`POST /api/kintai/timecard/window`)。
+//! `execute_typed`) に固定の窓を与え、`apply_timecard_window` の応答・書いた後の表 (`kintai.kintai_events`・
+//! `event_changes`)・`stored_window_signatures` の戻りが固定した期待値になることを実 Postgres で確かめる
+//! (Refs #322、`POST /api/kintai/timecard/window`)。期待値は、root の `KintaiPgStore` (sqlx) に同じ窓を与えて一致していた値。
+//! ファイル名の `window_parity` は、比較の相手を外す前の名前を残している。
 //!
 //! あわせて fold の口の失敗の写し (`FoldStoreError::into_fail`): 上流 (alc) の本文も DB の message も 502 の本文と
 //! `fold_error` に出ないこと。
@@ -9,6 +10,8 @@
 //! `KINTAI_TEST_DATABASE_URL` が無ければ**失敗する** (skip して緑にしない)。CI は worker-kintai.yml の `pg-parity` job。
 
 mod common;
+
+use std::collections::BTreeMap;
 
 use alc_worker_db::PgClient;
 use chrono::{DateTime, FixedOffset, NaiveDate};
@@ -20,7 +23,6 @@ use kintai_kosoku::route_flow::{apply_timecard_window, fold_into, TimecardWindow
 use kintai_logic::common::Fail;
 use kintai_logic::fold_routes::{fold_ctx, jst_from_ms, parse_window};
 use kintai_pg::{FoldStore, FoldStoreError};
-use rust_ichibanboshi::kintai_push::KintaiPgStore;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -38,12 +40,10 @@ impl FoldClock for Fixed {
     }
 }
 
-/// root の経路 (テナント A) と Worker の経路 (テナント B)。
-struct Both {
+/// Worker の経路 (テナントはテストごとに新しい UUID)。
+struct Env {
     pool: sqlx::PgPool,
-    root: KintaiPgStore,
     worker: FoldStore,
-    a: Uuid,
     b: Uuid,
 }
 
@@ -57,7 +57,7 @@ async fn client(url: &str) -> tokio_postgres::Client {
     client
 }
 
-async fn both() -> Both {
+async fn env() -> Env {
     let url = database_url();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -65,12 +65,10 @@ async fn both() -> Both {
         .await
         .expect("sqlx connect");
     ensure_schema(&pool).await;
-    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    Both {
-        root: KintaiPgStore::from_pool(pool.clone(), a),
+    let b = Uuid::new_v4();
+    Env {
         pool,
         worker: FoldStore::new(PgClient::new(client(&url).await), b),
-        a,
         b,
     }
 }
@@ -123,8 +121,8 @@ fn result_json(mut v: Value) -> Value {
 /// 2 か月の窓を dry-run → 初回 → 1 日の修正と 1 日の消去 → 同じものの再送、の順に両方の経路へ流し、毎回の応答・
 /// 最後の表の中身・署名が一致すること。名乗っていない乗務員と窓の外の行は落として数える。
 #[tokio::test(flavor = "multi_thread")]
-async fn window_writes_the_same_rows_as_the_root_path() {
-    let t = both().await;
+async fn window_writes_the_fixed_rows() {
+    let t = env().await;
     let unko = "26053109153000000012341";
     let first = vec![
         raw(1130, "2026-05-31 08:00:00", "始業", "timecard", None),
@@ -150,50 +148,123 @@ async fn window_writes_the_same_rows_as_the_root_path() {
         window(&[1130, 2001], second.clone(), false),
         window(&[1130, 2001], second, false),
     ];
+    let want = [
+        json!({"days_deleted": 0, "days_written": 3, "deduped": 0, "drivers": 2,
+               "drivers_changed": [1130, 2001], "drivers_written": 2, "dry_run": true,
+               "elapsed_ms": 0, "events_written": 6, "misplaced": 2,
+               "rejected": {"UnknownState": 1}, "unknown_states": ["点呼"]}),
+        json!({"days_deleted": 0, "days_written": 3, "deduped": 0, "drivers": 2,
+               "drivers_changed": [1130, 2001], "drivers_written": 2, "dry_run": false,
+               "elapsed_ms": 0, "events_written": 6, "misplaced": 2,
+               "rejected": {"UnknownState": 1}, "unknown_states": ["点呼"]}),
+        json!({"days_deleted": 1, "days_written": 1, "deduped": 0, "drivers": 2,
+               "drivers_changed": [1130, 2001], "drivers_written": 2, "dry_run": false,
+               "elapsed_ms": 0, "events_written": 2, "misplaced": 0, "rejected": {},
+               "unknown_states": []}),
+        json!({"days_deleted": 0, "days_written": 0, "deduped": 0, "drivers": 2,
+               "drivers_changed": [], "drivers_written": 0, "dry_run": false,
+               "elapsed_ms": 0, "events_written": 0, "misplaced": 0, "rejected": {},
+               "unknown_states": []}),
+    ];
     for (i, w) in steps.iter().enumerate() {
-        let want = rust_ichibanboshi::kintai_push::apply_timecard_window(&t.root, w)
-            .await
-            .expect("root");
         let got = apply_timecard_window(&t.worker, w, &Fixed)
             .await
             .expect("worker");
-        assert_eq!(
-            result_json(json!(got)),
-            result_json(json!(want)),
-            "step {i} の応答"
-        );
+        assert_eq!(result_json(json!(got)), want[i], "step {i} の応答");
     }
 
-    let events = dump(&t.pool, EVENTS, t.a).await;
-    assert_eq!(dump(&t.pool, EVENTS, t.b).await, events);
-    assert_eq!(events.as_array().unwrap().len(), 4, "{events}");
-    let changes = dump(&t.pool, CHANGES, t.a).await;
-    assert_eq!(dump(&t.pool, CHANGES, t.b).await, changes);
+    // 2 回目の窓 (05-31 の始業の修正・06-15 の乗務員 2001 の消去) で上書きされた後の 4 行。dry-run は書かない
+    let events = dump(&t.pool, EVENTS, t.b).await;
+    let ev = |at: &str, utc: &str, state: &str, source: &str, unko: Option<&str>| {
+        json!({"driver_cd": 1130, "occurred_at": utc, "state": state, "source": source,
+               "unko_no": unko,
+               "raw": {"datetime": at, "driver_id": 1130, "end_datetime": null, "source": source,
+                       "state": state, "unko_no": unko, "vehicle": "1234"}})
+    };
+    let unko = Some("26053109153000000012341");
+    assert_eq!(
+        events,
+        json!([
+            ev(
+                "2026-05-31 07:30:00",
+                "2026-05-30T22:30:00+00:00",
+                "始業",
+                "timecard",
+                None
+            ),
+            ev(
+                "2026-05-31 09:15:30",
+                "2026-05-31T00:15:30+00:00",
+                "運行開始",
+                "dtako",
+                unko
+            ),
+            ev(
+                "2026-06-01 02:00:00",
+                "2026-05-31T17:00:00+00:00",
+                "運行終了",
+                "dtako",
+                unko
+            ),
+            ev(
+                "2026-06-01 03:00:00",
+                "2026-05-31T18:00:00+00:00",
+                "終業",
+                "timecard",
+                None
+            ),
+        ])
+    );
+
     // 05-31 の修正と 06-15 の消去 (after = NULL)。初回・dry-run・再送は記録しない
-    assert_eq!(changes.as_array().unwrap().len(), 2, "{changes}");
+    let changes = dump(&t.pool, CHANGES, t.b).await;
+    let snap = |at: &str, state: &str, source: &str, unko: Option<&str>| json!({"occurred_at": at, "source": source, "state": state, "unko_no": unko});
+    assert_eq!(
+        changes,
+        json!([
+            {"driver_cd": 1130, "date": "2026-05-31",
+             "before": [snap("2026-05-31 08:00:00", "始業", "timecard", None),
+                        snap("2026-05-31 09:15:30", "運行開始", "dtako", unko)],
+             "after": [snap("2026-05-31 07:30:00", "始業", "timecard", None),
+                       snap("2026-05-31 09:15:30", "運行開始", "dtako", unko)]},
+            {"driver_cd": 2001, "date": "2026-06-15",
+             "before": [snap("2026-06-15 08:00:00", "始業", "timecard", None),
+                        snap("2026-06-15 17:00:00", "終業", "timecard", None)],
+             "after": null},
+        ])
+    );
 
     let (from, to) = (
         jst_day_bounds(d("2026-05-01")).0,
         jst_day_bounds(d("2026-07-01")).0,
     );
-    for drivers in [vec![1130, 2001, 4242], vec![2001], vec![]] {
-        let want = t
-            .root
-            .stored_window_signatures(&drivers, from, to)
-            .await
-            .unwrap();
-        let got = TimecardWindowIo::stored_window_signatures(&t.worker, &drivers, from, to)
-            .await
-            .unwrap();
-        assert_eq!(got, want, "drivers {drivers:?}");
-    }
-    let got = TimecardWindowIo::stored_window_signatures(&t.worker, &[1130], from, to)
+    let sig = |s: &str| s.to_string();
+    let got = TimecardWindowIo::stored_window_signatures(&t.worker, &[1130, 2001, 4242], from, to)
         .await
         .unwrap();
     assert_eq!(
-        got[&1130].keys().copied().collect::<Vec<_>>(),
-        vec![d("2026-05-31"), d("2026-06-01")]
+        got,
+        BTreeMap::from([(
+            1130,
+            BTreeMap::from([
+                (
+                    d("2026-05-31"),
+                    sig("c8c712739cfb9e1da301844ab2bf7a119ab0627f1afdacbe9fa179960e96785f")
+                ),
+                (
+                    d("2026-06-01"),
+                    sig("d88a4b874c7bdc3e8f6afb19657c3914d07b4e3345f18b33a0b2375a9668fdf4")
+                ),
+            ])
+        )])
     );
+    // 消去済み (2001)・保存の無い乗務員・空の並びは空
+    for drivers in [vec![2001], vec![]] {
+        let got = TimecardWindowIo::stored_window_signatures(&t.worker, &drivers, from, to)
+            .await
+            .unwrap();
+        assert!(got.is_empty(), "drivers {drivers:?}: {got:?}");
+    }
 }
 
 /// 上流の本文 (接続先を含む) を返して落ちる読み。
@@ -230,7 +301,7 @@ impl FoldEventsIo for Failing {
 /// stale は独立に試して載る。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_fold_reports_the_kind_only() {
-    let t = both().await;
+    let t = env().await;
     let w = window(
         &[1130],
         vec![raw(1130, "2026-06-02 08:00:00", "始業", "timecard", None)],
@@ -281,9 +352,9 @@ async fn a_db_failure_reports_the_sqlstate_only() {
     assert!(!format!("{e:?}").is_empty());
 }
 
-/// 段取りが月・窓を読めなかった (口が先に検査するので通常は起きない) のは root と同じ 503 と文言。
+/// 段取りが月・窓を読めなかった (口が先に検査するので通常は起きない) のは 503 と固定の文言 (root の文言と同じだった)。
 #[test]
-fn bad_months_are_503_with_the_root_wording() {
+fn bad_months_are_503_with_fixed_wording() {
     use kintai_kosoku::fold_flow::BadMonth;
     use kintai_kosoku::route_flow::BadWindow;
     let e = FoldStoreError::from(BadMonth("2026-13".to_string()));

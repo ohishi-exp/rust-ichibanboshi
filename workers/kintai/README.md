@@ -305,11 +305,12 @@ Cloud Run 版 (root の `src/routes/kintai_timecard.rs` の `receive`・`signatu
 - **`statement_timeout`**: 元は接続ごとに `SET statement_timeout = 300000`。Worker は transaction の頭で
   `set_config('statement_timeout', '300000', true)` (transaction の中だけ効く)。Hyperdrive 越しで効くかは CI では確かめられない
   (native の postgres では効く)。効かなくても Workers の CPU / 実行時間の上限の方が先に来る
-- **元との一致の確かめ方**: `pg/tests/root_parity.rs` が root の sqlx の経路 (`apply_timecard_batch`・`put_wage_snapshot`・
-  `stored_day_signatures`) と `kintai-pg` に同じ入力を与え、`kintai.kintai_events`・`event_changes`・`wage_snapshot` の中身と応答が
-  一致することを実 postgres で確かめる (worker-kintai.yml の `pg-parity` job)。int8[]・timestamptz[]・text[]・jsonb[] (NULL 入り)・
-  date[]・int2[]・int4[] (NULL 入り)・bool[] がここを通る。入力の検査は `pg/tests/axum_parity.rs` が root の axum の handler と
-  同じ status・本文になることを確かめる (DB 不要)
+- **値の確かめ方**: `pg/tests/root_parity.rs` が `kintai-pg` (`apply_timecard_batch`・`put_wage_snapshot`・`stored_day_signatures`) に
+  固定の入力を与え、`kintai.kintai_events`・`event_changes`・`wage_snapshot` の中身と応答が**固定した期待値**になることを実 postgres
+  で確かめる (worker-kintai.yml の `pg-parity` job)。期待値は root の sqlx の経路に同じ入力を与えて一致していた値。int8[]・
+  timestamptz[]・text[]・jsonb[] (NULL 入り)・date[]・int2[]・int4[] (NULL 入り)・bool[] がここを通る。入力の検査の status・本文
+  (axum の `Json` / `Query` の拒否文言を含む) の固定値は `pg/tests/axum_parity.rs` (DB 不要)。ファイル名の `*_parity` は、比較の相手
+  (root) を外す前の名前を残している
 
 ### 元 (root の src/) と写し (logic/) の対応 — **撤去までは片方を直したらもう片方も直す**
 
@@ -443,12 +444,15 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 ### 比べ方
 
 - 経路・認可の振り分け・400 の文言・失敗の写し・`logic_version`・時計: `logic/tests/fold_routes.rs` (DB 不要、100% gate)
-- 打刻の置き換え: `pg/tests/window_parity.rs` が root の `apply_timecard_window` (sqlx) と Worker の `FoldStore` に同じ窓を流し、応答
-  (`elapsed_ms` を除く)・`kintai.kintai_events`・`event_changes`・`stored_window_signatures` の戻りが一致することを実 postgres で確かめる。
+- 打刻の置き換え: `pg/tests/window_parity.rs` が Worker の `FoldStore` に固定の窓を流し、応答 (`elapsed_ms` を除く)・
+  `kintai.kintai_events`・`event_changes`・`stored_window_signatures` の戻りが固定した期待値 (root の `apply_timecard_window` (sqlx)
+  と一致していた値) になることを実 postgres で確かめる。
   上流の失敗が `fold_error` に種別だけで載ること、DB の失敗が `kintai push db failed: <SQLSTATE>` だけになることも同じファイル
-- fold の書き (`FoldStoreIo`): `pg/tests/fold_store_parity.rs`、読み (`FoldEventsIo`): `pg/tests/fold_events_parity.rs` (root の
-  `HttpKintaiEventsRepo` + `PgKintaiEventsRepo` = 本番の Cloud Run 版の構成と、同じ写し・同じ alc の応答で `all_events_between`・
-  `month_head_anchors`・`dtako_month_read_since` が一致すること。`PUSHED_SOURCES` 外の source・窓の外・別テナントの行が入らないこと)。
+- fold の書き (`FoldStoreIo`): `pg/tests/fold_store_parity.rs` (Worker で書いた行を Worker の読みで読み戻して一致すること (往復) と
+  件数。月ゲートの材料・運行一覧・`stale_state`・`recalc_driver_page` は固定値)、読み (`FoldEventsIo`):
+  `pg/tests/fold_events_parity.rs` (固定の写し・固定の alc の応答に対する `all_events_between`・`month_head_anchors`・
+  `dtako_month_read_since` の要求の並びと戻り値。期待値は root の `HttpKintaiEventsRepo` + `PgKintaiEventsRepo` = 本番の Cloud Run 版
+  の構成と一致していた値。`PUSHED_SOURCES` 外の source・窓の外・別テナントの行が入らないこと)。
   写しの SQL 3 本が root から移す前と同じことは `kosoku/tests/pushed_events_snapshot.rs` (sha256)
 - 実機 (Hyperdrive・RPC・VPC の経路) は CI では通せない — `wrangler dev --remote` で 1 か月の preview (`GET /api/kintai/recalc?month=`) を叩く
 
@@ -481,10 +485,10 @@ D1 だけの部分 (1 回の `batch` に流す文の束・結果の行の読み�
 | `synced_at` | `format_synced_at(Utc::now())` (RFC3339・ナノ秒 9 桁・`+00:00`) | 同じ書式 (`Date.now()` のミリ秒から。小数部の下 6 桁は 0) |
 | 壊れた summary_json の行 | 行単位で落として warn | 同じ (行単位で落として `console_error`) |
 
-**比べ方**: `pg/tests/restraint_d1_parity.rs` が、root の axum の handler + rusqlite の store と、D1 と同じ文の束を native の SQLite で
-1 transaction ずつ流した経路 (表は `SCHEMA_SQL`、行は D1 と同じ「列名をキーにした object・数は浮動小数」で受ける) に同じ要求の列
-(成功・400・本文 / Query の拒否・部分上書き・年跨ぎ・`LIKE` の `_` で別 comp が混ざらないこと) を与え、status と本文のバイト列
-(`synced_at` の値だけ伏せる) が一致することを確かめる。wasm 専用の部分 (binding・JsValue への写し) は `wrangler dev --local` で
+**確かめ方**: `pg/tests/restraint_d1_parity.rs` が、D1 と同じ文の束を native の SQLite で 1 transaction ずつ流した経路 (表は
+`SCHEMA_SQL`、行は D1 と同じ「列名をキーにした object・数は浮動小数」で受ける) に固定の要求の列 (成功・400・本文 / Query の拒否・
+部分上書き・年跨ぎ・`LIKE` の `_` で別 comp が混ざらないこと) を与え、status と本文のバイト列 (`synced_at` の値だけ伏せる) が
+固定した期待値 (オンプレ版の axum の handler + rusqlite の store と一致していた値) になることを確かめる。wasm 専用の部分 (binding・JsValue への写し) は `wrangler dev --local` で
 確かめた (下の「ローカル検証」)。
 
 ### 1 回の PUT の entries の上限 — 500
@@ -579,11 +583,10 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 - `pg/` (`kintai-pg`): Supabase への書き込み (`stored_day_signatures`・`replace_window`・`apply_timecard_batch`・`put_wage_snapshot`)。
   fold の書き込み側 `FoldStoreIo` (9 メソッド。`stale_state`・`recalc_driver_page` を含む) は `src/fold_store.rs` の `FoldStore` (1 接続を mutex で持ち、メソッドごとに `tenant_tx` 1 回)。同じ `FoldStore` に fold の読みのうち送った写しの 3 本 `PushedEventsRead` (kintai-logic の trait。SQL は `kintai_kosoku::pushed_events`) と、打刻の置き換え `TimecardWindowIo` (`stored_window_signatures`・
   既存の `replace_window` を同じ接続で) も impl する。失敗の写しは `FoldStoreError::into_fail` (502 は種別だけ)。
-  root の `KintaiPgStore` との一致は `tests/fold_store_parity.rs`・`tests/window_parity.rs` (実 DB)。
+  書いた行・読み戻しの固定は `tests/fold_store_parity.rs`・`tests/window_parity.rs` (実 DB)。
   kit の `tenant_tx` の中の `query_typed` / `execute_typed` だけで、native でも動く (Worker は Hyperdrive の接続を、テストは native の
-  tokio-postgres の接続を渡す)。実 DB が要るので 100% gate には入れず、`pg-parity` job が root と突き合わせる。dev-dependency に
-  repo ルートの package (`rust-ichibanboshi`) を持つ (比べる相手。wasm のビルドには入らない)。root を dev-dependency に持つのがここだけなので、
-  拘束サマリのオンプレ版と D1 の経路の比較 (`tests/restraint_d1_parity.rs`、DB 不要) もここに置く
+  tokio-postgres の接続を渡す)。実 DB が要るので 100% gate には入れず、`pg-parity` job が固定の期待値と突き合わせる (repo ルートの package への
+  dev-dependency は持たない)。拘束サマリの D1 の経路の SQLite のテスト (`tests/restraint_d1_parity.rs`、DB 不要) もここに置く
 
 - `output_sha.rs`: ソースのハッシュの畳み方 (`fold_output_sha`。version の etag と記録用の `code_sha`)。repo ルートの build.rs と `worker/build.rs` が `include!` する (crate の src の外 = どちらの glob にも入らない)
 

@@ -1,11 +1,13 @@
-//! 勤怠 Worker の書き込み部品 (`kintai_pg`、tokio-postgres の `query_typed` / `execute_typed`) と、root の Cloud Run 版
-//! (sqlx) の経路に**同じ入力**を与え、書いた後の表の中身と応答が一致することを実 Postgres で確かめる (Refs #322)。
+//! 勤怠 Worker の書き込み部品 (`kintai_pg`、tokio-postgres の `query_typed` / `execute_typed`) に固定の入力を与え、応答と
+//! 書いた後の表の中身が固定した期待値になることを実 Postgres で確かめる (Refs #322)。
 //!
+//! - 期待値は、root の Cloud Run 版 (sqlx) の経路に同じ入力を与えて一致していた値を書き出したもの。root を撤去した後は
+//!   この表が Worker の書き込みの正本。ファイル名の `root_parity` は、比較の相手を外す前の名前を残している
 //! - 表: `kintai.kintai_events`・`kintai.event_changes`・`kintai.wage_snapshot` (時刻の既定値 `ingested_at`・
 //!   `recorded_at`・`computed_at` とテナントは除く)。int8[]・timestamptz[]・text[]・jsonb[] (NULL 入り)・date[]・int2[]・
 //!   int4[] (NULL 入り)・bool[] の型付けをここで通す
-//! - テナントは経路ごとに新しい UUID (root = A、Worker = B)。同じ DB・同じ migration
-//! - Worker 側は口と同じく、本文を `kintai_logic` の `parse_batch` / `parse_snapshot` に通してから書く
+//! - テナントはテストごとに新しい UUID。同じ DB・同じ migration
+//! - 本文は口と同じく `kintai_logic` の `parse_batch` / `parse_snapshot` に通してから書く
 //!
 //! `KINTAI_TEST_DATABASE_URL` が無ければ**失敗する** (skip して緑にしない)。CI は worker-kintai.yml の
 //! `pg-parity` job (postgres service。ci.yml の `kintai migration + RLS` job と同じ形)。手元では:
@@ -17,18 +19,13 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use alc_worker_db::PgClient;
-use axum::{Extension, Json};
 use chrono::NaiveDate;
 use kintai_kosoku::kintai_push::{jst_day_bounds, TimecardBatch};
 use kintai_logic::timecard_write::parse_batch;
 use kintai_logic::wage_snapshot::{MonthMasters, SnapshotRequest, WageSnapshotRow};
 use kintai_logic::wage_write::parse_snapshot;
-use rust_ichibanboshi::kintai_push::{apply_timecard_batch, KintaiPgStore};
-use rust_ichibanboshi::routes::kintai_timecard::ReadTenant;
-use rust_ichibanboshi::routes::wage_snapshot::put_wage_snapshot;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -38,16 +35,14 @@ mod common;
 
 use common::{database_url, ensure_schema};
 
-/// root の経路 (テナント A) と Worker の経路 (テナント B)。
-struct Both {
+/// Worker の経路 (テナントはテストごとに新しい UUID)。
+struct Worker {
     pool: sqlx::PgPool,
-    root: Arc<KintaiPgStore>,
     worker: PgClient,
-    a: Uuid,
-    b: Uuid,
+    tenant: Uuid,
 }
 
-async fn both() -> Both {
+async fn worker() -> Worker {
     let url = database_url();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -55,19 +50,16 @@ async fn both() -> Both {
         .await
         .expect("sqlx connect");
     ensure_schema(&pool).await;
-    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
         .await
         .expect("tokio-postgres connect");
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    Both {
-        root: Arc::new(KintaiPgStore::from_pool(pool.clone(), a)),
+    Worker {
         pool,
         worker: PgClient::new(client),
-        a,
-        b,
+        tenant: Uuid::new_v4(),
     }
 }
 
@@ -121,11 +113,11 @@ fn batch(days: Vec<(&str, Vec<Value>)>, delete: &[&str]) -> TimecardBatch {
     }
 }
 
-/// 初回取り込み → 1 日の打刻の修正と 1 日の削除と新しい日 → 同じものの再送、を両方の経路に流し、毎回の応答と
-/// 最後の表の中身・署名が一致すること。
+/// 初回取り込み → 1 日の打刻の修正と 1 日の削除と新しい日 → 同じものの再送、を流し、毎回の応答と最後の表の中身・署名が
+/// 固定した値になること。
 #[tokio::test(flavor = "multi_thread")]
-async fn timecard_writes_the_same_rows_as_the_root_path() {
-    let mut t = both().await;
+async fn timecard_writes_the_fixed_rows() {
+    let mut t = worker().await;
     let unko = "26060109153000000012341";
     let steps = [
         batch(
@@ -199,40 +191,104 @@ async fn timecard_writes_the_same_rows_as_the_root_path() {
             &[],
         ),
     ];
+    let want = [
+        json!({"days_deleted": 0, "days_written": 2, "deduped": 1, "events_written": 4,
+               "misplaced": 4, "rejected": {"UnknownState": 1}, "unknown_states": ["点呼"]}),
+        json!({"days_deleted": 1, "days_written": 2, "deduped": 0, "events_written": 4,
+               "misplaced": 0, "rejected": {}, "unknown_states": []}),
+        json!({"days_deleted": 0, "days_written": 1, "deduped": 0, "events_written": 3,
+               "misplaced": 0, "rejected": {}, "unknown_states": []}),
+    ];
     for (i, step) in steps.iter().enumerate() {
-        let want = apply_timecard_batch(&t.root, step).await.expect("root");
         let body = serde_json::to_vec(step).unwrap();
         let parsed = parse_batch(JSON, &body).expect("parse_batch");
-        let got = kintai_pg::apply_timecard_batch(&mut t.worker, t.b, &parsed)
+        let got = kintai_pg::apply_timecard_batch(&mut t.worker, t.tenant, &parsed)
             .await
             .expect("worker");
-        assert_eq!(got, want, "step {i} の応答");
+        assert_eq!(json!(got), want[i], "step {i} の応答");
     }
 
-    let events = dump(&t.pool, EVENTS, t.a).await;
-    assert_eq!(dump(&t.pool, EVENTS, t.b).await, events);
-    assert_eq!(events.as_array().unwrap().len(), 4, "{events}");
-    assert_eq!(events[1]["raw"]["vehicle"], "1234", "raw は jsonb のまま");
-    assert_eq!(events[1]["unko_no"], unko);
+    // 06-01 の修正後 (07:30 始業・09:15:30 運行開始・18:02:05 終業) と 06-03 の運行終了。06-02 は消え、月の外 (05-31・07-01)
+    // と別の乗務員は入らない。`raw` は jsonb のまま、`occurred_at` は UTC
+    let events = dump(&t.pool, EVENTS, t.tenant).await;
+    let ev = |at: &str, utc: &str, state: &str, source: &str, unko: Option<&str>| {
+        json!({"driver_cd": 1130, "occurred_at": utc, "state": state, "source": source,
+               "unko_no": unko,
+               "raw": {"datetime": at, "driver_id": 1130, "end_datetime": null, "source": source,
+                       "state": state, "unko_no": unko, "vehicle": "1234"}})
+    };
+    assert_eq!(
+        events,
+        json!([
+            ev(
+                "2026-06-01 07:30:00",
+                "2026-05-31T22:30:00+00:00",
+                "始業",
+                "timecard",
+                None
+            ),
+            ev(
+                "2026-06-01 09:15:30",
+                "2026-06-01T00:15:30+00:00",
+                "運行開始",
+                "dtako",
+                Some(unko)
+            ),
+            ev(
+                "2026-06-01 18:02:05",
+                "2026-06-01T09:02:05+00:00",
+                "終業",
+                "timecard",
+                None
+            ),
+            ev(
+                "2026-06-03 23:59:59",
+                "2026-06-03T14:59:59+00:00",
+                "運行終了",
+                "dtako",
+                Some(unko)
+            ),
+        ])
+    );
 
-    let changes = dump(&t.pool, CHANGES, t.a).await;
-    assert_eq!(dump(&t.pool, CHANGES, t.b).await, changes);
     // 06-01 の修正 (前後あり) と 06-02 の削除 (after = NULL)。初回取り込み・06-03・再送は記録しない
-    assert_eq!(changes.as_array().unwrap().len(), 2, "{changes}");
-    assert_eq!(changes[1]["after"], Value::Null);
+    let changes = dump(&t.pool, CHANGES, t.tenant).await;
+    let snap = |at: &str, state: &str, source: &str, unko: Option<&str>| json!({"occurred_at": at, "source": source, "state": state, "unko_no": unko});
+    assert_eq!(
+        changes,
+        json!([
+            {"driver_cd": 1130, "date": "2026-06-01",
+             "before": [snap("2026-06-01 08:00:00", "始業", "timecard", None),
+                        snap("2026-06-01 09:15:30", "運行開始", "dtako", Some(unko)),
+                        snap("2026-06-01 18:02:05", "終業", "timecard", None)],
+             "after": [snap("2026-06-01 07:30:00", "始業", "timecard", None),
+                       snap("2026-06-01 09:15:30", "運行開始", "dtako", Some(unko)),
+                       snap("2026-06-01 18:02:05", "終業", "timecard", None)]},
+            {"driver_cd": 1130, "date": "2026-06-02",
+             "before": [snap("2026-06-02 08:00:00", "始業", "timecard", None)],
+             "after": null},
+        ])
+    );
 
     let (from, to) = (
         jst_day_bounds(d("2026-06-01")).0,
         jst_day_bounds(d("2026-07-01")).0,
     );
-    let want = t.root.stored_day_signatures(1130, from, to).await.unwrap();
-    let got = kintai_pg::stored_day_signatures(&mut t.worker, t.b, 1130, from, to)
+    let got = kintai_pg::stored_day_signatures(&mut t.worker, t.tenant, 1130, from, to)
         .await
         .unwrap();
-    assert_eq!(got, want);
     assert_eq!(
-        got.keys().copied().collect::<Vec<_>>(),
-        vec![d("2026-06-01"), d("2026-06-03")]
+        got,
+        BTreeMap::from([
+            (
+                d("2026-06-01"),
+                "438bc351294be18cb18aded34749acb278be1136d1f25c1412c000f21fbdeee4".to_string()
+            ),
+            (
+                d("2026-06-03"),
+                "50687cea1daadb0e3173fac0af76c895eed59f166637ee4222994e7d66f8ce86".to_string()
+            ),
+        ])
     );
     // 書いていない乗務員・テナントの署名は空
     let other = kintai_pg::stored_day_signatures(&mut t.worker, Uuid::new_v4(), 1130, from, to)
@@ -278,7 +334,7 @@ fn snapshot(rows: Vec<WageSnapshotRow>, synced: &str) -> SnapshotRequest {
     }
 }
 
-/// `computed_at` は書いた時刻 (経路ごとに違う) なので、比べる前に形だけ確かめて外す。
+/// `computed_at` は書いた時刻なので、比べる前に形だけ確かめて外す。
 fn without_computed_at(mut v: Value) -> Value {
     if let Some(at) = v.get("computed_at") {
         assert!(at.is_string(), "{v}");
@@ -287,11 +343,21 @@ fn without_computed_at(mut v: Value) -> Value {
     v
 }
 
-/// 保存 → 同じものの再送 (書かない) → 行と版の変更 → 0 行 (DELETE だけ)、を両方の経路に流し、毎回の応答と
-/// 表の中身が一致すること。
+/// 期待する 1 行 (`ym` は月初、`restraint_source`・`comp_id` などは `snapshot` の固定値)。
+fn wage_want(driver_cd: i64, total: Value, missing: bool, synced: &str) -> Value {
+    json!({"branch_code": 3, "branch_name": null, "calc_base": 200000, "calc_overtime": null,
+           "calc_total": total, "comp_id": "comp-1", "company": "本社", "driver_cd": driver_cd,
+           "driver_name": format!("乗務員{driver_cd}"), "hourly_rate": 1250, "job_name": null,
+           "min_wage_sha": null, "paid_base": 190000, "paid_overtime": 30000, "pay_kubun": 2,
+           "payroll_synced_at": synced, "restraint_missing": missing, "restraint_source": "gcp",
+           "salary_item_sha": "sha-1", "timecard_kosoku": "yes", "wage_logic_version": "wage-1",
+           "working_minutes": 10500, "ym": "2026-06-01"})
+}
+
+/// 保存 → 同じものの再送 (書かない) → 行と版の変更 → 0 行 (DELETE だけ)、を流し、毎回の応答と表の中身が固定した値になること。
 #[tokio::test(flavor = "multi_thread")]
-async fn wage_snapshot_writes_the_same_rows_as_the_root_path() {
-    let mut t = both().await;
+async fn wage_snapshot_writes_the_fixed_rows() {
+    let mut t = worker().await;
     let steps = vec![
         snapshot(
             vec![wage_row(1130, Some(231_000)), wage_row(1702, None)],
@@ -307,37 +373,40 @@ async fn wage_snapshot_writes_the_same_rows_as_the_root_path() {
         ),
         snapshot(vec![], "2026-07-04T00:00:00+09:00"),
     ];
-    let mut tables = Vec::new();
+    let synced1 = "2026-07-03T09:12:00+00:00";
+    let synced2 = "2026-07-03T15:00:00+00:00";
+    let want_responses = [
+        json!({"saved": 2, "skipped_unchanged": false, "timecard_kosoku": "yes"}),
+        json!({"saved": 2, "skipped_unchanged": true, "timecard_kosoku": "yes"}),
+        json!({"saved": 1, "skipped_unchanged": false, "timecard_kosoku": "yes"}),
+        json!({"saved": 0, "skipped_unchanged": false, "timecard_kosoku": "yes"}),
+    ];
+    let want_tables = [
+        json!([
+            wage_want(1130, json!(231000), false, synced1),
+            wage_want(1702, Value::Null, true, synced1),
+        ]),
+        // 同じ内容の再送は書かない (表も動かない)
+        json!([
+            wage_want(1130, json!(231000), false, synced1),
+            wage_want(1702, Value::Null, true, synced1),
+        ]),
+        // 行と版の変更: 消えた乗務員の行は残らない
+        json!([wage_want(1130, json!(240000), false, synced2)]),
+        json!([]),
+    ];
     for (i, step) in steps.into_iter().enumerate() {
-        let Json(want) = put_wage_snapshot(
-            Extension(Some(t.root.clone())),
-            Extension(ReadTenant(Some(t.a))),
-            Json(step.clone()),
-        )
-        .await
-        .expect("root");
         let body = serde_json::to_vec(&step).unwrap();
         let (valid, synced_at) = parse_snapshot(JSON, &body).expect("parse_snapshot");
-        let got = kintai_pg::put_wage_snapshot(&mut t.worker, t.b, valid, synced_at)
+        let got = kintai_pg::put_wage_snapshot(&mut t.worker, t.tenant, valid, synced_at)
             .await
             .expect("worker");
         assert_eq!(
             without_computed_at(got),
-            without_computed_at(want),
+            want_responses[i],
             "step {i} の応答"
         );
-        let wages = dump(&t.pool, WAGES, t.a).await;
-        assert_eq!(dump(&t.pool, WAGES, t.b).await, wages, "step {i} の表");
-        tables.push(wages);
+        let wages = dump(&t.pool, WAGES, t.tenant).await;
+        assert_eq!(wages, want_tables[i], "step {i} の表");
     }
-    assert_eq!(tables[0].as_array().unwrap().len(), 2);
-    assert_eq!(tables[1], tables[0], "同じ内容の再送は書かない");
-    assert_eq!(tables[0][1]["calc_total"], Value::Null, "int4[] の NULL");
-    assert_eq!(tables[0][0]["pay_kubun"], 2, "int2[]");
-    assert_eq!(
-        tables[2].as_array().unwrap().len(),
-        1,
-        "消えた乗務員の行は残らない"
-    );
-    assert_eq!(tables[3], json!([]));
 }

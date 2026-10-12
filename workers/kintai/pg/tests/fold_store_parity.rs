@@ -1,10 +1,11 @@
 //! fold の書き込み側 `FoldStoreIo` の Worker 実装 (`kintai_pg::FoldStore`、tokio-postgres の `tenant_tx` + `query_typed*` /
-//! `execute_typed`) と root の `KintaiPgStore` (sqlx) に**同じ入力**を与え、9 メソッドの戻りと書いた後の表の中身が一致する
-//! ことを実 Postgres で確かめる (Refs #322)。
+//! `execute_typed`) の 9 メソッドを実 Postgres で確かめる (Refs #322)。root の `KintaiPgStore` (sqlx) との突き合わせは
+//! やめ、**Worker で書いた行を Worker の読みで読み戻して一致すること (往復) と件数**を確かめる。SQL 本文は共有 crate が
+//! sha256 で縛っている (kosoku/tests の snapshot)。ファイル名の `fold_store_parity` は、比較の相手を外す前の名前を残している。
 //!
 //! - 表: `kintai.shifts`・`day_summaries`・`day_parts`・`fold_gate` (テナントと `folded_at` は除く)
 //! - 畳んだ結果は golden の固定入力 (`kosoku/tests/golden/fold_input.json`) を `fold_driver_month` に通したもの
-//! - テナントは経路ごとに新しい UUID (root = A、Worker = B)。同じ DB・同じ migration
+//! - テナントはテストごとに新しい UUID。同じ DB・同じ migration
 //!
 //! `KINTAI_TEST_DATABASE_URL` が無ければ**失敗する** (skip して緑にしない)。CI は worker-kintai.yml の `pg-parity` job。
 
@@ -21,22 +22,19 @@ use kintai_kosoku::kintai_fold::{fold_driver_month, logic_version, FoldUnit};
 use kintai_kosoku::kintai_push::{jst_day_bounds, month_date_bounds};
 use kintai_kosoku::kosoku::KosokuParams;
 use kintai_pg::FoldStore;
-use rust_ichibanboshi::kintai_push::KintaiPgStore;
 use serde_json::Value;
 use uuid::Uuid;
 
 const MONTH: &str = "2026-06";
 
-/// root の経路 (テナント A) と Worker の経路 (テナント B)。
-struct Both {
+/// Worker の経路 (テナントはテストごとに新しい UUID)。
+struct Env {
     pool: sqlx::PgPool,
-    root: KintaiPgStore,
     worker: FoldStore,
-    a: Uuid,
-    b: Uuid,
+    tenant: Uuid,
 }
 
-async fn both() -> Both {
+async fn env() -> Env {
     let url = database_url();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -44,19 +42,17 @@ async fn both() -> Both {
         .await
         .expect("sqlx connect");
     ensure_schema(&pool).await;
-    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let tenant = Uuid::new_v4();
     let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
         .await
         .expect("tokio-postgres connect");
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    Both {
-        root: KintaiPgStore::from_pool(pool.clone(), a),
+    Env {
         pool,
-        worker: FoldStore::new(PgClient::new(client), b),
-        a,
-        b,
+        worker: FoldStore::new(PgClient::new(client), tenant),
+        tenant,
     }
 }
 
@@ -88,13 +84,11 @@ SELECT coalesce(jsonb_agg(to_jsonb(t) - 'tenant_id' - 'folded_at' ORDER BY month
   FROM kintai.fold_gate t WHERE tenant_id = $1
 "#;
 
-/// 3 表の中身 (テナント列を除く) が両経路で同じこと。返すのは Worker 側の (shifts, day_summaries, day_parts)。
-async fn same_tables(t: &Both) -> (Value, Value, Value) {
+/// 3 表の中身 (テナント列を除く): (shifts, day_summaries, day_parts)。
+async fn tables(t: &Env) -> (Value, Value, Value) {
     let mut out = Vec::new();
     for sql in [SHIFTS, DAYS, PARTS] {
-        let (ra, wb) = (dump(&t.pool, sql, t.a).await, dump(&t.pool, sql, t.b).await);
-        assert_eq!(ra, wb, "{sql}");
-        out.push(wb);
+        out.push(dump(&t.pool, sql, t.tenant).await);
     }
     let parts = out.pop().unwrap();
     let days = out.pop().unwrap();
@@ -137,40 +131,28 @@ fn as_driver(u: &FoldUnit, cd: i64) -> FoldUnit {
     u
 }
 
-async fn write_both(t: &Both, u: &FoldUnit, fp: &str, ver: &str) {
-    t.root
-        .write_unit(MONTH, u, fp, ver)
-        .await
-        .expect("root write_unit");
+async fn write(t: &Env, u: &FoldUnit, fp: &str, ver: &str) {
     t.worker
         .write_unit(MONTH, u, fp, ver)
         .await
         .expect("worker write_unit");
 }
 
-async fn same_states(
-    t: &Both,
+async fn states(
+    t: &Env,
     drivers: &[i64],
 ) -> BTreeMap<i64, kintai_kosoku::kintai_fold::StoredState> {
-    let r = t
-        .root
+    t.worker
         .stored_states(drivers, MONTH)
         .await
-        .expect("root stored_states");
-    let w = t
-        .worker
-        .stored_states(drivers, MONTH)
-        .await
-        .expect("worker stored_states");
-    assert_eq!(r, w);
-    w
+        .expect("worker stored_states")
 }
 
 /// 空 → 初回の書き込み → 上書き (前の行が消える) → 空 unit (全部消える) の各段で、`stored_states` の戻りと 3 表の中身が
-/// 両経路で一致すること。壊れた月はどちらも書く前に落ちる。
+/// 書いたものと一致する (往復と件数)。壊れた月は書く前に落ちる。
 #[tokio::test(flavor = "multi_thread")]
-async fn write_unit_and_stored_states_match_the_root_path() {
-    let t = both().await;
+async fn write_unit_and_stored_states_round_trip() {
+    let t = env().await;
     let units = golden_units();
     let ver = logic_version(&KosokuParams::default());
     let (fp1, fp2) = ("1".repeat(64), "2".repeat(64));
@@ -178,16 +160,16 @@ async fn write_unit_and_stored_states_match_the_root_path() {
     drivers.push(999_999); // 保存の無い乗務員 (空の値で入る)
 
     // 空の drivers は空、保存が無ければ全員 0
-    assert!(same_states(&t, &[]).await.is_empty());
-    let before = same_states(&t, &drivers).await;
+    assert!(states(&t, &[]).await.is_empty());
+    let before = states(&t, &drivers).await;
     assert_eq!(before.len(), drivers.len());
     assert!(before.values().all(|s| s.is_empty()));
 
-    // 初回
+    // 初回: 書いた件数が表の件数と一致する
     for u in &units {
-        write_both(&t, u, &fp1, &ver).await;
+        write(&t, u, &fp1, &ver).await;
     }
-    let (shifts, days, parts) = same_tables(&t).await;
+    let (shifts, days, parts) = tables(&t).await;
     let n: usize = units.iter().map(|u| u.shifts.len()).sum();
     assert_eq!(len(&shifts), n);
     assert_eq!(
@@ -199,9 +181,13 @@ async fn write_unit_and_stored_states_match_the_root_path() {
         units.iter().map(|u| u.day_parts.len()).sum::<usize>()
     );
     assert!(days.to_string().contains("non_working"));
-    let states = same_states(&t, &drivers).await;
-    assert_eq!(states[&units[0].driver_cd].fingerprints, vec![fp1.clone()]);
-    assert!(states[&999_999].is_empty());
+    let got = states(&t, &drivers).await;
+    for u in &units {
+        let s = &got[&u.driver_cd];
+        assert_eq!(s.fingerprints, vec![fp1.clone()], "{}", u.driver_cd);
+        assert_eq!(s.shifts, u.shifts.len() as i64, "{}", u.driver_cd);
+    }
+    assert!(got[&999_999].is_empty());
 
     // 上書き: 先頭の乗務員を勤務 1 本ぶんに縮めて別の指紋で書き直す → 前の行は残らない
     let mut short = units[0].clone();
@@ -210,32 +196,30 @@ async fn write_unit_and_stored_states_match_the_root_path() {
     short.day_summaries.retain(|d| d.shift_start_at == keep);
     short.day_parts.retain(|p| p.shift_start_at == keep);
     assert!(units[0].shifts.len() > 1, "上書きで行が減る形にする");
-    write_both(&t, &short, &fp2, &ver).await;
-    let (shifts, _, _) = same_tables(&t).await;
+    write(&t, &short, &fp2, &ver).await;
+    let (shifts, days, parts) = tables(&t).await;
     assert_eq!(len(&shifts), n - units[0].shifts.len() + 1);
-    let s = &same_states(&t, &drivers).await[&units[0].driver_cd];
+    let others = &units[1..];
+    let day_rows: usize = others.iter().map(|u| u.day_summaries.len()).sum();
+    assert_eq!(len(&days), short.day_summaries.len() + day_rows);
+    let part_rows: usize = others.iter().map(|u| u.day_parts.len()).sum();
+    assert_eq!(len(&parts), short.day_parts.len() + part_rows);
+    let s = &states(&t, &drivers).await[&units[0].driver_cd];
     assert_eq!((s.fingerprints.clone(), s.shifts), (vec![fp2.clone()], 1));
 
     // 空 unit: その乗務員の月の行が全部消える (day_summaries / day_parts は CASCADE)
-    write_both(
-        &t,
-        &FoldUnit {
-            driver_cd: units[0].driver_cd,
-            ..FoldUnit::default()
-        },
-        &fp2,
-        &ver,
-    )
-    .await;
-    same_tables(&t).await;
-    assert!(same_states(&t, &drivers).await[&units[0].driver_cd].is_empty());
+    let empty = FoldUnit {
+        driver_cd: units[0].driver_cd,
+        ..FoldUnit::default()
+    };
+    write(&t, &empty, &fp2, &ver).await;
+    let (shifts, days, parts) = tables(&t).await;
+    assert_eq!(len(&shifts), n - units[0].shifts.len());
+    assert_eq!(len(&days), day_rows);
+    assert_eq!(len(&parts), part_rows);
+    assert!(states(&t, &drivers).await[&units[0].driver_cd].is_empty());
 
-    // 壊れた月は書く前に落ちる (どちらも)
-    assert!(t
-        .root
-        .write_unit("2026-13", &units[1], &fp1, &ver)
-        .await
-        .is_err());
+    // 壊れた月は書く前に落ちる
     let e = t
         .worker
         .write_unit("2026-13", &units[1], &fp1, &ver)
@@ -243,14 +227,13 @@ async fn write_unit_and_stored_states_match_the_root_path() {
         .unwrap_err();
     assert_eq!(e.to_string(), "bad month: 2026-13");
     assert!(t.worker.stored_states(&drivers, "x").await.is_err());
-    same_tables(&t).await;
+    assert_eq!(len(&tables(&t).await.0), n - units[0].shifts.len());
 }
 
-/// 月ゲート: 無い月は両方 None、書いた値 (digest は `CHAR(64)` なので 64 文字) がそのまま読め、2 回目の書き込みで上書きされる。表の中身も一致する。
+/// 月ゲート: 無い月は None、書いた値 (digest は `CHAR(64)` なので 64 文字) がそのまま読め、2 回目の書き込みで上書きされる。
 #[tokio::test(flavor = "multi_thread")]
-async fn fold_gate_matches_the_root_path() {
-    let t = both().await;
-    assert_eq!(t.root.read_fold_gate(MONTH).await.unwrap(), None);
+async fn fold_gate_round_trips() {
+    let t = env().await;
     assert_eq!(t.worker.read_fold_gate(MONTH).await.unwrap(), None);
     for (dtako, punch) in [("d1", "p1"), ("d2", "p2")] {
         let gate = FoldGateRow {
@@ -258,31 +241,27 @@ async fn fold_gate_matches_the_root_path() {
             punch_digest: punch.repeat(32),
             logic_version: logic_version(&KosokuParams::default()),
         };
-        t.root.write_fold_gate(MONTH, &gate).await.unwrap();
         t.worker.write_fold_gate(MONTH, &gate).await.unwrap();
-        let r = t.root.read_fold_gate(MONTH).await.unwrap();
-        assert_eq!(r, t.worker.read_fold_gate(MONTH).await.unwrap());
-        assert_eq!(r, Some(gate));
-        assert_eq!(
-            dump(&t.pool, GATES, t.a).await,
-            dump(&t.pool, GATES, t.b).await
-        );
+        assert_eq!(t.worker.read_fold_gate(MONTH).await.unwrap(), Some(gate));
+        assert_eq!(len(&dump(&t.pool, GATES, t.tenant).await), 1);
     }
-    assert_eq!(len(&dump(&t.pool, GATES, t.b).await), 1);
     assert_eq!(t.worker.read_fold_gate("2026-07").await.unwrap(), None);
 }
 
-/// 打刻の月ゲート材料・運行一覧・運行を持った乗務員CD が、同じ events を持つ 2 テナントで一致する。
-/// 窓の外・`alc_app` (押し込み対象外の source)・`unko_no` 空は落ちる。events が無い月の digest も一致する。
+/// 打刻の月ゲート材料・運行一覧・運行を持った乗務員CD。窓の外・`alc_app` (押し込み対象外の source)・`unko_no` 空は
+/// 落ちる。events が無い月は一覧が空で、digest は events で動く。
 #[tokio::test(flavor = "multi_thread")]
-async fn event_reads_match_the_root_path() {
-    let t = both().await;
+async fn event_reads_return_the_fixed_values() {
+    let t = env().await;
     let (m0, m1) = month_date_bounds(MONTH).unwrap();
     let (from, to) = (jst_day_bounds(m0).0, jst_day_bounds(m1).0);
 
-    // events が無い月 (digest は sha256('') の固定値、一覧は空)
-    let r = t.root.month_punch_digest(from, to).await.unwrap();
-    assert_eq!(r, t.worker.month_punch_digest(from, to).await.unwrap());
+    // events が無い月 (一覧は空)
+    let empty = t.worker.month_punch_digest(from, to).await.unwrap();
+    assert_eq!(
+        empty,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
     assert!(t
         .worker
         .month_operations(from, to)
@@ -339,30 +318,29 @@ async fn event_reads_match_the_root_path() {
         ),
         (1170, "2026-06-20 07:00:00+09", "始業", "timecard", None),
     ];
-    for tenant in [t.a, t.b] {
-        for (cd, at, state, source, unko) in rows {
-            sqlx::query(
-                "INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw) \
-                 VALUES ($1, $2, $3::timestamptz, $4, $5, $6, '{}'::jsonb)",
-            )
-            .bind(tenant)
-            .bind(cd)
-            .bind(at)
-            .bind(state)
-            .bind(source)
-            .bind(unko)
-            .execute(&t.pool)
-            .await
-            .expect("seed events");
-        }
+    for (cd, at, state, source, unko) in rows {
+        sqlx::query(
+            "INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw) \
+             VALUES ($1, $2, $3::timestamptz, $4, $5, $6, '{}'::jsonb)",
+        )
+        .bind(t.tenant)
+        .bind(cd)
+        .bind(at)
+        .bind(state)
+        .bind(source)
+        .bind(unko)
+        .execute(&t.pool)
+        .await
+        .expect("seed events");
     }
 
-    let d = t.root.month_punch_digest(from, to).await.unwrap();
-    assert_eq!(d, t.worker.month_punch_digest(from, to).await.unwrap());
-    assert_ne!(d, r, "events で digest が動く");
+    let d = t.worker.month_punch_digest(from, to).await.unwrap();
+    assert_eq!(
+        d,
+        "ea1c9040fd1401ba4a6224840c5a440cbe01641d6824dab83e84e2b6c11bc77c"
+    );
 
-    let ops = t.root.month_operations(from, to).await.unwrap();
-    assert_eq!(ops, t.worker.month_operations(from, to).await.unwrap());
+    let ops = t.worker.month_operations(from, to).await.unwrap();
     let day = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
     assert_eq!(
         ops,
@@ -382,15 +360,14 @@ async fn event_reads_match_the_root_path() {
         ]
     );
 
-    let cds = t.root.operation_driver_cds().await.unwrap();
-    assert_eq!(cds, t.worker.operation_driver_cds().await.unwrap());
+    let cds = t.worker.operation_driver_cds().await.unwrap();
     assert_eq!(cds, [1130, 1140, 1170].into_iter().collect());
 }
 
-/// 100 乗務員ぶんの write_unit を両経路で回し、表の中身が一致すること (所要時間は stderr に出す。判定はしない)。
+/// 100 乗務員ぶんの write_unit を回し、書いた件数が表の件数と一致すること (所要時間は stderr に出す。判定はしない)。
 #[tokio::test(flavor = "multi_thread")]
-async fn hundred_drivers_write_the_same_rows() {
-    let t = both().await;
+async fn hundred_drivers_round_trip() {
+    let t = env().await;
     let golden = golden_units();
     let ver = logic_version(&KosokuParams::default());
     let fp = "3".repeat(64);
@@ -399,57 +376,45 @@ async fn hundred_drivers_write_the_same_rows() {
         .collect();
     let started = Instant::now();
     for u in &units {
-        t.root.write_unit(MONTH, u, &fp, &ver).await.unwrap();
-    }
-    let root_ms = started.elapsed().as_millis();
-    let started = Instant::now();
-    for u in &units {
         t.worker.write_unit(MONTH, u, &fp, &ver).await.unwrap();
     }
-    let worker_ms = started.elapsed().as_millis();
-    eprintln!("write_unit x100: root {root_ms} ms / worker {worker_ms} ms");
-    let (shifts, _, _) = same_tables(&t).await;
+    eprintln!(
+        "write_unit x100: worker {} ms",
+        started.elapsed().as_millis()
+    );
+    let (shifts, _, _) = tables(&t).await;
     assert_eq!(
         len(&shifts),
         units.iter().map(|u| u.shifts.len()).sum::<usize>()
     );
+    let drivers: Vec<i64> = units.iter().map(|u| u.driver_cd).collect();
+    let got = states(&t, &drivers).await;
+    assert_eq!(got.len(), 100);
+    assert!(got.values().all(|s| s.fingerprints == vec![fp.clone()]));
 }
 
-/// `stale_state` (月の並びの版の数え上げ) と `recalc_driver_page` (全量再計算の母集団の 1 ページ) が、同じ表を持つ
-/// 2 テナントで一致する。母集団は打刻・保存済み・`extra` の和で、`after`・`stale_only`・`limit`・0 以下の除外が効く。
-/// 壊れた月・空の並びはどちらも落ちる (Worker は root と同じ文面)。
+/// `stale_state` (月の並びの版の数え上げ) と `recalc_driver_page` (全量再計算の母集団の 1 ページ)。母集団は打刻・保存済み・
+/// `extra` の和で、`after`・`stale_only`・`limit`・0 以下の除外が効く。壊れた月・空の並びは落ちる。
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_state_and_recalc_driver_page_match_the_root_path() {
-    let t = both().await;
+async fn stale_state_and_recalc_driver_page_return_the_fixed_values() {
+    let t = env().await;
     let units = golden_units();
     let ver = logic_version(&KosokuParams::default());
     let months = vec![MONTH.to_string()];
 
     // 空の月: stale 0・版の一覧は空、母集団は extra だけ (版の列は CHAR(16))
     let none = BTreeSet::new();
-    let r = t.root.stale_state(&months, &ver).await.unwrap();
-    assert_eq!(r, t.worker.stale_state(&months, &ver).await.unwrap());
+    let r = t.worker.stale_state(&months, &ver).await.unwrap();
     assert_eq!((r.drivers, r.versions.len()), (0, 0));
     let extra = BTreeSet::from([-5, 0, 77]);
     let page = |after, stale_only, limit, extra: BTreeSet<i64>| {
         let t = &t;
         let ver = ver.clone();
         async move {
-            let r = t
-                .root
+            t.worker
                 .recalc_driver_page(MONTH, &ver, &extra, after, stale_only, limit)
                 .await
-                .unwrap();
-            let w = t
-                .worker
-                .recalc_driver_page(MONTH, &ver, &extra, after, stale_only, limit)
-                .await
-                .unwrap();
-            assert_eq!(
-                r, w,
-                "after={after:?} stale_only={stale_only} limit={limit}"
-            );
-            w
+                .unwrap()
         }
     };
     assert_eq!(page(None, false, 50, extra.clone()).await, vec![77]);
@@ -457,21 +422,18 @@ async fn stale_state_and_recalc_driver_page_match_the_root_path() {
 
     // 現行版で 1 人目、古い版で 2 人目を書き、打刻だけの乗務員を 1 人足す
     let (a, b) = (units[0].driver_cd, units[1].driver_cd);
-    write_both(&t, &units[0], &"1".repeat(64), &ver).await;
-    write_both(&t, &units[1], &"2".repeat(64), "0000000000000000").await;
-    for tenant in [t.a, t.b] {
-        sqlx::query(
-            "INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw) \
-             VALUES ($1, 31, '2026-06-03 08:00:00+09', '始業', 'timecard', NULL, '{}'::jsonb)",
-        )
-        .bind(tenant)
-        .execute(&t.pool)
-        .await
-        .expect("seed events");
-    }
+    write(&t, &units[0], &"1".repeat(64), &ver).await;
+    write(&t, &units[1], &"2".repeat(64), "0000000000000000").await;
+    sqlx::query(
+        "INSERT INTO kintai.kintai_events (tenant_id, driver_cd, occurred_at, state, source, unko_no, raw) \
+         VALUES ($1, 31, '2026-06-03 08:00:00+09', '始業', 'timecard', NULL, '{}'::jsonb)",
+    )
+    .bind(t.tenant)
+    .execute(&t.pool)
+    .await
+    .expect("seed events");
 
-    let r = t.root.stale_state(&months, &ver).await.unwrap();
-    assert_eq!(r, t.worker.stale_state(&months, &ver).await.unwrap());
+    let r = t.worker.stale_state(&months, &ver).await.unwrap();
     assert_eq!(r.drivers, 1, "古い版の乗務員だけ");
     assert_eq!(r.logic_version, ver);
     let mut versions = r.versions.clone();
@@ -479,12 +441,10 @@ async fn stale_state_and_recalc_driver_page_match_the_root_path() {
     let mut want = vec![ver.clone(), "0000000000000000".to_string()];
     want.sort();
     assert_eq!(versions, want);
-    // 月が飛んでいても 1 回で数える (並びの順にも依らない)
+    // 月が飛んでいても 1 回で数える (並びの順にも依らない): 2026-05..2026-08 の間の 2026-06 の 1 人を数えるだけ
     let wide = vec!["2026-08".to_string(), "2026-05".to_string()];
-    assert_eq!(
-        t.root.stale_state(&wide, &ver).await.unwrap(),
-        t.worker.stale_state(&wide, &ver).await.unwrap()
-    );
+    let w = t.worker.stale_state(&wide, &ver).await.unwrap();
+    assert_eq!((w.drivers, w.versions.len()), (1, 2));
 
     let mut all = vec![31, a, b, 77];
     all.sort();
@@ -503,18 +463,11 @@ async fn stale_state_and_recalc_driver_page_match_the_root_path() {
     );
 
     // 壊れた月・空の並び
-    assert!(t.root.stale_state(&[], &ver).await.is_err());
     let e = t.worker.stale_state(&[], &ver).await.unwrap_err();
     assert_eq!(e.to_string(), "months が空です");
     let bad = vec!["2026-13".to_string()];
-    assert!(t.root.stale_state(&bad, &ver).await.is_err());
     let e = t.worker.stale_state(&bad, &ver).await.unwrap_err();
     assert_eq!(e.to_string(), "bad month: 2026-13");
-    assert!(t
-        .root
-        .recalc_driver_page("x", &ver, &none, None, false, 5)
-        .await
-        .is_err());
     let e = t
         .worker
         .recalc_driver_page("x", &ver, &none, None, false, 5)

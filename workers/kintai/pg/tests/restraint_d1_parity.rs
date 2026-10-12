@@ -1,19 +1,15 @@
-//! 拘束サマリ (restraint) の 3 口: オンプレ版 (root の axum の handler + rusqlite の `RestraintStore`) と、勤怠 Worker の D1 の経路を
-//! native の SQLite で流したものに**同じ要求の列**を与え、応答 (status と本文) が一致することを確かめる (Refs #322)。DB は要らない。
+//! 拘束サマリ (restraint) の 3 口: 勤怠 Worker の D1 の経路を native の SQLite で流したものに**固定の要求の列**を与え、応答
+//! (status と本文) が固定した期待値になることを確かめる (Refs #322)。DB は要らない。
+//!
+//! 期待値は、オンプレ版 (root の axum の handler + rusqlite の `RestraintStore`) に同じ要求の列を与えて一致していた値
+//! (本文の `synced_at` は時刻なので `<synced_at>` に伏せる)。ファイル名の `restraint_d1_parity` は、比較の相手を外す前の名前を
+//! 残している。
 //!
 //! D1 の経路は Worker (`worker/src/restraint.rs`) と同じ順・同じ部品で組む: 本文 (`parse_json`) / Query (`parse_query`) →
 //! 検査 (`restraint`) → 文の束 (`restraint_d1`) を 1 transaction で流す (D1 の `batch` と同じ) → 行を列名をキーにした object
 //! (D1 の結果と同じ形) にして `restraint_d1` が応答を組む。表は D1 の migration (`SCHEMA_SQL` = migrations/0001_restraint.sql)。
 //! wasm 専用の部分 (D1 の binding・JsValue への写し) だけがここに無い。
-//!
-//! この crate に置くのは、repo ルートの package (オンプレ版) を dev-dependency に持つのがここだけだから。
 
-use std::sync::Arc;
-
-use axum::body::Body;
-use axum::http::Request;
-use axum::routing::{get, put};
-use axum::{Extension, Router};
 use kintai_logic::common::{parse_json, parse_query, Fail};
 use kintai_logic::restraint::{
     parse_synced_months, parse_wage_source, summary_binds, validate_push, Bind, ErrorBody,
@@ -25,39 +21,7 @@ use kintai_logic::restraint_d1::{
 };
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params_from_iter, Connection};
-use rust_ichibanboshi::restraint_store::{DynRestraintStore, RestraintStore, RestraintStoreApi};
-use rust_ichibanboshi::routes::restraint::{put_summaries, synced_months, wage_source};
 use serde_json::{json, Value};
-use tower::ServiceExt;
-
-// ── オンプレ版 ──
-
-fn root_app(store: DynRestraintStore) -> Router {
-    Router::new()
-        .route("/api/restraint/summaries", put(put_summaries))
-        .route("/api/restraint/wage-source", get(wage_source))
-        .route("/api/restraint/synced-months", get(synced_months))
-        .layer(Extension(store))
-}
-
-async fn root(
-    store: &DynRestraintStore,
-    method: &str,
-    uri: &str,
-    body: Option<&str>,
-) -> (u16, String) {
-    let mut b = Request::builder().method(method).uri(uri);
-    if body.is_some() {
-        b = b.header("content-type", "application/json");
-    }
-    let req = b.body(Body::from(body.unwrap_or("").to_string())).unwrap();
-    let res = root_app(store.clone()).oneshot(req).await.unwrap();
-    let status = res.status().as_u16();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, String::from_utf8(bytes.to_vec()).unwrap())
-}
 
 /// JSON ならその値、平文なら文字列。
 fn body_value(bytes: &[u8]) -> Value {
@@ -195,13 +159,11 @@ fn mask(body: &str) -> String {
     out
 }
 
-/// 2 つの応答が status・本文 (synced_at を伏せたバイト列) で一致し、synced_at の書式がオンプレ版と同じこと。
-fn assert_same(got: &(u16, String), want: &(u16, String), what: &str) {
+/// 応答が status・本文 (synced_at を伏せたバイト列) で期待値と一致し、synced_at の書式がオンプレ版と同じこと。
+fn assert_fixed(got: &(u16, String), want: &(u16, &str), what: &str) {
     assert_eq!(got.0, want.0, "{what}: status");
-    assert_eq!(mask(&got.1), mask(&want.1), "{what}: 本文");
-    for body in [&got.1, &want.1] {
-        normalize(&mut body_value(body.as_bytes()));
-    }
+    assert_eq!(mask(&got.1), want.1, "{what}: 本文");
+    normalize(&mut body_value(got.1.as_bytes()));
 }
 
 /// synced_at は時刻なので "<synced_at>" に (null はそのまま)。書式はオンプレ版と同じであることを先に確かめる。
@@ -325,37 +287,112 @@ fn steps() -> Vec<Step> {
     ]
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_same_requests_give_the_same_responses() {
-    let store: DynRestraintStore = Arc::new(RestraintStore::open(":memory:").unwrap());
+/// `steps()` と同じ順の期待値 (status, `synced_at` を伏せた本文)。
+fn expected() -> Vec<(u16, &'static str)> {
+    let put = |saved: u8| -> (u16, &'static str) {
+        match saved {
+            0 => (200, r#"{"saved":0,"synced_at":"<synced_at>"}"#),
+            1 => (200, r#"{"saved":1,"synced_at":"<synced_at>"}"#),
+            _ => (200, r#"{"saved":2,"synced_at":"<synced_at>"}"#),
+        }
+    };
+    vec![
+        put(2),
+        put(2),
+        put(1),
+        put(1),
+        put(1),
+        put(0),
+        put(1),
+        put(1),
+        // 400 の検査 (順と文言)
+        (400, r#"{"error":"comp_id が不正です"}"#),
+        (
+            400,
+            r#"{"error":"source は theearth / timecard のいずれかで指定してください"}"#,
+        ),
+        (400, r#"{"error":"month は YYYY-MM で指定してください"}"#),
+        (400, r#"{"error":"driver_cd が空の entry があります"}"#),
+        (
+            400,
+            r#"{"error":"driver_cd=9 は no_data でないのに summary がありません"}"#,
+        ),
+        // 本文が読めない (axum の Json の拒否と同じ平文)
+        (
+            400,
+            "Failed to parse the request body as JSON: key must be a string at line 1 column 2",
+        ),
+        (
+            422,
+            "Failed to deserialize the JSON body into the target type: missing field `source` at line 1 column 15",
+        ),
+        // wage-source: 200 (100 は上書き後の 999・200 は残る・300 は no_data・前月 05 の 100)
+        (
+            200,
+            r#"{"comp_id":"27324455","month":"2026-06","prev_month":"2026-05","current_theearth":{"summaries":[{"driver_cd":"100","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"100","driverName":"乗務員100","restraintMinutes":999},"fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z"},{"driver_cd":"200","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"200","driverName":"乗務員200","restraintMinutes":700},"fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z"}],"no_data_drivers":["300"],"synced_at":"<synced_at>"},"current_timecard":{"summaries":[{"driver_cd":"300","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"300","driverName":"乗務員300","restraintMinutes":480},"fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z"}],"no_data_drivers":[],"synced_at":"<synced_at>"},"prev_theearth":{"summaries":[{"driver_cd":"100","summary":{"days":[{"day":1,"isRestDay":false}],"driverCd":"100","driverName":"乗務員100","restraintMinutes":500},"fetched_at":"2026-07-01T00-00-00Z","last_verified_at":"2026-07-02T00-00-00Z"}],"no_data_drivers":[],"synced_at":"<synced_at>"},"prev_timecard":{"summaries":[],"no_data_drivers":[],"synced_at":null}}"#,
+        ),
+        (
+            200,
+            r#"{"comp_id":"27324455","month":"2026-01","prev_month":"2025-12","current_theearth":{"summaries":[],"no_data_drivers":[],"synced_at":"<synced_at>"},"current_timecard":{"summaries":[],"no_data_drivers":[],"synced_at":null},"prev_theearth":{"summaries":[],"no_data_drivers":[],"synced_at":null},"prev_timecard":{"summaries":[],"no_data_drivers":["400"],"synced_at":"<synced_at>"}}"#,
+        ),
+        (
+            200,
+            r#"{"comp_id":"nobody","month":"2026-06","prev_month":"2026-05","current_theearth":{"summaries":[],"no_data_drivers":[],"synced_at":null},"current_timecard":{"summaries":[],"no_data_drivers":[],"synced_at":null},"prev_theearth":{"summaries":[],"no_data_drivers":[],"synced_at":null},"prev_timecard":{"summaries":[],"no_data_drivers":[],"synced_at":null}}"#,
+        ),
+        (400, r#"{"error":"comp が不正です"}"#),
+        (400, r#"{"error":"month は YYYY-MM で指定してください"}"#),
+        (
+            400,
+            "Failed to deserialize query string: missing field `month`",
+        ),
+        // synced-months
+        (
+            200,
+            r#"{"entries":[{"source":"theearth","month":"2026-01","synced_at":"<synced_at>","row_count":0},{"source":"theearth","month":"2026-05","synced_at":"<synced_at>","row_count":1},{"source":"theearth","month":"2026-06","synced_at":"<synced_at>","row_count":3},{"source":"timecard","month":"2025-12","synced_at":"<synced_at>","row_count":1},{"source":"timecard","month":"2026-06","synced_at":"<synced_at>","row_count":1}]}"#,
+        ),
+        (
+            200,
+            r#"{"entries":[{"source":"theearth","month":"2026-06","synced_at":"<synced_at>","row_count":1}]}"#,
+        ),
+        (200, r#"{"entries":[]}"#),
+        (400, r#"{"error":"comp が不正です"}"#),
+        (
+            400,
+            "Failed to deserialize query string: missing field `comp`",
+        ),
+    ]
+}
+
+#[test]
+fn the_fixed_requests_give_the_fixed_responses() {
     let mut d1 = D1::new();
     let mut now = 1_791_594_123_000_i64;
-    for (i, step) in steps().into_iter().enumerate() {
-        let (want, got) = match &step {
+    let want = expected();
+    let steps = steps();
+    assert_eq!(steps.len(), want.len());
+    for (i, step) in steps.into_iter().enumerate() {
+        let got = match &step {
             Step::Put(body) => {
                 now += 1;
-                (
-                    root(&store, "PUT", "/api/restraint/summaries", Some(body)).await,
-                    d1.put(body, now),
-                )
+                d1.put(body, now)
             }
             Step::Get(uri) => {
                 let query = uri.split_once('?').map_or("", |(_, q)| q);
-                let got = if uri.starts_with("/api/restraint/wage-source") {
+                if uri.starts_with("/api/restraint/wage-source") {
                     d1.wage_source(query)
                 } else {
                     d1.synced_months(query)
-                };
-                (root(&store, "GET", uri, None).await, got)
+                }
             }
         };
-        assert_same(&got, &want, &format!("要求 {i}"));
+        assert_fixed(&got, &want[i], &format!("要求 {i}"));
     }
 }
 
-/// 壊れた summary_json の行 (検査を通らない形で表に入ったもの) を、どちらも行単位で落として残りを返す。
-#[tokio::test(flavor = "multi_thread")]
-async fn broken_rows_are_dropped_the_same_way() {
+/// 壊れた summary_json の行 (検査を通らない形で表に入ったもの) を行単位で落として残りを返す。
+/// 行だけを入れた (sync_state を書いていない) ので `synced_at` は null。
+#[test]
+fn broken_rows_are_dropped() {
     let rows = [
         RestraintEntry {
             driver_cd: "100".into(),
@@ -379,17 +416,6 @@ async fn broken_rows_are_dropped_the_same_way() {
             last_verified_at: None,
         },
     ];
-    let raw = RestraintStore::open(":memory:").unwrap();
-    raw.upsert(
-        "27324455",
-        "theearth",
-        "2026-06",
-        &rows,
-        "2026-07-01T00:00:00.000000000+00:00",
-    )
-    .await
-    .unwrap();
-    let store: DynRestraintStore = Arc::new(raw);
     let mut d1 = D1::new();
     let stmts: Vec<Stmt> = rows
         .iter()
@@ -399,15 +425,10 @@ async fn broken_rows_are_dropped_the_same_way() {
         })
         .collect();
     d1.batch(&stmts);
-    let uri = "/api/restraint/wage-source?comp=27324455&month=2026-06";
-    let want = root(&store, "GET", uri, None).await;
-    // オンプレ版は upsert で sync_state も書いた (synced_at あり)。D1 側は行だけ入れたので null — そこだけ違う
-    let got = d1.wage_source(uri.split_once('?').unwrap().1);
-    let nulled = mask(&want.1).replacen("\"synced_at\":\"<synced_at>\"", "\"synced_at\":null", 1);
-    assert_eq!((got.0, got.1.clone()), (want.0, nulled));
-    let v = body_value(got.1.as_bytes());
+    let got = d1.wage_source("comp=27324455&month=2026-06");
+    assert_eq!(got.0, 200);
     assert_eq!(
-        v["current_theearth"]["summaries"].as_array().unwrap().len(),
-        1
+        got.1,
+        r#"{"comp_id":"27324455","month":"2026-06","prev_month":"2026-05","current_theearth":{"summaries":[{"driver_cd":"200","summary":{"driverCd":"200"},"fetched_at":"f","last_verified_at":null}],"no_data_drivers":[],"synced_at":null},"current_timecard":{"summaries":[],"no_data_drivers":[],"synced_at":null},"prev_theearth":{"summaries":[],"no_data_drivers":[],"synced_at":null},"prev_timecard":{"summaries":[],"no_data_drivers":[],"synced_at":null}}"#
     );
 }
