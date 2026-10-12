@@ -1,0 +1,25 @@
+# 売上 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。
+# この段の口は GET /health・POST /probe (D1 に SELECT 1) と、D1 (binding URIAGE_DB) を読む GET /api/uriage/* の 6 本
+# (daily・person-monthly-totals・person-partner-totals・r2/pending・recalc-jobs・verify-history)。
+# SQL・検査・行の読み取り・応答は uriage-logic の d1 (オンプレ版と同じ文・同じ応答の型)。書き込みの口・SQL Server・CakePHP・R2 は次の PR。
+[package]
+name = "uriage-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# クエリ文字列の読み方はオンプレ版 (axum の Query) と同じ: serde_urlencoded + serde_path_to_error
+form_urlencoded = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+serde_urlencoded = "0.7"
+uriage-logic = { path = "../logic" }
+wasm-bindgen = "0.2"
+# d1: 担当者別売上の D1 (binding URIAGE_DB)
+worker = { version = "=0.8.7", features = ["d1"] }
+worker-sys = "=0.8.7"

@@ -35,3 +35,11 @@ path = "workers/uriage/logic/src/cakephp.rs"
 # 口の Query と応答の型・r2/pending の verify gate・verify-debug の行
 [[files]]
 path = "workers/uriage/logic/src/api.rs"
+
+# D1 の表の定義・読みの口 6 本の文・検査・行の読み取り・応答。応答は logic/tests/d1.rs がオンプレ版と一致させた期待値で固定
+[[files]]
+path = "workers/uriage/logic/src/d1.rs"
+
+# Worker の経路の判定と応答の形 (404 / 405・失敗の本文)
+[[files]]
+path = "workers/uriage/logic/src/routes.rs"

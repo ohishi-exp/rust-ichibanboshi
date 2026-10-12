@@ -6,7 +6,9 @@
 pub mod api;
 pub mod cakephp;
 pub mod compute;
+pub mod d1;
 pub mod period;
 pub mod raw;
+pub mod routes;
 pub mod sqlserver;
 pub mod verify;
