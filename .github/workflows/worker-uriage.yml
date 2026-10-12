@@ -1,0 +1,94 @@
+name: worker-uriage
+
+# workers/uriage (担当者別売上の Worker 化、Refs #322)。いまは純粋部分の crate uriage-logic だけ (Worker の crate・deploy は次の PR)。
+#   - pull_request / main への push → logic の test と 100% gate、wasm32 で build できること・clippy、root の Cargo.lock の鮮度
+# (この経路は secret も token も使わない)
+# root (オンプレ版) も uriage-logic に path 依存するので、root の売上の口 (src/routes/uriage.rs 等) を変えたときも走らせる。
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'workers/uriage/**'
+      - '.github/workflows/worker-uriage.yml'
+      - 'src/routes/uriage.rs'
+      - 'src/repo.rs'
+      - 'src/cakephp.rs'
+      - 'src/sqlite.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    branches: [main]
+    paths:
+      - 'workers/uriage/**'
+      - '.github/workflows/worker-uriage.yml'
+      - 'src/routes/uriage.rs'
+      - 'src/repo.rs'
+      - 'src/cakephp.rs'
+      - 'src/sqlite.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  logic:
+    name: Logic test + 100% gate + wasm32 build + clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/uriage
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      # root (repo ルートの package) は uriage-logic に path 依存する。
+      # workers/uriage だけを変えて root の Cargo.lock を更新し忘れると、main の CI (--locked の build) が落ちる
+      - name: Root Cargo.lock is up to date
+        working-directory: .
+        run: |
+          if ! cargo metadata --locked --format-version 1 > /dev/null; then
+            echo "::error::root の Cargo.lock が古い。workers/uriage の依存を変えたら root の Cargo.lock も更新する (root が uriage-logic に path 依存しているため)。cargo metadata --format-version 1 で更新できる"
+            exit 1
+          fi
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: uriage-worker
+          workspaces: workers/uriage -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # SQL の文字列と ndjson・fingerprint のゴールデン (logic/tests/golden.rs) を含む
+      - name: Test (uriage-logic)
+        working-directory: .
+        run: cargo test --locked --manifest-path workers/uriage/Cargo.toml -p uriage-logic
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # 行カバレッジ 100% gate (登録簿 workers/uriage/coverage_100.toml)。判定は repo ルートの
+      # check_coverage_100.sh を共用する
+      - name: Coverage 100% gate (uriage-logic)
+        working-directory: .
+        run: |
+          cov="$RUNNER_TEMP/uriage-logic-cov.txt"
+          cargo llvm-cov --locked --manifest-path workers/uriage/Cargo.toml -p uriage-logic --text > "$cov"
+          bash scripts/check_coverage_100.sh --config workers/uriage/coverage_100.toml --use-cache "$cov"
+
+      # Worker (次の PR) が wasm32 で使えること (tiberius・tokio・clock に依存していないこと)
+      - name: Build (wasm32-unknown-unknown)
+        run: cargo build --locked --target wasm32-unknown-unknown
+
+      - name: Clippy (wasm32-unknown-unknown)
+        run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Clippy (native、テスト込み)
+        run: cargo clippy --locked --all-targets -- -D warnings
