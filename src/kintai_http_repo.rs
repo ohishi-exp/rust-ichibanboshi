@@ -199,8 +199,8 @@ impl KintaiTokenProvider for CommandTokenProvider {
 /// GCE / Cloud Run の metadata server。**コンテナの中から** identity token を取る唯一の道。
 ///
 /// `auth_token_command = "gcloud auth print-identity-token"` は**開発機から Cloud Run を
-/// 叩く**ための経路で、Cloud Run の中では動かない — `Dockerfile` が入れているのは
-/// `ca-certificates` だけで、`gcloud` も `curl` も存在しない。
+/// 叩く**ための経路で、Cloud Run の中では動かない — image に入っていたのは
+/// `ca-certificates` だけで、`gcloud` も `curl` も存在しなかった。
 pub const METADATA_BASE_URL: &str = "http://metadata.google.internal";
 
 /// metadata server の identity token endpoint (audience を query で渡す)。

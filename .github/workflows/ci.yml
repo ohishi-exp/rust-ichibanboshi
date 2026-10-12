@@ -10,9 +10,8 @@ name: CI
 # そのぶん価値がある — kintai_push_pg_test / kintai_fold_pg_test が
 # KINTAI_TEST_DATABASE_URL 付きで **skip されずに走る唯一の場所**。
 #
-# **Cloud Run への deploy は gcp-image.yml (main push) が持っている。あちらの
-# トリガは絶対に触らないこと。** この ci.yml 内の deploy (オンプレ CF Tunnel SSH)
-# と kintai-migrate は if で main push 限定なので branch push では発火しない。
+# この ci.yml 内の deploy (オンプレ CF Tunnel SSH) と kintai-migrate は if で
+# main push 限定なので branch push では発火しない。Cloud Run への deploy は撤去済み。
 on:
   push:
     branches: [main, 'fix/**', 'feat/**', 'perf/**', 'docs/**', 'chore/**', 'claude/**']

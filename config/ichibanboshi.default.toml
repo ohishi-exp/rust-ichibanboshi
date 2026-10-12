@@ -3,7 +3,7 @@ bind_addr = "127.0.0.1"
 
 # SQL Server (CAPE#01) を**使うと宣言するか**。既定 true = オンプレ (ohishi-data) の形。
 # 宣言したものに起動時に繋がらなければ**起動失敗**する (静かな degraded を作らない)。
-# SQL Server を持たない実行形態 (Cloud Run 等) は enabled = false を宣言する。その場合
+# SQL Server を持たない実行形態 (かつての Cloud Run 版等) は enabled = false を宣言する。その場合
 # pool を作らず SQL Server 依存ルートは 503 fail-closed、/health は
 # backends.sqlserver = "disabled" を返す。環境変数 DATABASE_ENABLED でも指定できる。
 [database]
@@ -80,11 +80,11 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 #                        シェルは経由せず空白で argv に分割して exec する
 #                        (パイプ・リダイレクト・クォートは使えない)
 #   auth_token_metadata — GCE / Cloud Run の metadata server から identity token を取る。
-#                        **Cloud Run の中ではこれしか選べない** — イメージには
-#                        ca-certificates しか入っておらず gcloud も curl も無い。
+#                        **Cloud Run の中ではこれしか選べなかった** — イメージには
+#                        ca-certificates しか入っておらず gcloud も curl も無かった。
 #                        audience は base_url をそのまま使う
 #
-# 環境変数でも同じ項目を指定できる (Cloud Run の主経路):
+# 環境変数でも同じ項目を指定できる (Cloud Run 版の主経路だった。Cloud Run への deploy は撤去済み):
 #   KINTAI_EVENTS_SOURCE / _BASE_URL / _TENANT_ID / _TIMEOUT_SECS
 #   KINTAI_EVENTS_AUTH_TOKEN / _AUTH_TOKEN_COMMAND / _AUTH_TOKEN_METADATA / _AUTH_TOKEN_TTL_SECS
 # [kintai_events]
@@ -102,7 +102,7 @@ allowed_origins = ["https://ichibanboshi.mtamaramu.com"]
 # 同じ流儀)。宣言したのに接続先や tenant_id が無ければ**起動を失敗させる**。
 #
 # **畳んで書くのは GCP 側** (2026-07-30 の決定)。オンプレは MariaDB から打刻を読んで
-# relay に返すだけで、書くのは Cloud Run 側。オンプレ直書き (#217 の形) も残してあるので、
+# relay に返すだけで、書くのは Cloud Run 版だった (撤去済み)。オンプレ直書き (#217 の形) も残してあるので、
 # 両方の形態でこの宣言が生きる。ここで使うロールは kintai_writer。
 #
 # **この pool は打刻の読み返しにも使う** (Refs #205 の G6)。[kintai_events] source = "http"
