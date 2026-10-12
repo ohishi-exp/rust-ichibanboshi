@@ -32,12 +32,33 @@ pub struct MastersResponse {
 pub struct OfficeMasters {
     pub display_name: String,
     /// 入力担当C (string keys、CakePHP 側 JSON 仕様) → 担当者名
+    #[serde(default, deserialize_with = "map_or_empty_list")]
     pub persons: HashMap<String, String>,
     /// 稼動部門コード → 営業所名 (別営業所判定)
+    #[serde(default, deserialize_with = "map_or_empty_list")]
     pub other: HashMap<String, String>,
     /// 受注部門コード配列 (PR #766 で追加)
     #[serde(default)]
     pub bumon: Vec<String>,
+}
+
+/// object は map、空の配列 `[]` は空の map として読む。PHP は空の連想配列を `[]` で出す
+/// (担当者のいない営業所の `persons`)。空でない配列は黙って捨てずエラーにする。
+fn map_or_empty_list<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MapOrList {
+        Map(HashMap<String, String>),
+        List(Vec<serde::de::IgnoredAny>),
+    }
+    match MapOrList::deserialize(d)? {
+        MapOrList::Map(m) => Ok(m),
+        MapOrList::List(l) if l.is_empty() => Ok(HashMap::new()),
+        MapOrList::List(_) => Err(serde::de::Error::custom("non-empty array")),
+    }
 }
 
 impl OfficeMasters {
@@ -204,6 +225,38 @@ mod tests {
         }"#;
         let m: MastersResponse = serde_json::from_str(json).unwrap();
         assert!(m.offices["1"].bumon.is_empty());
+    }
+
+    #[test]
+    fn empty_array_persons_and_other_read_as_empty_maps() {
+        let json = r#"{
+            "date": "2026-09-30",
+            "offices": {
+                "1": {"display_name": "本社", "persons": {"1499": "青井"}, "other": []},
+                "9": {"display_name": "宮崎", "persons": [], "other": {"031": "帯広"}}
+            }
+        }"#;
+        let m: MastersResponse = serde_json::from_str(json).unwrap();
+        assert!(m.offices["9"].persons.is_empty());
+        assert_eq!(m.offices["9"].other.len(), 1);
+        assert_eq!(m.offices["1"].persons["1499"], "青井");
+        assert!(m.offices["1"].other.is_empty());
+    }
+
+    #[test]
+    fn non_empty_array_persons_is_an_error() {
+        let json = r#"{"date": "d", "offices": {"1": {"display_name": "x", "persons": ["x"], "other": {}}}}"#;
+        assert!(serde_json::from_str::<MastersResponse>(json).is_err());
+        let err = read_json::<MastersResponse>(200, json.as_bytes()).unwrap_err();
+        assert_eq!(err, CakephpError::Json);
+    }
+
+    #[test]
+    fn missing_persons_and_other_default_to_empty() {
+        let json = r#"{"date": "d", "offices": {"1": {"display_name": "x"}}}"#;
+        let m: MastersResponse = serde_json::from_str(json).unwrap();
+        assert!(m.offices["1"].persons.is_empty());
+        assert!(m.offices["1"].other.is_empty());
     }
 
     #[test]
