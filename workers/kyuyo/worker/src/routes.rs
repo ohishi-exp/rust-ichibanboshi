@@ -16,7 +16,7 @@ use kyuyo_logic::service::{
     companies_response, company_month_params, company_name, db_open_error_reply, month_indexes,
     ok_reply, payroll_rows, repo_error_reply, store_write_error, validate_company_month, DbError,
 };
-use kyuyo_logic::{Endpoint, Reply};
+use kyuyo_logic::{log_line_for, Endpoint, Reply};
 use worker::{console_error, console_log, console_warn, Date, Env, SqlStorage, Url};
 
 use crate::repo::{open, Db};
@@ -98,7 +98,7 @@ impl Ctx<'_> {
     }
 
     fn log_fail(&self, what: &str, e: &DbError) {
-        console_error!("{}", e.log_line(what, self.ms()));
+        console_error!("{}", log_line_for(what, e.stage, &e.kind, self.ms()));
     }
 
     fn log_ok(&self, what: &str, source: &str) {
@@ -162,7 +162,8 @@ impl Ctx<'_> {
         match db.company_names().await {
             Ok(pairs) => Some(pairs),
             Err(e) => {
-                console_warn!("{} (company_names)", e.log_line(what, self.ms()));
+                let line = log_line_for(what, e.stage, &e.kind, self.ms());
+                console_warn!("{line} (company_names)");
                 None
             }
         }

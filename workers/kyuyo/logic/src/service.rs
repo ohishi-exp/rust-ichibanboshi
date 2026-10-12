@@ -15,27 +15,11 @@ use crate::payroll::{
     build_companies, build_payroll_rows, parse_month, PayrollRow, RawKoumokuRow, RawKyuyoRow,
     RawShukeiRow, ALLOWED_COMPANIES,
 };
-use crate::{ErrKind, Reply, Stage};
+use crate::{Reply, Stage};
 
-/// 給与大臣を読む処理の失敗 (Worker の repo が返す)。本文は持たない (stage と種類だけ)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DbError {
-    pub stage: Stage,
-    pub kind: ErrKind,
-}
-
-impl DbError {
-    /// ログ 1 行 (`kyuyo payroll: failed at query (12 ms) kind=server:208/16/1`)。
-    pub fn log_line(&self, what: &str, elapsed_ms: u64) -> String {
-        crate::log_line_for(what, self.stage, &self.kind, elapsed_ms)
-    }
-
-    /// 「DB が開けない」(SQL Server error 4060)。オンプレ版 `map_db_open_err` の判定 ("Cannot open database"
-    /// は 4060 の文言) を、文言でなくエラー番号で行う。
-    pub fn cannot_open(&self) -> bool {
-        matches!(self.kind, ErrKind::Server { code: 4060, .. })
-    }
-}
+/// 給与大臣を読む処理の失敗 (Worker の repo が返す)。共有 crate `vpc-tds-logic` のもの。
+/// `cannot_open` は SQL Server error 4060 (オンプレ版 `map_db_open_err` の "Cannot open database") を番号で見る。
+pub use vpc_tds_logic::DbError;
 
 fn error_reply(status: u16, error: impl Into<String>) -> Reply {
     Reply {
@@ -209,6 +193,7 @@ pub fn encode_warnings(warnings: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::payroll::EmployeeRow;
+    use crate::ErrKind;
 
     fn db_err(stage: Stage, kind: ErrKind) -> DbError {
         DbError { stage, kind }
@@ -267,17 +252,10 @@ mod tests {
     }
 
     #[test]
-    fn cannot_open_by_code() {
-        assert!(db_err(Stage::Query, server(4060)).cannot_open());
-        assert!(!db_err(Stage::Query, server(208)).cannot_open());
-        assert!(!db_err(Stage::Query, ErrKind::Io("Other".into())).cannot_open());
-    }
-
-    #[test]
     fn log_line() {
         let e = db_err(Stage::Query, server(208));
         assert_eq!(
-            e.log_line("payroll", 12),
+            crate::log_line_for("payroll", e.stage, &e.kind, 12),
             "kyuyo payroll: failed at query (12 ms) kind=server:208/16/1"
         );
     }

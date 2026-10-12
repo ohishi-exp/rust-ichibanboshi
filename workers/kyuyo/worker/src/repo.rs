@@ -7,11 +7,8 @@
 //! 1 リクエスト = 1 接続 ([`open`] で繋ぎ、終わったら [`Db::close`])。bb8 は wasm32 で使えないので pool は持たない。
 //! 失敗は `DbError` (stage と種類だけ) で返し、エラーの本文・ホスト・ユーザー名はどこにも出さない。
 
-use std::future::Future;
-use std::pin::pin;
 use std::time::Duration;
 
-use futures_util::future::{select, Either};
 use kyuyo_logic::payroll::{
     normalize_company_code, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
     KINDATA_COLUMNS, MONEY_COLUMNS,
@@ -21,90 +18,35 @@ use kyuyo_logic::sql::{
     employees_sql, koumoku_sql, payroll_month_sql, shukei_totals_sql, COMPANY_NAMES_SQL,
     DATABASES_WITH_ACCESS_SQL, DATABASE_NAMES_SQL,
 };
-use kyuyo_logic::{parse_creds, Creds, ErrKind, Stage};
-use tiberius::error::Error as TdsError;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Row};
-use tokio_util::compat::Compat;
-use worker::{Delay, Env, Socket};
+use kyuyo_logic::{ErrKind, Stage};
+use tiberius::Row;
+use vpc_tds::{Conn, Target};
+use worker::Env;
 
-use crate::{text, transport};
+pub(crate) use vpc_tds::{kind_of, timeout};
 
-/// TCP を開いてからログインが終わるまでの上限。応答しない相手で fetch を握り続けない。
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 1 本のクエリの上限。`companies` の HAS_DBACCESS は AUTO_CLOSE の全 DB を開いて回るので 10 秒級になる。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub(crate) type Conn = Client<Compat<Socket>>;
-
-/// tiberius のエラーを失敗の種類に写す。`message` や表示文言は読まない (種類・番号・状態だけ)。
-pub(crate) fn kind_of(e: &TdsError) -> ErrKind {
-    match e {
-        TdsError::Io { kind, .. } => ErrKind::Io(format!("{kind:?}")),
-        TdsError::Server(t) => ErrKind::Server {
-            code: t.code(),
-            class: t.class(),
-            state: t.state(),
-        },
-        TdsError::Protocol(_) => ErrKind::Protocol,
-        TdsError::Encoding(_) => ErrKind::Encoding,
-        TdsError::Tls(_) => ErrKind::Tls,
-        TdsError::Routing { .. } => ErrKind::Routing,
-        _ => ErrKind::Other,
-    }
-}
+/// 本番は Workers VPC の binding `KYUYO_VPC`、ローカル検証は var `LOCAL_SQL_ADDR` / `LOCAL_KYUYO_SQL_JSON`
+/// (本番の vars には置かない。scripts/check-exposure.sh が検査する)。
+/// DB は SQL 側で [KYDATA…].dbo.* と完全修飾するので master 固定。
+const TARGET: Target = Target {
+    binding: "KYUYO_VPC",
+    nominal_addr: "kyuyo-sql:1433",
+    local_addr_var: "LOCAL_SQL_ADDR",
+    database: "master",
+    secret: "KYUYO_SQL",
+    local_creds_var: "LOCAL_KYUYO_SQL_JSON",
+};
 
 fn fail(stage: Stage, kind: ErrKind) -> DbError {
     DbError { stage, kind }
 }
 
-/// 資格情報を読み、TCP を開いてログインする (database `master`、平文 TDS)。`/probe` もこれを通る。
+/// 資格情報を読み、TCP を開いてログインする (共有 crate `vpc-tds`、平文 TDS)。`/probe` もこれを通る。
 pub(crate) async fn connect(env: &Env) -> Result<Conn, DbError> {
-    let creds = load_creds(env)
-        .await
-        .map_err(|stage| fail(stage, ErrKind::Other))?;
-
-    let mut config = Config::new();
-    config.authentication(AuthMethod::sql_server(&creds.user, &creds.pass));
-    // 社内 LAN 区間の平文 TDS (SQL Server 2008 R2 は新しい TLS を話せない。オンプレ版と同じ)
-    config.encryption(EncryptionLevel::NotSupported);
-    // DB は SQL 側で [KYDATA…].dbo.* と完全修飾するので master 固定
-    config.database("master");
-
-    timeout(CONNECT_TIMEOUT, async {
-        let stream = transport::open(env)
-            .await
-            .map_err(|_| fail(Stage::Connect, ErrKind::Transport))?;
-        Client::connect(config, stream)
-            .await
-            .map_err(|e| fail(Stage::Login, kind_of(&e)))
-    })
-    .await
-    .ok_or(fail(Stage::Connect, ErrKind::Timeout))?
-}
-
-/// 資格情報を読んで検証する (`kyuyo_logic::parse_creds`)。読めない・キー欠け・空は `Stage::Secret` (中身はどこにも出さない)。
-async fn load_creds(env: &Env) -> Result<Creds, Stage> {
-    // ローカル検証 (wrangler dev) だけ: Secrets Store が使えないので var LOCAL_KYUYO_SQL_JSON で代える。
-    // 本番の vars には置かない (scripts/check-exposure.sh が検査する)
-    let json = match text(env, "LOCAL_KYUYO_SQL_JSON") {
-        Some(json) => json,
-        None => env
-            .secret_store("KYUYO_SQL")
-            .map_err(|_| Stage::Secret)?
-            .get()
-            .await
-            .map_err(|_| Stage::Secret)?
-            .ok_or(Stage::Secret)?,
-    };
-    parse_creds(&json)
-}
-
-/// `fut` を `limit` で打ち切る。時間切れは `None`。
-pub(crate) async fn timeout<T>(limit: Duration, fut: impl Future<Output = T>) -> Option<T> {
-    match select(pin!(fut), pin!(Delay::from(limit))).await {
-        Either::Left((v, _)) => Some(v),
-        Either::Right(_) => None,
-    }
+    vpc_tds::connect(env, &TARGET).await
 }
 
 fn get_str(row: &Row, idx: usize) -> String {

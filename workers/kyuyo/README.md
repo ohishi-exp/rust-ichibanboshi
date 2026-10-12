@@ -29,11 +29,9 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `worker/src/state.rs` | Durable Object `KyuyoState` (SQLite)。SQL Server を開く処理はこの中のロックの中だけ |
 | `worker/src/auth.rs` | auth-worker の `KyuyoAuthEntrypoint.authorize(token)` (binding `AUTH_KYUYO`) への RPC |
 | `worker/src/probe.rs` | `POST /probe` の本体 (DO のロックの中で走る) |
-| `worker/src/repo.rs` | 資格情報・TCP・ログイン (`connect`、`/probe` と共用) と、`sql.rs` の文を流して `Raw*Row` に詰める読み取り (型が合わなければ空文字 / 0、オンプレ版と同じ) |
+| `worker/src/repo.rs` | 繋ぎ先の指定 (`connect`、`/probe` と共用。資格情報・TCP・ログインの本体は共有 crate `workers/shared/vpc-tds`) と、`sql.rs` の文を流して `Raw*Row` に詰める読み取り (型が合わなければ空文字 / 0、オンプレ版と同じ) |
 | `worker/src/routes.rs` | 5 口の本体 (DO のロックの中で走る。1 リクエスト = 1 接続) |
 | `worker/src/store.rs` | DO の SQLite の derived store の読み書き (オンプレ版 `src/kyuyo/store.rs` と同じ表・同じ中身) |
-| `worker/src/tcp.rs` | VPC binding の JS `connect()` を呼ぶ extern |
-| `worker/src/transport.rs` | socket を開いて `tokio_util::compat` で tiberius に渡せる形にする |
 | `scripts/check-exposure.sh` | `worker/wrangler.toml` の公開範囲の検査 (CI で毎回) |
 | `scripts/check-exposure-test.sh` | 上の陰性対照 |
 
