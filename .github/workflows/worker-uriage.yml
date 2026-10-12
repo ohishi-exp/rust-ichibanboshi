@@ -95,6 +95,12 @@ jobs:
           cargo llvm-cov --locked --manifest-path workers/uriage/Cargo.toml -p uriage-logic --text > "$cov"
           bash scripts/check_coverage_100.sh --config workers/uriage/coverage_100.toml --use-cache "$cov"
 
+      # state.db → D1/R2 の移送スクリプト (scripts/export_state_db.py) のテスト。python3 の標準ライブラリだけ。
+      # PR-F (オンプレ版の売上の撤去) でスクリプトと一緒に消す
+      - name: Test (state.db export script)
+        working-directory: .
+        run: python3 -m unittest workers/uriage/scripts/test_export_state_db.py
+
       # Worker と logic が wasm32 で build できること (logic が tiberius・tokio・clock に依存していないこと)
       - name: Build (wasm32-unknown-unknown)
         run: cargo build --locked --target wasm32-unknown-unknown
