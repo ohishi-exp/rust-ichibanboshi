@@ -7,7 +7,7 @@
 #
 # 実測は `cargo llvm-cov --text` 1 本。本 repo のテストは lib unit test も
 # tests/ の統合テストも全て MockRepo / wiremock / 純粋関数で完結しており、
-# SQL Server も MariaDB も環境変数も要らない (= DB 起動の要否で分ける軸が無い)。
+# SQL Server も環境変数も要らない (= DB 起動の要否で分ける軸が無い)。
 #
 # ## なぜ rust-alc-api にある `type` (unit / mock / combined) が無いのか
 #
@@ -42,16 +42,9 @@
 [[files]]
 path = "src/config.rs"
 
-# --- 生イベントの読み先 (Refs #205 実装計画 02) ---
-
-# 上流 (rust-alc-api の /api/dtako/events) は wiremock で stub する。
-# base URL を const にせず struct フィールドで受けているのはこのため
-[[files]]
-path = "src/kintai_http_repo.rs"
-
-# --- 拘束時間の純粋ロジック (DB も HTTP も触らない) ---
-# kosoku / kosoku_paper / kintai_rest_diff / kintai_reading_dates / kintai_tail_gap_probe は
-# 共有 crate workers/kintai/kosoku に移した (Refs #322)。登録簿は workers/kintai/coverage_100.toml
+# 勤怠のファイル (kintai_* / kosoku / restraint / dtako / shift_* / stale_months / unko_gaps /
+# change_log / wage_snapshot) はオンプレ版から撤去した (Refs #322)。勤怠 Worker の登録簿は
+# workers/kintai/coverage_100.toml
 
 [[files]]
 path = "src/rdp_nego.rs"
@@ -67,76 +60,21 @@ path = "src/rdp_defaults.rs"
 [[files]]
 path = "src/cf_access.rs"
 
-[[files]]
-path = "src/change_log.rs"
-
 # --- routes (全て MockRepo / wiremock でカバー) ---
-
-[[files]]
-path = "src/routes/change_log.rs"
 
 [[files]]
 path = "src/routes/health.rs"
 
-[[files]]
-path = "src/routes/kintai.rs"
-
-# 実測 112/112 で 100% (Refs #205 の 18)。CI の Coverage regression check は
-# postgres service 込みで cov-check を回すので、pg テストが要る形のまま登録できる
-[[files]]
-path = "src/routes/kintai_day_summaries.rs"
-
-# 実測 25/25 で 100% だが未登録だった (2026-07-30 の棚卸しで追加)
-[[files]]
-path = "src/routes/kintai_version.rs"
-
-[[files]]
-path = "src/routes/restraint.rs"
-
-# 勤務ごとの始業・終業・日別サマリ・暦日の按分を返す口 (Refs
-# ohishi-exp/nuxt-dtako-admin#1133)。shift_overlaps.rs と同じく pg テストが要る形の
-# まま登録 (CI の Coverage regression check は postgres service 込みで cov-check を回す)
-[[files]]
-path = "src/routes/shift_days.rs"
-
-# 同じ乗務員の勤務の時間帯が重なっている組を返す口 (Refs ohishi-exp/nuxt-dtako-admin#1123)。
-# stale_months.rs / unko_gaps.rs と同じく pg テストが要る形のまま登録 (CI の
-# Coverage regression check は postgres service 込みで cov-check を回す)
-[[files]]
-path = "src/routes/shift_overlaps.rs"
-
-# 月別 stale (畳み直しが要るか) を 1 往復で返す軽い口 (Refs #620 の 1)。実測
-# 248/248 で 100%。kintai_day_summaries.rs と同じく pg テストが要る形のまま登録
-# (CI の Coverage regression check は postgres service 込みで cov-check を回す)
-[[files]]
-path = "src/routes/stale_months.rs"
-
-# 取り込み漏れ候補 (also_in_month) の GCP にしか無い運行の運行NO を返す口
-# (Refs ohishi-exp/nuxt-dtako-admin#623 の 1)。実測 422/422 で 100%。
-# stale_months.rs と同じく pg テストが要る形のまま登録 (CI の Coverage
-# regression check は postgres service 込みで cov-check を回す)
-[[files]]
-path = "src/routes/unko_gaps.rs"
-
-# dtako_events の作業区分 (層 A) を 乗務員 × 暦日 × 区分 の秒数で返す口
-# (Refs ohishi-exp/nuxt-dtako-admin#612 の PR-2)。dtako_day.rs と同型で、
-# MockRepo / FailingRepo だけでカバーできる (DB 不要)
-[[files]]
-path = "src/routes/dtako_worktime.rs"
-
-# --- 未登録 (2026-07-30 実測、100% 未達) ---
+# --- 未登録 (2026-10-12 実測、100% 未達) ---
 #
 # 到達したら登録すること。`make cov-not100` で最新の未達一覧が出る。
 #
-#   src/cakephp.rs            220/223  98.7%  (miss 3)
-#   src/sqlite.rs            1798/1823 98.6%  (miss 25)
-#   src/restraint_store.rs    163/189  86.2%  (miss 26)
-#   src/kintai_version.rs     122/145  84.1%  (miss 23)
-#   src/routes/uriage.rs     1106/1334 82.9%  (miss 228)
-#   src/kintai_repo.rs        134/168  79.8%  (miss 34)
-#   src/kintai_pg_repo.rs      36/43   83.7%  (miss 7)   DB 層 (2026-07-31 実測)
-#   src/kintai_store.rs        67/92   72.8%  (miss 25)
-#   src/db.rs                   0/36    0.0%              DB 層
-#   src/main.rs                 0/25    0.0%              entrypoint
-#   src/repo.rs                          0.0%              DB 層 (tiberius 直叩き)
-#   src/server.rs                        0.0%              pool 生成 + bind
+#   src/cakephp.rs              92/96   95.8%  (miss 4)
+#   src/rdcleanpath.rs         123/126  97.6%  (miss 3)
+#   src/sqlite.rs             1844/1869 98.7%  (miss 25)
+#   src/routes/uriage.rs       522/710  73.5%  (miss 188)
+#   src/db.rs                    0/36    0.0%              DB 層
+#   src/main.rs                  0/20    0.0%              entrypoint
+#   src/repo.rs                  0/57    0.0%              DB 層 (tiberius 直叩き)
+#   src/server.rs                0/79    0.0%              pool 生成 + bind
+#   src/bin/rdp_relay.rs         0/298   0.0%              中継の entrypoint

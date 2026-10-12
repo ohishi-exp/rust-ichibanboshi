@@ -12,11 +12,7 @@ pub struct AppArgs {
     pub console: bool,
 
     /// Path to config file (TOML)
-    // `global = true` なのは、`ichibanboshi sync --month 2026-07 --config ...` の
-    // ようにサブコマンドの**後ろ**にも書けるようにするため (systemd の
-    // `deploy/ichibanboshi-sync.sh` がこの順で渡す)。doc コメントにすると
-    // `--help` の説明欄にそのまま出るので通常のコメントで書く。
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub config: Option<String>,
 
     /// HTTP server port (overrides config file)
@@ -99,56 +95,6 @@ pub struct CakephpConfig {
     /// HTTP request timeout (秒)。default 30 秒
     #[serde(default = "default_cakephp_timeout_secs")]
     pub timeout_secs: u64,
-
-    /// タイムカード derived store (SQLite、Refs #106 Phase 2) のパス。
-    /// 空 = 無効 (常に CakePHP 素通し)。キャッシュ扱い — 消して再 sync で再構築可。
-    #[serde(default = "default_kintai_sqlite_path")]
-    pub sqlite_path: String,
-}
-
-/// 修正リンク組み立て用の base URL 2 つ (Refs #205 の 57)。
-///
-/// `/api/kintai/day-events` が値ずれの修正導線 (theearth から csvdata.zip を
-/// 落とす → 社内 nginx のフォームへ) の**リンクを文字列として組む**ためだけに使う。
-/// **fetch はしない** — オンプレから nginx / dtako へ実際に到達可能かは見ない。
-/// 実値は repo に置かず、デプロイ先で env か TOML に注入する
-/// (`CakephpConfig.base_url` と同じ作法)。空文字ならその項目のリンクを省く。
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct DtakoDayLinksConfig {
-    /// 社内 nginx (CakePHP、`yhonda-ohishi/nginx`) の base URL。
-    /// `<base>/ryohi-rows/view/<23 桁 unko_no>` が未ログインで開けるビューア
-    /// (`AppController::beforeFilter` の `addUnauthenticatedActions` に `view`、
-    /// Refs #205 の 57 実機確認)。空 = リンク省略。
-    #[serde(default)]
-    pub ryohi_base_url: String,
-    /// dtako-admin (nuxt SPA) の base URL。**`daily-report-api/zip` は直接開けない**
-    /// — SPA の `authHeaders()` (Bearer token + `X-Theearth-*` ヘッダ) が無いと
-    /// 失敗する (Refs #205 の 57 実機確認、`useTheearthSession.ts`)。ここから組む
-    /// `zip` リンクは参考値、`<base>/daily-report-edit` (検索画面) だけが実際に
-    /// 開いて使える。空 = リンク省略。
-    #[serde(default)]
-    pub dtako_base_url: String,
-}
-
-/// 拘束サマリ store configuration (Refs #106 Phase 3)
-#[derive(Debug, Clone, Deserialize)]
-pub struct RestraintConfig {
-    /// 拘束サマリ SQLite のパス。空 = 無効 (push / wage-source は 503)。
-    /// relay の resummarize (全月) で再構築できる写し (docs/plan-kyuyo-sqlite-store.md)。
-    #[serde(default = "default_restraint_sqlite_path")]
-    pub sqlite_path: String,
-}
-
-impl Default for RestraintConfig {
-    fn default() -> Self {
-        Self {
-            sqlite_path: default_restraint_sqlite_path(),
-        }
-    }
-}
-
-fn default_restraint_sqlite_path() -> String {
-    "/opt/ichibanboshi/restraint_local.sqlite".to_string()
 }
 
 /// Raw NDJSON.gz 出力 configuration (Phase 2: R2 warm backup の input、issue #762)
@@ -161,271 +107,13 @@ pub struct RawConfig {
     pub dir: String,
 }
 
-/// 社内 MariaDB (勤怠の生イベント) 読み取り configuration (Refs #116)。
-///
-/// 同一ホストの docker `db` コンテナ (172.18.21.35 をマスタにしたレプリカ) を
-/// loopback で読む。CakePHP が `127.0.0.1:120` で同居しているのと同じ 1 hop で、
-/// **DNS も TLS も経路に入らない**。実値は repo に置かず、デプロイ先の
-/// `ichibanboshi.toml` で注入する。未設定なら
-/// `/api/kintai/events` は fail-closed (503)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct MariadbConfig {
-    /// MariaDB のホスト。空 = 機能無効。
-    #[serde(default = "default_mariadb_host")]
-    pub host: String,
-
-    #[serde(default = "default_mariadb_port")]
-    pub port: u16,
-
-    /// 読み取り専用ユーザー (SELECT のみを GRANT した専用アカウント)。
-    #[serde(default = "default_mariadb_user")]
-    pub user: String,
-
-    #[serde(default)]
-    pub password: String,
-
-    /// CakePHP が使っている DB 名。空 = 機能無効。
-    #[serde(default)]
-    pub database: String,
-}
-
-impl MariadbConfig {
-    /// 接続設定が揃っているか (揃っていなければ `/api/kintai/events` は 503)。
-    pub fn enabled(&self) -> bool {
-        !self.host.is_empty() && !self.database.is_empty() && !self.password.is_empty()
-    }
-}
-
-/// 勤怠の生イベントをどこから読むか (Refs #205 実装計画 02)。
-///
-/// オンプレ (`ohishi-data`) は社内 MariaDB を直読みできるが、GCP (Cloud Run) からは
-/// 到達できない。そこで**読み先を宣言で切り替える** — `source = "http"` にすると
-/// `rust-alc-api` の `GET /api/dtako/events` (ippoan/rust-alc-api#578) から生 CSV 行を
-/// 取り、`kintai_repo` の戻り値の形に写す ([`crate::kintai_http_repo`])。
-///
-/// **既定は `mariadb`** なのでオンプレの挙動は 1 バイトも変わらない。MariaDB 実装は
-/// 撤去せず残す — 上流に口が無い読み出し (打刻 / フェリー) の委譲先になり、
-/// HTTP 経路の出力を MariaDB と突き合わせて検証する足場でもある (#205 の G6)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct KintaiEventsConfig {
-    /// 読み先の宣言。`"mariadb"` (既定) / `"http"`。
-    #[serde(default)]
-    pub source: KintaiEventsSource,
-
-    /// `rust-alc-api` の origin (例 `https://rust-alc-api-xxxx.asia-northeast1.run.app`)。
-    /// 末尾の `/` は付けても付けなくてもよい。`source = "http"` では必須。
-    #[serde(default)]
-    pub base_url: String,
-
-    /// 上流に渡す `X-Tenant-ID` (一番星のテナント UUID)。`source = "http"` では必須。
-    ///
-    /// 上流の tenant 経路は「前段が検証済み identity をヘッダーで注入する」前提の
-    /// dumb backend (`alc-core` の `require_tenant_header`) なので、直叩きする
-    /// こちらがテナントを名乗る。網層のロックダウンは Cloud Run IAM が担う。
-    #[serde(default)]
-    pub tenant_id: String,
-
-    /// HTTP request timeout (秒)。全乗務員 1 か月は R2 GET 約 1,100 回を上流が
-    /// 並列で回すため、CakePHP 中継 (30 秒) より長めの既定にしてある。
-    #[serde(default = "default_kintai_events_timeout_secs")]
-    pub timeout_secs: u64,
-
-    /// 静的な Bearer token。**取得方法をコードに焼かないための 2 経路のうち片方**で、
-    /// device JWT へ差し替える 07 の受け皿でもある (#205 実装計画 07)。
-    #[serde(default)]
-    pub auth_token: String,
-
-    /// token を吐くコマンド (例 `gcloud auth print-identity-token`)。当面の Google
-    /// 認証はこちら。**シェルは経由しない** — 空白で argv に分割して直接 exec する
-    /// ので、パイプ・リダイレクト・クォートは使えない (使えたら設定が注入経路になる)。
-    #[serde(default)]
-    pub auth_token_command: String,
-
-    /// GCE / Cloud Run の metadata server から identity token を取る (Refs #205 の G7)。
-    ///
-    /// **Cloud Run の中ではこれしか選べない。** `auth_token_command` に指定していた
-    /// `gcloud auth print-identity-token` は開発機から叩くための経路で、コンテナには
-    /// `gcloud` も `curl` も入っていなかった (image は `ca-certificates` だけ)。
-    /// audience は `base_url` をそのまま使う。
-    #[serde(default)]
-    pub auth_token_metadata: bool,
-
-    /// token をキャッシュする秒数。Google の identity token は 1 時間有効なので、
-    /// 既定 900 秒なら毎リクエストで `gcloud` / metadata server を叩かずに済む。
-    #[serde(default = "default_kintai_events_token_ttl_secs")]
-    pub auth_token_ttl_secs: u64,
-}
-
-/// [`KintaiEventsConfig::source`] の TOML / env 表現。
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum KintaiEventsSource {
-    /// 社内 MariaDB 直読み (既定 = オンプレの形、Refs #116)。
-    #[default]
-    Mariadb,
-    /// `rust-alc-api` の `GET /api/dtako/events` 経由 (GCP の形、Refs #205 の 02)。
-    Http,
-}
-
-impl KintaiEventsConfig {
-    /// HTTP 読み先を使うと宣言したか。
-    pub fn http_enabled(&self) -> bool {
-        self.source == KintaiEventsSource::Http
-    }
-
-    /// 宣言の整合性検査。**足りない設定を黙って既定へ落とさず起動を失敗させる**
-    /// (`[database] enabled` と同じ方針 — 「起動はしているが実は読めていない」を作らない)。
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.http_enabled() {
-            return Ok(());
-        }
-        if self.base_url.trim().is_empty() {
-            return Err("[kintai_events] source = \"http\" requires base_url".to_string());
-        }
-        if self.tenant_id.trim().is_empty() {
-            return Err("[kintai_events] source = \"http\" requires tenant_id".to_string());
-        }
-        let routes = usize::from(!self.auth_token.is_empty())
-            + usize::from(!self.auth_token_command.trim().is_empty())
-            + usize::from(self.auth_token_metadata);
-        if routes > 1 {
-            return Err("[kintai_events] set only one of auth_token / auth_token_command / auth_token_metadata".to_string());
-        }
-        Ok(())
-    }
-}
-
-impl Default for KintaiEventsConfig {
-    fn default() -> Self {
-        Self {
-            source: KintaiEventsSource::default(),
-            base_url: String::new(),
-            tenant_id: String::new(),
-            timeout_secs: default_kintai_events_timeout_secs(),
-            auth_token: String::new(),
-            auth_token_command: String::new(),
-            auth_token_metadata: false,
-            auth_token_ttl_secs: default_kintai_events_token_ttl_secs(),
-        }
-    }
-}
-
-fn default_kintai_events_timeout_secs() -> u64 {
-    120
-}
-
-fn default_kintai_events_token_ttl_secs() -> u64 {
-    900
-}
-
-/// 畳んだ勤怠を書く先 (Supabase の `kintai` スキーマ、Refs #205 実装計画 04〜06)。
-///
-/// **書くのは常にオンプレ側** (`ohishi-data` の `rust-ichibanboshi`)。GCP からオンプレへは
-/// 到達できないので push 方向しか無い (#205 の決定 8)。読む側 (Cloud Run) はこの設定を
-/// 持たず、畳んだ 3 層を `kintai_reader` で読むだけ。
-///
-/// 既定は `enabled = false` = 無効。宣言しない限り CLI (`push` / `recalc` / `sync`) は
-/// 何もせずに落ちる — 「設定を忘れたまま走って 0 件成功に見える」を作らない
-/// (`[database] enabled` と同じ流儀)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct KintaiPushConfig {
-    /// 畳んだ勤怠の書き込みを**使うと宣言するか**。既定 `false`。
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// `kintai` スキーマへの接続文字列。ロールは `kintai_writer` (BYPASSRLS)。
-    ///
-    /// **session mode の pooler (5432) を使う。** transaction mode (6543) は
-    /// prepared statement の扱いが違い、`sqlx` の既定 (文を準備して使い回す) と
-    /// 噛み合わない。direct connection (`db.<ref>.supabase.co`) は IPv6 のみ。
-    #[serde(default)]
-    pub database_url: String,
-
-    /// 書き込む `tenant_id`。**`rust-alc-api` の `alc_api.tenants.id` をそのまま使う。**
-    ///
-    /// 新規に採番しない (#205「決着済み」)。揃えないとアクセス権が二重管理になる —
-    /// 生イベントの読み出しは既に alc の tenant_id で認可されており、`kintai.*` 6 表の
-    /// RLS policy も `app.current_tenant_id` に依存するので、ずれると静かに全件遮断するか
-    /// 別テナントへ書く。[`KintaiPushConfig::validate`] が `[kintai_events]` との一致を
-    /// 起動時に検査する。
-    ///
-    /// **空でよい。** 打刻の受け口 (`POST /api/kintai/timecard`) は `X-Tenant-ID` を
-    /// 読んで書き先を決める — relay が KV (`dtako-relay-config` の `dtako_accounts`)
-    /// から持ってくる値がそれで、設定に写すと同じ値を 2 か所で保つことになる。
-    /// 書いた場合は **pin** として働き、ヘッダと食い違えば受け口が 403 を返す。
-    /// `push` / `recalc` / `sync` の CLI はヘッダを持たないので**必須**。
-    #[serde(default)]
-    pub tenant_id: String,
-
-    /// 接続の待ち時間 (秒)。
-    #[serde(default = "default_kintai_push_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
-
-    /// 1 文あたりの上限 (秒)。`SET statement_timeout` に渡す。
-    ///
-    /// 走るのは月単位のバッチなので、読み出し経路 (#184 の convoy 対策) より長い。
-    #[serde(default = "default_kintai_push_statement_timeout_secs")]
-    pub statement_timeout_secs: u64,
-}
-
-/// transaction mode の pooler の port。ここに繋ぐと prepared statement が壊れる。
-const SUPABASE_TRANSACTION_POOLER_PORT: &str = ":6543";
-
-impl KintaiPushConfig {
-    /// 宣言の整合性検査。`events_tenant_id` は `[kintai_events] tenant_id`。
-    ///
-    /// **足りない設定を黙って既定へ落とさず起動を失敗させる。**
-    pub fn validate(&self, events_tenant_id: &str) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-        if self.database_url.trim().is_empty() {
-            return Err("[kintai_push] enabled = true requires database_url".to_string());
-        }
-        if self.database_url.contains(SUPABASE_TRANSACTION_POOLER_PORT) {
-            return Err("[kintai_push] database_url uses the transaction pooler (6543); use session mode (5432)".to_string());
-        }
-        // tenant_id は任意。空なら**リクエストが名乗る** (受け口が `X-Tenant-ID` を
-        // 読む)。ここで必須にすると relay が KV で持っている値を設定にも写すことに
-        // なり、同じ値の二重管理になる
-        let pin = self.tenant_id.trim();
-        if pin.is_empty() {
-            return Ok(());
-        }
-        if uuid::Uuid::parse_str(pin).is_err() {
-            return Err("[kintai_push] tenant_id must be the alc_api.tenants.id UUID".to_string());
-        }
-        // テナントが 2 つの値に割れたまま動くと、alc 側では見えて kintai 側では
-        // 見えない (あるいは別テナントへ書く) 状態を人手で保つことになる
-        let events = events_tenant_id.trim();
-        if !events.is_empty() && !events.eq_ignore_ascii_case(pin) {
-            return Err("[kintai_push] tenant_id must match [kintai_events] tenant_id".to_string());
-        }
-        Ok(())
-    }
-}
-
-impl Default for KintaiPushConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            database_url: String::new(),
-            tenant_id: String::new(),
-            connect_timeout_secs: default_kintai_push_connect_timeout_secs(),
-            statement_timeout_secs: default_kintai_push_statement_timeout_secs(),
-        }
-    }
-}
-
-fn default_kintai_push_connect_timeout_secs() -> u64 {
-    30
-}
-
-fn default_kintai_push_statement_timeout_secs() -> u64 {
-    300
-}
-
 /// Runtime configuration
+///
+/// **知らない節は読み飛ばす** (`deny_unknown_fields` を付けない)。オンプレの
+/// `ichibanboshi.toml` には撤去済みの節 (`[auth]` `[kyuyo]` と勤怠の `[mariadb]`
+/// `[kintai_events]` `[kintai_push]` `[kosoku]` `[restraint]` `[dtako_day_links]`、
+/// `[cakephp] sqlite_path`) が残っており、読めないと起動ごと落ちて売上も止まる
+/// (Refs #322。`tests/config_test.rs` が固定する)。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default = "default_port")]
@@ -448,86 +136,6 @@ pub struct Config {
 
     #[serde(default)]
     pub raw: RawConfig,
-
-    #[serde(default)]
-    pub restraint: RestraintConfig,
-
-    #[serde(default)]
-    pub mariadb: MariadbConfig,
-
-    /// 生イベントの読み先の宣言 (Refs #205 実装計画 02)。既定は MariaDB 直読み。
-    #[serde(default)]
-    pub kintai_events: KintaiEventsConfig,
-
-    /// 畳んだ勤怠の書き先の宣言 (Refs #205 実装計画 04〜06)。既定は無効。
-    #[serde(default)]
-    pub kintai_push: KintaiPushConfig,
-
-    #[serde(default)]
-    pub kosoku: KosokuConfigToml,
-
-    /// 修正リンク (`/api/kintai/day-events`) 組み立て用 base URL (Refs #205 の 57)。
-    #[serde(default)]
-    pub dtako_day_links: DtakoDayLinksConfig,
-}
-
-/// 拘束時間サマリ (`/api/kintai/kosoku-daily`) の計算パラメータ (Refs #118)。
-///
-/// 既定は就業規則どおり (所定 7.5 時間 / 法定 8 時間 / 休憩は 10 分以上)。
-/// 規則が変わったときに再ビルドせず TOML で追随できるよう外に出してある。
-#[derive(Debug, Clone, Deserialize)]
-pub struct KosokuConfigToml {
-    /// 休憩として数える最小の長さ (分)。
-    #[serde(default = "default_break_threshold_minutes")]
-    pub break_threshold_minutes: i64,
-
-    /// 所定労働時間 (分)。既定 450 = 7.5 時間。
-    #[serde(default = "default_prescribed_minutes")]
-    pub prescribed_minutes: i64,
-
-    /// 法定労働時間 (分)。既定 480 = 8 時間。所定との差が法定内残業 (割増 1.0)。
-    #[serde(default = "default_legal_minutes")]
-    pub legal_minutes: i64,
-
-    /// 秒の落とし方。`"paper_per_segment"` (既定、紙のタイムカード表と同じ区分ごとの
-    /// 切り捨て。Refs #182) / `"truncate_elapsed"` (従来方式 = 勤務単位の経過切り捨て) /
-    /// `"floor_endpoints"` (両端床)。突合で 1 分ずれる原因だったので設定にした
-    /// (Refs ohishi-exp/nuxt-dtako-admin#501)。
-    #[serde(default = "default_restraint_rounding")]
-    pub restraint_rounding: RestraintRoundingToml,
-}
-
-/// [`crate::kosoku::RestraintRounding`] の TOML 表現。
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RestraintRoundingToml {
-    /// 区分ごとに紙の流儀で切り捨てる (紙と同じ、Refs #182)。
-    PaperPerSegment,
-    /// 経過時間を切り捨てる (勤務単位の近似。#182 の「従来方式」)。
-    TruncateElapsed,
-    /// 両端をそれぞれ切り捨てる (従来)。
-    FloorEndpoints,
-}
-
-impl From<RestraintRoundingToml> for crate::kosoku::RestraintRounding {
-    fn from(v: RestraintRoundingToml) -> Self {
-        match v {
-            RestraintRoundingToml::PaperPerSegment => Self::PaperPerSegment,
-            RestraintRoundingToml::TruncateElapsed => Self::TruncateElapsed,
-            RestraintRoundingToml::FloorEndpoints => Self::FloorEndpoints,
-        }
-    }
-}
-
-impl Default for KosokuConfigToml {
-    fn default() -> Self {
-        Self {
-            break_threshold_minutes: default_break_threshold_minutes(),
-            prescribed_minutes: default_prescribed_minutes(),
-            legal_minutes: default_legal_minutes(),
-            restraint_rounding: default_restraint_rounding(),
-        }
-    }
 }
 
 fn default_port() -> u16 {
@@ -563,54 +171,6 @@ fn default_cakephp_timeout_secs() -> u64 {
 fn default_raw_dir() -> String {
     "/opt/ichibanboshi/raw".to_string()
 }
-fn default_kintai_sqlite_path() -> String {
-    "/opt/ichibanboshi/kintai_local.sqlite".to_string()
-}
-
-fn default_mariadb_host() -> String {
-    // CakePHP と同居しているホストの docker `db` コンテナ (loopback 1 hop)
-    "127.0.0.1".to_string()
-}
-
-fn default_mariadb_port() -> u16 {
-    3306
-}
-
-fn default_mariadb_user() -> String {
-    "kintai_reader".to_string()
-}
-
-fn default_break_threshold_minutes() -> i64 {
-    10
-}
-
-fn default_prescribed_minutes() -> i64 {
-    // 所定 7.5 時間
-    450
-}
-
-fn default_legal_minutes() -> i64 {
-    // 法定 8 時間
-    480
-}
-
-fn default_restraint_rounding() -> RestraintRoundingToml {
-    // 紙のタイムカード表に合わせる (区分ごとの切り捨て、Refs #182)
-    RestraintRoundingToml::PaperPerSegment
-}
-
-impl Default for MariadbConfig {
-    fn default() -> Self {
-        Self {
-            host: default_mariadb_host(),
-            port: default_mariadb_port(),
-            user: default_mariadb_user(),
-            password: String::new(),
-            database: String::new(),
-        }
-    }
-}
-
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -647,7 +207,6 @@ impl Default for CakephpConfig {
         Self {
             base_url: String::new(),
             timeout_secs: default_cakephp_timeout_secs(),
-            sqlite_path: default_kintai_sqlite_path(),
         }
     }
 }
@@ -712,36 +271,6 @@ fn env_opt_u16(get: EnvLookup, key: &str) -> Result<Option<Option<u16>>, String>
     }
 }
 
-/// 秒数などの `u64` 項目。`env_u16` と同じく壊れた値で起動を失敗させる。
-fn env_u64(get: EnvLookup, key: &str) -> Result<Option<u64>, String> {
-    match get(key) {
-        None => Ok(None),
-        Some(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|e| format!("{key}: invalid number {raw:?} ({e})")),
-    }
-}
-
-/// 生イベントの読み先の宣言。**知らない値は既定へ落とさず起動を失敗させる**
-/// (`KINTAI_EVENTS_SOURCE=htpp` が静かに MariaDB 読みになると事故る)。
-fn env_kintai_events_source(
-    get: EnvLookup,
-    key: &str,
-) -> Result<Option<KintaiEventsSource>, String> {
-    match get(key) {
-        None => Ok(None),
-        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "mariadb" => Ok(Some(KintaiEventsSource::Mariadb)),
-            "http" => Ok(Some(KintaiEventsSource::Http)),
-            _ => Err(format!(
-                "{key}: invalid source {raw:?} (expected mariadb/http)"
-            )),
-        },
-    }
-}
-
 /// 真偽値。`true` / `false` / `1` / `0` (大文字小文字を問わない) のみ受ける。
 fn env_bool(get: EnvLookup, key: &str) -> Result<Option<bool>, String> {
     match get(key) {
@@ -772,10 +301,7 @@ impl Config {
     /// (Secret Manager → `secretKeyRef`) が必ず勝つようにするため。オンプレは
     /// 環境変数を一切設定しないので TOML が完全に主導権を持ち、挙動は変わらない。
     ///
-    /// 対象は**秘匿値と、実行形態の判別に要る項目**に絞ってある。SQLite のパスや
-    /// `[kosoku]` の就業規則パラメータは意図的に対象外 (理由は docs ではなく
-    /// 各フィールドのコメント、および `[kosoku]` は `kintai_version` の ETag に
-    /// 畳み込まれているので環境ごとに変わると意味が壊れる)。
+    /// 対象は**秘匿値と、実行形態の判別に要る項目**に絞ってある。
     pub fn apply_env_overrides(&mut self, get: EnvLookup) -> Result<(), String> {
         // ── HTTP listener (Cloud Run は PORT を注入し、0.0.0.0 での listen を要求する) ──
         if let Some(v) = env_u16(get, "PORT")? {
@@ -824,82 +350,11 @@ impl Config {
             self.database.trust_server_certificate = v;
         }
 
-        // ── 勤怠の生イベント (社内 MariaDB、Refs #116) ──
-        if let Some(v) = env_str(get, "MARIADB_HOST") {
-            self.mariadb.host = v;
-        }
-        if let Some(v) = env_u16(get, "MARIADB_PORT")? {
-            self.mariadb.port = v;
-        }
-        if let Some(v) = env_str(get, "MARIADB_USER") {
-            self.mariadb.user = v;
-        }
-        if let Some(v) = env_str(get, "MARIADB_PASSWORD") {
-            self.mariadb.password = v;
-        }
-        if let Some(v) = env_str(get, "MARIADB_DATABASE") {
-            self.mariadb.database = v;
-        }
-
-        // ── 生イベントの読み先 (Refs #205 実装計画 02) ──
-        // GCP instance は MariaDB に到達できないので、ここを env だけで宣言できる
-        // 必要がある (`secretKeyRef` が token を入れる形も含む)
-        if let Some(v) = env_kintai_events_source(get, "KINTAI_EVENTS_SOURCE")? {
-            self.kintai_events.source = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_EVENTS_BASE_URL") {
-            self.kintai_events.base_url = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_EVENTS_TENANT_ID") {
-            self.kintai_events.tenant_id = v;
-        }
-        if let Some(v) = env_u64(get, "KINTAI_EVENTS_TIMEOUT_SECS")? {
-            self.kintai_events.timeout_secs = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_EVENTS_AUTH_TOKEN") {
-            self.kintai_events.auth_token = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_EVENTS_AUTH_TOKEN_COMMAND") {
-            self.kintai_events.auth_token_command = v;
-        }
-        if let Some(v) = env_bool(get, "KINTAI_EVENTS_AUTH_TOKEN_METADATA")? {
-            self.kintai_events.auth_token_metadata = v;
-        }
-        if let Some(v) = env_u64(get, "KINTAI_EVENTS_AUTH_TOKEN_TTL_SECS")? {
-            self.kintai_events.auth_token_ttl_secs = v;
-        }
-
-        // ── 畳んだ勤怠の書き先 (Refs #205 実装計画 04〜06) ──
-        // 接続文字列は `KINTAI_DATABASE_URL` (migration スクリプトが使う所有者権限の
-        // 方) とは**別物**。あちらは DDL を当てる口で、こちらは `kintai_writer`
-        if let Some(v) = env_bool(get, "KINTAI_PUSH_ENABLED")? {
-            self.kintai_push.enabled = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_PUSH_DATABASE_URL") {
-            self.kintai_push.database_url = v;
-        }
-        if let Some(v) = env_str(get, "KINTAI_PUSH_TENANT_ID") {
-            self.kintai_push.tenant_id = v;
-        }
-        if let Some(v) = env_u64(get, "KINTAI_PUSH_CONNECT_TIMEOUT_SECS")? {
-            self.kintai_push.connect_timeout_secs = v;
-        }
-        if let Some(v) = env_u64(get, "KINTAI_PUSH_STATEMENT_TIMEOUT_SECS")? {
-            self.kintai_push.statement_timeout_secs = v;
-        }
-
         // ── その他の秘匿値 / 外部接続先 ──
         // JWT_SECRET は持たない。到達不能だった HS256 自前検証は #207 で撤去済みで、
         // 認可は Cloudflare Access (オンプレ) / Cloud Run IAM (GCP) が担う
         if let Some(v) = env_str(get, "CAKEPHP_BASE_URL") {
             self.cakephp.base_url = v;
-        }
-        // 修正リンク組み立て用 (Refs #205 の 57)。fetch はしないので到達性は問わない
-        if let Some(v) = env_str(get, "DTAKO_DAY_RYOHI_BASE_URL") {
-            self.dtako_day_links.ryohi_base_url = v;
-        }
-        if let Some(v) = env_str(get, "DTAKO_DAY_DTAKO_BASE_URL") {
-            self.dtako_day_links.dtako_base_url = v;
         }
         if let Some(v) = env_list(get, "CORS_ALLOWED_ORIGINS") {
             self.cors.allowed_origins = v;
@@ -955,12 +410,6 @@ impl Config {
             sqlite: SqliteConfig::default(),
             cakephp: CakephpConfig::default(),
             raw: RawConfig::default(),
-            restraint: RestraintConfig::default(),
-            mariadb: MariadbConfig::default(),
-            kintai_events: KintaiEventsConfig::default(),
-            kintai_push: KintaiPushConfig::default(),
-            kosoku: KosokuConfigToml::default(),
-            dtako_day_links: DtakoDayLinksConfig::default(),
         })
     }
 }

@@ -29,7 +29,7 @@
 test job) が毎 PR で `scripts/check_coverage_100.sh` を回し、1 行でも落ちたら fail する。
 
 - 確認は `make cov-check`。未達ファイルの一覧は `make cov-not100`、特定ファイルの
-  未カバー行は `make cov-file F=kosoku`。テストは DB も環境変数も不要
+  未カバー行は `make cov-file F=uriage`。テストは DB も環境変数も不要
 - **gate 対象ファイルで `tracing` マクロを複数行にしない。** フォーマット文字列が
   独立行になると (手書きでも rustfmt の 100 桁折り返しでも) その行は llvm-cov の行
   カバレッジに乗らず gate が落ちる。メッセージを短くして必ず 1 行に収める

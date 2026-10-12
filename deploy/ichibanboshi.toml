@@ -11,8 +11,3 @@ trust_server_certificate = true
 
 [cors]
 allowed_origins = ["https://ichibanboshi.mtamaramu.com", "https://rust-ichiban.mtamaramu.com", "http://localhost:3000"]
-
-# 拘束サマリ store (SQLite、Refs #106 Phase 3)。省略時 /opt/ichibanboshi/restraint_local.sqlite、
-# 空文字で無効 (/api/restraint/* が 503)。relay の resummarize (全月) で再構築できる写し
-# [restraint]
-# sqlite_path = "/opt/ichibanboshi/restraint_local.sqlite"
