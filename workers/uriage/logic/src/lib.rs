@@ -9,6 +9,8 @@ pub mod compute;
 pub mod d1;
 pub mod period;
 pub mod raw;
+pub mod recalc;
 pub mod routes;
 pub mod sqlserver;
 pub mod verify;
+pub mod write_auth;

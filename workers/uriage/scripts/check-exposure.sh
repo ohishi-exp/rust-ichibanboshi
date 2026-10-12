@@ -7,6 +7,9 @@
 #   (d) トップレベルの d1_databases に URIAGE_DB (database_name = ichibanboshi-uriage・migrations_dir = "migrations") がある。
 #       d1_databases はトップレベル以外 (表の奥) のどこにも置かない (本番の D1 へ届く binding をトップレベルの外へ漏らさない)
 #   (e) services (他の Worker への binding) を持たない (トップレベルにも表の奥にも)
+#   (f) LOCAL_ で始まるキーが無い ([vars]・[env.*.vars] 等どこにも。ローカルで VPC / Secrets Store を迂回する口になる)
+#   (g) vpc_services (URIAGE_SQL_VPC・URIAGE_CAKEPHP_VPC)・secrets_store_secrets (ICHIBAN_SQL・URIAGE_WRITE_TOKEN)・
+#       r2_buckets (URIAGE_R2 = bucket ichibanboshi-uriage) がトップレベルにあり、トップレベル以外 (表の奥) のどこにも無い
 # どれか 1 つでも違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash workers/uriage/scripts/check-exposure.sh [wrangler.toml]   (既定 workers/uriage/worker/wrangler.toml)
@@ -80,7 +83,45 @@ if "services" in cfg:
 for name in nested(cfg, "services"):
     err(f"{name} がある (この Worker は他の Worker への binding を持たない)")
 
+
+# (f) LOCAL_ で始まるキーを、表・表の配列の奥まで探す
+def local_keys(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            name = f"{prefix}.{k}" if prefix else k
+            if k.startswith("LOCAL_"):
+                yield name
+            yield from local_keys(v, name)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from local_keys(v, f"{prefix}[{i}]")
+
+
+for name in local_keys(cfg):
+    err(f"{name} がある (LOCAL_ で始まる var は作らない。ローカルで VPC / Secrets Store を迂回する口になる)")
+
+
+# (g) VPC・Secrets Store・R2 はトップレベルにだけ置く
+def top_binding(table, binding):
+    items = cfg.get(table) or []
+    return next((v for v in items if isinstance(v, dict) and v.get("binding") == binding), None)
+
+
+for table, bindings in (
+    ("vpc_services", ("URIAGE_SQL_VPC", "URIAGE_CAKEPHP_VPC")),
+    ("secrets_store_secrets", ("ICHIBAN_SQL", "URIAGE_WRITE_TOKEN")),
+    ("r2_buckets", ("URIAGE_R2",)),
+):
+    for binding in bindings:
+        if top_binding(table, binding) is None:
+            err(f"トップレベルに {table} の {binding} が無い")
+    for name in nested(cfg, table):
+        err(f"{name} がある ({table} はトップレベルにだけ置く)")
+r2 = top_binding("r2_buckets", "URIAGE_R2")
+if r2 is not None and r2.get("bucket_name") != "ichibanboshi-uriage":
+    err("r2_buckets の URIAGE_R2 の bucket_name が ichibanboshi-uriage でない")
+
 if errors:
     sys.exit(1)
-print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・D1 の URIAGE_DB はトップレベルだけ・services 無し")
+print(f"OK: {path} は workers_dev / preview_urls = false・route 無し・env 無し・D1 / R2 / VPC / Secrets Store はトップレベルだけ・services 無し・LOCAL_ 無し")
 PY

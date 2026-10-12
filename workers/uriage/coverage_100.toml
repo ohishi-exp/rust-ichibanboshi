@@ -43,3 +43,11 @@ path = "workers/uriage/logic/src/d1.rs"
 # Worker の経路の判定と応答の形 (404 / 405・失敗の本文)
 [[files]]
 path = "workers/uriage/logic/src/routes.rs"
+
+# recalc の段取り・bucket の D1 の文 (0 行の除外・json_each・ON CONFLICT)・job の上限。logic/tests/recalc.rs が SQLite に流して固定
+[[files]]
+path = "workers/uriage/logic/src/recalc.rs"
+
+# 書き込みの口の token の照合 (workers/kintai/logic/src/write_auth.rs の写し)
+[[files]]
+path = "workers/uriage/logic/src/write_auth.rs"

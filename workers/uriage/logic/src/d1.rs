@@ -6,7 +6,7 @@
 //! - **結果の行の読み取り** ([`respond`]): D1 の `raw()` (列の並びの配列。数は JS の number) を受けて、オンプレ版と同じ
 //!   応答の型に詰めて直列化する。読めなければ 500 (`rows:malformed`)
 //!
-//! 書き込みの文 (recalc・verify・admin) は次の PR で足す。
+//! 書き込みの文: recalc は [`crate::recalc`]。verify・admin は次の PR で足す。
 
 use serde_json::Value;
 

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use uriage_logic::d1::{
     ping_ok, respond, statements, Bind, Read, Stmt, D1_BINDING, PING_SQL, SCHEMA_SQL,
 };
-use uriage_logic::routes::{route, ReadRoute, Reply, Route, HEALTH_BODY, PROBE_BODY};
+use uriage_logic::routes::{route, sql_kind, ReadRoute, Reply, Route, HEALTH_BODY, PROBE_BODY};
 
 const FIXTURE: &str = include_str!("fixtures/d1_fixture.sql");
 const REQUESTS: &str = include_str!("fixtures/d1_requests.txt");
@@ -183,9 +183,13 @@ fn routes_and_methods() {
     assert_eq!(route("POST", "/health"), Route::MethodNotAllowed);
     assert_eq!(route("GET", "/probe"), Route::MethodNotAllowed);
     assert_eq!(route("POST", "/api/uriage/daily"), Route::MethodNotAllowed);
+    // 書き込みの口 recalc は POST だけ
+    assert_eq!(route("POST", "/api/uriage/recalc"), Route::Recalc);
+    assert_eq!(route("GET", "/api/uriage/recalc"), Route::MethodNotAllowed);
+    assert_eq!(route("PUT", "/api/uriage/recalc"), Route::MethodNotAllowed);
     // 書き込みの口 (次の PR) と移さない口は 404
     for path in [
-        "/api/uriage/recalc",
+        "/api/uriage/recalc/",
         "/api/uriage/verify",
         "/api/uriage/verify-debug",
         "/api/uriage/admin/delete",
@@ -230,7 +234,22 @@ fn replies() {
     );
     assert_eq!(
         serde_json::from_str::<Value>(PROBE_BODY).unwrap(),
-        json!({"ok": true, "d1": "ok"})
+        json!({"ok": true, "d1": "ok", "sqlserver": "ok", "cakephp": "ok"})
+    );
+    assert_eq!(Reply::for_route(Route::Recalc), None);
+    let m = Reply::missing("URIAGE_R2");
+    assert_eq!(
+        (m.status, m.body.as_str()),
+        (503, r#"{"ok":false,"stage":"binding","kind":"URIAGE_R2"}"#)
+    );
+    let u = Reply::upstream("cakephp", "status:500");
+    assert_eq!(
+        (u.status, u.body.as_str()),
+        (502, r#"{"ok":false,"stage":"cakephp","kind":"status:500"}"#)
+    );
+    assert_eq!(
+        sql_kind("login", "server:18456/14/1"),
+        "login:server:18456/14/1"
     );
 }
 

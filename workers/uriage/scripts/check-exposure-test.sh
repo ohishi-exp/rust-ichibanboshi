@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-exposure.sh の陰性対照 (workers/ichiban/scripts/check-exposure-test.sh を写している)。wrangler.toml を tomllib で読んだ dict を 1 か所ずつ崩して TOML に書き戻し、
-# (a)〜(e) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
+# (a)〜(g) それぞれで exit 1 になること、元のまま・書き戻しただけなら exit 0 になることを確かめる。
 # 文字列の特定の表の直前に行を挿す作りにはしない (表の中身に紛れて別の表のキーになる — rust-alc-api#698)。
 # CI で check-exposure.sh の直後に走る。
 #
@@ -114,6 +114,31 @@ mutate 1 "(d) d1_databases を表の奥にも置く" \
 mutate 1 "(e) services を足す" 'cfg["services"] = [{"binding": "AUTH", "service": "auth-worker"}]'
 mutate 1 "(e) services を表の奥に置く" \
   'cfg["observability"]["services"] = [{"binding": "AUTH", "service": "auth-worker"}]'
+# (f)
+mutate 1 "(f) vars に LOCAL_SQL_ADDR" 'cfg["vars"] = {"LOCAL_SQL_ADDR": "127.0.0.1:1433"}'
+mutate 1 "(f) vars に LOCAL_URIAGE_SQL_JSON" 'cfg["vars"] = {"LOCAL_URIAGE_SQL_JSON": "{}"}'
+mutate 1 "(f) 表の奥に LOCAL_ のキー" 'cfg["observability"]["LOCAL_X"] = "1"'
+# (g)
+mutate 1 "(g) vpc_services の URIAGE_SQL_VPC を消す" \
+  'cfg["vpc_services"] = [v for v in cfg["vpc_services"] if v["binding"] != "URIAGE_SQL_VPC"]'
+mutate 1 "(g) vpc_services の URIAGE_CAKEPHP_VPC を消す" \
+  'cfg["vpc_services"] = [v for v in cfg["vpc_services"] if v["binding"] != "URIAGE_CAKEPHP_VPC"]'
+mutate 1 "(g) vpc_services を env 側へ動かす" \
+  'cfg["env"] = {"prod": {"vpc_services": cfg.pop("vpc_services")}}'
+mutate 1 "(g) vpc_services を表の奥にも置く" \
+  'cfg["observability"]["vpc_services"] = [dict(cfg["vpc_services"][0])]'
+mutate 1 "(g) secrets_store_secrets の URIAGE_WRITE_TOKEN を消す" \
+  'cfg["secrets_store_secrets"] = [v for v in cfg["secrets_store_secrets"] if v["binding"] != "URIAGE_WRITE_TOKEN"]'
+mutate 1 "(g) secrets_store_secrets の ICHIBAN_SQL を消す" \
+  'cfg["secrets_store_secrets"] = [v for v in cfg["secrets_store_secrets"] if v["binding"] != "ICHIBAN_SQL"]'
+mutate 1 "(g) secrets_store_secrets を表の奥にも置く" \
+  'cfg["observability"]["secrets_store_secrets"] = [dict(cfg["secrets_store_secrets"][0])]'
+mutate 1 "(g) r2_buckets を消す" 'del cfg["r2_buckets"]'
+mutate 1 "(g) r2_buckets の bucket_name を変える" 'cfg["r2_buckets"][0]["bucket_name"] = "other"'
+mutate 1 "(g) r2_buckets を env 側へ動かす" \
+  'cfg["env"] = {"prod": {"r2_buckets": cfg.pop("r2_buckets")}}'
+mutate 1 "(g) r2_buckets を表の奥にも置く" \
+  'cfg["observability"]["r2_buckets"] = [dict(cfg["r2_buckets"][0])]'
 
 if bash scripts/check-exposure.sh "$tmp/none.toml" >/dev/null 2>&1; then
   echo "FAIL 存在しない toml: exit 0, want 非 0"; fail=1

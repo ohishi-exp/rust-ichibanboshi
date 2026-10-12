@@ -1,7 +1,9 @@
 # 売上 Worker (Refs ohishi-exp/rust-ichibanboshi#322)。Service Binding からだけ届く。
-# この段の口は GET /health・POST /probe (D1 に SELECT 1) と、D1 (binding URIAGE_DB) を読む GET /api/uriage/* の 6 本
-# (daily・person-monthly-totals・person-partner-totals・r2/pending・recalc-jobs・verify-history)。
-# SQL・検査・行の読み取り・応答は uriage-logic の d1 (オンプレ版と同じ文・同じ応答の型)。書き込みの口・SQL Server・CakePHP・R2 は次の PR。
+# 口は GET /health・POST /probe (D1・SQL Server・CakePHP)、D1 (binding URIAGE_DB) を読む GET /api/uriage/* の 6 本
+# (daily・person-monthly-totals・person-partner-totals・r2/pending・recalc-jobs・verify-history)、書き込みの口 POST /api/uriage/recalc
+# (token 必須。CakePHP を Workers VPC の HTTP で、SQL Server を Workers VPC の TCP で読み、D1 に書いて raw を R2 に置く)。
+# SQL・検査・行の読み取り・応答・段取りは uriage-logic (オンプレ版と同じ文・同じ応答の型)。verify・admin は次の PR。
+# tiberius の rustls feature と bb8-tiberius は wasm32 で落ちる (getrandom / mio / rustls-native-certs) ので入れない。
 [package]
 name = "uriage-worker"
 version = "0.1.0"
@@ -14,12 +16,18 @@ crate-type = ["cdylib"]
 [dependencies]
 # クエリ文字列の読み方はオンプレ版 (axum の Query) と同じ: serde_urlencoded + serde_path_to_error
 form_urlencoded = "1"
+# CakePHP の fetch の打ち切り (select)
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 serde_urlencoded = "0.7"
+# SQL Server の行の読み取り (workers/ichiban と同じ版・feature)
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono"] }
 uriage-logic = { path = "../logic" }
+# Workers VPC の TCP・TDS のログイン (workers/ichiban・workers/kyuyo と共有)
+vpc-tds = { path = "../../shared/vpc-tds" }
 wasm-bindgen = "0.2"
-# d1: 担当者別売上の D1 (binding URIAGE_DB)
+# d1: 担当者別売上の D1 (binding URIAGE_DB)。R2 (Bucket) は既定で入っている
 worker = { version = "=0.8.7", features = ["d1"] }
 worker-sys = "=0.8.7"
