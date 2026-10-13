@@ -10,7 +10,7 @@ name: CI
 # main push 限定なので branch push では発火しない。Cloud Run への deploy は撤去済み。
 on:
   push:
-    branches: [main, 'fix/**', 'feat/**', 'perf/**', 'docs/**', 'chore/**', 'refactor/**', 'claude/**']
+    branches: [main, 'fix/**', 'feat/**', 'perf/**', 'docs/**', 'chore/**', 'claude/**']
   pull_request:
     branches: [main]
 
