@@ -23,7 +23,7 @@ RestartSec=5
 User=ubuntu
 Group=ubuntu
 
-# 中継は外から繋がれる口なので、既存の ichibanboshi (User=root) より絞る。
+# 中継は外から繋がれる口なので root では動かさず、書き込み先も絞る。
 # ログは stdout → journal なので書き込み先は要らない。
 NoNewPrivileges=true
 PrivateTmp=true

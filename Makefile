@@ -1,6 +1,6 @@
 # rust-ichibanboshi 開発用 Makefile
 #
-# テストは全て MockRepo / wiremock / 純粋関数で完結しており、SQL Server も
+# テストは src 内の mod tests だけで、wiremock / 純粋関数で完結しており、SQL Server も
 # MariaDB も環境変数も要らない。したがって rust-alc-api にある db-up / itest /
 # cov-check-unit / cov-check-mock のような「DB 有無で分ける」ターゲットは無い。
 
@@ -12,9 +12,9 @@
 test:
 	cargo test --locked
 
-# 特定テストファイル: make test-file T=kosoku_daily_test
+# 特定テスト (名前で絞る): make test-file T=cf_access
 test-file:
-	cargo test --test $(T)
+	cargo test --locked $(T)
 
 # --- kintai スキーマの migration (Refs #205 実装計画 03) ---
 #
@@ -66,7 +66,7 @@ cov-summary: cov
 cov-not100: cov
 	bash scripts/parse_coverage.sh not-100 "" $(COV_CACHE)
 
-# 特定ファイルの未カバー行: make cov-file F=kosoku
+# 特定ファイルの未カバー行: make cov-file F=cf_access
 cov-file: cov
 	bash scripts/parse_coverage.sh file $(F) $(COV_CACHE)
 

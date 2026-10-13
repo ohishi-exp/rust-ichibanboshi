@@ -10,7 +10,7 @@ name: CI
 # main push 限定なので branch push では発火しない。Cloud Run への deploy は撤去済み。
 on:
   push:
-    branches: [main, 'fix/**', 'feat/**', 'perf/**', 'docs/**', 'chore/**', 'claude/**']
+    branches: [main, 'fix/**', 'feat/**', 'perf/**', 'docs/**', 'chore/**', 'refactor/**', 'claude/**']
   pull_request:
     branches: [main]
 
@@ -135,9 +135,10 @@ jobs:
           KINTAI_WRITER_PASSWORD: verify-only-not-a-real-password
         run: bash scripts/verify_kintai_rls.sh
 
-  # main への merge (push) で musl binary を build → Cloudflare Tunnel SSH 経由で
-  # ohishi-data に自動 deploy する (Refs #14)。GitHub Actions runner は Tailscale
-  # 網に居ないので、deploy.sh の Tailscale 経路ではなく cloudflared access ssh を
+  # main への merge (push) で rdp-relay の musl binary を build → Cloudflare Tunnel SSH 経由で
+  # ohishi-data に自動 deploy する (Refs #14)。root package の binary は rdp-relay だけ
+  # (売上・勤怠のオンプレ版 ichibanboshi は Worker へ移して撤去した、Refs #322)。
+  # GitHub Actions runner は Tailscale 網に居ないので、deploy.sh の Tailscale 経路ではなく cloudflared access ssh を
   # ProxyCommand にした SSH で到達し、CF Access service token で認証する。
   # deploy ロジックは deploy.sh (手動 fallback) と scripts/deploy-remote.sh を共有。
   deploy:
@@ -173,7 +174,7 @@ jobs:
         # --locked で Cargo.lock 整合性を強制 (reproducible)。
         # CC_x86_64_unknown_linux_musl は ring 等の C 依存を musl-gcc で cross-compile
         # するため (rust-flickr ci.yml と同 pattern)。
-        run: cargo build --release --target x86_64-unknown-linux-musl --locked
+        run: cargo build --release --target x86_64-unknown-linux-musl --locked --bin rdp-relay
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
@@ -201,14 +202,8 @@ jobs:
           DEPLOY_SSH_PROXY_COMMAND: "cloudflared access ssh --hostname %h"
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          # RDP 中継も一緒に運ぶ。`cargo build` は [[bin]] を全部作るので build 手順は
-          # 増えない (ichibanboshi と同じ musl release から拾うだけ)。
-          DEPLOY_EXTRA_BINARY: target/x86_64-unknown-linux-musl/release/rdp-relay
-          DEPLOY_EXTRA_NAME: rdp-relay
-          # ホスト側の unit と /etc/ichibanboshi/rdp-relay.env は設置済みなので、
-          # 中継の health も deploy のたびに確かめる。中継が上がらないまま
-          # 気づかない状態を作らないため (RemoteApp が丸ごと死ぬ)。
-          DEPLOY_EXTRA_HEALTH_PORT: 3390
+          # binary・unit 名・health の port (3390) は deploy-remote.sh の既定が rdp-relay を指す。
+          # 中継が上がらないまま気づかない状態を作らないため health は毎回確かめる (RemoteApp が丸ごと死ぬ)
         run: |
           if [ -z "$DEPLOY_SSH_HOST" ]; then
             echo "::error::vars.DEPLOY_SSH_HOST is not set — configure repo/org variable" >&2

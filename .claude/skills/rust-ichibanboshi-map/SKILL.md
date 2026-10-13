@@ -2,14 +2,14 @@
 name: rust-ichibanboshi-map
 generated-from: rust-ichibanboshi:a866c377c770e9f305c21db5b818c9839887d86d
 paths: [src/]
-description: rust-ichibanboshi (一番星 SQL Server CAPE#01 の売上データを tiberius で読み REST API 提供する Rust/Axum サービス) の構造ナビゲーション。sales 集計エンドポイント / tiberius+bb8 接続 / 売上集計ロジック (税抜カラム・請求K) / musl deploy + Cloudflare Tunnel の gotcha を 1 枚にまとめる。トリガー:「rust-ichibanboshi」「一番星」「CAPE#01」「tiberius」「SQL Server 売上」「月計テーブル」「請求K」「税抜金額」「傭車」「Cloudflare Tunnel」「CF Access Service Token」「rdp-relay」「RDP 中継」「RemoteApp」「RDCleanPath」「Cf-Access-Jwt-Assertion」等。
+description: rust-ichibanboshi (一番星 SQL Server CAPE#01 の売上・勤怠・給与の読みを提供する Cloudflare Worker 群 `workers/` と、root package の RDP 中継 `rdp-relay`) の構造ナビゲーション。Worker の区画 / 売上集計ロジック (税抜カラム・請求K) / rdp-relay の musl deploy の gotcha を 1 枚にまとめる。トリガー:「rust-ichibanboshi」「一番星」「CAPE#01」「tiberius」「SQL Server 売上」「月計テーブル」「請求K」「税抜金額」「傭車」「Cloudflare Tunnel」「CF Access Service Token」「rdp-relay」「RDP 中継」「RemoteApp」「RDCleanPath」「Cf-Access-Jwt-Assertion」等。
 ---
 
 # rust-ichibanboshi-map — rust-ichibanboshi 構造ナビゲーション
 
-一番星の SQL Server (CAPE#01) から売上データを tiberius (+bb8 pool) で読み、Axum で
-REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudflare Tunnel
-(`rust-ichiban.mtamaramu.com`) → systemd で稼働する本サービス、という経路。
+一番星の SQL Server (CAPE#01) 等の読みは Cloudflare Worker 群 (`workers/`) が提供する。
+root package (`src/`) は **RDP 中継 `rdp-relay` だけ** (オンプレの systemd)。
+オンプレ版の売上 API `ichibanboshi` (旧 :3100) は Worker へ移して撤去した (#322)。
 
 > ここは索引。集計ロジックの完全な条件・カラム名は CLAUDE.md と repo 側が正。
 > frontmatter の `generated-from` が現 tree-sha とズレたら hook が再生成を促す。
@@ -18,26 +18,12 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 
 | ファイル | 役割 |
 |---|---|
-| `src/main.rs` | clap entrypoint。`--console` の有無に関わらず console 起動 (フラグは互換のため残置) |
-| `src/lib.rs` | crate ルート (`rust_ichibanboshi`) — 各 module re-export |
-| `src/server.rs` | `run()` — pool 生成 + Axum Router 組み立て + graceful shutdown |
-| `src/config.rs` | `Config` / `AppArgs` (clap) / TOML 読み込み / `addr()` |
-| `src/db.rs` | `create_pool` — bb8-tiberius pool (named instance / NotSupported 暗号化) |
-| `src/repo.rs` | `TiberiusRepo` / `DynRepo` trait — SQL クエリ本体 (DB 層) |
-| `src/auth.rs` | `JwtSecret` / JWT 検証 |
-| `src/routes/health.rs` | `/health` (`backends` は `sqlserver` だけ) |
-| `src/routes/uriage.rs` + `src/sqlite.rs` + `src/cakephp.rs` | 担当者別売上 `/api/uriage/*` (純粋部分は共有 crate `workers/uriage/logic`)。`cakephp.rs` は masters・editable-months・print-json の client (エラー型等は `kintai-logic` から借りる) |
+| `src/lib.rs` | crate ルート (`rust_ichibanboshi`) — rdp-relay の部品 4 つ (`cf_access`・`rdcleanpath`・`rdp_defaults`・`rdp_nego`) |
+| `src/bin/rdp_relay.rs` | root package の唯一の binary。下記「RDP 中継」節 |
+| `workers/uriage/` | 担当者別売上 `/api/uriage/*` は **Cloudflare Worker** に移った (#322)。集計・SQL・raw ndjson と fingerprint の純粋部分は `logic/` (`uriage-logic`)、store は D1/R2。オンプレ版 (`src/routes/uriage.rs`・`sqlite.rs`・`cakephp.rs`) は撤去済み。詳細は `workers/uriage/README.md` |
 | `workers/kintai/` | **勤怠 (kintai・restraint・dtako・timecard・wage・shift 等) は勤怠 Worker だけが持つ。** オンプレ版の勤怠の route・モジュール・テスト・設定・バッチ (`push`/`recalc`/`sync`)・build.rs の etag の仕組みは撤去済み (#322)。詳細は `workers/kintai/README.md` |
-| `workers/ichiban/` | 一番星 (CAPE#01) の管理画面向け 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・`/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) は **Cloudflare Worker `ichibanboshi-ichiban`** に移った (#322)。`logic/` (`ichiban-logic`) に SQL 文・型・絞り込み判定・`build_*` を置く (6 本の SQL を直すのはここ。`worker/src/rows.rs` と列の並びが 1 対 1)。**オンプレ版の 5 本は削除済み。6 本は Worker だけが提供** (オンプレの `/health` は他系統の監視用に残す。`src/repo.rs` は `ichiban-logic` に依存せず、`HEALTH_SQL` を同じ文字列で持つ)。売上・運賃・燃料サーチャージ・schema の口も Worker に移り、オンプレ版は削除済み (#322)。gate は `workers/ichiban/coverage_100.toml` (worker-ichiban.yml)。詳細は `workers/ichiban/README.md` |
+| `workers/ichiban/` | 一番星 (CAPE#01) の管理画面向け 6 本 (`/health`・`/api/employees`・`/api/vehicles`・`/api/sales/departments`・`/api/sales/vehicle-daily`・`/api/costs/vehicle-daily`) は **Cloudflare Worker `ichibanboshi-ichiban`** に移った (#322)。`logic/` (`ichiban-logic`) に SQL 文・型・絞り込み判定・`build_*` を置く (6 本の SQL を直すのはここ。`worker/src/rows.rs` と列の並びが 1 対 1)。**オンプレ版は削除済み。6 本は Worker だけが提供**。売上・運賃・燃料サーチャージ・schema の口も Worker に移り、オンプレ版は削除済み (#322)。gate は `workers/ichiban/coverage_100.toml` (worker-ichiban.yml)。詳細は `workers/ichiban/README.md` |
 | `workers/kyuyo/` | 給与大臣 `/kyuyo/*` の読み出しは **Cloudflare Worker `ichibanboshi-kyuyo`** に移った (#322)。オンプレ版 (`src/kyuyo/`・`src/routes/kyuyo.rs`・`/api/kyuyo/*`) は撤去済み。純粋ロジック `logic/src/payroll.rs`・SQL 文 `logic/src/sql.rs`・応答型 `logic/src/api.rs`・store の DDL `logic/src/store_keys.rs`、DO `KyuyoState`、認可は auth-worker の `KyuyoAuthEntrypoint`。**coverage 100% gate は `workers/kyuyo/coverage_100.toml` (worker-kyuyo.yml が判定)**。詳細は `workers/kyuyo/README.md` |
-
-## entrypoint / Axum router (`src/server.rs::run`)
-
-- `/health`
-- 売上 9 本・運賃 6 本・燃料サーチャージ・schema 3 本は一番星 Worker (`workers/ichiban/`) に移った (#322)。オンプレ版は削除済み
-- `/api/uriage/*` (担当者別売上、下記「担当者別売上」節)
-- layer: CORS (allowed_origins) + TraceLayer + `Extension(DynRepo)` 等
-- repo は `Arc<TiberiusRepo>` を `DynRepo` として Extension 注入 → test は MockRepo に差し替え可能
 
 ## gotcha (CLAUDE.md / Cargo.toml 由来)
 
@@ -45,21 +31,18 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
   (傭車は `税抜傭車*`)。`金額` カラムは実費の内税/外税で消費税の含み方が変わるため使わない。
   日付は `売上年月日`、請求区分 `請求K IN ('0','2')`、自車/傭車判定は `傭車先C = '000000'`。
 - **月計テーブルは締め時点スナップショット** — 締め後の遡り修正は再集計されないため日報明細と差が出る。
-- **SQL Server 接続**: host `172.18.21.102`、名前付きインスタンス `softec`
-  (`using_named_connection()` 必須)、DB `CAPE#01`、`EncryptionLevel::NotSupported`、文字コード Shift_JIS。
-- **実運用は Linux systemd (オンプレ) と勤怠 Worker (`workers/kintai`)。** Windows サービスと MSI・Cloud Run への deploy (image の build・smoke・deploy の workflow) は #322 で撤去済み。オンプレ版の勤怠も撤去済み (#322)。
-- **オンプレの `ichibanboshi.toml` に勤怠の節が残っていても起動する** — `Config` は `deny_unknown_fields` を付けず知らない節を読み飛ばす。`tests/config_test.rs` の `ONPREM_TOML` が固定。付けると起動が落ちて売上ごと止まる (deploy に巻き戻しは無い)
-- **CF Access Service Token 必須**: Tunnel 経由のリクエストは `CF-Access-Client-Id/Secret` 無しだと 403。
+- **SQL Server 接続**: 名前付きインスタンス `softec`、DB `CAPE#01`、暗号化なし、文字コード Shift_JIS
+  (Worker からの接続部品は `workers/shared/`)。
+- **実運用は Cloudflare Worker 群 (`workers/`) と、オンプレの systemd で動く `rdp-relay` だけ。** Windows サービスと MSI・Cloud Run への deploy、オンプレ版の売上・勤怠 (`ichibanboshi`) は #322 で撤去済み。root に売上・勤怠を戻さない
 
 ## CI / deploy から見た立ち位置
 
-- **`./deploy.sh`**: `cargo build --release --target x86_64-unknown-linux-musl` (GLIBC 不一致回避の
-  static link) → scp で `/tmp` → `mv` (atomic) で `/opt/ichibanboshi/`。systemd `ichibanboshi-watcher.path`
-  (PathModified) がバイナリ変更を検知して自動 restart。実行先 `ohishi-data.tailea945d.ts.net`。
-- `.github/workflows/`: `ci.yml` / `tag-release.yml`。
-- `coverage_100.toml`: `auth.rs` / `config.rs` / `routes/health.rs` 等を 100% 維持
-  (全て MockRepo / 純粋関数テストで DB 不要)。`scripts/check_coverage_100.sh` で検証。
-- `deploy/` に `ichibanboshi.service` / `.toml`、`config/ichibanboshi.default.toml`。
+- `ci.yml`: root package (rdp-relay) の fmt・clippy・test・100% gate、kintai migration の検証と適用、
+  main push で `deploy` (rdp-relay だけをオンプレへ。下記「デプロイ」節)。
+- Worker ごとの workflow は `worker-<名前>.yml` (Worker の deploy はタグで、merge では出ない)。
+- `coverage_100.toml`: `cf_access.rs` / `rdp_defaults.rs` / `rdp_nego.rs` を 100% 維持
+  (wiremock / 純粋関数テストで DB 不要)。`scripts/check_coverage_100.sh` で検証。
+- `deploy/` は rdp-relay の unit (`rdp-relay.service`・`rdp-relay-lan.service`・`rdp-relay-watcher.{path,service}`) と env の雛形。
 
 ## 関連 skill
 
@@ -67,64 +50,10 @@ REST API 提供するサービス。`nuxt-ichibanboshi` (CF Workers) → Cloudfl
 - `coverage-check` — 未カバー行抽出
 - `cross-repo-symbol-index` — この per-repo map の鮮度 hook 運用方針
 
-## CLAUDE.md から移設 (2026-07-06)
+## 担当者別売上 — Worker `workers/uriage/`
 
-## 担当者別売上 (Phase 2、Refs #762) のデータ流れと status
-
-```
-SQL Server (CAPE#01、172.18.21.102)
-    ↓ recalc 実行 (rust の POST /api/uriage/recalc)
-[ohishi-data:3100 (rust host)]
-  ├─ SQLite (/opt/ichibanboshi/state.db): uriage_person_daily / recalc_jobs / verify_jobs
-  └─ disk (/opt/ichibanboshi/raw/{month}/eigyosho-{id}.ndjson.gz): R2 投入用 raw NDJSON.gz
-    ↓ R2 sync (nuxt の /api/uriage/r2-sync = rust から raw を fetch して R2 へ put)
-[Cloudflare R2 bucket]
-  └─ uriage/{month}/eigyosho-{id}.ndjson.gz
-    ↓ Worker から read
-[ブラウザ UI (nuxt /admin/*)]
-```
-
-**`state.db` は 3 つの derived store とは別扱い** (`[sqlite] path`、Refs #205 の G4)。
-`uriage_person_*` は SQL Server から作り直せるが、`recalc_jobs` は fingerprint と
-R2 同期状態の**唯一の記録**で、消えると差分再計算の基準が失われる。**空文字で無効宣言**
-でき、その instance では `/api/uriage/*` が 503 になる — SQL Server を持たない形
-(Cloud Run 版だった形) は `SQLITE_PATH=""` を入れること。入れないと揮発 FS に空の `state.db` が生えて
-「壊れている」ではなく「0 件」を返す。オンプレは既定のままで挙動不変。
-
-`recalc_jobs.status` の意味:
-
-| status | SQLite | disk raw | R2 | UI から見える? |
-|---|---|---|---|---|
-| `r2_synced` (✅ R2 同期済) | ある | ある | ある | 見える |
-| `computed` (🟡 計算済、R2 同期待ち) | ある | ある | **無い** | 見えない |
-| `failed` (❌ 失敗) | failed 記録のみ | 無し | 無し | 見えない |
-
-タイムスタンプ列の意味:
-
-| 列 | 意味 |
-|---|---|
-| `created_at` | 行が初めて作られた時刻 (= 初回 recalc 時) |
-| `computed_at` | **最後に recalc が走った時刻** (fingerprint が変わったかどうかに関わらず更新) |
-| `fingerprint_changed_at` | **fingerprint が実際に変化した時刻** (= data が変わった時刻、fingerprint 不変な再 recalc では更新されない) |
-| `r2_synced_at` | 最後に R2 同期に成功した時刻 (= R2 オブジェクトが最新化された時刻) |
-
-要点:
-
-- **`computed` は「rust host にはデータがあるが、R2 にはまだ転送していない」状態**。
-  ブラウザから直接 SQLite は見えないので、R2 同期しないと UI 側には反映されない。
-- `record_recalc_computed` は **fingerprint が同じ再 recalc** では status / `r2_synced_at` /
-  `fingerprint_changed_at` をすべて維持する。**fingerprint 変化時のみ** `status='computed'`
-  + `r2_synced_at=NULL` + `fingerprint_changed_at=now` を立てて R2 再送信を促す
-  (user 2026-06-30: 「ｒ２同期待ちおかしくね?」「finger verified のほうがよくね?」)。
-- `computed_at` は不変/変化に関わらず毎回更新される (= 最終 recalc 試行時刻)。なので
-  「`computed_at` が新しいのに `fingerprint_changed_at` が古い」 = 「最近 recalc は走ったが
-  data は変わっていない」と読める。
-- verify (PHP vs Rust) は `verify_jobs` (PK: unko_date, eigyosho_id, cal) に upsert。
-  `verify_coverage` view が `(month, eigyosho_id)` で集計し、`r2_pending` view と
-  `list_recalc_jobs` が LEFT JOIN して `verified_count / ok / ng` を露出する。
-- `r2_pending` view の条件: `status='computed' AND r2_synced_at IS NULL AND raw_path IS NOT NULL
-  AND (fingerprint_before IS NULL OR fingerprint_before != fingerprint_after)`。
-  fingerprint 変化なし (= データ同じ) なら R2 への再送信は不要。
+オンプレ版の `/api/uriage/*` (state.db の SQLite と disk の raw NDJSON.gz、:3100 の rust host) は撤去済み (#322)。
+口・store (D1/R2)・recalc / verify / R2 同期の status と fingerprint の扱いは `workers/uriage/README.md` が正。
 
 ## 給与 (給与大臣) の読み出し — Worker `workers/kyuyo/` (旧 `/api/kyuyo/*`)
 
@@ -219,10 +148,8 @@ Service Token の口とは扱いが違う。以下は列と項目番号の知識
 
 ## SQL Server 接続
 
-- **ホスト**: `172.18.21.102` (ohishi-srv)
 - **インスタンス**: `softec`（名前付きインスタンス、`using_named_connection()` 必須）
 - **データベース**: `CAPE#01`
-- **ユーザー**: `pbi` / `test`
 - **暗号化**: `EncryptionLevel::NotSupported`（PHP の `encrypt=optional` 相当）
 - **文字コード**: Shift_JIS (CP932)
 
@@ -230,16 +157,18 @@ Service Token の口とは扱いが違う。以下は列と項目番号の知識
 
 ### CI 自動デプロイ (推奨、Refs #14)
 
-`main` への merge で `ci.yml` の `deploy` job が musl binary を build →
+`main` への merge で `ci.yml` の `deploy` job が **rdp-relay の** musl binary
+(`cargo build --release --target x86_64-unknown-linux-musl --locked --bin rdp-relay`) を build →
 **Cloudflare Tunnel SSH 経由**で `ohishi-data` に deploy → PathModified 自動 restart →
-`/health` 200 を確認する。GitHub Actions runner は Tailscale 網に居ないため、
-Tailscale ではなく `cloudflared access ssh` を `ProxyCommand` にした SSH で到達し、
-**CF Access service token** で認証する。
+rdp-relay の `/health` (:3390、listen しているアドレスを `ss` で引く) 200 を確認する。
+GitHub Actions runner は Tailscale 網に居ないため、`cloudflared access ssh` を `ProxyCommand` にした
+SSH で到達し、**CF Access service token** で認証する。
 
 - trigger: `push: branches: [main]` (= merge で本番反映)、`needs: [test]`
 - 実 deploy ロジックは手動 `deploy.sh` と `scripts/deploy-remote.sh` を共有
-  (host 名・proxy・鍵を env 化)
+  (host 名・proxy・鍵を env 化。binary・unit 名・health port の既定は rdp-relay)
 - deploy 失敗 (build / SSH / health != 200) は job が **loud fail** する
+- **オンプレの `ichibanboshi.service` には触らない** (撤去後の停止・退避は人が手で行う)
 
 必要な GitHub secrets / variables (ohishi-exp repo or org):
 
@@ -247,26 +176,19 @@ Tailscale ではなく `cloudflared access ssh` を `ProxyCommand` にした SSH
 |---|---|---|
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | secret | CF Access service token (SSH 経路の認証) |
 | `DEPLOY_SSH_KEY` | secret | CI 専用 SSH 秘密鍵 (host の authorized_keys に公開鍵を登録) |
-| `DEPLOY_SSH_HOST` | variable | `ssh-rust-ichiban.mtamaramu.com` 等 (CF Tunnel SSH ingress hostname) |
-
-host 側 (一度きり): `cloudflared` Tunnel に SSH ingress
-(`ssh-rust-ichiban.mtamaramu.com` → `ssh://localhost:22`) を追加 → CF Access app +
-Service Auth ポリシーで保護 (CI 専用 token のみ許可) → deploy ユーザー
-(`ubuntu`) の `~/.ssh/authorized_keys` に CI 公開鍵を登録。
+| `DEPLOY_SSH_HOST` | variable | CF Tunnel SSH ingress hostname |
 
 ### 手動 fallback (Tailscale 経路)
 
 ```bash
-# musl build → Tailscale SSH で deploy → 自動 restart
+# rdp-relay の musl build → Tailscale SSH で deploy → 自動 restart → health
 ./deploy.sh
 ```
 
-- **実行先**: `ohishi-data.tailea945d.ts.net` (ubuntu / ***REMOVED***)
-- **インストール先**: `/opt/ichibanboshi/`（ubuntu 所有、sudo 不要）
-- **サービス**: `systemctl status ichibanboshi`
-- **自動再起動**: `ichibanboshi-watcher.path` (systemd PathModified) がバイナリ変更を検知 → 自動 restart
+- **インストール先**: `/opt/ichibanboshi/rdp-relay`（ubuntu 所有、sudo 不要）
+- **サービス**: `systemctl status rdp-relay` (LAN 用 `rdp-relay-lan` も同じ binary)
+- **自動再起動**: `rdp-relay-watcher.path` (systemd PathModified) がバイナリ変更を検知 → 両インスタンスを restart
 - **ビルド**: musl スタティックリンク（GLIBC バージョン不一致回避）
-- `deploy.sh` / `scripts/deploy-remote.sh` の流れ: `cargo build --release --target x86_64-unknown-linux-musl` → `scp /tmp` → `mv`（アトミック） → PathModified で自動 restart → `/health` 疎通確認
 
 ## migration (`migrations/` — kintai スキーマ / Supabase)
 
@@ -322,20 +244,17 @@ CI (`ci.yml` の migration job) が毎 PR で同じ検証を回す。
 
 ## RDP 中継 (`rdp-relay`) — ブラウザ ↔ RDS (Refs #296)
 
-**同じ repo の 2 本目の binary。** `cargo build` が `[[bin]]` を全部作るので、
-売上 API (`ichibanboshi`) と同じ musl release から拾って同じ SSH deploy で運ぶ
-(`ci.yml` の `DEPLOY_EXTRA_BINARY` / `DEPLOY_EXTRA_NAME`)。`ohishi-data` の上で
-**2 つの systemd サービスが並走**する。
+**root package の唯一の binary。** `ci.yml` の `deploy` job が musl release を build して
+SSH deploy で運ぶ。`ohishi-data` の上で `rdp-relay.service` (cf-access) と
+`rdp-relay-lan.service` (vpc、LAN 向け) が同じ binary で動く。
 
-| | `ichibanboshi.service` | `rdp-relay.service` |
-|---|---|---|
-| ポート | 3100 (LAN) | `RDP_RELAY_BIND` (既定 loopback、site では LAN IP) |
-| 実行ユーザー | `root` | `ubuntu` + `ProtectSystem=strict` 等 |
-| 再起動 | `ichibanboshi-watcher` | `rdp-relay-watcher` (binary の mtime を見て restart) |
+| | `rdp-relay.service` |
+|---|---|
+| ポート | `RDP_RELAY_BIND` (既定 loopback :3390、site では LAN IP) |
+| 実行ユーザー | `ubuntu` + `ProtectSystem=strict` 等 |
+| 再起動 | `rdp-relay-watcher` (binary の mtime を見て restart) |
 
-**deploy 後の health チェックは 3100 しか見ていない** (`DEPLOY_EXTRA_HEALTH_PORT` 未設定)。
-中継が起動に失敗しても main の deploy は緑のままなので、`rdp-relay` を触った PR の後は
-自分で確かめる (`systemctl is-active rdp-relay` / `curl <bind>/health`)。
+**deploy 後の health チェックは rdp-relay (:3390) を見る** — 中継が起動に失敗すると deploy job が赤くなる。
 
 ### 経路と認証
 
@@ -391,9 +310,8 @@ preflight は 403 で落とす — 実測)。
 
 ## Cloudflare Access
 
-- **トンネル**: `rust-ichiban.mtamaramu.com` → `http://172.18.21.35:3100`
-- **Service Token**: CF-Access-Client-Id / CF-Access-Client-Secret
-- トークンなしのリクエストは 403
+- nuxt-ichibanboshi → Worker の口は CF Access Service Token (`CF-Access-Client-Id/Secret`) 付き。無ければ 403
+- rdp-relay の入口は Access の JWT (`Cf-Access-Jwt-Assertion`) を中継自身も検証する (上の「経路と認証」)
 
 ## フロントエンド
 

@@ -25,7 +25,7 @@ RestartSec=5
 User=ubuntu
 Group=ubuntu
 
-# rdp-relay.service と同じ絞り。外から繋がれる口なので既存 ichibanboshi より狭く。
+# rdp-relay.service と同じ絞り。外から繋がれる口なので root では動かさず狭く。
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
