@@ -5,8 +5,7 @@
 //! 代わりに張る」中継が必ず要る。この bin がそれになる。
 //!
 //! 置き場所は `ohishi-data` — 社内 LAN 側にあり RDS (172.18.21.102:3389) へ直接届くため、
-//! 経路が 1 段減る。既存の `ichibanboshi` サービスと同じ systemd の型で動かす
-//! (`deploy/rdp-relay.service`)。
+//! 経路が 1 段減る。systemd で動かす (`deploy/rdp-relay.service`)。
 //!
 //! 口は 2 つ。`probe` が「Rust から X.224 → TLS を張れるか」を実機に対して確かめる用、
 //! `serve` が本番の中継。

@@ -2,23 +2,16 @@ name: worker-uriage
 
 # workers/uriage (担当者別売上の Worker `ichibanboshi-uriage`、Refs #322)。
 #   - pull_request / main への push → logic の test と 100% gate、Worker の build・clippy・公開範囲の検査・wrangler deploy --dry-run・
-#     local D1 への migration の適用、root の Cargo.lock の鮮度 (この経路は secret も token も使わない)
+#     local D1 への migration の適用 (この経路は secret も token も使わない)
 #   - タグ worker-uriage-v*            → 本番の D1 に未適用の migration が無いことを確かめてから本番へ deploy
 # merge では本番に出ない (タグで deploy)。v*.*.* タグには当てない。本番 D1 への migration の適用は人が手で打つ。
 # account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。wrangler の出力はファイルに取り、mask してから伏せて出す。
-# root (オンプレ版) も uriage-logic に path 依存するので、root の売上の口 (src/routes/uriage.rs 等) を変えたときも走らせる。
 on:
   pull_request:
     branches: [main]
     paths:
       - 'workers/uriage/**'
       - '.github/workflows/worker-uriage.yml'
-      - 'src/routes/uriage.rs'
-      - 'src/repo.rs'
-      - 'src/cakephp.rs'
-      - 'src/sqlite.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
   push:
     branches: [main]
     # タグの push には paths が効かない (タグは常に走る)
@@ -26,12 +19,6 @@ on:
     paths:
       - 'workers/uriage/**'
       - '.github/workflows/worker-uriage.yml'
-      - 'src/routes/uriage.rs'
-      - 'src/repo.rs'
-      - 'src/cakephp.rs'
-      - 'src/sqlite.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
 
 permissions:
   contents: read
@@ -61,16 +48,6 @@ jobs:
 
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
-
-      # root (repo ルートの package) は uriage-logic に path 依存する。
-      # workers/uriage だけを変えて root の Cargo.lock を更新し忘れると、main の CI (--locked の build) が落ちる
-      - name: Root Cargo.lock is up to date
-        working-directory: .
-        run: |
-          if ! cargo metadata --locked --format-version 1 > /dev/null; then
-            echo "::error::root の Cargo.lock が古い。workers/uriage の依存を変えたら root の Cargo.lock も更新する (root が uriage-logic に path 依存しているため)。cargo metadata --format-version 1 で更新できる"
-            exit 1
-          fi
 
       - uses: swatinem/rust-cache@v2
         with:

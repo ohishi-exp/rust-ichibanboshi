@@ -5,9 +5,9 @@
 #
 #   確認: make cov-check   (= bash scripts/check_coverage_100.sh)
 #
-# 実測は `cargo llvm-cov --text` 1 本。本 repo のテストは lib unit test も
-# tests/ の統合テストも全て MockRepo / wiremock / 純粋関数で完結しており、
-# SQL Server も環境変数も要らない (= DB 起動の要否で分ける軸が無い)。
+# 実測は `cargo llvm-cov --text` 1 本。本 repo (root package = rdp-relay) のテストは
+# src 内の mod tests だけで、wiremock / 純粋関数で完結しており、
+# DB も環境変数も要らない (= DB 起動の要否で分ける軸が無い)。
 #
 # ## なぜ rust-alc-api にある `type` (unit / mock / combined) が無いのか
 #
@@ -26,8 +26,7 @@
 # - **計測データに現れないファイルを入れない。** 現れなかったら gate はスキップ
 #   せず fail する (先例はここを WARN で握り潰しており、登録済みなのに一度も
 #   検証されていないファイルが実在した)。
-#   `src/lib.rs` / `src/routes/mod.rs` は re-export だけで
-#   実行行が 0 なので登録できない。
+#   `src/lib.rs` は mod 宣言だけで実行行が 0 なので登録できない。
 # - 100% に到達したファイルは登録漏れさせない (登録漏れ = gate が守っていない)
 #
 # ## 落とし穴
@@ -37,14 +36,8 @@
 # 100% gate が落ちる。メッセージを短くして 1 行に収める。
 # (rust-alc-api で PR #399 / #400 の 2 回発生した実績のある罠)
 
-# --- 認証 / 設定 ---
-
-[[files]]
-path = "src/config.rs"
-
-# 勤怠のファイル (kintai_* / kosoku / restraint / dtako / shift_* / stale_months / unko_gaps /
-# change_log / wage_snapshot) はオンプレ版から撤去した (Refs #322)。勤怠 Worker の登録簿は
-# workers/kintai/coverage_100.toml
+# 売上・勤怠・config・routes はオンプレ版ごと撤去した (Refs #322)。Worker の登録簿は
+# workers/<名前>/coverage_100.toml
 
 [[files]]
 path = "src/rdp_nego.rs"
@@ -60,21 +53,9 @@ path = "src/rdp_defaults.rs"
 [[files]]
 path = "src/cf_access.rs"
 
-# --- routes (全て MockRepo / wiremock でカバー) ---
-
-[[files]]
-path = "src/routes/health.rs"
-
 # --- 未登録 (2026-10-12 実測、100% 未達) ---
 #
 # 到達したら登録すること。`make cov-not100` で最新の未達一覧が出る。
 #
-#   src/cakephp.rs              92/96   95.8%  (miss 4)
 #   src/rdcleanpath.rs         123/126  97.6%  (miss 3)
-#   src/sqlite.rs             1844/1869 98.7%  (miss 25)
-#   src/routes/uriage.rs       522/710  73.5%  (miss 188)
-#   src/db.rs                    0/36    0.0%              DB 層
-#   src/main.rs                  0/20    0.0%              entrypoint
-#   src/repo.rs                  0/57    0.0%              DB 層 (tiberius 直叩き)
-#   src/server.rs                0/79    0.0%              pool 生成 + bind
 #   src/bin/rdp_relay.rs         0/298   0.0%              中継の entrypoint

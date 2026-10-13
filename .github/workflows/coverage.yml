@@ -5,7 +5,7 @@ name: Coverage Check
 # 専用レポート (Job Summary に出る)。
 #
 # rust-alc-api の同名 workflow から postgres service と init_local_db.sql を
-# 落としてある — 本 repo のテストは MockRepo / wiremock / 純粋関数で完結し、
+# 落としてある — 本 repo のテストは wiremock / 純粋関数で完結し、
 # DB も環境変数も要らないため。
 
 on:
@@ -21,7 +21,7 @@ on:
           - file
         default: not-100
       file_pattern:
-        description: 'File pattern (mode=file only, e.g. "kosoku" or "uriage")'
+        description: 'File pattern (mode=file only, e.g. "cf_access" or "rdp_nego")'
         required: false
         type: string
         default: ''
