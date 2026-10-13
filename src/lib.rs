@@ -1,11 +1,4 @@
-pub mod cakephp;
 pub mod cf_access;
-pub mod config;
-pub mod db;
 pub mod rdcleanpath;
 pub mod rdp_defaults;
 pub mod rdp_nego;
-pub mod repo;
-pub mod routes;
-pub mod server;
-pub mod sqlite;
