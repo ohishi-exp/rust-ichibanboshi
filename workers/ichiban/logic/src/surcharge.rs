@@ -16,7 +16,7 @@ const SURCHARGE_SOURCE_PREFIX: &str = "運転日報明細 + 得意先ﾏｽﾀ +
 /// 列: 0 請求K, 1 得意先C, 2 得意先N, 3 発地域N, 4 着地域N, 5 車種C, 6 車種N, 7 売上年月日, 8 運賃,
 /// 9 入金予定日, 10 傭車先C, 11 品名C, 12 品名N, 13 車輌C, 14 燃料サーチャージ, 15 行 ID, 16 入力担当C, 17 入力者N。
 /// マスタはスカラサブクエリ (TOP 1) で引き、明細 1 行 = 出力 1 行を保つ (LEFT JOIN のファンアウト防止)。
-const SURCHARGE_SQL_BODY: &str = "t.[請求K], t.[得意先C], \
+const SURCHARGE_SQL_BODY: &str = concat!("t.[請求K], t.[得意先C], \
      ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = t.[得意先C]), ''), \
      ISNULL((SELECT TOP 1 o.[地域N] FROM [地域ﾏｽﾀ] o WHERE o.[地域C] = t.[発地域C]), ''), \
      ISNULL((SELECT TOP 1 d.[地域N] FROM [地域ﾏｽﾀ] d WHERE d.[地域C] = t.[着地域C]), ''), \
@@ -36,11 +36,11 @@ const SURCHARGE_SQL_BODY: &str = "t.[請求K], t.[得意先C], \
        WHERE za.[管理年月日] = t.[管理年月日] \
          AND za.[管理C] = t.[管理C] \
          AND za.[自車傭車K] = '0'), 0), \
-     CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
+     ", crate::row_id_expr!(), ", \
      ISNULL(t.[入力担当C], ''), \
      ISNULL((SELECT TOP 1 s.[社員N] FROM [社員ﾏｽﾀ] s WHERE s.[社員C] = t.[入力担当C]), '') \
      FROM [運転日報明細] t \
-     WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 ";
+     WHERE t.[売上年月日] >= @P1 AND t.[売上年月日] < @P2 ");
 
 /// 並び順 (`kind` の絞り込みの後ろに付ける)。gate 対象で `format!` を 1 行に収めるため定数に出している。
 const SURCHARGE_ORDER_SQL: &str = "ORDER BY t.[入金予定日], t.[得意先C], t.[売上年月日]";

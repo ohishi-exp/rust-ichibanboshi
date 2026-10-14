@@ -36,6 +36,10 @@ fn test_days_sql_binds_every_value() {
     // 部門C の絞りは呼ぶ側の仕事
     assert!(!LEAVE_DAYS_SQL.contains("部門C"));
     assert!(LEAVE_DAYS_SQL.ends_with("ORDER BY [運行年月日], [運転手C]"));
+    // 行 ID (編集されても変わらない) と 最終更新 を列 3・4 に返す
+    assert!(LEAVE_DAYS_SQL.contains("FROM [運転日報明細] t "));
+    assert!(LEAVE_DAYS_SQL.contains(ichiban_logic::row_id_expr!()));
+    assert!(LEAVE_DAYS_SQL.contains("CONVERT(varchar(23), [最終更新], 121) "));
 }
 
 #[test]
@@ -128,11 +132,15 @@ fn test_build_leave_days_trims_and_formats() {
             employee_code: " 1021 ".into(),
             date: dt(2026, 10, 1, 0),
             item_name: "有休 ".into(),
+            row_id: " 20261001-12 ".into(),
+            last_updated: Some("2026-10-01 09:12:34.567".into()),
         },
         RawLeaveDayRow {
             employee_code: "1022".into(),
             date: dt(2026, 10, 2, 13),
             item_name: "".into(),
+            row_id: "20261002-7".into(),
+            last_updated: None,
         },
     ];
     let out = build_leave_days(&raw);
@@ -142,6 +150,12 @@ fn test_build_leave_days_trims_and_formats() {
     assert_eq!(out[0].item_name, "有休");
     assert_eq!(out[1].date, "2026-10-02"); // 時刻部は捨てる
     assert_eq!(out[1].item_name, "");
+    assert_eq!(out[0].row_id, "20261001-12");
+    assert_eq!(
+        out[0].last_updated.as_deref(),
+        Some("2026-10-01 09:12:34.567")
+    );
+    assert_eq!(out[1].last_updated, None);
 }
 
 #[test]
@@ -150,6 +164,8 @@ fn test_days_json_shape() {
         employee_code: "1021".into(),
         date: dt(2026, 10, 1, 0),
         item_name: "有休".into(),
+        row_id: "20261001-12".into(),
+        last_updated: Some("2026-10-01 09:12:34.567".into()),
     }];
     let body = ListResponse {
         source_table: LEAVE_DAYS_SOURCE.to_string(),
@@ -157,7 +173,22 @@ fn test_days_json_shape() {
     };
     assert_eq!(
         serde_json::to_string(&body).unwrap(),
-        r#"{"source_table":"運転日報明細","data":[{"employee_code":"1021","date":"2026-10-01","item_name":"有休"}]}"#
+        r#"{"source_table":"運転日報明細","data":[{"employee_code":"1021","date":"2026-10-01","item_name":"有休","row_id":"20261001-12","last_updated":"2026-10-01 09:12:34.567"}]}"#
+    );
+}
+
+#[test]
+fn test_days_json_null_last_updated() {
+    let raw = vec![RawLeaveDayRow {
+        employee_code: "1021".into(),
+        date: dt(2026, 10, 1, 0),
+        item_name: "有休".into(),
+        row_id: "20261001-12".into(),
+        last_updated: None,
+    }];
+    assert_eq!(
+        serde_json::to_string(&build_leave_days(&raw)).unwrap(),
+        r#"[{"employee_code":"1021","date":"2026-10-01","item_name":"有休","row_id":"20261001-12","last_updated":null}]"#
     );
 }
 
