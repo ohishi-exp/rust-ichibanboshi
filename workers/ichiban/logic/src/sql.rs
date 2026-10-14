@@ -30,6 +30,14 @@ pub const EMPLOYEES_SQL: &str = "SELECT CONVERT(varchar(20), [社員C]) AS [社�
                  ISNULL(MAX([社員R]), '') AS [社員R] \
                  FROM [社員ﾏｽﾀ] GROUP BY [社員C] ORDER BY [社員C]";
 
+/// 運転日報明細・経費明細の行 ID (`管理年月日(YYYYMMDD)-管理C`)。編集されても変わらない。テーブル別名 `t` が前提。
+#[macro_export]
+macro_rules! row_id_expr {
+    () => {
+        "CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C])"
+    };
+}
+
 /// `/api/sales/vehicle-daily` の `SELECT TOP n` より後ろ。全体は [`vehicle_daily_sql`] で組む。
 ///
 /// 積地・卸地は 2 系統返す (#12 実機調査): 発地域C/着地域C → 地域ﾏｽﾀ.地域N は
@@ -53,7 +61,7 @@ pub const EMPLOYEES_SQL: &str = "SELECT CONVERT(varchar(20), [社員C]) AS [社�
 ///
 /// バインドの順: @P1 from, @P2 to, @P3 vehicle, @P4 customer, @P5 `%origin%`,
 /// @P6 `%dest%`, @P7 driver (@P7 は後から足したので番号と WHERE の並びがずれている)。
-pub const VEHICLE_DAILY_SQL_BODY: &str = "t.[売上年月日], \
+pub const VEHICLE_DAILY_SQL_BODY: &str = concat!("t.[売上年月日], \
              ISNULL(t.[車輌C], ''), \
              ISNULL(t.[得意先C], ''), \
              ISNULL((SELECT TOP 1 c.[得意先N] FROM [得意先ﾏｽﾀ] c WHERE c.[得意先C] = t.[得意先C]), ''), \
@@ -65,7 +73,7 @@ pub const VEHICLE_DAILY_SQL_BODY: &str = "t.[売上年月日], \
              ISNULL(t.[税抜傭車金額],0)+ISNULL(t.[税抜傭車割増],0)+ISNULL(t.[税抜傭車実費],0)-ISNULL(t.[傭車値引],0), \
              ISNULL(t.[品名C], ''), ISNULL(t.[品名N], ''), \
              ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), ISNULL(t.[単位], ''), \
-             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
+             ", crate::row_id_expr!(), ", \
              ISNULL(t.[車輌H], ''), ISNULL(t.[運転手C], ''), \
              ISNULL((SELECT TOP 1 s.[社員N] FROM [社員ﾏｽﾀ] s WHERE s.[社員C] = t.[運転手C]), ''), \
              ISNULL(t.[請求K], '') \
@@ -80,7 +88,7 @@ pub const VEHICLE_DAILY_SQL_BODY: &str = "t.[売上年月日], \
                AND (@P6 IS NULL \
                  OR ISNULL((SELECT TOP 1 dm.[地域N] FROM [地域ﾏｽﾀ] dm WHERE dm.[地域C] = t.[着地域C]), '') LIKE @P6 \
                  OR ISNULL(t.[着地N], '') LIKE @P6) \
-             ORDER BY t.[売上年月日], t.[管理C]";
+             ORDER BY t.[売上年月日], t.[管理C]");
 
 /// `/api/costs/vehicle-daily` の `SELECT TOP n` より後ろ。全体は [`costs_daily_sql`] で組む。
 ///
@@ -104,7 +112,7 @@ pub const VEHICLE_DAILY_SQL_BODY: &str = "t.[売上年月日], \
 /// を避ける。呼び出し側 (handler) が「最低 1 つ必須」を検証する (全件スキャン防止)。
 ///
 /// バインドの順: @P1 from, @P2 to, @P3 vehicle, @P4 driver, @P5 kind。
-pub const COSTS_DAILY_SQL_BODY: &str = "t.[運行年月日], \
+pub const COSTS_DAILY_SQL_BODY: &str = concat!("t.[運行年月日], \
              ISNULL(t.[車輌C], ''), ISNULL(t.[車輌H], ''), ISNULL(t.[運転手C], ''), \
              ISNULL(t.[経費C], ''), \
              ISNULL((SELECT TOP 1 m.[経費N] FROM [経費ﾏｽﾀ] m \
@@ -114,7 +122,7 @@ pub const COSTS_DAILY_SQL_BODY: &str = "t.[運行年月日], \
              ISNULL(t.[数量], 0), ISNULL(t.[単価], 0), \
              ISNULL(t.[税抜金額], 0), ISNULL(t.[軽油引取税], 0), ISNULL(t.[KM], 0), \
              ISNULL(t.[固定経費K], ''), \
-             CONCAT(CONVERT(varchar(8), t.[管理年月日], 112), '-', t.[管理C]), \
+             ", crate::row_id_expr!(), ", \
              ISNULL(t.[備考], ''), ISNULL(t.[未払先C], ''), ISNULL(t.[未払先H], ''), \
              ISNULL((SELECT TOP 1 v.[未払先N] FROM [未払先ﾏｽﾀ] v \
                WHERE v.[未払先C] = t.[未払先C] AND v.[未払先H] = t.[未払先H]), ''), \
@@ -124,7 +132,7 @@ pub const COSTS_DAILY_SQL_BODY: &str = "t.[運行年月日], \
                AND (@P3 IS NULL OR t.[車輌C] = @P3) \
                AND (@P4 IS NULL OR t.[運転手C] = @P4) \
                AND (@P5 IS NULL OR t.[経費種別C] = @P5) \
-             ORDER BY t.[運行年月日], t.[管理C]";
+             ORDER BY t.[運行年月日], t.[管理C]");
 
 /// `/api/sales/vehicle-daily` の SQL 全体。`limit` は 1..=5000 に丸める。
 pub fn vehicle_daily_sql(limit: i32) -> String {

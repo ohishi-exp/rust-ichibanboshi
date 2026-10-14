@@ -7,13 +7,15 @@ use tiberius::Row;
 
 use super::{decode_cp932, get_datetime};
 
-/// days の列: 0 運転手C, 1 運行年月日, 2 品名N。
+/// days の列: 0 運転手C, 1 運行年月日, 2 品名N, 3 行 ID, 4 最終更新 (NULL・型不一致は None)。
 pub(crate) fn days(rows: &[Row]) -> Vec<RawLeaveDayRow> {
     rows.iter()
         .map(|r| RawLeaveDayRow {
             employee_code: decode_cp932(r, 0),
             date: get_datetime(r, 1),
             item_name: decode_cp932(r, 2),
+            row_id: decode_cp932(r, 3),
+            last_updated: r.try_get::<&str, _>(4).ok().flatten().map(str::to_string),
         })
         .collect()
 }

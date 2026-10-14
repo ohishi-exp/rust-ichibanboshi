@@ -23,12 +23,16 @@ pub const MAX_DAYS: i64 = 92;
 // ══════════════════════════════════════════════════════════════
 
 /// 休暇入力の行 (@P1 得意先C, @P2 開始日 (以上), @P3 終了日の翌日 (未満))。
-/// 列: 0 運転手C (varchar に寄せる), 1 運行年月日, 2 品名N。並びは 運行年月日, 運転手C。
-pub const LEAVE_DAYS_SQL: &str =
-    "SELECT CONVERT(varchar(20), [運転手C]), [運行年月日], ISNULL([品名N], '') \
-             FROM [運転日報明細] \
+/// 列: 0 運転手C (varchar に寄せる), 1 運行年月日, 2 品名N, 3 行 ID, 4 最終更新 (`yyyy-mm-dd hh:mi:ss.mmm`)。
+/// 並びは 運行年月日, 運転手C。
+pub const LEAVE_DAYS_SQL: &str = concat!(
+    "SELECT CONVERT(varchar(20), [運転手C]), [運行年月日], ISNULL([品名N], ''), ",
+    crate::row_id_expr!(),
+    ", CONVERT(varchar(23), [最終更新], 121) \
+             FROM [運転日報明細] t \
              WHERE [得意先C] = @P1 AND [運行年月日] >= @P2 AND [運行年月日] < @P3 \
-             ORDER BY [運行年月日], [運転手C]";
+             ORDER BY [運行年月日], [運転手C]"
+);
 
 /// 社員 1 人 1 行。列: 0 社員C, 1 社員N, 2 部門C, 3 入社年月日, 4 退職年月日。
 ///
@@ -94,6 +98,9 @@ pub struct RawLeaveDayRow {
     pub employee_code: String,
     pub date: NaiveDateTime,
     pub item_name: String,
+    pub row_id: String,
+    /// NULL は `None`。
+    pub last_updated: Option<String>,
 }
 
 /// `LEAVE_EMPLOYEES_SQL` の 1 行。日付の NULL は `None`。
@@ -117,6 +124,10 @@ pub struct LeaveDay {
     pub date: String,
     /// 品名N (trim のみ。正規化は呼ぶ側)。
     pub item_name: String,
+    /// 行 ID (`管理年月日(YYYYMMDD)-管理C`)。編集されても変わらない。
+    pub row_id: String,
+    /// 最終更新 (`yyyy-mm-dd hh:mi:ss.mmm`)。NULL は `null`。
+    pub last_updated: Option<String>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -145,6 +156,8 @@ pub fn build_leave_days(raw: &[RawLeaveDayRow]) -> Vec<LeaveDay> {
             employee_code: r.employee_code.trim().to_string(),
             date: ymd(&r.date),
             item_name: r.item_name.trim().to_string(),
+            row_id: r.row_id.trim().to_string(),
+            last_updated: r.last_updated.clone(),
         })
         .collect()
 }
