@@ -2,18 +2,21 @@
 //! fold の口のうち読むだけの `stale-months` ([`stale_months`]。経路は [`crate::fold`])。
 //!
 //! 入力の検査・SQL・`$n` の型・応答の組み立ては kintai-logic (root の src/ の写し)。ここは DB との往復だけ:
-//! 検査 (400) → binding の有無 (無ければ 503) → テナント (`KINTAI_TENANT_ID`、無ければ 503) → connect (失敗は 502) →
+//! 検査 (400) → binding の有無 (無ければ 503) → テナント ([`Tenants`]。無ければ 503、許可外は 403) → connect (失敗は 502) →
 //! `PgClient::tenant_tx` の中で `query_typed` → 行を owned な型に詰め直す → 応答 (200)。順は元の handler と同じ。
 //!
-//! - **テナントは設定 pin。`X-Tenant-ID` は読まない。** 接続ロールは BYPASSRLS なので、SQL の `WHERE tenant_id = $1`
-//!   (`$1` = pin の UUID) が他テナントを見せない唯一の担保 (kintai-logic の `tests/common.rs` で確かめている)
+//! - **テナントは既定が設定 pin (`KINTAI_TENANT_ID`)。`X-Tenant-ID` は読まない。** 呼び手が `X-Kintai-Tenant-Id` で
+//!   名指しすれば、既定か `KINTAI_TENANT_IDS` に入っているものだけを使う (解決は kintai-logic の `resolve_tenant`)。
+//!   接続ロールは BYPASSRLS なので、SQL の `WHERE tenant_id = $1` (`$1` = 解決した UUID) が他テナントを見せない唯一の担保
+//!   (kintai-logic の `tests/common.rs` で確かめている)
 //! - 名前付き prepared statement は使わない (`query_typed` / `query_typed_one` だけ。Hyperdrive では接続が切れる)
 //! - 502 の本文は元の文言の頭 + kit の `kind` (SQLSTATE か固定の語)。DB の message・接続先は出さない
 
 use alc_worker_db::hyperdrive;
 use alc_worker_db::{kind, PgClient, TxOutput};
 use kintai_logic::common::{
-    db_fail, no_db, no_write_db, preflight, write_preflight, Fail, HYPERDRIVE_BINDING, TENANT_VAR,
+    db_fail, no_db, no_write_db, preflight, write_preflight, Fail, Tenancy, TenantInput,
+    HYPERDRIVE_BINDING, TENANT_HEADER, TENANT_IDS_VAR, TENANT_VAR,
 };
 use kintai_logic::{
     change_log, day_summaries, shift_days, shift_overlaps, timecard_write, unko_gaps, wage_range,
@@ -22,7 +25,7 @@ use tokio_postgres::{Error as PgError, Row};
 use uuid::Uuid;
 use wasm_bindgen::JsValue;
 use worker::js_sys::Reflect;
-use worker::Env;
+use worker::{Env, Request};
 
 use crate::probe::Read;
 
@@ -31,35 +34,72 @@ struct Out<T>(T);
 
 impl<T: Send + 'static> TxOutput for Out<T> {}
 
+/// テナントを決める材料 (var 2 本とリクエストのヘッダ)。fetch の入口で 1 回作り、DB を開く口と alc の RPC へ持ち回る。
+pub(crate) struct Tenants {
+    default: Option<String>,
+    allowed: Option<String>,
+    header: Option<String>,
+}
+
+impl Tenants {
+    pub(crate) fn of(req: &Request, env: &Env) -> Self {
+        let var = |name| env.var(name).ok().map(|v| v.to_string());
+        Self {
+            default: var(TENANT_VAR),
+            allowed: var(TENANT_IDS_VAR),
+            header: req.headers().get(TENANT_HEADER).ok().flatten(),
+        }
+    }
+
+    pub(crate) fn input(&self) -> TenantInput<'_> {
+        TenantInput {
+            default: self.default.as_deref(),
+            allowed: self.allowed.as_deref(),
+            header: self.header.as_deref(),
+        }
+    }
+}
+
 /// 口ごとに読んで応答の JSON を返す。
-pub(crate) async fn serve(read: Read, query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+pub(crate) async fn serve(
+    read: Read,
+    query: &str,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
     match read {
-        Read::DaySummaries => day_summaries(query, env).await,
-        Read::ShiftOverlaps => shift_overlaps(query, env).await,
-        Read::ShiftDays => shift_days(query, env).await,
-        Read::ChangeLog => change_log(query, env).await,
-        Read::WageRange => wage_range(query, env).await,
-        Read::Signatures => signatures(query, env).await,
-        Read::UnkoGaps => unko_gaps(query, env).await,
+        Read::DaySummaries => day_summaries(query, env, tenants).await,
+        Read::ShiftOverlaps => shift_overlaps(query, env, tenants).await,
+        Read::ShiftDays => shift_days(query, env, tenants).await,
+        Read::ChangeLog => change_log(query, env, tenants).await,
+        Read::WageRange => wage_range(query, env, tenants).await,
+        Read::Signatures => signatures(query, env, tenants).await,
+        Read::UnkoGaps => unko_gaps(query, env, tenants).await,
     }
 }
 
 /// binding の有無 → テナント → connect の順 (元の handler と同じく、設定の欠落は DB に繋ぐ前に 503 で決める)。
-/// binding が無い = 503 / テナントが無い = 503 (どちらも connect しない) / 在るのに繋がらない = 502。
-async fn open(env: &Env, what: &str) -> Result<(PgClient, Uuid), Fail> {
-    open_db(env, what, false).await
+/// binding が無い = 503 / テナントが無い = 503・許可外 = 403 (どちらも connect しない) / 在るのに繋がらない = 502。
+async fn open(env: &Env, tenants: &Tenants, what: &str) -> Result<(PgClient, Uuid), Fail> {
+    let (pg, t) = open_db(env, tenants, what, false).await?;
+    Ok((pg, t.tenant))
 }
 
 /// [`open`] の本体。`write` は書き込みの口 (と元が書き先の store を使っていた `timecard/signatures`) で、binding が
 /// 無いときの 503 の文言だけが違う (元の `[kintai_push] が無効です (書き先がありません)` に当たる)。
-pub(crate) async fn open_db(env: &Env, what: &str, write: bool) -> Result<(PgClient, Uuid), Fail> {
+pub(crate) async fn open_db(
+    env: &Env,
+    tenants: &Tenants,
+    what: &str,
+    write: bool,
+) -> Result<(PgClient, Tenancy), Fail> {
     // kit の hyperdrive::connect と同じ判定 (undefined のときだけ「無い」。読めなければ「在る」とし、connect の Err に任せる)
     let has_binding =
         Reflect::get(env, &JsValue::from(HYPERDRIVE_BINDING)).map_or(true, |v| !v.is_undefined());
-    let raw = env.var(TENANT_VAR).ok().map(|v| v.to_string());
-    let tenant = match write {
-        true => write_preflight(has_binding, raw.as_deref())?,
-        false => preflight(has_binding, raw.as_deref())?,
+    let input = tenants.input();
+    let tenancy = match write {
+        true => write_preflight(has_binding, &input)?,
+        false => preflight(has_binding, &input)?,
     };
     let pg = match hyperdrive::connect(env, HYPERDRIVE_BINDING).await {
         Ok(Some(pg)) => pg,
@@ -68,13 +108,17 @@ pub(crate) async fn open_db(env: &Env, what: &str, write: bool) -> Result<(PgCli
         // ConnectError の Display は binding 名・段・kind だけ (接続文字列・宛先を含まない)
         Err(e) => return Err(db_fail(what, &e.to_string())),
     };
-    Ok((pg, tenant))
+    Ok((pg, tenancy))
 }
 
-async fn day_summaries(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn day_summaries(
+    query: &str,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
     use day_summaries::{parse, respond, Binds, DB_WHAT, MINUTE_COLUMNS, SELECT_SQL};
     let req = parse(query)?;
-    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    let (mut pg, tenant) = open(env, tenants, DB_WHAT).await?;
     let binds = Binds::new(tenant, &req);
     let rows = pg
         .tenant_tx(tenant, move |tx| {
@@ -104,10 +148,14 @@ async fn day_summaries(query: &str, env: &Env) -> Result<serde_json::Value, Fail
     Ok(respond(&req.month, &rows.0))
 }
 
-async fn shift_overlaps(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn shift_overlaps(
+    query: &str,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
     use shift_overlaps::{parse, respond, Binds, DB_WHAT, SELECT_SQL};
     let req = parse(query)?;
-    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    let (mut pg, tenant) = open(env, tenants, DB_WHAT).await?;
     let binds = Binds::new(tenant, &req);
     let rows = pg
         .tenant_tx(tenant, move |tx| {
@@ -133,10 +181,10 @@ async fn shift_overlaps(query: &str, env: &Env) -> Result<serde_json::Value, Fai
     Ok(respond(&req.month, &rows.0))
 }
 
-async fn shift_days(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn shift_days(query: &str, env: &Env, tenants: &Tenants) -> Result<serde_json::Value, Fail> {
     use shift_days::{parse, respond, Binds, DB_WHAT, SELECT_SQL};
     let req = parse(query)?;
-    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    let (mut pg, tenant) = open(env, tenants, DB_WHAT).await?;
     let binds = Binds::new(tenant, &req);
     let rows = pg
         .tenant_tx(tenant, move |tx| {
@@ -163,10 +211,10 @@ async fn shift_days(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
     Ok(respond(&req, rows.0))
 }
 
-async fn change_log(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn change_log(query: &str, env: &Env, tenants: &Tenants) -> Result<serde_json::Value, Fail> {
     use change_log::{parse, respond, Binds, DB_WHAT, SELECT_SQL, SINCE_SQL};
     let req = parse(query)?;
-    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    let (mut pg, tenant) = open(env, tenants, DB_WHAT).await?;
     let binds = Binds::new(tenant, &req);
     let out = pg
         .tenant_tx(tenant, move |tx| {
@@ -193,10 +241,10 @@ async fn change_log(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
     Ok(respond(&req, since, changes))
 }
 
-async fn wage_range(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn wage_range(query: &str, env: &Env, tenants: &Tenants) -> Result<serde_json::Value, Fail> {
     use wage_range::{parse, respond, Binds, DB_WHAT, SELECT_RANGE_SQL};
     let req = parse(query)?;
-    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    let (mut pg, tenant) = open(env, tenants, DB_WHAT).await?;
     let binds = Binds::new(tenant, &req);
     let rows = pg
         .tenant_tx(tenant, move |tx| {
@@ -215,10 +263,10 @@ async fn wage_range(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
 
 /// `GET /api/kintai/timecard/signatures` (元は書き先の store を使っていたので、binding が無いときは書き込みの口と同じ 503)。
 /// 検査 (400) → binding (503) → テナント (503) → connect (502) → `STORED_SIGNATURES_SQL` → 応答。
-async fn signatures(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn signatures(query: &str, env: &Env, tenants: &Tenants) -> Result<serde_json::Value, Fail> {
     use timecard_write::{parse_signatures, signatures_respond, DB_WHAT};
     let req = parse_signatures(query)?;
-    let (mut pg, tenant) = open_db(env, DB_WHAT, true).await?;
+    let (mut pg, Tenancy { tenant, .. }) = open_db(env, tenants, DB_WHAT, true).await?;
     let sigs = kintai_pg::stored_day_signatures(&mut pg, tenant, req.driver_cd, req.from, req.to)
         .await
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
@@ -228,13 +276,17 @@ async fn signatures(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
 /// `GET /api/kintai/stale-months` (root の `src/routes/stale_months.rs` と同じ応答。範囲・SQL・応答は kintai-logic の
 /// `stale_months`)。範囲 (400) → binding (503、root の書き先の store と同じ文言) → テナント (503) → connect (502) →
 /// `STALE_MONTHS_SQL` (502) → 応答。版は fold の口と同じ `KosokuParams` の既定値から作る。
-pub(crate) async fn stale_months(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+pub(crate) async fn stale_months(
+    query: &str,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
     use kintai_logic::fold_routes::{logic_version, STALE_DB_WHAT};
     use kintai_logic::mariadb_reads::jst_today;
     use kintai_logic::stale_months::{parse, response, StaleMonthRow, STALE_MONTHS_SQL};
     use tokio_postgres::types::Type;
     let (lo, hi) = parse(query, jst_today(worker::Date::now().as_millis()))?;
-    let (mut pg, tenant) = open_db(env, STALE_DB_WHAT, true).await?;
+    let (mut pg, Tenancy { tenant, .. }) = open_db(env, tenants, STALE_DB_WHAT, true).await?;
     let version = logic_version();
     let v = version.clone();
     let rows = pg
@@ -272,13 +324,14 @@ pub(crate) async fn stale_months(query: &str, env: &Env) -> Result<serde_json::V
 /// 検査 (400) → binding (503) → テナント (503) → connect (502) → `MONTH_OPERATIONS_SQL` (502) → auth-worker の RPC (`KintaiAlcEntrypoint.dtakoEtags`) で
 /// alc の etags (binding が無い 503・404 は `gcp_etags_available: false`・他の失敗は 502) → 応答。順は root と同じ。
 /// RPC は JS の値の await なので transaction の外で打つ。
-async fn unko_gaps(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
+async fn unko_gaps(query: &str, env: &Env, tenants: &Tenants) -> Result<serde_json::Value, Fail> {
     use unko_gaps::{
         broken_month, etags_search, parse, read_etags, respond, Binds, Onprem, Window, DB_WHAT,
         MONTH_OPERATIONS_SQL,
     };
     let req = parse(query)?;
-    let (mut pg, tenant) = open(env, DB_WHAT).await?;
+    let (mut pg, tenancy) = open_db(env, tenants, DB_WHAT, false).await?;
+    let tenant = tenancy.tenant;
     // parse が通した月では常に作れる (作れなければ root と同じ 400)
     let window = Window::of(&req.month)?;
     let binds = Binds::new(tenant, &window);
@@ -301,7 +354,7 @@ async fn unko_gaps(query: &str, env: &Env) -> Result<serde_json::Value, Fail> {
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))?;
     let onprem = Onprem::from_rows(rows.0.iter().map(|(d, u)| (*d, u.as_str())));
     let search = etags_search(&req.month).ok_or_else(|| broken_month(&req.month))?;
-    let gcp = read_etags(&crate::alc::fetch_etags(env, &search).await?)?;
+    let gcp = read_etags(&crate::alc::fetch_etags(env, &search, &tenancy).await?)?;
     Ok(respond(
         &req.month,
         &window,

@@ -30,6 +30,10 @@
 //!   Cloud Run 版と同じ応答。段取りは共有 crate の `kintai_kosoku::route_flow`、読みは alc の RPC と送った写し
 //!   (kintai-pg の `FoldStore`。社内 MariaDB は読まない)、書きも `FoldStore`。**POST の 2 本は書き込みの口と同じ `X-Kintai-Write-Token` を照合する**。GET recalc は書かない)。
 //!
+//! テナント: 既定は `KINTAI_TENANT_ID` の設定 pin。呼び手 (relay) が `X-Kintai-Tenant-Id` で名指しすれば、既定か
+//! `KINTAI_TENANT_IDS` に入っているテナントだけを使う (外は 403。解決は kintai-logic の `resolve_tenant`)。既定以外のテナントで
+//! 通すのは Supabase と alc だけの口 (`probe::Route::reach`)。社内 MariaDB・CakePHP・D1・probe は 403。
+//!
 //! 到達面: fetch は Service Binding からだけ届く (route・workers.dev・preview 無し)。
 //! **読みの口は認可なし (ユーザー決定 2026-10-10、一番星と同じ)。** 関門は呼び手の側 (relay の共有 secret、kyuyo-mcp の OAuth)。
 //! **書き込みの口は Worker が共有 secret を照合する** (ユーザー決定 2026-10-10。読みのために binding を持つ呼び手が POST を
@@ -53,7 +57,7 @@ use std::pin::pin;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
-use kintai_logic::common::{mariadb_fail, mariadb_unconfigured, Fail};
+use kintai_logic::common::{mariadb_fail, mariadb_unconfigured, tenant_gate, Fail};
 use kintai_logic::dtako_reads::{DtakoRead, Links, DTAKO_BASE_URL_VAR, RYOHI_BASE_URL_VAR};
 use kintai_logic::kosoku_reads::{
     anchors_from, ferry_or_empty, head_sqls, parse_kosoku_daily, parse_timecard_drivers,
@@ -71,6 +75,7 @@ use probe::{
     log_line, parse_creds, reply_for, reply_for_route, route, Creds, Failure, ProbeOk, Reply,
     Route, Stage,
 };
+use reads::Tenants;
 
 /// TCP を開くまでの上限。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,16 +95,23 @@ const OUTPUT_SHA: &str = env!("KINTAI_WORKER_OUTPUT_SHA");
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
     let route = route(req.method().as_ref(), &req.path());
+    // テナントの関門 (ヘッダが無ければ素通し = 今と同じ)。既定以外のテナントは Supabase と alc の口だけ
+    let tenants = Tenants::of(&req, &env);
+    if let Some(reach) = route.reach() {
+        if let Err(f) = tenant_gate(&tenants.input(), reach) {
+            return run_read("tenant", async { Err(f) }).await;
+        }
+    }
     if let Route::Restraint(r) = route {
         return restraint::serve(r, &mut req, &env).await;
     }
     if let Route::Fold(r) = route {
         let query = req.url()?.query().unwrap_or("").to_string();
-        let outcome = fold::serve(r, &query, &mut req, &env);
+        let outcome = fold::serve(r, &query, &mut req, &env, &tenants);
         return run_read(r.as_str(), outcome).await;
     }
     if let Route::Write(write) = route {
-        let outcome = writes::serve(write, &mut req, &env);
+        let outcome = writes::serve(write, &mut req, &env, &tenants);
         return run_read(write.as_str(), outcome).await;
     }
     if let Route::Cakephp(read) = route {
@@ -109,7 +121,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     }
     if let Route::Read(read) = route {
         let url = req.url()?;
-        let outcome = reads::serve(read, url.query().unwrap_or(""), &env);
+        let outcome = reads::serve(read, url.query().unwrap_or(""), &env, &tenants);
         return run_read(read.as_str(), outcome).await;
     }
     if let Route::Mariadb(read) = route {

@@ -6,12 +6,13 @@
 //!
 //! 検査の順は **認可 → 入力 → テナント → DB**:
 //! `X-Kintai-Write-Token` を Secrets Store の `KINTAI_WRITE_TOKEN` と照合 (無い・違う = 403、binding が無い・読めない = 503) →
-//! 本文 (axum の `Json` と同じ 415 / 413 / 400 / 422 と、元の 400) → binding (503) → テナント (`KINTAI_TENANT_ID`、503) →
+//! 本文 (axum の `Json` と同じ 415 / 413 / 400 / 422 と、元の 400) → binding (503) → テナント ([`Tenants`]、503 / 許可外は 403) →
 //! connect (502) → `kintai_pg` (1 transaction) → 応答 (200、元と同じ JSON)。
 //!
 //! - 入力の検査・応答・認可の判定は kintai-logic (`timecard_write`・`wage_write`・`write_auth`)、DB との往復は kintai-pg
-//! - **テナントは設定 pin。`X-Tenant-ID` は読まない** (元の timecard は `X-Tenant-ID` を読み pin と食い違えば 403・
-//!   無ければ 400 だった。Worker では pin だけで決める)
+//! - **テナントは既定が設定 pin。`X-Tenant-ID` は読まない** (元の timecard は `X-Tenant-ID` を読み pin と食い違えば 403・
+//!   無ければ 400 だった。Worker では pin と、呼び手が `X-Kintai-Tenant-Id` で名指しした許可リストの中だけで決める)。
+//!   autoload は社内 CakePHP なので既定テナントでしか呼べない (関門は lib.rs の fetch)
 //! - 502 の本文は元の文言の頭 + kit の `kind`。DB の message・接続先は出さない
 
 use alc_worker_db::kind;
@@ -22,24 +23,25 @@ use kintai_pg::ApplyError;
 use worker::{Env, Request};
 
 use crate::probe::Write;
-use crate::reads::open_db;
+use crate::reads::{open_db, Tenants};
 
 /// 口ごとに書いて応答の JSON を返す。
 pub(crate) async fn serve(
     write: Write,
     req: &mut Request,
     env: &Env,
+    tenants: &Tenants,
 ) -> Result<serde_json::Value, Fail> {
     let token = req.headers().get(WRITE_TOKEN_HEADER).ok().flatten();
     authorize(load_token(env).await.as_deref(), token.as_deref())?;
     match write {
         Write::Timecard => {
             let (content_type, body) = read_body(req).await?;
-            timecard(content_type.as_deref(), &body, env).await
+            timecard(content_type.as_deref(), &body, env, tenants).await
         }
         Write::WageSnapshot => {
             let (content_type, body) = read_body(req).await?;
-            wage_snapshot(content_type.as_deref(), &body, env).await
+            wage_snapshot(content_type.as_deref(), &body, env, tenants).await
         }
         // 本文は zip (JSON ではない)。入力の検査と段取りは CakePHP の中継の側
         Write::DtakoAutoload => crate::cakephp::autoload(req, env).await,
@@ -66,10 +68,12 @@ async fn timecard(
     content_type: Option<&str>,
     body: &[u8],
     env: &Env,
+    tenants: &Tenants,
 ) -> Result<serde_json::Value, Fail> {
     use timecard_write::{batch_respond, parse_batch, DB_WHAT};
     let batch = parse_batch(content_type, body)?;
-    let (mut pg, tenant) = open_db(env, DB_WHAT, true).await?;
+    let (mut pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let tenant = tenancy.tenant;
     let result = kintai_pg::apply_timecard_batch(&mut pg, tenant, &batch)
         .await
         .map_err(|e| match e {
@@ -84,10 +88,12 @@ async fn wage_snapshot(
     content_type: Option<&str>,
     body: &[u8],
     env: &Env,
+    tenants: &Tenants,
 ) -> Result<serde_json::Value, Fail> {
     use wage_write::{parse_snapshot, DB_WHAT};
     let (valid, synced_at) = parse_snapshot(content_type, body)?;
-    let (mut pg, tenant) = open_db(env, DB_WHAT, true).await?;
+    let (mut pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let tenant = tenancy.tenant;
     kintai_pg::put_wage_snapshot(&mut pg, tenant, valid, synced_at)
         .await
         .map_err(|e| db_fail(DB_WHAT, &kind(&e)))

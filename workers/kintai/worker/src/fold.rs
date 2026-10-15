@@ -10,7 +10,8 @@
 //! - 時計 = [`WorkerClock`] (`Date.now()`。wasm32 では `Instant`・`SystemTime`・`Utc::now` を使わない)
 //!
 //! 検査の順は root の殻と同じで、書き込みの口 (POST の 2 本) だけ先頭に認可が入る:
-//! 認可 (403 / 503) → 入力 (400 等) → binding (503) → テナント (503) → connect (502) → 段取り (失敗は 503 / 502)。
+//! 認可 (403 / 503) → 入力 (400 等) → binding (503) → テナント (503 / 許可外は 403) → connect (502) → 段取り (失敗は 503 / 502)。
+//! テナントは [`Tenants`] で決め、既定以外なら alc の RPC にも `tenantId` を渡す ([`EnvAlc::new`])。
 //! window の畳み直しの失敗は root と同じく 200 のまま `fold_error`・`fold_error_status`・`stale_error` に載せる。
 //! 502 の本文と `fold_error` は種別だけ (DB や上流の message を出さない。kintai-logic の `fold_routes`)。
 
@@ -29,7 +30,7 @@ use kintai_pg::FoldStore;
 use worker::{console_log, Date, Env, Request};
 
 use crate::alc::EnvAlc;
-use crate::reads::{open_db, stale_months};
+use crate::reads::{open_db, stale_months, Tenants};
 use crate::writes::{load_token, read_body};
 use crate::OUTPUT_SHA;
 
@@ -65,30 +66,40 @@ pub(crate) async fn serve(
     query: &str,
     req: &mut Request,
     env: &Env,
+    tenants: &Tenants,
 ) -> Result<serde_json::Value, Fail> {
     if route.is_write() {
         let token = req.headers().get(WRITE_TOKEN_HEADER).ok().flatten();
         authorize(load_token(env).await.as_deref(), token.as_deref())?;
     }
     match route {
-        FoldRoute::RecalcPreview => recalc(parse_recalc_query(query)?, env).await,
+        FoldRoute::RecalcPreview => recalc(parse_recalc_query(query)?, env, tenants).await,
         FoldRoute::Recalc => {
             let (content_type, body) = read_body(req).await?;
-            recalc(parse_recalc_body(content_type.as_deref(), &body)?, env).await
+            recalc(
+                parse_recalc_body(content_type.as_deref(), &body)?,
+                env,
+                tenants,
+            )
+            .await
         }
         FoldRoute::TimecardWindow => {
             let (content_type, body) = read_body(req).await?;
-            window(parse_window(content_type.as_deref(), &body)?, env).await
+            window(parse_window(content_type.as_deref(), &body)?, env, tenants).await
         }
-        FoldRoute::StaleMonths => stale_months(query, env).await,
+        FoldRoute::StaleMonths => stale_months(query, env, tenants).await,
     }
 }
 
 /// 全量再計算の 1 ページ (GET は `apply` を持たないので書かない)。
-async fn recalc(req: RecalcRequest, env: &Env) -> Result<serde_json::Value, Fail> {
-    let (pg, tenant) = open_db(env, DB_WHAT, true).await?;
-    let store = FoldStore::new(pg, tenant);
-    let alc = EnvAlc(env);
+async fn recalc(
+    req: RecalcRequest,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
+    let (pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let store = FoldStore::new(pg, tenancy.tenant);
+    let alc = EnvAlc::new(env, &tenancy);
     let repo = fold_events(&alc, &store);
     let clock = WorkerClock;
     let ctx = fold_ctx(OUTPUT_SHA, &clock);
@@ -98,9 +109,13 @@ async fn recalc(req: RecalcRequest, env: &Env) -> Result<serde_json::Value, Fail
 }
 
 /// 窓ぶんの打刻を置き換え、`fold` なら変わった乗務員だけ畳み直す。置き換えの失敗は 503 / 502、畳み直しの失敗は 200 のまま。
-async fn window(window: TimecardWindow, env: &Env) -> Result<serde_json::Value, Fail> {
-    let (pg, tenant) = open_db(env, DB_WHAT, true).await?;
-    let store = FoldStore::new(pg, tenant);
+async fn window(
+    window: TimecardWindow,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
+    let (pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let store = FoldStore::new(pg, tenancy.tenant);
     let clock = WorkerClock;
     let result = apply_timecard_window(&store, &window, &clock)
         .await
@@ -109,7 +124,7 @@ async fn window(window: TimecardWindow, env: &Env) -> Result<serde_json::Value, 
     console_log!("kintai timecard/window: written {w}, deleted {d}, misplaced {m}");
     let mut body = serde_json::json!(result);
     if window.fold {
-        let alc = EnvAlc(env);
+        let alc = EnvAlc::new(env, &tenancy);
         let repo = fold_events(&alc, &store);
         let ctx = fold_ctx(OUTPUT_SHA, &clock);
         let status_of = |e: kintai_pg::FoldStoreError| {

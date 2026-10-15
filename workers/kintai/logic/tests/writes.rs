@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 use kintai_kosoku::kintai_push::{TimecardBatch, TimecardBatchResult};
-use kintai_logic::common::{no_write_db, parse_json, write_preflight, MAX_JSON_BODY_BYTES};
+use kintai_logic::common::{
+    no_write_db, parse_json, write_preflight, TenantInput, MAX_JSON_BODY_BYTES,
+};
 use kintai_logic::timecard_write::{
     batch_respond, parse_batch, parse_signatures, signatures_respond, DB_WHAT,
 };
@@ -217,13 +219,24 @@ fn a_snapshot_is_validated_in_the_original_order() {
 #[test]
 fn write_preflight_says_write_when_the_binding_is_missing() {
     assert_eq!(
-        write_preflight(false, Some("x")).unwrap_err(),
+        write_preflight(false, &TenantInput::pinned(Some("x"))).unwrap_err(),
         no_write_db()
     );
     assert_eq!(no_write_db().status, 503);
     assert!(no_write_db().body.contains("書き先"));
-    assert_eq!(write_preflight(true, None).unwrap_err().status, 503);
+    assert_eq!(
+        write_preflight(true, &TenantInput::pinned(None))
+            .unwrap_err()
+            .status,
+        503
+    );
     // テナントの値は実在しない作り物 (リテラルを書かず、数から作る)
     let t = uuid::Uuid::from_u128(0x5ca1_ab1e).to_string();
-    assert_eq!(write_preflight(true, Some(&t)).unwrap().to_string(), t);
+    assert_eq!(
+        write_preflight(true, &TenantInput::pinned(Some(&t)))
+            .unwrap()
+            .tenant
+            .to_string(),
+        t
+    );
 }

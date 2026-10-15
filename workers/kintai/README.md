@@ -236,8 +236,9 @@ Cloud Run 版 (root の `src/routes/`) が Supabase を読むだけで答えて�
 
 失敗の本文はすべて `text/plain; charset=utf-8`。検査の順は元の handler と同じ (入力 → binding → テナント → DB)。
 
-- **テナントは設定 pin (`KINTAI_TENANT_ID`)。`X-Tenant-ID` は読まない。** 接続ロールは BYPASSRLS なので、SQL の
-  `WHERE tenant_id = $1` (`$1` = pin の UUID) が他テナントを見せない唯一の担保。`logic/tests/common.rs` が
+- **テナントは既定が設定 pin (`KINTAI_TENANT_ID`)。`X-Tenant-ID` は読まない。** 呼び手が `X-Kintai-Tenant-Id` で名指ししたときの
+  扱いは下の「テナント」の節。接続ロールは BYPASSRLS なので、SQL の
+  `WHERE tenant_id = $1` (`$1` = 解決したテナントの UUID) が他テナントを見せない唯一の担保。`logic/tests/common.rs` が
   6 本の SQL 定数すべての `tenant_id = $1` と、各口の第 1 引数が `Type::UUID` の pin であることを確かめる
 - DB へは `alc-worker-db` (ippoan/alc-worker-kit、rev は直下の `Cargo.toml` の 1 か所) の `PgClient::tenant_tx` の中で
   `query_typed` / `query_typed_one` だけを流す (名前付き prepared statement は Hyperdrive で接続が切れる)。全 `$n` に型を付ける。
@@ -254,9 +255,9 @@ root (オンプレ版・Cloud Run 版) の `src/routes/unko_gaps.rs` の口を�
 |---|---|---|
 | Query・`month` | 400 (`month は必須です (YYYY-MM)` / `month は YYYY-MM で指定してください`) | **同じ** (共有 crate の `check_month`) |
 | 書き先の store / binding | `[kintai_push]` が無効なら 503 | `KINTAI_HYPERDRIVE` が無ければ 503 (他の Supabase の読みと同じ文言) |
-| テナント | `X-Tenant-ID` → `[kintai_push]` の pin、どちらも無ければ 503 (alc へは `[kintai_events] tenant_id`) | Supabase は `KINTAI_TENANT_ID` の pin だけ (空・不正は 503)。alc へのテナントは auth-worker の `KintaiAlcEntrypoint` が固定 (Worker からは渡さない) |
+| テナント | `X-Tenant-ID` → `[kintai_push]` の pin、どちらも無ければ 503 (alc へは `[kintai_events] tenant_id`) | Supabase は既定が `KINTAI_TENANT_ID` の pin (空・不正は 503)。alc へのテナントは既定なら auth-worker の `KintaiAlcEntrypoint` が固定 (Worker からは渡さない)。`X-Kintai-Tenant-Id` で既定以外を名指しされたときだけ第 2 引数 `tenantId` で渡す (下の「テナント」の節) |
 | オンプレ側 | `MONTH_OPERATIONS_SQL` (sqlx)、失敗は 502 `kintai.kintai_events unko read failed: …` | 同じ SQL を `query_typed` (`$1` uuid・`$2`/`$3` timestamptz・`$4` text[])、失敗は 502 (文言の頭は同じ・後ろは kit の `kind`) |
-| alc の etags | reqwest で `GET /api/dtako/events/etags?date_from=<月初>&date_to=<翌月初>` | auth-worker の勤怠 Worker 専用の `KintaiAlcEntrypoint.dtakoEtags(search)` (binding `KINTAI_ALC_RPC`)。渡すのは期間の query (`etags_search`) だけで、path・method (GET)・tenant は auth-worker 側で固定 |
+| alc の etags | reqwest で `GET /api/dtako/events/etags?date_from=<月初>&date_to=<翌月初>` | auth-worker の勤怠 Worker 専用の `KintaiAlcEntrypoint.dtakoEtags(search[, tenantId])` (binding `KINTAI_ALC_RPC`)。渡すのは期間の query (`etags_search`) と、既定以外のテナントのときだけ `tenantId`。path・method (GET) は auth-worker 側で固定 |
 | etags が 404 | `gcp_etags_available: false` (200) | **同じ** |
 | etags が 404 以外の非 2xx・本文が読めない・通信断 | **warn だけで `gcp_etags_available: false` (200)** | **502** (`alc dtako-etags status <n>: <本文の先頭 200 字>` / `alc dtako-etags parse: …` / `alc dtako-etags request: rpc`)。auth-worker 自身の拒否 (tenant 未設定の 503 `kintai_alc_tenant_unset`・query 不正の 400) も同じ形で本文に error の語が載る |
 | `KINTAI_ALC_RPC` が無い | (無い) | 503 `auth-worker の binding (KINTAI_ALC_RPC) が無い (alc の etags を読めません)` |
@@ -295,9 +296,9 @@ Cloud Run 版 (root の `src/routes/kintai_timecard.rs` の `receive`・`signatu
 
 検査の順は **認可 → 入力 → binding → テナント → DB** (認可の前に本文を読んで 400 を返さない)。
 
-- **テナントは `KINTAI_TENANT_ID` の設定 pin。`X-Tenant-ID` は読まない。** 元の timecard・signatures は `X-Tenant-ID` を読み、設定の pin と
-  食い違えば 403・どちらも無ければ 400 だった。Worker は pin だけで決めるので、その 403 / 400 は無い (pin が無ければ 503)。
-  呼び手 (relay) が名乗るテナントと pin が違っても pin に書く — 単一テナントの運用が前提
+- **テナントは既定が `KINTAI_TENANT_ID` の設定 pin。`X-Tenant-ID` は読まない。** 元の timecard・signatures は `X-Tenant-ID` を読み、設定の pin と
+  食い違えば 403・どちらも無ければ 400 だった。Worker は pin (と `X-Kintai-Tenant-Id` で名指しされた許可リストの中) だけで決めるので、
+  その 400 は無い (pin が無ければ 503、許可外の名指しは 403。下の「テナント」の節)
 - 書き込みの部品は `pg/` (`kintai-pg`): kit の `PgClient::tenant_tx` の中で、共有 crate (`kintai_kosoku::kintai_push`・
   `kintai_logic::{change_log, wage_write}`) の SQL と Vec の束を `query_typed` / `execute_typed` に `Type::*_ARRAY` 付きで渡す。
   型なしの `ANY($5)` は SQL を書き換えず `Type::TEXT_ARRAY` を渡す。全 SQL の `$1` は pin の UUID (`tenant_id = $1`、
@@ -434,7 +435,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 | | root (Cloud Run 版) | Worker |
 |---|---|---|
 | 認可 | edge の CF Access だけ | POST の 2 本は `X-Kintai-Write-Token` (書き込みの口と同じ。無い・違う = 403、binding が読めない = 503)。GET の 2 本はなし |
-| テナント | 書き先は `X-Tenant-ID` (pin と食い違えば 403・どちらも無ければ 400)、読み先との不一致は 403 (`assert_same_tenant`)。stale-months は `[kintai_events]` → `[kintai_push]` の pin | `KINTAI_TENANT_ID` の pin だけ (空・不正は 503 `読み先のテナントが決まりません (KINTAI_TENANT_ID を設定してください)`)。alc のテナントは auth-worker が固定するので不一致の 403 は無い |
+| テナント | 書き先は `X-Tenant-ID` (pin と食い違えば 403・どちらも無ければ 400)、読み先との不一致は 403 (`assert_same_tenant`)。stale-months は `[kintai_events]` → `[kintai_push]` の pin | 既定は `KINTAI_TENANT_ID` の pin (空・不正は 503 `読み先のテナントが決まりません (KINTAI_TENANT_ID を設定してください)`)。`X-Kintai-Tenant-Id` で既定以外を名指しされたら Supabase も alc (`tenantId`) も同じテナントで読み書きする (読み先と書き先が食い違わないので不一致の 403 は無い。許可外の名指しは 403) |
 | 503 (書き先が無い) | `[kintai_push] が無効です (書き先がありません)` | `[KINTAI_HYPERDRIVE] が無効です (書き先がありません)` |
 | 502 の本文 | `kintai events read failed: <上流の文言そのまま>` / `kintai push db failed: <sqlx の文言>` / `kintai.day_summaries stale read failed: <sqlx の文言>` | 同じ頭 + **種別だけ** |
 | 読みの binding が無い (`KINTAI_ALC_RPC`) | 読みの失敗として 502 | 同じく 502 (`kintai events read failed: …`。root の `map_push_err` に合わせる)。写しは書きと同じ `KINTAI_HYPERDRIVE` なので、無ければ先に 503 |
@@ -520,6 +521,44 @@ SQLite の中身は relay が push した写しで、relay の resummarize (全�
 先に 3 をやると、D1 が空のうちは `synced-months` が空になり、月タブが全部「未同期」と出る。`wage-source` は `synced_at = null` なら
 relay が R2 にフォールバックするので値の正しさは保たれる (遅くなるだけ)。
 
+## テナント (既定と `X-Kintai-Tenant-Id`)
+
+dtako の会社ごとに Supabase / alc のテナントが違う。呼び手 (relay) は会社から引いたテナントを `X-Kintai-Tenant-Id` で付けて呼ぶ。
+**解決は kintai-logic の `common::resolve_tenant` 1 つ**で、Supabase を開く全経路 (`reads::open_db` の `preflight` / `write_preflight`。
+読み・書き・fold が全部ここを通る) と alc の RPC がこれを使う。
+
+| 入力 | 結果 |
+|---|---|
+| ヘッダ無し | 既定 (`KINTAI_TENANT_ID`)。今までと完全に同じ (空・UUID でない・nil は 503、口ごとの検査の順も同じ) |
+| ヘッダが既定と同じ UUID | 既定 (どの口も通る。alc に `tenantId` は渡さない) |
+| ヘッダが `KINTAI_TENANT_IDS` (カンマ区切り) に入っている | 既定以外として採用 |
+| ヘッダが UUID でない・nil・空・どちらにも入っていない | **403** `X-Kintai-Tenant-Id のテナントは許可されていません` |
+
+**既定以外のテナントで通す口は許可の列挙** (`worker/src/probe.rs` の `Route::reach`)。関門は fetch の入口
+(`common::tenant_gate`) で、口を走らせる前に 403 を返す:
+
+| 口 | 読み書きする先 | 既定以外のテナント |
+|---|---|---|
+| `GET /api/kintai/{day-summaries,shift-overlaps,shift-days,change-log,wage-range,timecard/signatures}` | Supabase | 通す |
+| `GET /api/kintai/unko-gaps` | Supabase + alc (etags、`tenantId` 付き) | 通す |
+| `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` (fold) | Supabase + alc (`tenantId` 付き) | 通す |
+| `POST /api/kintai/{timecard,wage-snapshot}` | Supabase | 通す |
+| `POST /api/dtako/autoload` | 社内 CakePHP | **403** |
+| `GET /api/kintai/{daily,pdf-json}` | 社内 CakePHP | **403** |
+| `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe,day-events}`・`GET /api/dtako/worktime` | 社内 MariaDB | **403** |
+| `GET /api/kintai/{kosoku-daily,version,timecard/drivers,timecard/events}` | 社内 MariaDB | **403** |
+| `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` | D1 | **403** |
+| `POST /probe` | 社内 MariaDB | **403** |
+
+403 の本文は `このテナントでは使えません (社内の勤怠データは既定テナントにしかありません)`。404・405 は関門を通さない。
+
+- alc (`KINTAI_ALC_RPC`) へは、解決したテナントが既定以外のときだけ `dtakoEtags(search, tenantId)` / `dtakoEvents(search, tenantId)` で渡す。
+  既定なら 1 引数のまま (auth-worker 側が未対応でも今と同じ動作)。auth-worker は許可リスト外の `tenantId` を 403、許可リスト未設定を 503 で返す
+- 打刻 (`kintai.kintai_events`) の無いテナントでは、fold の入力は alc の運行データだけ (打刻の無い乗務員は `ShiftSource::Rest` で畳まれる)
+- `Route::reach` (worker crate) は native のテストを持たない。判定の本体 (`resolve_tenant`・`tenant_gate`) は `logic/tests/common.rs`
+- **deploy の順**: auth-worker (`tenantId` を受ける版) → この Worker (タグ `worker-kintai-v*`) → relay (ヘッダを付ける版)。
+  この Worker が先に出ても、ヘッダが来ないうちは今と同じ
+
 ## 到達面と認可
 
 Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は Secrets Store の binding で読み、呼び手の cookie・Authorization は受け取らない。
@@ -543,10 +582,11 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 - `KINTAI_HYPERDRIVE` — Supabase への Hyperdrive (分割 worker と共有の実行用ロールの設定)。**トップレベルにだけ置く**。無ければ Supabase の口 (読み 7 本・書き 2 本・fold の 4 本) は 503
 - `KINTAI_ALC_RPC` — auth-worker の勤怠 Worker 専用の `KintaiAlcEntrypoint` への Service Binding (`[[services]]`、`service = "auth-worker"`・`entrypoint = "KintaiAlcEntrypoint"`)。
   unko-gaps が `dtakoEtags(search)` で alc の etags を、fold の読み (`FoldEventsIo`。recalc・timecard/window の口) が `dtakoEtags(search)` と
-  `dtakoEvents(search)` で etags と全乗務員の生イベントを読むのに使う (渡すのは query の鍵だけで、path・method・tenant は auth-worker 側で
-  固定)。**トップレベルにだけ置く** (check-exposure の (k))。無ければ unko-gaps は 503・fold の読みは 502 (`kintai events read failed: …`)
+  `dtakoEvents(search)` で etags と全乗務員の生イベントを読むのに使う (渡すのは query の鍵だけで、path・method・既定の tenant は auth-worker 側で
+  固定。既定以外のテナントのときだけ第 2 引数 `tenantId` を足す — 下の「テナント」の節)。**トップレベルにだけ置く** (check-exposure の (k))。無ければ unko-gaps は 503・fold の読みは 502 (`kintai events read failed: …`)
 - `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` (`[vars]`) — day-events のリンクの base URL。空 = そのリンクを省く。本番は deploy 時に同名の repo variable を `--var` で渡す (社内ホスト名を repo に書かない)
-- `KINTAI_TENANT_ID` (`[vars]`) — 読み先のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
+- `KINTAI_TENANT_ID` (`[vars]`) — 既定のテナントの UUID。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` (Cloud Run 版と同じ) を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のままで、空の間は `GET /api/kintai/*` は 503
+- `KINTAI_TENANT_IDS` (`[vars]`) — 既定のほかに `X-Kintai-Tenant-Id` で選べるテナント (カンマ区切りの UUID)。空なら既定だけ。本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_IDS` を `--var` で渡す (未設定・空なら渡さない = 既定だけ。UUID を git に焼かない)
 - `CF_VERSION_METADATA` — 版の元
 - `[limits] cpu_ms = 120000` — kosoku-daily の全員版のため (上記)
 - 外から届かない: `workers_dev = false` / `preview_urls = false` / route・env なし / `LOCAL_*` の var なし /
@@ -613,3 +653,5 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 
 タグ `worker-kintai-v*` の push で `.github/workflows/worker-kintai.yml` の deploy job が `wrangler deploy --tag <タグ> --message <git SHA>`
 を打つ (org の secret `CLOUDFLARE_API_TOKEN`)。main への merge では本番に出ない。
+既定のテナントは repo variable `KINTAI_EVENTS_TENANT_ID`、既定のほかに選べるテナントは `KINTAI_EVENTS_TENANT_IDS` (カンマ区切り。
+未設定・空なら `--var` を付けない = 既定だけ。要素は 1 つずつ小文字 hex の UUID (nil 以外) か検査する) を `--var` で渡す。
