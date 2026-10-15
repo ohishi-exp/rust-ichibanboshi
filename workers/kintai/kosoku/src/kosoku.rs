@@ -1049,6 +1049,76 @@ fn split_long_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
         .collect()
 }
 
+/// [`split_long_shift`] のあと、**打刻も社内 MariaDB の運行イベントも持たない乗務員**
+/// (= イベントが全部 alc の `dtako_events`) だけ、運行の外を勤務から外す ([`outside_runs`])。
+fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
+    let parts = split_long_shift(shift, events);
+    if !events.iter().all(|e| e.source == "dtako_events") {
+        return parts;
+    }
+    let outside = outside_runs(events);
+    parts
+        .into_iter()
+        .flat_map(|s| {
+            subtract_intervals(&[(s.start, s.end)], &outside)
+                .into_iter()
+                .map(move |(start, end)| Shift {
+                    start,
+                    end,
+                    source: s.source,
+                })
+        })
+        .filter(|s| s.end > s.start)
+        .collect()
+}
+
+/// **運行の外** — 運行終了から次の運行開始まで、イベントが 1 件も無い区間
+/// (ユーザー決定 2026-10-15「入ってないのに拘束にいれるな」)。
+///
+/// 打刻の無い会社 (北海大運) は休息イベントだけで勤務を区切る ([`shifts_from_rest`])。
+/// 休息は運行 (KUDGIVT) の中にしか記録されないので、帰庫 (運行終了) から次の出庫
+/// (運行開始) までは**どの運行のデータにも入らない**。休息が無いまま帰庫すると、
+/// この空白が前の勤務の続きとして拘束・実働に入っていた。実測 (乗務員 4 / 2026-07):
+/// 07-02 13:55 → 07-03 10:23 が 1 勤務・実働 1,140 分 (theearth は 134 + 140 分)。
+///
+/// - 社内 MariaDB から打刻・運行の確定イベント (`timecard` / `dtako`) を借りる会社 (大石)
+///   には使わない — 勤務は打刻が閉じ、継ぎ目は紙も数える (#123)。借り先を持たない会社は
+///   イベントが全部 `dtako_events` になる ([`crate::alc_events::is_borrowed_source`])
+/// - 空白の中にイベントが 1 件でも始まっていれば外さない (データがある)
+/// - 最後の運行終了の後に運行開始が無ければ、その後ろ (イベントが無い間) は外
+fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let mut bounds: Vec<(NaiveDateTime, bool)> = events
+        .iter()
+        .filter(|e| e.state == "運行開始" || e.state == "運行終了")
+        .map(|e| (e.start, e.state == "運行終了"))
+        .collect();
+    // 同じ時刻なら運行開始を先に並べる — 継ぎ目 0 分で勤務を割らない
+    bounds.sort_by_key(|(t, is_end)| (*t, *is_end));
+    let far = NaiveDateTime::MAX;
+    let mut out = Vec::new();
+    for (i, (t, is_end)) in bounds.iter().enumerate() {
+        if !is_end {
+            continue;
+        }
+        let next = bounds.get(i + 1);
+        if next.is_some_and(|(_, e)| *e) {
+            continue;
+        }
+        let until = next.map_or(far, |(n, _)| *n);
+        // 空白の中に始まるイベント (休憩・休息・運転など) があればデータあり
+        let first_inside = events
+            .iter()
+            .map(|e| e.start)
+            .filter(|s| s > t && *s < until)
+            .min();
+        let until = first_inside.unwrap_or(until);
+        if until > *t {
+            out.push((*t, until));
+        }
+    }
+    merge_intervals(out)
+}
+
 /// 休息と見なす「運行終了 → 次の運行開始」の空き (分)。
 ///
 /// 改善基準告示の休息期間 (継続 8 時間以上) に合わせる。実測 (96 名 / 2026-06) では
@@ -2094,7 +2164,7 @@ fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
         // こちらの拘束には無い。分割前の勤務で覆うと、その領域が覆いに残って
         // `paper_outside` が取り漏らす (実測 1674 / 2026-05-13: 日中の 11.5 時間の
         // 空きを紙が 運行終了 → 運行開始 の対で数える 688 分が漏れていた)
-        .flat_map(|s| split_long_shift(s, events))
+        .flat_map(|s| split_shift(s, events))
         .map(|s| Shift {
             start: floor_min(s.start),
             end: floor_min(s.end),
@@ -2171,7 +2241,7 @@ pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) 
             }
         })
         // 打刻が数日をまとめて挟んだ勤務は、中の休息で切り直す (Refs #133)
-        .flat_map(|s| split_long_shift(&s, &events))
+        .flat_map(|s| split_shift(&s, &events))
         .collect();
     shifts
         .iter()
@@ -4370,6 +4440,87 @@ mod tests {
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].start, "2026-06-02 04:42:00");
         assert_eq!(days[0].end, "2026-06-02 16:18:00");
+    }
+
+    /// alc だけの会社 (北海大運) の点イベント。運行開始・運行終了も `dtako_events` で来る。
+    fn alc(datetime: &str, state: &str) -> serde_json::Value {
+        json!({"datetime": datetime, "end_datetime": null, "source": "dtako_events", "state": state})
+    }
+
+    fn shift_spans(rows: &[serde_json::Value]) -> Vec<(String, String)> {
+        daily_summary(rows, "2026-07", &KosokuParams::default())
+            .iter()
+            .map(|d| (d.start.clone(), d.end.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn alc_only_shift_is_cut_between_run_end_and_next_run_start() {
+        // 乗務員 4 / 2026-07-02 の形: 休息明けに走って帰庫し、休息の無いまま翌朝出庫。
+        // 帰庫 → 出庫の夜はどの運行のデータにも無いので拘束にしない
+        let rows = vec![
+            ev("2026-07-01 20:00:00", "2026-07-02 13:55:00", "休息"),
+            alc("2026-07-02 20:00:00", "運行終了"),
+            alc("2026-07-03 06:00:00", "運行開始"),
+            ev("2026-07-03 10:23:00", "2026-07-03 22:00:00", "休息"),
+        ];
+        assert_eq!(
+            shift_spans(&rows),
+            vec![
+                ("2026-07-02 13:55:00".into(), "2026-07-02 20:00:00".into()),
+                ("2026-07-03 06:00:00".into(), "2026-07-03 10:23:00".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn alc_only_gap_with_an_event_inside_is_kept() {
+        // 空白の中にイベントが始まっていればデータがある — そこから先は外さない
+        let rows = vec![
+            ev("2026-07-01 20:00:00", "2026-07-02 13:55:00", "休息"),
+            alc("2026-07-02 20:00:00", "運行終了"),
+            ev("2026-07-02 22:00:00", "2026-07-02 22:30:00", "休憩"),
+            alc("2026-07-03 06:00:00", "運行開始"),
+            ev("2026-07-03 10:23:00", "2026-07-03 22:00:00", "休息"),
+        ];
+        assert_eq!(
+            shift_spans(&rows),
+            vec![
+                ("2026-07-02 13:55:00".into(), "2026-07-02 20:00:00".into()),
+                ("2026-07-02 22:00:00".into(), "2026-07-03 10:23:00".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn alc_only_tail_after_the_last_run_end_is_cut() {
+        // 運行終了の後に運行開始が無い (= 帰庫したまま) なら、その後ろは勤務ではない。
+        // 運行終了が続いても最後の運行終了から外す
+        let rows = vec![
+            ev("2026-07-01 20:00:00", "2026-07-02 05:00:00", "休息"),
+            alc("2026-07-02 15:00:00", "運行終了"),
+            alc("2026-07-02 15:30:00", "運行終了"),
+            ev("2026-07-03 01:00:00", "2026-07-03 08:00:00", "休息"),
+        ];
+        assert_eq!(
+            shift_spans(&rows),
+            vec![("2026-07-02 05:00:00".into(), "2026-07-02 15:30:00".into())],
+        );
+    }
+
+    #[test]
+    fn borrowed_sources_keep_the_gap_inside_the_shift() {
+        // 社内 MariaDB の運行イベント (`dtako`) を持つ乗務員は従来どおり — 継ぎ目は勤務の続き (#123)
+        let rows = vec![
+            ev("2026-07-01 20:00:00", "2026-07-02 13:55:00", "休息"),
+            dtako("2026-07-02 20:00:00", "運行終了"),
+            dtako("2026-07-03 06:00:00", "運行開始"),
+            ev("2026-07-03 10:23:00", "2026-07-03 22:00:00", "休息"),
+        ];
+        assert_eq!(
+            shift_spans(&rows),
+            vec![("2026-07-02 13:55:00".into(), "2026-07-03 10:23:00".into())],
+        );
     }
 
     #[test]

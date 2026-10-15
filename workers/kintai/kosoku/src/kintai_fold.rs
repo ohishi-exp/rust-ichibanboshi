@@ -218,7 +218,7 @@ pub const LOGIC_VERSION_LEN: usize = 16;
 ///
 /// 初期値は 560d21d まで版の材料だったソースのハッシュ (`KINTAI_OUTPUT_SHA`) の値 — 手で上げる定数に替えた
 /// 時点で保存済みの版が stale にならないよう、同じ値から始めた (Refs #322)。
-pub const LOGIC_BASE: &str = "f1d20fa098afb2b8";
+pub const LOGIC_BASE: &str = "de3d9f17519333e2";
 
 /// 保存行に焼く「ロジック + 設定」の印 (16 桁 hex) = `sha256(LOGIC_BASE | KosokuParams の Debug)` の先頭 16 桁。
 ///
@@ -1162,14 +1162,14 @@ mod tests {
         );
     }
 
-    /// **[`LOGIC_BASE`] の初期値で、版は 560d21d の本番と同じ値のまま** (= この切り替えで畳み直しが要らない)。
+    /// 今の [`LOGIC_BASE`] と既定設定の版。手で上げたらこのテストも新しい値に直し、旧値はここに残す。
     ///
-    /// `1b8f00ba48e9a77b` は 2026-10-11 の本番の recalc の応答の `logic_version`。手で上げたらこのテストも
-    /// 新しい値に直す (旧値は 560d21d 時点の記録としてコメントに残す)。
+    /// - `f1d20fa098afb2b8` → `1b8f00ba48e9a77b`: 560d21d の本番と同じ値 (2026-10-11 の本番の recalc の応答)
+    /// - `de3d9f17519333e2` → `e933f1af05b84137`: alc だけの会社で運行の外を勤務から外した (2026-10-15)
     #[test]
     fn the_logic_version_is_the_one_in_production() {
-        assert_eq!(LOGIC_BASE, "f1d20fa098afb2b8");
-        assert_eq!(logic_version(&KosokuParams::default()), "1b8f00ba48e9a77b");
+        assert_eq!(LOGIC_BASE, "de3d9f17519333e2");
+        assert_eq!(logic_version(&KosokuParams::default()), "e933f1af05b84137");
     }
 
     /// 版の材料は [`LOGIC_BASE`] と設定だけ。ソースのハッシュは引数にも無い (コメント 1 文字では動かない)。
