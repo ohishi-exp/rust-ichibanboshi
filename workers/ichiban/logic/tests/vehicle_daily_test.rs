@@ -43,6 +43,7 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             driver_code: "1656".into(),
             driver_name: "西島 健太".into(),
             request_kind: "0".into(),
+            last_updated: Some("2026-06-22 09:15:30.123".into()),
         },
         // 傭車 (傭車先C!='000000') → subcontract_amount を使う。品名/数量/単価/単位も未入力のエッジ。
         RawVehicleDailyRow {
@@ -69,6 +70,7 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
             driver_name: "".into(),
             // 請求区分が空のエッジ (ISNULL の既定値)。
             request_kind: "".into(),
+            last_updated: None,
         },
     ];
 
@@ -99,6 +101,10 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(first.driver_name, "西島 健太");
     // 請求区分はそのまま返す (どれを収支に入れるかは消費側の判断)
     assert_eq!(first.request_kind, "0");
+    assert_eq!(
+        first.last_updated.as_deref(),
+        Some("2026-06-22 09:15:30.123")
+    );
 
     let second = &rows[1];
     assert_eq!(second.sale_date, "2026-06-20");
@@ -107,6 +113,7 @@ fn test_build_vehicle_daily_rows_self_and_subcontract() {
     assert_eq!(second.driver_code, "");
     assert_eq!(second.driver_name, "");
     assert_eq!(second.request_kind, "");
+    assert_eq!(second.last_updated, None);
     assert_eq!(second.amount, 40_000);
     // 積地・卸地・得意先名は空文字のまま passthrough (surcharge_base 同様に県正規化しない)
     assert_eq!(second.origin_area_name, "");
@@ -224,10 +231,11 @@ fn test_response_row_json_field_order() {
         driver_code: "1656".into(),
         driver_name: "n".into(),
         request_kind: "0".into(),
+        last_updated: Some("2026-06-22 09:15:30.123".into()),
     };
     let json = serde_json::to_string(&build_vehicle_daily_rows(&[raw])).unwrap();
     assert_eq!(
         json,
-        r#"[{"sale_date":"2026-06-21","vehicle_number":"8504","customer_code":"000001","customer_name":"c","origin_area_name":"oa","dest_area_name":"da","origin":"o","dest":"d","is_subcontracted":false,"amount":1,"item_code":"ic","item_name":"in","quantity":1.5,"unit_price":2.0,"unit":"u","row_id":"r","vehicle_branch":"01","driver_code":"1656","driver_name":"n","request_kind":"0"}]"#
+        r#"[{"sale_date":"2026-06-21","vehicle_number":"8504","customer_code":"000001","customer_name":"c","origin_area_name":"oa","dest_area_name":"da","origin":"o","dest":"d","is_subcontracted":false,"amount":1,"item_code":"ic","item_name":"in","quantity":1.5,"unit_price":2.0,"unit":"u","row_id":"r","vehicle_branch":"01","driver_code":"1656","driver_name":"n","request_kind":"0","last_updated":"2026-06-22 09:15:30.123"}]"#
     );
 }

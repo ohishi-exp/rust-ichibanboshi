@@ -137,6 +137,7 @@ pub(crate) fn vehicle_daily(rows: &[Row]) -> Vec<RawVehicleDailyRow> {
             driver_code: decode_cp932(r, 18),
             driver_name: decode_cp932(r, 19),
             request_kind: decode_cp932(r, 20),
+            last_updated: r.try_get::<&str, _>(21).ok().flatten().map(str::to_string),
         })
         .collect()
 }
