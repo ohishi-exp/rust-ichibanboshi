@@ -2,6 +2,7 @@
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
 use kintai_logic::cakephp_relay::CakephpRead;
+use kintai_logic::common::Reach;
 use kintai_logic::dtako_reads::DtakoRead;
 use kintai_logic::fold_routes::FoldRoute;
 use kintai_logic::kosoku_reads::KosokuRead;
@@ -37,6 +38,26 @@ pub(crate) enum Route {
     Fold(FoldRoute),
     NotFound,
     MethodNotAllowed,
+}
+
+impl Route {
+    /// 既定以外のテナント (`X-Kintai-Tenant-Id`) で通すか。**許可の列挙**: Supabase と alc だけを読み書きする口
+    /// (Read の 7 本・fold の 4 本・Write のうち timecard・wage-snapshot) だけを [`Reach::AnyAllowed`] にし、
+    /// 社内 MariaDB・CakePHP (autoload を含む)・D1・probe は [`Reach::DefaultOnly`]。404・405 は関門を通さない (`None`)。
+    pub(crate) fn reach(self) -> Option<Reach> {
+        Some(match self {
+            Route::Read(_) | Route::Fold(_) => Reach::AnyAllowed,
+            Route::Write(Write::Timecard | Write::WageSnapshot) => Reach::AnyAllowed,
+            Route::Write(Write::DtakoAutoload)
+            | Route::Probe
+            | Route::Cakephp(_)
+            | Route::Mariadb(_)
+            | Route::Dtako(_)
+            | Route::Kosoku(_)
+            | Route::Restraint(_) => Reach::DefaultOnly,
+            Route::NotFound | Route::MethodNotAllowed => return None,
+        })
+    }
 }
 
 /// Supabase の勤怠スキーマを読む口 (純粋部分は kintai-logic)。

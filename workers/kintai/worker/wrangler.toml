@@ -102,13 +102,18 @@ binding = "KINTAI_ALC_RPC"
 service = "auth-worker"
 entrypoint = "KintaiAlcEntrypoint"
 
-# 読み先のテナント (UUID の文字列)。GET /api/kintai/* はこの pin だけでテナントを決め、X-Tenant-ID は読まない。
+# 既定のテナント (UUID の文字列)。X-Kintai-Tenant-Id が無ければこの pin だけでテナントを決める。X-Tenant-ID は読まない。
 # 空・UUID でない・nil UUID なら 503。
 # 本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_ID` を `--var` で渡す (git 履歴に UUID を焼かない)。ここは空のまま
+#
+# 既定のほかに呼び手 (relay) が X-Kintai-Tenant-Id で選べるテナント (カンマ区切りの UUID)。空なら既定だけ (ヘッダで別のテナントを
+# 名指しすると 403)。既定以外のテナントで通るのは Supabase と alc だけの口 (社内 MariaDB・CakePHP・D1 の口は 403)。
+# 本番は deploy 時に repo variable `KINTAI_EVENTS_TENANT_IDS` を `--var` で渡す (UUID を git に焼かない。KINTAI_TENANT_ID と同じ)。ここは空のまま
 #
 # GET /api/kintai/day-events のリンクの base URL (社内 nginx・dtako-admin)。空 = その項目のリンクを省く (オンプレ版の設定と同じ意味)。
 # 本番は deploy 時に repo variable `KINTAI_RYOHI_BASE_URL`・`KINTAI_DTAKO_BASE_URL` を `--var` で渡す (社内ホスト名を repo に書かない)。ここは空のまま
 [vars]
 KINTAI_TENANT_ID = ""
+KINTAI_TENANT_IDS = ""
 KINTAI_RYOHI_BASE_URL = ""
 KINTAI_DTAKO_BASE_URL = ""

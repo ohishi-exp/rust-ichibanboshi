@@ -11,8 +11,10 @@
 use bytes::BytesMut;
 use chrono::{NaiveDate, TimeZone, Utc};
 use kintai_logic::common::{
-    bad_request, db_fail, is_valid_month, jst_midnight, month_bounds, no_db, parse_driver,
-    parse_query, preflight, tenant_of, Fail, Param, HYPERDRIVE_BINDING, TENANT_VAR,
+    bad_request, db_fail, is_valid_month, jst_midnight, month_bounds, no_db,
+    other_tenant_forbidden, parse_driver, parse_query, preflight, resolve_tenant, tenant_gate,
+    tenant_not_allowed, tenant_of, Fail, Param, Reach, Tenancy, TenantInput, HYPERDRIVE_BINDING,
+    TENANT_HEADER, TENANT_IDS_VAR, TENANT_VAR,
 };
 use kintai_logic::{change_log, day_summaries, shift_days, shift_overlaps, wage_range};
 use postgres_types::{IsNull, Type};
@@ -170,17 +172,180 @@ fn no_usable_pin_is_service_unavailable() {
 fn preflight_decides_before_connecting_in_the_original_order() {
     let t = uuid(9);
     let raw = t.to_string();
-    assert_eq!(preflight(true, Some(&raw)), Ok(t));
-    assert_eq!(preflight(false, Some(&raw)), Err(no_db()));
+    let pinned = |raw| TenantInput::pinned(raw);
+    assert_eq!(preflight(true, &pinned(Some(&raw))), Ok(default_tenancy(t)));
+    assert_eq!(preflight(false, &pinned(Some(&raw))), Err(no_db()));
     assert_eq!(
-        preflight(false, None),
+        preflight(false, &pinned(None)),
         Err(no_db()),
         "両方欠けたら binding が先"
     );
     for raw in [None, Some(""), Some("00000000-0000-0000-0000-000000000000")] {
-        let f = preflight(true, raw).expect_err("テナントが決まらなければ connect に進まない");
+        let f =
+            preflight(true, &pinned(raw)).expect_err("テナントが決まらなければ connect に進まない");
         assert_eq!(f, tenant_of(raw).unwrap_err(), "{raw:?}");
         assert_eq!(f.status, 503);
+    }
+    // ヘッダの 403 も binding の 503 より後
+    let bad = TenantInput {
+        header: Some("not-a-uuid"),
+        ..pinned(Some(&raw))
+    };
+    assert_eq!(preflight(false, &bad), Err(no_db()));
+    assert_eq!(preflight(true, &bad), Err(tenant_not_allowed()));
+}
+
+// ── リクエストごとのテナント (X-Kintai-Tenant-Id) ──
+
+fn default_tenancy(tenant: Uuid) -> Tenancy {
+    Tenancy {
+        tenant,
+        is_default: true,
+    }
+}
+
+#[test]
+fn tenant_names_are_fixed() {
+    assert_eq!(TENANT_VAR, "KINTAI_TENANT_ID");
+    assert_eq!(TENANT_IDS_VAR, "KINTAI_TENANT_IDS");
+    assert_eq!(TENANT_HEADER, "X-Kintai-Tenant-Id");
+}
+
+/// ヘッダ無し = 今までの pin と同じ (KINTAI_TENANT_IDS は見ない。不正な既定は 503 のまま)。
+#[test]
+fn without_the_header_the_default_pin_decides() {
+    let d = uuid(1).to_string();
+    let other = uuid(2).to_string();
+    let input = TenantInput {
+        default: Some(&d),
+        allowed: Some(&other),
+        header: None,
+    };
+    assert_eq!(resolve_tenant(&input), Ok(default_tenancy(uuid(1))));
+    for raw in [
+        None,
+        Some(""),
+        Some("x"),
+        Some("00000000-0000-0000-0000-000000000000"),
+    ] {
+        let input = TenantInput {
+            default: raw,
+            allowed: Some(&other),
+            header: None,
+        };
+        assert_eq!(resolve_tenant(&input), Err(tenant_of(raw).unwrap_err()));
+    }
+}
+
+/// ヘッダが既定と同じなら既定扱い (大文字でも UUID として同じなら同じ)。KINTAI_TENANT_IDS は空でよい。
+#[test]
+fn the_header_naming_the_default_is_the_default() {
+    let d = uuid(1).to_string();
+    let upper = d.to_uppercase();
+    for allowed in [None, Some("")] {
+        let input = TenantInput {
+            default: Some(&d),
+            allowed,
+            header: Some(&upper),
+        };
+        assert_eq!(resolve_tenant(&input), Ok(default_tenancy(uuid(1))));
+    }
+}
+
+/// KINTAI_TENANT_IDS に入っていれば既定以外として採用 (空白を挟んでも・読めない要素が混ざっても)。
+#[test]
+fn a_listed_header_is_another_tenant() {
+    let d = uuid(1).to_string();
+    let listed = format!("junk, {} ,{}", uuid(2), uuid(3));
+    for n in [2, 3] {
+        let h = uuid(n).to_string();
+        let input = TenantInput {
+            default: Some(&d),
+            allowed: Some(&listed),
+            header: Some(&h),
+        };
+        let t = resolve_tenant(&input).expect("listed");
+        assert_eq!(
+            t,
+            Tenancy {
+                tenant: uuid(n),
+                is_default: false
+            }
+        );
+        assert_eq!(t.alc_tenant_id(), Some(h.clone()));
+    }
+    // 既定が空でも、許可リストに入っていれば選べる
+    let h = uuid(2).to_string();
+    let input = TenantInput {
+        default: None,
+        allowed: Some(&listed),
+        header: Some(&h),
+    };
+    assert!(!resolve_tenant(&input).unwrap().is_default);
+}
+
+/// 既定の Tenancy は alc に tenantId を渡さない。
+#[test]
+fn the_default_tenancy_sends_no_tenant_id_to_alc() {
+    assert_eq!(default_tenancy(uuid(1)).alc_tenant_id(), None);
+}
+
+/// 許可されていない・読めない・nil・空のヘッダは 403 (KINTAI_TENANT_IDS が空なら既定以外は全部 403)。
+#[test]
+fn an_unlisted_or_broken_header_is_forbidden() {
+    let d = uuid(1).to_string();
+    let listed = uuid(2).to_string();
+    let unlisted = uuid(4).to_string();
+    let nil = Uuid::nil().to_string();
+    for (allowed, header) in [
+        (Some(listed.as_str()), unlisted.as_str()),
+        (None, listed.as_str()),
+        (Some(""), listed.as_str()),
+        (Some(listed.as_str()), "not-a-uuid"),
+        (Some(listed.as_str()), ""),
+        (Some(nil.as_str()), nil.as_str()),
+    ] {
+        let input = TenantInput {
+            default: Some(&d),
+            allowed,
+            header: Some(header),
+        };
+        let f = resolve_tenant(&input).expect_err("forbidden");
+        assert_eq!(f, tenant_not_allowed(), "{allowed:?} {header:?}");
+        assert_eq!(f.status, 403);
+    }
+}
+
+/// 口の関門: ヘッダ無しは何も見ない (既定が空でも通す = 今と同じく口ごとの順で決まる)。
+/// 既定以外のテナントは Supabase と alc だけの口 (AnyAllowed) なら通り、それ以外 (DefaultOnly) は 403。
+#[test]
+fn the_gate_lets_other_tenants_reach_only_supabase_and_alc() {
+    for reach in [Reach::AnyAllowed, Reach::DefaultOnly] {
+        assert_eq!(tenant_gate(&TenantInput::default(), reach), Ok(()));
+    }
+    let d = uuid(1).to_string();
+    let other = uuid(2).to_string();
+    let with = |header| TenantInput {
+        default: Some(&d),
+        allowed: Some(&other),
+        header,
+    };
+    // 既定を名指し → どの口も通る
+    for reach in [Reach::AnyAllowed, Reach::DefaultOnly] {
+        assert_eq!(tenant_gate(&with(Some(&d)), reach), Ok(()));
+    }
+    // 既定以外
+    assert_eq!(tenant_gate(&with(Some(&other)), Reach::AnyAllowed), Ok(()));
+    let f = tenant_gate(&with(Some(&other)), Reach::DefaultOnly).unwrap_err();
+    assert_eq!(f, other_tenant_forbidden());
+    assert_eq!(f.status, 403);
+    assert!(f.body.contains("既定テナント"), "{}", f.body);
+    // 許可されていないヘッダはどの口でも 403
+    for reach in [Reach::AnyAllowed, Reach::DefaultOnly] {
+        assert_eq!(
+            tenant_gate(&with(Some("x")), reach),
+            Err(tenant_not_allowed())
+        );
     }
 }
 

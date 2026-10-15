@@ -7,7 +7,7 @@ use chrono::{Datelike, NaiveDate, Timelike};
 use kintai_kosoku::fold_flow::FoldClock;
 use kintai_kosoku::kintai_fold::logic_version as root_logic_version;
 use kintai_kosoku::kosoku::KosokuParams;
-use kintai_logic::common::{write_preflight, Fail};
+use kintai_logic::common::{write_preflight, Fail, TenantInput};
 use kintai_logic::fold_routes::{
     fold_ctx, jst_from_ms, kind_only, logic_version, not_configured, params, parse_recalc_body,
     parse_recalc_query, parse_window, read_failed, FoldRoute, DB_WHAT, STALE_DB_WHAT,
@@ -101,7 +101,7 @@ fn write_routes_refuse_a_missing_or_wrong_token() {
 /// binding が無ければ 503 (root の書き先の store と同じ「書き先がありません」。stale-months も root は書き先の store を見る)。
 #[test]
 fn a_missing_binding_is_service_unavailable() {
-    let f = write_preflight(false, Some("pin")).unwrap_err();
+    let f = write_preflight(false, &TenantInput::pinned(Some("pin"))).unwrap_err();
     assert_eq!(f.status, 503);
     assert_eq!(
         f.body,

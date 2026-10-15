@@ -8,8 +8,14 @@ use postgres_types::{ToSql, Type};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-/// 読み先のテナントを固定する var (wrangler.toml の `[vars]`)。**`X-Tenant-ID` は読まない。**
+/// 既定のテナントを固定する var (wrangler.toml の `[vars]`)。**`X-Tenant-ID` は読まない。**
 pub const TENANT_VAR: &str = "KINTAI_TENANT_ID";
+
+/// 既定のほかに [`TENANT_HEADER`] で選べるテナント (wrangler.toml の `[vars]`。カンマ区切りの UUID、空なら既定だけ)。
+pub const TENANT_IDS_VAR: &str = "KINTAI_TENANT_IDS";
+
+/// 呼び手 (relay) がテナントを名指しするヘッダ。無ければ既定 ([`TENANT_VAR`])。
+pub const TENANT_HEADER: &str = "X-Kintai-Tenant-Id";
 
 /// Supabase へ繋ぐ Hyperdrive の binding (wrangler.toml のトップレベルにだけ置く)。
 pub const HYPERDRIVE_BINDING: &str = "KINTAI_HYPERDRIVE";
@@ -114,7 +120,7 @@ pub fn jst_midnight(date: NaiveDate) -> DateTime<FixedOffset> {
         .expect("JST has no DST gap")
 }
 
-/// 読み先のテナント (`KINTAI_TENANT_ID` の設定 pin)。**`X-Tenant-ID` は読まない。**
+/// 既定のテナント (`KINTAI_TENANT_ID` の設定 pin)。**`X-Tenant-ID` は読まない。**
 ///
 /// 無い・空・UUID として読めない・nil UUID は 503。nil で引くと 0 件が返るだけで、
 /// 「設定が無い」と「その月の勤務が無い」を呼び出し側が区別できない (元の Refs #205 の 23)。
@@ -128,22 +134,127 @@ pub fn tenant_of(raw: Option<&str>) -> Result<Uuid, Fail> {
     }
 }
 
-/// DB に繋ぐ**前**の検査。元の handler と同じ順 (binding が無ければ 503 → テナントが決まらなければ 503) で、
+/// テナントを決める材料。`default` = [`TENANT_VAR`]、`allowed` = [`TENANT_IDS_VAR`]、`header` = [`TENANT_HEADER`]。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantInput<'a> {
+    pub default: Option<&'a str>,
+    pub allowed: Option<&'a str>,
+    pub header: Option<&'a str>,
+}
+
+impl<'a> TenantInput<'a> {
+    /// ヘッダ無し・既定だけ (今までの pin と同じ)。
+    pub fn pinned(default: Option<&'a str>) -> Self {
+        Self {
+            default,
+            ..Self::default()
+        }
+    }
+}
+
+/// 解決したテナント。`is_default` は既定 ([`TENANT_VAR`]) と同じか (alc の RPC にテナントを渡すかの分かれ目)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tenancy {
+    pub tenant: Uuid,
+    pub is_default: bool,
+}
+
+impl Tenancy {
+    /// alc の RPC (`KINTAI_ALC_RPC`) に渡す `tenantId`。既定なら `None` (渡さない = auth-worker の既定のまま)。
+    pub fn alc_tenant_id(&self) -> Option<String> {
+        (!self.is_default).then(|| self.tenant.to_string())
+    }
+}
+
+/// 403 (ヘッダのテナントが UUID でない・nil・既定にも [`TENANT_IDS_VAR`] にも無い)。
+pub fn tenant_not_allowed() -> Fail {
+    Fail::new(403, "X-Kintai-Tenant-Id のテナントは許可されていません")
+}
+
+/// 403 (既定以外のテナントで、社内の勤怠データ (MariaDB・CakePHP・D1 等) を使う口を呼んだ)。
+pub fn other_tenant_forbidden() -> Fail {
+    Fail::new(
+        403,
+        "このテナントでは使えません (社内の勤怠データは既定テナントにしかありません)",
+    )
+}
+
+/// **テナントの解決 (全経路がここを通る)。**
+///
+/// - ヘッダ無し → 既定 (今までの [`tenant_of`] と同じ。空・不正・nil は 503)
+/// - ヘッダあり → UUID として読めて nil でなく、既定 ∪ [`TENANT_IDS_VAR`] に入っていれば採用。それ以外は 403
+///
+/// [`TENANT_IDS_VAR`] の中の読めない要素は数えない (どのヘッダとも一致しないだけ)。
+pub fn resolve_tenant(input: &TenantInput) -> Result<Tenancy, Fail> {
+    let Some(header) = input.header else {
+        let tenant = tenant_of(input.default)?;
+        return Ok(Tenancy {
+            tenant,
+            is_default: true,
+        });
+    };
+    let asked = match Uuid::parse_str(header) {
+        Ok(t) if !t.is_nil() => t,
+        _ => return Err(tenant_not_allowed()),
+    };
+    if tenant_of(input.default).ok() == Some(asked) {
+        return Ok(Tenancy {
+            tenant: asked,
+            is_default: true,
+        });
+    }
+    let listed = input
+        .allowed
+        .unwrap_or_default()
+        .split(',')
+        .any(|s| Uuid::parse_str(s.trim()).ok() == Some(asked));
+    match listed {
+        true => Ok(Tenancy {
+            tenant: asked,
+            is_default: false,
+        }),
+        false => Err(tenant_not_allowed()),
+    }
+}
+
+/// 口がどのテナントで使えるか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Supabase と alc だけを読み書きする口 (許可されたテナントならどれでも)
+    AnyAllowed,
+    /// 社内 MariaDB・CakePHP・D1 等を使う口 (既定テナントだけ)
+    DefaultOnly,
+}
+
+/// 口を走らせる**前**の関門。ヘッダが無ければ何も見ない (今と同じく、テナントは DB に繋ぐ直前に [`preflight`] が決める)。
+/// ヘッダがあれば解決し (403)、既定以外のテナントで [`Reach::DefaultOnly`] の口なら 403。
+pub fn tenant_gate(input: &TenantInput, reach: Reach) -> Result<(), Fail> {
+    if input.header.is_none() {
+        return Ok(());
+    }
+    let tenancy = resolve_tenant(input)?;
+    match tenancy.is_default || reach == Reach::AnyAllowed {
+        true => Ok(()),
+        false => Err(other_tenant_forbidden()),
+    }
+}
+
+/// DB に繋ぐ**前**の検査。元の handler と同じ順 (binding が無ければ 503 → テナントが決まらなければ 503 / 403) で、
 /// どちらかが欠ければ呼び手は connect しない (`KINTAI_TENANT_ID` が空の初期状態で、接続の失敗 (502) が
 /// 設定欠落 (503) を隠さないように)。`has_binding` は `KINTAI_HYPERDRIVE` が env に在るか。
-pub fn preflight(has_binding: bool, tenant_raw: Option<&str>) -> Result<Uuid, Fail> {
+pub fn preflight(has_binding: bool, input: &TenantInput) -> Result<Tenancy, Fail> {
     if !has_binding {
         return Err(no_db());
     }
-    tenant_of(tenant_raw)
+    resolve_tenant(input)
 }
 
 /// 書き込みの口の [`preflight`]。binding が無いときの文言だけ違う (元の `[kintai_push] が無効です (書き先がありません)`)。
-pub fn write_preflight(has_binding: bool, tenant_raw: Option<&str>) -> Result<Uuid, Fail> {
+pub fn write_preflight(has_binding: bool, input: &TenantInput) -> Result<Tenancy, Fail> {
     if !has_binding {
         return Err(no_write_db());
     }
-    tenant_of(tenant_raw)
+    resolve_tenant(input)
 }
 
 /// 503 (`KINTAI_HYPERDRIVE` の binding が無い、書き込みの口)。
