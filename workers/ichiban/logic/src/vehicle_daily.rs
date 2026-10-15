@@ -70,6 +70,8 @@ pub struct RawVehicleDailyRow {
     pub driver_name: String,
     /// `請求K` (請求区分)。`"0"` 通常運送 / `"1"` 請求のみ / `"2"` 非請求。
     pub request_kind: String,
+    /// `最終更新` (`yyyy-mm-dd hh:mi:ss.mmm`)。NULL は `None`。
+    pub last_updated: Option<String>,
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -124,6 +126,8 @@ pub struct VehicleDailyRow {
     /// 車輌ごとの収支や運行との突合からは外すのが正しい (得意先ﾏｽﾀにも
     /// `車輌収支用(非請求)` という得意先が実在する)。
     pub request_kind: String,
+    /// `最終更新` (`yyyy-mm-dd hh:mi:ss.mmm`)。NULL は `null`。休暇日の口と同じ書式。
+    pub last_updated: Option<String>,
 }
 
 /// Raw 行リストをレスポンス行に変換 (自車/傭車どちらの金額を使うか判定・日付整形)。
@@ -156,6 +160,7 @@ pub fn build_vehicle_daily_rows(raw: &[RawVehicleDailyRow]) -> Vec<VehicleDailyR
                 driver_code: r.driver_code.clone(),
                 driver_name: r.driver_name.clone(),
                 request_kind: r.request_kind.clone(),
+                last_updated: r.last_updated.clone(),
             }
         })
         .collect()

@@ -38,6 +38,10 @@ fn test_vehicle_daily_uses_tax_excluded_amounts() {
     ));
     assert!(VEHICLE_DAILY_SQL_BODY.contains("ISNULL(t.[傭車先C], '')"));
     assert!(!VEHICLE_DAILY_SQL_BODY.contains("t.[金額]"));
+    // 最終更新は SELECT の末尾の列 (FROM の直前)。休暇日の口と同じ書式
+    assert!(VEHICLE_DAILY_SQL_BODY.contains(
+        "ISNULL(t.[請求K], ''), CONVERT(varchar(23), t.[最終更新], 121) FROM [運転日報明細] t"
+    ));
     assert!(COSTS_DAILY_SQL_BODY.contains("ISNULL(t.[税抜金額], 0)"));
     assert!(!COSTS_DAILY_SQL_BODY.contains("t.[金額]"));
 }
