@@ -323,7 +323,7 @@ async fn a_failed_fold_reports_the_kind_only() {
     );
     assert!(!body.to_string().contains("db.internal"), "{body}");
     assert!(body.get("fold").is_none());
-    assert_eq!(body["stale"]["logic_version"], "1b8f00ba48e9a77b");
+    assert_eq!(body["stale"]["logic_version"], "e933f1af05b84137");
     assert!(body.get("stale_error").is_none());
 }
 
