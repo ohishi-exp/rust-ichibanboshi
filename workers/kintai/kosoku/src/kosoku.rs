@@ -4602,6 +4602,12 @@ mod tests {
     }
 
     #[test]
+    fn shifts_from_alc_of_no_events_is_empty() {
+        // alc_only を通ったあとはイベントが必ずあるが、空でも落ちない
+        assert!(shifts_from_alc(&[]).is_empty());
+    }
+
+    #[test]
     fn alc_only_day_trip_without_rest_is_a_shift() {
         // 乗務員 17 / 2026-07-24 の形: 06:28 運行開始 → 18:18 運行終了の日帰りに休息が 1 件も無い。
         // 休息だけで組むと行ごと落ちていた (theearth 実働 592 分)
