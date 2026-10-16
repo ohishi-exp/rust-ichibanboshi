@@ -46,6 +46,8 @@ pub struct DaySummaryRow {
     pub legal_holiday_night_minutes: i64,
     /// 実働でない区間 (009 の `non_working`)。区間なしは空 = `[]` を書く (NULL は書かない)。
     pub non_working: Vec<NonWorking>,
+    /// 計上日 (010 の `count_date`)。`None` = 始業の日 (`date`) に計上する (NULL を書く)。
+    pub count_date: Option<NaiveDate>,
 }
 
 /// `day_parts` 1 行。
@@ -172,6 +174,7 @@ pub fn fold_days(driver_cd: i64, days: &[DaySummary]) -> FoldUnit {
             overtime_night_minutes: d.overtime_night_minutes,
             legal_holiday_night_minutes: d.legal_holiday_night_minutes,
             non_working: d.non_working.clone(),
+            count_date: d.count_date.as_deref().and_then(parse_date),
         });
         for p in &d.parts {
             let Some(part_date) = parse_date(&p.date) else {
@@ -218,7 +221,7 @@ pub const LOGIC_VERSION_LEN: usize = 16;
 ///
 /// 初期値は 560d21d まで版の材料だったソースのハッシュ (`KINTAI_OUTPUT_SHA`) の値 — 手で上げる定数に替えた
 /// 時点で保存済みの版が stale にならないよう、同じ値から始めた (Refs #322)。
-pub const LOGIC_BASE: &str = "8f3f81002a00b287";
+pub const LOGIC_BASE: &str = "e84b3628a33af733";
 
 /// 保存行に焼く「ロジック + 設定」の印 (16 桁 hex) = `sha256(LOGIC_BASE | KosokuParams の Debug)` の先頭 16 桁。
 ///
@@ -611,21 +614,22 @@ INSERT INTO kintai.day_summaries
         restraint_minutes, working_minutes, break_minutes, rest_minus_minutes,
         statutory_minutes, within_statutory_overtime_minutes, overtime_minutes,
         legal_holiday_minutes, night_minutes, overtime_night_minutes,
-        legal_holiday_night_minutes, non_working, fingerprint, logic_version)
+        legal_holiday_night_minutes, non_working, count_date, fingerprint, logic_version)
 SELECT $1, d.driver_cd, d.date, d.shift_start_at, d.shift_source,
        d.restraint_minutes, d.working_minutes, d.break_minutes, d.rest_minus_minutes,
        d.statutory_minutes, d.within_statutory_overtime_minutes, d.overtime_minutes,
        d.legal_holiday_minutes, d.night_minutes, d.overtime_night_minutes,
-       d.legal_holiday_night_minutes, d.non_working, $18, $19
+       d.legal_holiday_night_minutes, d.non_working, d.count_date, $19, $20
   FROM unnest($2::int8[], $3::date[], $4::timestamptz[], $5::text[],
               $6::int4[], $7::int4[], $8::int4[], $9::int4[],
               $10::int4[], $11::int4[], $12::int4[],
-              $13::int4[], $14::int4[], $15::int4[], $16::int4[], $17::jsonb[])
+              $13::int4[], $14::int4[], $15::int4[], $16::int4[], $17::jsonb[],
+              $18::date[])
        AS d(driver_cd, date, shift_start_at, shift_source,
             restraint_minutes, working_minutes, break_minutes, rest_minus_minutes,
             statutory_minutes, within_statutory_overtime_minutes, overtime_minutes,
             legal_holiday_minutes, night_minutes, overtime_night_minutes,
-            legal_holiday_night_minutes, non_working)
+            legal_holiday_night_minutes, non_working, count_date)
 "#;
 
 /// 入れる暦日ビューを **1 文で**。
@@ -683,7 +687,7 @@ pub struct ShiftColumns {
     pub shift_source: Vec<String>,
 }
 
-/// [`INSERT_DAY_SUMMARIES_SQL`] の `$2`〜`$17`。分の 11 列は int4[] (`minutes` の並びは SQL の `$6`〜`$16` の順)、
+/// [`INSERT_DAY_SUMMARIES_SQL`] の `$2`〜`$18`。分の 11 列は int4[] (`minutes` の並びは SQL の `$6`〜`$16` の順)、
 /// `non_working` は行ごとに JSON の配列 1 つ (jsonb[] の要素 1 つ = 1 行ぶん)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaySummaryColumns {
@@ -693,6 +697,8 @@ pub struct DaySummaryColumns {
     pub shift_source: Vec<String>,
     pub minutes: [Vec<i32>; 11],
     pub non_working: Vec<serde_json::Value>,
+    /// `$18` (date[]、NULL = 始業の日に計上)。
+    pub count_date: Vec<Option<NaiveDate>>,
 }
 
 /// [`INSERT_DAY_PARTS_SQL`] の `$2`〜`$7` (int8[]・timestamptz[]・date[]・int4[] × 3)。
@@ -757,6 +763,7 @@ fn day_summary_columns_by(unit: &FoldUnit, chunk_rows: usize) -> Vec<DaySummaryC
                     .iter()
                     .map(|d| non_working_json(&d.non_working))
                     .collect(),
+                count_date: chunk.iter().map(|d| d.count_date).collect(),
             }
         })
         .collect()
@@ -833,6 +840,7 @@ mod tests {
             run_head_minutes: 0,
             lunch_overlap_minutes: 0,
             non_working: Vec::new(),
+            count_date: None,
         }
     }
 
@@ -857,6 +865,16 @@ mod tests {
         p
     }
 
+    #[test]
+    fn fold_days_carries_the_count_date_and_drops_a_broken_one() {
+        let mut ok = day("2026-07-01", "2026-07-01 05:09:00", "2026-07-01 08:25:00");
+        ok.count_date = Some("2026-06-30".to_string());
+        let mut bad = day("2026-07-02", "2026-07-02 05:00:00", "2026-07-02 08:00:00");
+        bad.count_date = Some("nope".to_string());
+        let unit = fold_days(1, &[ok, bad]);
+        let counts: Vec<_> = unit.day_summaries.iter().map(|d| d.count_date).collect();
+        assert_eq!(counts, vec![parse_date("2026-06-30"), None]);
+    }
     #[test]
     fn fold_maps_every_minutes_column() {
         let unit = fold_days(
@@ -1168,10 +1186,11 @@ mod tests {
     /// - `de3d9f17519333e2` → `e933f1af05b84137`: alc だけの会社で運行の外を勤務から外した (2026-10-15)
     /// - `8c8ccb14dcf1838f` → `8afe30c2223c40aa`: そのうち 8 時間以下の運行の外は勤務に残し休憩に数えた (2026-10-16)
     /// - `8f3f81002a00b287` → `4b3752a95e519674`: alc だけの会社は運行のデータで勤務を組む (休息の無い日帰り) (2026-10-16)
+    /// - `e84b3628a33af733` → `6a1a77dbb45d2a60`: alc だけの会社の勤務に計上日 (運行開始の日) を持たせた (2026-10-16)
     #[test]
     fn the_logic_version_is_the_one_in_production() {
-        assert_eq!(LOGIC_BASE, "8f3f81002a00b287");
-        assert_eq!(logic_version(&KosokuParams::default()), "4b3752a95e519674");
+        assert_eq!(LOGIC_BASE, "e84b3628a33af733");
+        assert_eq!(logic_version(&KosokuParams::default()), "6a1a77dbb45d2a60");
     }
 
     /// 版の材料は [`LOGIC_BASE`] と設定だけ。ソースのハッシュは引数にも無い (コメント 1 文字では動かない)。

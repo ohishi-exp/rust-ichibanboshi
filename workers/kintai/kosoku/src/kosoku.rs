@@ -450,6 +450,13 @@ pub struct DaySummary {
     /// 返すので、出すと休憩の時刻の到達面が広がる。保存 (`kintai_fold`) だけが読む。
     #[serde(skip)]
     pub non_working: Vec<NonWorking>,
+    /// 計上日 (`YYYY-MM-DD`、migration 010 の `count_date`)。`None` = 始業の日 (`date`) に計上する。
+    ///
+    /// [`alc_only`] の乗務員だけ、その勤務を含む運行の**運行開始の日**が始業の日より前なら入れる
+    /// ([`count_date_of`])。theearth の拘束時間管理表が「運行単位で、集計開始月に計上」するため。
+    /// **serde の出力には出さない** (`kosoku-daily` の応答の形を変えない)。保存 (`kintai_fold`) だけが読む。
+    #[serde(skip)]
+    pub count_date: Option<String>,
 }
 
 /// 生行 (`serde_json::Value`) をイベントへ。**壊れた行は黙って捨てる** —
@@ -1138,6 +1145,33 @@ fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
                     .any(|e| e.state == "運行開始" && e.start == s.start)
         })
         .collect()
+}
+
+/// 勤務を含む運行の**運行開始の日** — それが始業の日より前のときだけ返す ([`DaySummary::count_date`])。
+///
+/// 実測 (北海大運 / 2026-07): 6/30 に出庫した運行が休息を挟んで 7/1 05:09 から帰庫まで続く勤務を、
+/// theearth は 6 月に数える (乗務員 12・15・16 で計 343 分、月合計の差と一致)。
+///
+/// - 勤務の始まりの時点で最後に来た運行の境界が**運行開始**ならその日 (同時刻なら運行開始が後)
+/// - 運行開始が読み窓の外 (前月) にあって見えなければ、勤務の直前の休息の**始まり**の日で代える —
+///   休息は運行の中にしか記録されないので、その休息の始まりは同じ運行の中
+/// - 境界が運行終了 (運行の外から始まる勤務) なら返さない
+fn count_date_of(events: &[Event], shift: &Shift) -> Option<chrono::NaiveDate> {
+    let last_bound = events
+        .iter()
+        .filter(|e| e.state == "運行開始" || e.state == "運行終了")
+        .filter(|e| floor_min(e.start) <= shift.start)
+        .max_by_key(|e| (e.start, e.state == "運行開始"));
+    let start = match last_bound {
+        Some(e) if e.state == "運行開始" => e.start,
+        Some(_) => return None,
+        None => rest_spans(events)
+            .into_iter()
+            .filter(|(_, end)| floor_min(*end) == shift.start)
+            .map(|(s, _)| s)
+            .min()?,
+    };
+    (start.date() < shift.start.date()).then_some(start.date())
 }
 
 /// **運行の外** — 運行終了から次の運行開始まで、イベントが 1 件も無い区間
@@ -2089,6 +2123,11 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
         overtime_night_minutes: ot_night,
         legal_holiday_night_minutes: hol_night,
         non_working,
+        count_date: if alc_only(events) {
+            count_date_of(events, &walk).map(|d| d.format("%Y-%m-%d").to_string())
+        } else {
+            None
+        },
     }
 }
 
@@ -4605,6 +4644,87 @@ mod tests {
     fn shifts_from_alc_of_no_events_is_empty() {
         // alc_only を通ったあとはイベントが必ずあるが、空でも落ちない
         assert!(shifts_from_alc(&[]).is_empty());
+    }
+
+    fn count_dates(rows: &[serde_json::Value], month: &str) -> Vec<(String, Option<String>)> {
+        daily_summary(rows, month, &KosokuParams::default())
+            .into_iter()
+            .map(|d| (d.start, d.count_date))
+            .collect()
+    }
+
+    #[test]
+    fn alc_only_shift_counts_on_the_day_its_run_started() {
+        // 6/30 に出庫した運行が休息を挟んで 7/1 05:09 から帰庫まで続く (乗務員 12 / 2026-07 の形)。
+        // 7/1 の勤務は 7 月の fold が書くが、計上日は運行開始の 6/30
+        let rows = vec![
+            alc("2026-06-30 06:00:00", "運行開始"),
+            ev("2026-06-30 06:00:00", "2026-06-30 18:00:00", "運転"),
+            ev("2026-06-30 18:00:00", "2026-07-01 05:09:00", "休息"),
+            ev("2026-07-01 05:09:00", "2026-07-01 08:25:00", "運転"),
+            alc("2026-07-01 08:25:00", "運行終了"),
+            alc("2026-07-02 13:00:00", "運行開始"),
+            ev("2026-07-02 13:00:00", "2026-07-02 17:00:00", "運転"),
+            alc("2026-07-02 17:00:00", "運行終了"),
+        ];
+        assert_eq!(
+            count_dates(&rows, "2026-07"),
+            vec![
+                (
+                    "2026-07-01 05:09:00".to_string(),
+                    Some("2026-06-30".to_string())
+                ),
+                // 当日に始まった運行は始業の日のまま
+                ("2026-07-02 13:00:00".to_string(), None),
+            ],
+        );
+    }
+
+    #[test]
+    fn alc_only_count_date_falls_back_to_the_rest_start_outside_the_window() {
+        // 運行開始が読み窓の外 (前月) で見えないときは、直前の休息の始まりの日で代える
+        let rows = vec![
+            ev("2026-06-30 18:00:00", "2026-07-01 05:09:00", "休息"),
+            ev("2026-07-01 05:09:00", "2026-07-01 08:25:00", "運転"),
+            alc("2026-07-01 08:25:00", "運行終了"),
+        ];
+        assert_eq!(
+            count_dates(&rows, "2026-07"),
+            vec![(
+                "2026-07-01 05:09:00".to_string(),
+                Some("2026-06-30".to_string())
+            )],
+        );
+    }
+
+    #[test]
+    fn a_shift_that_starts_after_a_run_end_has_no_count_date() {
+        // 勤務の始まりの直前の境界が運行終了 = 運行の外から始まる勤務。計上日は付けない
+        let rows = vec![
+            alc("2026-06-30 08:00:00", "運行開始"),
+            alc("2026-06-30 20:00:00", "運行終了"),
+            ev("2026-06-30 20:30:00", "2026-07-01 05:00:00", "休息"),
+            ev("2026-07-01 05:00:00", "2026-07-01 06:00:00", "運転"),
+            alc("2026-07-01 06:00:00", "運行開始"),
+            ev("2026-07-01 06:00:00", "2026-07-01 09:00:00", "運転"),
+            alc("2026-07-01 09:00:00", "運行終了"),
+        ];
+        let days = count_dates(&rows, "2026-07");
+        assert_eq!(days, vec![("2026-07-01 05:00:00".to_string(), None)]);
+    }
+
+    #[test]
+    fn borrowed_sources_never_get_a_count_date() {
+        // 社内 MariaDB の運行イベント (`dtako`) を借りる会社 (大石) は計上日を付けない
+        let rows = vec![
+            dtako("2026-06-30 06:00:00", "運行開始"),
+            ev("2026-06-30 18:00:00", "2026-07-01 05:09:00", "休息"),
+            dtako("2026-07-01 08:25:00", "運行終了"),
+            ev("2026-07-01 20:00:00", "2026-07-02 06:00:00", "休息"),
+        ];
+        assert!(count_dates(&rows, "2026-07")
+            .iter()
+            .all(|(_, c)| c.is_none()));
     }
 
     #[test]
