@@ -2350,8 +2350,8 @@ fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
 /// 勤務の組み方は fold と同じ ([`final_shifts_aligned`])。月初をまたぐ勤務 (始まり < 月初 < 終わり) が無ければ
 /// 起点は無い。打刻・社内 MariaDB の運行イベントを持つ乗務員は見ない (#317 の起点がある)。
 ///
-/// 2 つ目の戻り値は「最初の勤務が `from` (読んだ範囲の始まり) 以前から始まる乗務員がいる」— 勤務の途中から読んで
-/// いるので、呼び手は 1 日遡って読み直す ([`ALC_DAY_MINUTES`] の日締めは始業から数えるので、始業が見えるまで)。
+/// 2 つ目の戻り値は「最初の勤務が `from` (読んだ範囲の始まり) 以前から始まる乗務員、または行が全部 alc なのに運行の
+/// 境界が無い乗務員がいる」— 勤務 (運行) の途中から読んでいるので、呼び手は 1 日遡って読み直す ([`ALC_DAY_MINUTES`] の日締めは始業から数えるので、始業が見えるまで)。
 pub fn alc_open_shift_starts(
     rows: Vec<serde_json::Value>,
     month_start: NaiveDateTime,
@@ -2363,6 +2363,10 @@ pub fn alc_open_shift_starts(
         .filter_map(|(cd, rows)| {
             let events = parse_events(&rows);
             if !alc_only(&events) {
+                // 行が全部 alc なのに運行の境界 (運行開始・運行終了) が読んだ範囲に無い = 何日も続く運行の途中だけを
+                // 読んでいる。alc だけの乗務員と判定できないので、境界が見えるまで遡る (実測: 乗務員 3 / 2026-06 は
+                // 5/29 出庫 → 6/2 帰庫の運行の途中で、月初の前後 1 日には境界が無かった)
+                at_edge |= events.iter().all(|e| e.source == "dtako_events");
                 return None;
             }
             let shifts = final_shifts_aligned(&events);
@@ -4962,6 +4966,24 @@ mod tests {
         let (_, at_edge) =
             alc_open_shift_starts(rows, at("2026-07-01 00:00:00"), at("2026-06-30 17:00:00"));
         assert!(at_edge);
+        // 行が全部 alc で運行の境界が無い (運行の途中だけを読んでいる) なら遡る。打刻・運行の写しを持つ乗務員は見ない
+        let mut mid_run = vec![ev("2026-06-30 08:00:00", "2026-07-01 03:00:00", "運転")];
+        mid_run[0]["driver_id"] = json!(20);
+        let (open, at_edge) = alc_open_shift_starts(
+            mid_run,
+            at("2026-07-01 00:00:00"),
+            at("2026-06-30 00:00:00"),
+        );
+        assert!(open.is_empty());
+        assert!(at_edge);
+        let mut borrowed = vec![dtako("2026-06-30 08:00:00", "運行開始")];
+        borrowed[0]["driver_id"] = json!(21);
+        let (_, at_edge) = alc_open_shift_starts(
+            borrowed,
+            at("2026-07-01 00:00:00"),
+            at("2026-06-30 00:00:00"),
+        );
+        assert!(!at_edge);
     }
 
     #[test]
