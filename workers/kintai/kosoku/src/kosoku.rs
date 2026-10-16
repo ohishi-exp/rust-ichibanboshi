@@ -1051,8 +1051,14 @@ fn split_long_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
 
 /// **打刻も社内 MariaDB の運行イベントも持たない乗務員** (= イベントが全部 alc の `dtako_events`)。
 /// 借り先を持たない会社 (北海大運) はこうなる ([`crate::alc_events::is_borrowed_source`])。
+///
+/// **alc の運行開始・運行終了が 1 件もあること**も条件にする — 休息だけのデータ (合成の入力や、運行を
+/// 読めていない月) は従来どおり休息から勤務を組む ([`shifts_from_rest`])。
 fn alc_only(events: &[Event]) -> bool {
     events.iter().all(|e| e.source == "dtako_events")
+        && events
+            .iter()
+            .any(|e| e.state == "運行開始" || e.state == "運行終了")
 }
 
 /// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、[`RUN_GAP_REST_MINUTES`] を**超える**
@@ -1079,6 +1085,58 @@ fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
                 })
         })
         .filter(|s| s.end > s.start)
+        .collect()
+}
+
+/// 分割前の勤務。打刻の勤務と休息の勤務を合わせる ([`merge_shifts`])。[`alc_only`] の乗務員だけは
+/// 運行のデータで組む ([`shifts_from_alc`])。
+fn base_shifts(events: &[Event]) -> Vec<Shift> {
+    if alc_only(events) {
+        return shifts_from_alc(events);
+    }
+    merge_shifts(shifts_from_timecard(events), shifts_from_rest(events))
+}
+
+/// [`alc_only`] の乗務員の勤務 — **データのある範囲から、長い運行の外 ([`outside_runs`]) と休息を引いたもの**
+/// (ユーザー決定 2026-10-16)。
+///
+/// 休息だけで勤務を組む [`shifts_from_rest`] は「休息の終わり → 次の休息の始まり」しか勤務にしないので、
+/// 打刻の無い会社 (北海大運) では休息に挟まれない時間が丸ごと落ちていた。実測 (乗務員 17 / 2026-07):
+///
+/// - 07-24 06:28 運行開始 → 18:18 運行終了の日帰りに休息が 1 件も無く、行ごと無し (theearth 実働 592 分)。
+///   07-23〜31 の日帰りが全部こうで、月の実働が 4,809 分欠けていた
+/// - 07-22 06:31 → 07-23 15:39 の運行は、休息 (07-22 17:47 → 07-23 08:36) 明けから運行終了までが落ちた
+///   (theearth 07-23 実働 239 分)
+///
+/// 運行開始・運行終了・休息はどれも運行 (KUDGIVT) に入っている時刻なので、「データに無い時間を拘束に
+/// 入れない」(#392) と同じ線で組める。運行間が 8 時間以下の空きは勤務に残る (休憩に数える、[`summarize`])。
+fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
+    let (Some(first), Some(last)) = (
+        events.iter().map(|e| e.start).min(),
+        events.iter().map(|e| e.end.unwrap_or(e.start)).max(),
+    ) else {
+        return Vec::new();
+    };
+    let mut cut: Vec<(NaiveDateTime, NaiveDateTime)> = outside_runs(events)
+        .into_iter()
+        .filter(|(s, e)| (*e - *s).num_minutes() > RUN_GAP_REST_MINUTES)
+        .collect();
+    cut.extend(rest_spans(events));
+    subtract_intervals(&[(first, last)], &merge_intervals(cut))
+        .into_iter()
+        .map(|(start, end)| Shift {
+            start,
+            end,
+            source: ShiftSource::Rest,
+        })
+        // 運行のイベントが 1 件も無い区間 (休息と休息の間に何も記録が無い等) は勤務にしない — データが無い。
+        // 始端と同時刻の運行開始は証拠に数える (日帰りの勤務はそこから始まる)
+        .filter(|s| {
+            has_operation_strictly_after_start(events, s)
+                || events
+                    .iter()
+                    .any(|e| e.state == "運行開始" && e.start == s.start)
+        })
         .collect()
 }
 
@@ -2178,7 +2236,7 @@ pub fn apply_ferry_minus(days: &mut [DaySummary], ferry: &BTreeMap<String, i64>)
 /// 分割後の勤務 (分に揃えた影)。覆い ([`shift_cover`]) と拘束区間
 /// ([`restraint_spans_and_diagnostics`]) の共通の土台。
 fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
-    merge_shifts(shifts_from_timecard(events), shifts_from_rest(events))
+    base_shifts(events)
         .iter()
         .filter(|s| s.end > s.start)
         // **分割後の勤務で見る** (Refs #182 フォローアップ)。[`split_long_shift`] は
@@ -2247,7 +2305,7 @@ pub(crate) fn restraint_spans_and_diagnostics(events: &[Event]) -> (Spans, Spans
 /// 拘束を丸ごと当月に載せる。
 pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) -> Vec<DaySummary> {
     let events = parse_events(rows);
-    let shifts = merge_shifts(shifts_from_timecard(&events), shifts_from_rest(&events));
+    let shifts = base_shifts(&events);
     // 先に勤務の一覧を確定させる — run_head の重なり判定 (summarize の siblings) は
     // 分割後の勤務どうしで見る
     let shifts: Vec<Shift> = shifts
@@ -4539,6 +4597,49 @@ mod tests {
             vec![
                 ("2026-07-02 05:00:00", "2026-07-02 08:00:00"),
                 ("2026-07-02 16:01:00", "2026-07-02 18:00:00"),
+            ],
+        );
+    }
+
+    #[test]
+    fn alc_only_day_trip_without_rest_is_a_shift() {
+        // 乗務員 17 / 2026-07-24 の形: 06:28 運行開始 → 18:18 運行終了の日帰りに休息が 1 件も無い。
+        // 休息だけで組むと行ごと落ちていた (theearth 実働 592 分)
+        let rows = vec![
+            alc("2026-07-24 06:28:24", "運行開始"),
+            ev("2026-07-24 06:28:24", "2026-07-24 06:54:19", "運転"),
+            ev("2026-07-24 07:50:58", "2026-07-24 08:08:57", "休憩"),
+            ev("2026-07-24 08:08:57", "2026-07-24 18:00:00", "運転"),
+            alc("2026-07-24 18:18:00", "運行終了"),
+            alc("2026-07-25 06:14:22", "運行開始"),
+            ev("2026-07-25 06:14:22", "2026-07-25 17:00:00", "運転"),
+            alc("2026-07-25 17:30:00", "運行終了"),
+        ];
+        assert_eq!(
+            shift_spans(&rows),
+            vec![
+                ("2026-07-24 06:28:00".into(), "2026-07-24 18:18:00".into()),
+                ("2026-07-25 06:14:00".into(), "2026-07-25 17:30:00".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn alc_only_tail_after_the_last_rest_runs_to_the_run_end() {
+        // 乗務員 17 / 2026-07-22 の形: 運行の途中の休息 (17:47 → 翌 08:36) 明けから運行終了 15:39 まで。
+        // 次の休息が無いので落ちていた (theearth 07-23 実働 239 分)
+        let rows = vec![
+            alc("2026-07-22 06:31:34", "運行開始"),
+            ev("2026-07-22 06:31:34", "2026-07-22 17:47:43", "運転"),
+            ev("2026-07-22 17:47:43", "2026-07-23 08:36:27", "休息"),
+            ev("2026-07-23 08:36:27", "2026-07-23 15:39:13", "運転"),
+            alc("2026-07-23 15:39:13", "運行終了"),
+        ];
+        assert_eq!(
+            shift_spans(&rows),
+            vec![
+                ("2026-07-22 06:31:00".into(), "2026-07-22 17:47:00".into()),
+                ("2026-07-23 08:36:00".into(), "2026-07-23 15:39:00".into()),
             ],
         );
     }
