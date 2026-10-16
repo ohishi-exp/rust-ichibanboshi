@@ -300,6 +300,70 @@ pub fn merge_all_rows(
     rows
 }
 
+/// 運行の時間帯を決める行 (作業と運行の境界)。休息・休憩・エンジン ON・道路種別などは運行の外へはみ出すことがある
+/// (車輌を乗り換えた後も前の車輌の休息が開いたまま等) ので使わない。
+const OPERATION_SPAN_STATES: [&str; 8] = [
+    "運転",
+    "積み",
+    "降し",
+    "待機",
+    "その他",
+    "フェリー",
+    "運行開始",
+    "運行終了",
+];
+
+/// **同じ乗務員の 2 つの運行が時間で重なっている** (2 台が同時に動いている) ものを、エラーの warning にする
+/// (ユーザー決定 2026-10-17「2 台かぶりはわかるように出してくれたらいい、エラーとして処理」)。
+///
+/// 1 人が同時に 2 台を運転することはできないので、乗務員CD の付け間違い等のデータの誤り。勤務は 2 本の行を 1 本の
+/// 時間の流れとして組むので、両方の休息で切れて実働が正しく出ない。実測 (北海 乗務員 15 / 2026-06-03): 車輌 245
+/// (03:07 出庫) と 226 (03:26 出庫〜16:55 帰庫) が重なり、theearth より実働が 482 分少なかった。
+///
+/// 運行の時間帯は [`OPERATION_SPAN_STATES`] の行の最初の始まりから最後の終わりまで。封は止めない (入力の欠けではない)。
+pub fn overlapping_operations(events: &[RawEvent]) -> Vec<Warning> {
+    type Span = (NaiveDateTime, NaiveDateTime, Option<String>);
+    let mut ops: std::collections::BTreeMap<(i64, String), Span> = Default::default();
+    for e in events {
+        let (Some(driver), Some(unko_no), Some(state)) = (e.driver_id, &e.unko_no, &e.state) else {
+            continue;
+        };
+        if !OPERATION_SPAN_STATES.contains(&state.as_str()) {
+            continue;
+        }
+        let end = e.end.unwrap_or(e.start);
+        let slot =
+            ops.entry((driver, unko_no.clone()))
+                .or_insert((e.start, end, e.vehicle.clone()));
+        slot.0 = slot.0.min(e.start);
+        slot.1 = slot.1.max(end);
+    }
+    let mut by_driver: std::collections::BTreeMap<i64, Vec<(String, Span)>> = Default::default();
+    for ((driver, unko_no), span) in ops {
+        by_driver.entry(driver).or_default().push((unko_no, span));
+    }
+    let fmt = |t: NaiveDateTime| t.format(OUT_DATETIME_FORMAT).to_string();
+    let label = |unko_no: &str, (s, e, v): &Span| {
+        let vehicle = v.as_deref().unwrap_or("車輌不明");
+        format!("{unko_no} ({vehicle}、{}〜{})", fmt(*s), fmt(*e))
+    };
+    let mut out = Vec::new();
+    for (driver, mut list) in by_driver {
+        list.sort_by_key(|(u, (s, _, _))| (*s, u.clone()));
+        for (i, (ua, a)) in list.iter().enumerate() {
+            for (ub, b) in list.iter().skip(i + 1).take_while(|(_, b)| b.0 < a.1) {
+                tracing::warn!(driver, a = %ua, b = %ub, "2 台の運行が重なっている");
+                out.push(Warning::diagnostic(format!(
+                    "エラー: 2 台の運行が同じ時間に重なっています — 乗務員 {driver} の {} と {}。勤務と実働が正しく出ません (乗務員CD の付け間違いの疑い)",
+                    label(ua, a),
+                    label(ub, b)
+                )));
+            }
+        }
+    }
+    out
+}
+
 /// 上流から取った運行を写して `[from, to)` で絞る。`運行NO` で重複排除する (`seen` は chunk・ページをまたいで持ち回る)。
 pub fn collect(
     ops: Vec<UpstreamOperation>,
@@ -879,6 +943,139 @@ mod tests {
         let cols = EventCols::resolve(&h).unwrap();
         let ev = row_to_event(&cols, &row(&["DR01", "2026/03/01 08:00:00", "運転"]), "").unwrap();
         assert_eq!(ev.driver_id, None, "数値でない CD は null (0 に化かさない)");
+    }
+
+    fn op_ev(driver: i64, unko: &str, start: &str, end: &str, state: &str) -> RawEvent {
+        RawEvent {
+            start: dt(start),
+            end: Some(dt(end)),
+            driver_id: Some(driver),
+            state: Some(state.into()),
+            unko_no: Some(unko.into()),
+            vehicle: Some(format!("車{}", &unko[unko.len() - 3..])),
+        }
+    }
+
+    #[test]
+    fn overlapping_operations_of_one_driver_are_an_error() {
+        // 乗務員 15 / 2026-06-03 の形: 245 (03:07〜6/6) と 226 (03:26〜16:55) が重なる
+        let events = vec![
+            op_ev(
+                15,
+                "OP245",
+                "2026-06-03 03:07:33",
+                "2026-06-03 03:07:33",
+                "運行開始",
+            ),
+            op_ev(
+                15,
+                "OP245",
+                "2026-06-03 03:07:33",
+                "2026-06-06 12:02:12",
+                "運転",
+            ),
+            op_ev(
+                15,
+                "OP226",
+                "2026-06-03 03:26:45",
+                "2026-06-03 16:55:46",
+                "運転",
+            ),
+            // 重ならない運行・別の乗務員・運行の時間帯に入れない行
+            op_ev(
+                15,
+                "OP300",
+                "2026-06-07 05:00:00",
+                "2026-06-07 09:00:00",
+                "運転",
+            ),
+            op_ev(
+                16,
+                "OP226",
+                "2026-06-03 03:26:45",
+                "2026-06-03 16:55:46",
+                "運転",
+            ),
+            op_ev(
+                15,
+                "OP301",
+                "2026-06-06 11:00:00",
+                "2026-06-07 08:00:00",
+                "休息",
+            ),
+        ];
+        let got = overlapping_operations(&events);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].blocks_seal);
+        assert_eq!(
+            got[0].text,
+            "エラー: 2 台の運行が同じ時間に重なっています — 乗務員 15 の OP245 (車245、2026-06-03 03:07:33〜2026-06-06 12:02:12) と OP226 (車226、2026-06-03 03:26:45〜2026-06-03 16:55:46)。勤務と実働が正しく出ません (乗務員CD の付け間違いの疑い)"
+        );
+    }
+
+    #[test]
+    fn back_to_back_operations_are_not_an_error() {
+        // 運行終了と次の運行開始が同時刻なら重なりではない。乗務員・運行NO・イベント名の無い行は見ない
+        let mut events = vec![
+            op_ev(
+                15,
+                "OPA",
+                "2026-06-03 03:00:00",
+                "2026-06-03 10:00:00",
+                "運転",
+            ),
+            op_ev(
+                15,
+                "OPB",
+                "2026-06-03 10:00:00",
+                "2026-06-03 12:00:00",
+                "運転",
+            ),
+        ];
+        let mut stray = op_ev(
+            15,
+            "OPC",
+            "2026-06-03 04:00:00",
+            "2026-06-03 05:00:00",
+            "運転",
+        );
+        stray.driver_id = None;
+        let mut no_unko = op_ev(
+            15,
+            "OPC",
+            "2026-06-03 04:00:00",
+            "2026-06-03 05:00:00",
+            "運転",
+        );
+        no_unko.unko_no = None;
+        let mut no_state = op_ev(
+            15,
+            "OPC",
+            "2026-06-03 04:00:00",
+            "2026-06-03 05:00:00",
+            "運転",
+        );
+        no_state.state = None;
+        events.extend([stray, no_unko, no_state]);
+        assert!(overlapping_operations(&events).is_empty());
+        // 車輌が無くても文面は出る
+        let mut a = op_ev(
+            1,
+            "OPA",
+            "2026-06-03 03:00:00",
+            "2026-06-03 10:00:00",
+            "運転",
+        );
+        a.vehicle = None;
+        let b = op_ev(
+            1,
+            "OPB",
+            "2026-06-03 09:00:00",
+            "2026-06-03 12:00:00",
+            "運転",
+        );
+        let got = overlapping_operations(&[a, b]);
+        assert!(got[0].text.contains("OPA (車輌不明、"), "{}", got[0].text);
     }
 
     fn ev(start: &str, end: Option<&str>) -> RawEvent {

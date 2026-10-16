@@ -20,8 +20,9 @@
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime};
 use kintai_kosoku::alc_events::{
-    event_to_json, fetch_all_events, fetch_dtako_month_read, merge_all_rows, AlcEventsError,
-    AlcEventsGet, EventsPage, RawEvent, UpstreamAll, UpstreamEtags,
+    event_to_json, fetch_all_events, fetch_dtako_month_read, merge_all_rows,
+    overlapping_operations, AlcEventsError, AlcEventsGet, EventsPage, RawEvent, UpstreamAll,
+    UpstreamEtags,
 };
 use kintai_kosoku::anchors::HeadAnchors;
 use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
@@ -177,6 +178,8 @@ pub async fn driver_alc_events<A: AlcRpc, P: PushedEventsRead>(
         .into_iter()
         .filter(|e| e.driver_id == Some(driver))
         .collect();
+    let mut warnings = warnings;
+    warnings.extend(overlapping_operations(&mine));
     let borrowed: Vec<serde_json::Value> = io
         .pushed
         .pushed_all_events(pushed_window(&req.from, &req.to)?)
@@ -257,7 +260,9 @@ impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P>
         from: &str,
         to: &str,
     ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), Fail> {
-        let (events, warnings) = fetch_all_events(self, from, to).await?;
+        let (events, mut warnings) = fetch_all_events(self, from, to).await?;
+        // 2 台の運行が同じ時間に重なっていたらエラーとして出す (勤務と実働が正しく出ない)
+        warnings.extend(overlapping_operations(&events));
         let borrowed = self
             .pushed
             .pushed_all_events(pushed_window(from, to)?)

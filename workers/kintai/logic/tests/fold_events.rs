@@ -752,3 +752,54 @@ fn driver_alc_events_passes_read_failures_through() {
         502
     );
 }
+
+/// 同じ乗務員の 2 台の運行が重なっていたら、全員の読みにも 1 人ぶんの読みにもエラーの warning が出る (封は止めない)。
+#[test]
+fn overlapping_operations_come_back_as_an_error_warning() {
+    let body = json!({
+        "drivers": [{"operations": [
+            {
+                "unko_no": "OP-245",
+                "headers": ["対象乗務員CD", "開始日時", "終了日時", "イベント名", "車輌名"],
+                "rows": [["15", "2026/06/03 03:07:33", "2026/06/06 12:02:12", "運転", "帯広100け245"]],
+            },
+            {
+                "unko_no": "OP-226",
+                "headers": ["対象乗務員CD", "開始日時", "終了日時", "イベント名", "車輌名"],
+                "rows": [["15", "2026/06/03 03:26:45", "2026/06/03 16:55:46", "運転", "帯広100け226"]],
+            },
+        ]}],
+    })
+    .to_string();
+    let log = Log::default();
+    let a = alc(&log);
+    *a.events.borrow_mut() = vec![Ok(res(200, &body))];
+    let m = pushed_all(&log, Ok(vec![]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let (_, warnings) = block_on(FoldEventsIo::all_events_between(&w, FROM, TO)).unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0]
+        .text
+        .starts_with("エラー: 2 台の運行が同じ時間に重なっています — 乗務員 15 の OP-245"));
+    assert!(!warnings[0].blocks_seal);
+
+    let a = alc(&log);
+    *a.events.borrow_mut() = vec![Ok(res(200, &body))];
+    let m = pushed_all(&log, Ok(vec![]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let req = AlcEventsRequest {
+        driver: 15,
+        from: FROM.into(),
+        to: TO.into(),
+    };
+    let got = block_on(driver_alc_events(&w, &req)).unwrap();
+    assert_eq!(got["warnings"].as_array().unwrap().len(), 1);
+}
