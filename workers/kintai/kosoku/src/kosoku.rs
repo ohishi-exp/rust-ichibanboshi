@@ -1049,14 +1049,23 @@ fn split_long_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
         .collect()
 }
 
-/// [`split_long_shift`] のあと、**打刻も社内 MariaDB の運行イベントも持たない乗務員**
-/// (= イベントが全部 alc の `dtako_events`) だけ、運行の外を勤務から外す ([`outside_runs`])。
+/// **打刻も社内 MariaDB の運行イベントも持たない乗務員** (= イベントが全部 alc の `dtako_events`)。
+/// 借り先を持たない会社 (北海大運) はこうなる ([`crate::alc_events::is_borrowed_source`])。
+fn alc_only(events: &[Event]) -> bool {
+    events.iter().all(|e| e.source == "dtako_events")
+}
+
+/// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、**長い**運行の外 ([`outside_runs`]) を
+/// 勤務から外す。短い運行の外 (昼休み等) は勤務に残し、休憩として数える ([`summarize`])。
 fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     let parts = split_long_shift(shift, events);
-    if !events.iter().all(|e| e.source == "dtako_events") {
+    if !alc_only(events) {
         return parts;
     }
-    let outside = outside_runs(events);
+    let outside: Vec<_> = outside_runs(events)
+        .into_iter()
+        .filter(|(s, e)| (*e - *s).num_minutes() >= RUN_GAP_REST_MINUTES)
+        .collect();
     parts
         .into_iter()
         .flat_map(|s| {
@@ -1082,10 +1091,14 @@ fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
 /// 07-02 13:55 → 07-03 10:23 が 1 勤務・実働 1,140 分 (theearth は 134 + 140 分)。
 ///
 /// - 社内 MariaDB から打刻・運行の確定イベント (`timecard` / `dtako`) を借りる会社 (大石)
-///   には使わない — 勤務は打刻が閉じ、継ぎ目は紙も数える (#123)。借り先を持たない会社は
-///   イベントが全部 `dtako_events` になる ([`crate::alc_events::is_borrowed_source`])
+///   には使わない ([`alc_only`]) — 勤務は打刻が閉じ、継ぎ目は紙も数える (#123)
 /// - 空白の中にイベントが 1 件でも始まっていれば外さない (データがある)
 /// - 最後の運行終了の後に運行開始が無ければ、その後ろ (イベントが無い間) は外
+/// - **長さで扱いが分かれる** (ユーザー指摘 2026-10-16「昼休みじゃないのか？」)。
+///   [`RUN_GAP_REST_MINUTES`] 以上 (と帰庫したままの尻尾) は勤務から外し ([`split_shift`])、
+///   それ未満は休息期間に届かないので勤務に残して休憩に数える ([`summarize`])。
+///   theearth の拘束時間管理表は昼に帰庫して出直す間を拘束・休憩に入れている
+///   (2026-07 の実測: 全部外すと実働は theearth と一致したまま拘束だけ 7〜800 分短かった)
 fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     let mut bounds: Vec<(NaiveDateTime, bool)> = events
         .iter()
@@ -1799,10 +1812,18 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
     let has_op = has_operation(events, &walk);
     let (breaks, break_kind) = if has_op {
-        (
-            breaks_in(events, &walk, p.break_threshold_minutes),
-            NonWorkingKind::BreakEvent,
-        )
+        let mut breaks = breaks_in(events, &walk, p.break_threshold_minutes);
+        // 勤務に残した短い運行の外 (昼休み等) は休憩 ([`outside_runs`])
+        if alc_only(events) {
+            breaks.extend(
+                outside_runs(events)
+                    .into_iter()
+                    .filter(|(s, e)| (*e - *s).num_minutes() < RUN_GAP_REST_MINUTES)
+                    .map(|(s, e)| (floor_min(s).max(walk.start), floor_min(e).min(walk.end)))
+                    .filter(|(s, e)| e > s),
+            );
+        }
+        (merge_intervals(breaks), NonWorkingKind::BreakEvent)
     } else {
         // **運行に出ていない勤務にはデジタコの休憩イベントも無い** — 休憩イベントは
         // 運行に紐づいて記録されるので、勤務に重なる休憩が 1 件でもあれば
@@ -4475,7 +4496,8 @@ mod tests {
 
     #[test]
     fn alc_only_gap_with_an_event_inside_is_kept() {
-        // 空白の中にイベントが始まっていればデータがある — そこから先は外さない
+        // 空白の中にイベントが始まっていればデータがある — そこから先は外さない。
+        // 20:00 → 22:00 の 2 時間は休息期間に届かないので勤務に残り、休憩に数える
         let rows = vec![
             ev("2026-07-01 20:00:00", "2026-07-02 13:55:00", "休息"),
             alc("2026-07-02 20:00:00", "運行終了"),
@@ -4483,13 +4505,30 @@ mod tests {
             alc("2026-07-03 06:00:00", "運行開始"),
             ev("2026-07-03 10:23:00", "2026-07-03 22:00:00", "休息"),
         ];
-        assert_eq!(
-            shift_spans(&rows),
-            vec![
-                ("2026-07-02 13:55:00".into(), "2026-07-02 20:00:00".into()),
-                ("2026-07-02 22:00:00".into(), "2026-07-03 10:23:00".into()),
-            ],
-        );
+        let days = daily_summary(&rows, "2026-07", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-07-02 13:55:00");
+        assert_eq!(days[0].end, "2026-07-03 10:23:00");
+        assert_eq!(days[0].break_minutes, 120 + 30);
+    }
+
+    #[test]
+    fn alc_only_lunch_between_runs_is_restraint_and_break() {
+        // 昼に帰庫して出直す (ユーザー指摘 2026-10-16「昼休みじゃないのか？」)。
+        // 12:00 → 13:00 は拘束に残し、実働からは休憩として引く (theearth と同じ)
+        let rows = vec![
+            ev("2026-07-01 20:00:00", "2026-07-02 06:00:00", "休息"),
+            alc("2026-07-02 06:00:00", "運行開始"),
+            alc("2026-07-02 12:00:00", "運行終了"),
+            alc("2026-07-02 13:00:00", "運行開始"),
+            alc("2026-07-02 17:00:00", "運行終了"),
+            ev("2026-07-02 17:00:00", "2026-07-03 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-07", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].restraint_minutes, 660);
+        assert_eq!(days[0].break_minutes, 60);
+        assert_eq!(days[0].working_minutes, 600);
     }
 
     #[test]
