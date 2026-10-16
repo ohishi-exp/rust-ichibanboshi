@@ -1155,6 +1155,20 @@ fn base_shifts(events: &[Event]) -> Vec<Shift> {
     merge_shifts(shifts_from_timecard(events), shifts_from_rest(events))
 }
 
+/// [`alc_only`] の乗務員の勤務を組む「データのある範囲」に入れる行 — 作業 ([`DIGI_STATES`]・フェリー) と運行の境界・休息。
+///
+/// エンジン ON (`IG-Moving`)・実車・道路種別・アイドリングなどの重ねの行は入れない — 何日もまたいで続くことがあり、
+/// 読み窓の頭に入ると勤務の始まり (日締めの起点) を前へずらす。実測 (乗務員 9 / 2026-07): 7 月を月初から読むと
+/// 6/30 14:44 からの実車の行が範囲の頭になり、始業 6/30 14:44 の 24 時間後 (7/1 14:44) で日締めして 7/1 03:37〜14:44 の
+/// 実働 404 分を 6 月に送っていた。theearth の集計開始は「最初の作業開始時刻」。
+fn is_alc_span_event(e: &Event) -> bool {
+    DIGI_STATES.contains(&e.state.as_str())
+        || matches!(
+            e.state.as_str(),
+            "フェリー" | "運行開始" | "運行終了" | "休息"
+        )
+}
+
 /// [`alc_only`] の乗務員の勤務 — **データのある範囲から、長い運行の外 ([`outside_runs`]) と休息を引いたもの**
 /// (ユーザー決定 2026-10-16)。
 ///
@@ -1172,9 +1186,10 @@ fn base_shifts(events: &[Event]) -> Vec<Shift> {
 /// 勤務の区切り (日締め) は theearth の休息期間の定義どおり ([`alc_day_close`]、ユーザー決定 2026-10-17)。
 /// 休息期間にならない休息 (分割の相手が無い 180〜539 分) は勤務に残し、拘束から外す ([`restraint_rests`])。
 fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
+    let span: Vec<&Event> = events.iter().filter(|e| is_alc_span_event(e)).collect();
     let (Some(first), Some(last)) = (
-        events.iter().map(|e| e.start).min(),
-        events.iter().map(|e| e.end.unwrap_or(e.start)).max(),
+        span.iter().map(|e| e.start).min(),
+        span.iter().map(|e| e.end.unwrap_or(e.start)).max(),
     ) else {
         return Vec::new();
     };
@@ -4783,6 +4798,29 @@ mod tests {
         assert_eq!(
             driver_shifts(&short).1,
             vec![(at("2026-06-01 00:00:00"), at("2026-06-01 20:00:00"))],
+        );
+    }
+
+    #[test]
+    fn alc_only_overlay_rows_do_not_move_the_shift_start() {
+        // 乗務員 9 / 2026-07 の形: 月初から読むと 6/30 14:44 からの実車・IG-Moving の行が入るが、勤務の範囲は
+        // 作業・運行の境界・休息の行だけで決める (6/30 21:34 からの休息明け 7/1 03:37 が始業)
+        let rows = vec![
+            ev("2026-06-30 14:44:00", "2026-07-01 10:59:00", "実車"),
+            ev("2026-06-30 18:58:00", "2026-07-01 08:25:00", "IG-Moving"),
+            ev("2026-06-30 21:34:00", "2026-07-01 03:37:00", "休息"),
+            ev("2026-07-01 03:37:00", "2026-07-01 07:28:00", "運転"),
+            ev("2026-07-01 07:28:00", "2026-07-01 09:34:00", "休憩"),
+            ev("2026-07-01 09:34:00", "2026-07-01 11:47:00", "運転"),
+            alc("2026-07-01 11:47:00", "運行終了"),
+            alc("2026-07-01 12:40:00", "運行開始"),
+            ev("2026-07-01 12:40:00", "2026-07-01 17:54:00", "運転"),
+            ev("2026-07-01 17:54:00", "2026-07-02 05:15:00", "休息"),
+        ];
+        let at = |s: &str| NaiveDateTime::parse_from_str(s, FMT).unwrap();
+        assert_eq!(
+            driver_shifts(&rows).1,
+            vec![(at("2026-07-01 03:37:00"), at("2026-07-01 17:54:00"))],
         );
     }
 
