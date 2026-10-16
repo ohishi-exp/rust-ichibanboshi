@@ -6,7 +6,7 @@
 - Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 7 本 (`unko-gaps` は auth-worker の RPC で alc の etags も読む) と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
 - 社内 CakePHP (nginx) — 中継する `GET /api/kintai/{daily,pdf-json}` と `POST /api/dtako/autoload` (③ resetby-unko-no を含む) の 3 本 (オンプレ版から移した。下記)
 - D1 (`KINTAI_RESTRAINT_DB`) — 拘束サマリの `PUT /api/restraint/summaries` と `GET /api/restraint/{wage-source,synced-months}` (オンプレ版の SQLite から移した。下記)
-- fold (Supabase + auth-worker の RPC。社内 MariaDB は読まない) — `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` の 4 本 (Cloud Run 版から移した。下記)
+- fold (Supabase + auth-worker の RPC。社内 MariaDB は読まない) — `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` の 4 本 (Cloud Run 版から移した。下記) と、診断の `GET /api/kintai/alc-events` (fold が読む 1 人ぶんの alc の行と勤務)
 
 ## 到達の経路
 
@@ -420,6 +420,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 | `POST /api/kintai/recalc` | **`X-Kintai-Write-Token`** | 認可 → 本文 (axum の `Json` と同じ 415 / 413 / 400 / 422) → `month` | 同上 (本文は `Failed to parse the request body as JSON: …` 等) | 固定文言 | 同上 + `KINTAI_WRITE_TOKEN` が読めない | 同上 | 同上 (`apply: true` で初めて書く) |
 | `POST /api/kintai/timecard/window` | **`X-Kintai-Write-Token`** | 認可 → 本文 (同上) → `months` が空 → 最初の不正な月 | `months が空です` / `month は YYYY-MM です: <月>` | 固定文言 | 同上 | 置き換え (署名読み・置き換え) の DB の失敗 = `kintai push db failed: <種別>` | `TimecardWindowResult` (`drivers`・`drivers_written`・`drivers_changed`・`days_written`・`days_deleted`・`events_written`・`deduped`・`rejected`・`unknown_states`・`misplaced`・`dry_run`・`elapsed_ms`) + `fold` なら `fold` か `fold_error`・`fold_error_status`、と `stale` か `stale_error` |
 | `GET /api/kintai/stale-months` | なし | Query → `from`・`to` (`resolve_range`) | `to は YYYY-MM で指定してください` / `from は …` / `from は to 以前にしてください` / `月範囲 上限36` / Query が読めない | — | binding 無し (同上) / テナント | `kintai.day_summaries stale read failed: <種別>` | `{logic_version, from, to, default_window_months, months: [{month, stale_drivers, total_drivers}]}` |
+| `GET /api/kintai/alc-events` (診断。**書かない**) | なし | Query → `driver`・`from`・`to` (JST の `YYYY-MM-DD`、`to` の日を含む。62 日まで) | `from は YYYY-MM-DD で指定してください` / `to は …` / `from は to 以前にしてください` / `期間は 62 日までにしてください` / Query が読めない | — | binding 無し (同上) / テナント | `kintai events read failed: <種別>` (alc・写し) | fold と同じ読み (alc + 写しの借りる行) の 1 人ぶん: `{driver, from, to, alc_only, shifts: [{start, end, minutes}], operations: [{unko_no, vehicle, first, last, events, states}], events, borrowed, warnings}`。`shifts` は渡した期間の行だけで組むので、端の勤務は fold (月の読み窓) と違いうる |
 
 - **同じ path で method が違う**: `GET /api/kintai/recalc` は読みの口 (認可なし・`apply` を持たないので書けない)、`POST` は書き込みの口。他の method は 405。
   判定は `kintai_logic::fold_routes::FoldRoute::from_request` (経路の表で最初に見る)

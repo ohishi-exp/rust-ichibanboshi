@@ -9,8 +9,9 @@ use kintai_kosoku::kintai_fold::logic_version as root_logic_version;
 use kintai_kosoku::kosoku::KosokuParams;
 use kintai_logic::common::{write_preflight, Fail, TenantInput};
 use kintai_logic::fold_routes::{
-    fold_ctx, jst_from_ms, kind_only, logic_version, not_configured, params, parse_recalc_body,
-    parse_recalc_query, parse_window, read_failed, FoldRoute, DB_WHAT, STALE_DB_WHAT,
+    fold_ctx, jst_from_ms, kind_only, logic_version, not_configured, params,
+    parse_alc_events_query, parse_recalc_body, parse_recalc_query, parse_window, read_failed,
+    AlcEventsRequest, FoldRoute, DB_WHAT, STALE_DB_WHAT,
 };
 use kintai_logic::stale_months;
 use kintai_logic::write_auth::{authorize, FORBIDDEN};
@@ -18,6 +19,7 @@ use kintai_logic::write_auth::{authorize, FORBIDDEN};
 const RECALC: &str = "/api/kintai/recalc";
 const WINDOW: &str = "/api/kintai/timecard/window";
 const STALE: &str = "/api/kintai/stale-months";
+const ALC_EVENTS: &str = "/api/kintai/alc-events";
 const JSON: Option<&str> = Some("application/json");
 
 // ── 経路と認可 ──
@@ -52,6 +54,61 @@ fn window_is_a_post_only_write_and_stale_months_a_get_only_read() {
     assert_eq!(FoldRoute::from_request("POST", STALE), Some(None));
 }
 
+/// 診断の alc-events は GET だけの読みの口 (認可なし)。
+#[test]
+fn alc_events_is_a_get_only_read() {
+    assert_eq!(
+        FoldRoute::from_request("GET", ALC_EVENTS),
+        Some(Some(FoldRoute::AlcEvents))
+    );
+    assert!(!FoldRoute::AlcEvents.is_write());
+    assert_eq!(FoldRoute::from_request("POST", ALC_EVENTS), Some(None));
+}
+
+/// alc-events の Query: 日付は `YYYY-MM-DD`、`to` の日を含む (`[from, to+1)`)、62 日まで。
+#[test]
+fn the_alc_events_query_reads_dates_and_the_range() {
+    assert_eq!(
+        parse_alc_events_query("driver=12&from=2026-06-01&to=2026-06-24").unwrap(),
+        AlcEventsRequest {
+            driver: 12,
+            from: "2026-06-01 00:00:00".into(),
+            to: "2026-06-25 00:00:00".into(),
+        }
+    );
+    // 1 日だけ・上限ちょうど (62 日 = from..from+61)
+    assert!(parse_alc_events_query("driver=1&from=2026-06-01&to=2026-06-01").is_ok());
+    assert!(parse_alc_events_query("driver=1&from=2026-06-01&to=2026-08-01").is_ok());
+    let err = |q: &str| parse_alc_events_query(q).unwrap_err();
+    let bad = err("driver=1&from=2026-06-01&to=2026-08-02");
+    assert_eq!(
+        (bad.status, bad.body.as_str()),
+        (400, "期間は 62 日までにしてください")
+    );
+    let bad = err("driver=1&from=2026-06-02&to=2026-06-01");
+    assert_eq!(
+        (bad.status, bad.body.as_str()),
+        (400, "from は to 以前にしてください")
+    );
+    let bad = err("driver=1&from=2026/06/01&to=2026-06-01");
+    assert_eq!(
+        (bad.status, bad.body.as_str()),
+        (400, "from は YYYY-MM-DD で指定してください")
+    );
+    let bad = err("driver=1&from=2026-06-01&to=2026-06-31");
+    assert_eq!(
+        (bad.status, bad.body.as_str()),
+        (400, "to は YYYY-MM-DD で指定してください")
+    );
+    let bad = err("from=2026-06-01&to=2026-06-01");
+    assert_eq!(bad.status, 400);
+    assert!(
+        bad.body.starts_with("Failed to deserialize query string: "),
+        "{}",
+        bad.body
+    );
+}
+
 /// 4 口以外の path は他の経路に任せる (`None`)。前方一致で拾わない。
 #[test]
 fn other_paths_are_not_fold_routes() {
@@ -74,6 +131,7 @@ fn the_route_names_are_for_logs() {
         FoldRoute::Recalc,
         FoldRoute::TimecardWindow,
         FoldRoute::StaleMonths,
+        FoldRoute::AlcEvents,
     ]
     .iter()
     .map(|r| r.as_str())
@@ -84,7 +142,8 @@ fn the_route_names_are_for_logs() {
             "recalc (preview)",
             "recalc",
             "timecard/window",
-            "stale-months"
+            "stale-months",
+            "alc-events",
         ]
     );
 }

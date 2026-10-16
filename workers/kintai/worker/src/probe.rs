@@ -33,7 +33,7 @@ pub(crate) enum Route {
     Kosoku(KosokuRead),
     /// `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` — 拘束サマリの D1 (PUT は共有 secret の照合あり)
     Restraint(Restraint),
-    /// `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` — fold の 4 口
+    /// `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months`・`GET /api/kintai/alc-events` — fold の 5 口
     /// (POST の 2 本は共有 secret の照合あり。同じ path で method が違う分岐は kintai-logic の `FoldRoute`)
     Fold(FoldRoute),
     NotFound,
@@ -42,7 +42,7 @@ pub(crate) enum Route {
 
 impl Route {
     /// 既定以外のテナント (`X-Kintai-Tenant-Id`) で通すか。**許可の列挙**: Supabase と alc だけを読み書きする口
-    /// (Read の 7 本・fold の 4 本・Write のうち timecard・wage-snapshot) だけを [`Reach::AnyAllowed`] にし、
+    /// (Read の 7 本・fold の 5 本・Write のうち timecard・wage-snapshot) だけを [`Reach::AnyAllowed`] にし、
     /// 社内 MariaDB・CakePHP (autoload を含む)・D1・probe は [`Reach::DefaultOnly`]。404・405 は関門を通さない (`None`)。
     pub(crate) fn reach(self) -> Option<Reach> {
         Some(match self {
@@ -134,11 +134,11 @@ impl Write {
 
 /// 口は `POST /probe`・GET の 19 本 (Supabase 7 本・MariaDB 4 本 + day-events・dtako/worktime +
 /// kosoku-daily・version・timecard/drivers・timecard/events・CakePHP の daily・pdf-json)・POST の 3 本 (Supabase に書く
-/// timecard・wage-snapshot と CakePHP への autoload)・拘束サマリの 3 本・fold の 4 本 (GET/POST recalc・POST timecard/window・
+/// timecard・wage-snapshot と CakePHP への autoload)・拘束サマリの 3 本・fold の 5 本 (GET/POST recalc・POST timecard/window・GET alc-events・
 /// GET stale-months)。
 /// path が合って method が違えば 405、それ以外の path は 404。
 pub(crate) fn route(method: &str, path: &str) -> Route {
-    // fold の 4 口は同じ path で method が違う 2 本を含むので、method 込みで先に決める
+    // fold の口は同じ path で method が違う 2 本を含むので、method 込みで先に決める
     if let Some(fold) = FoldRoute::from_request(method, path) {
         return fold.map_or(Route::MethodNotAllowed, Route::Fold);
     }

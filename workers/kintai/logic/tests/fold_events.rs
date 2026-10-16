@@ -17,8 +17,10 @@ use kintai_kosoku::pushed_events::all_event_json;
 use kintai_kosoku::window::HeadPunch;
 use kintai_logic::common::Fail;
 use kintai_logic::fold_events::{
-    events_search, pushed_window, read_events, AlcRpc, PushedEventsRead, Span, WorkerFoldEvents,
+    driver_alc_events, events_search, pushed_window, read_events, AlcRpc, PushedEventsRead, Span,
+    WorkerFoldEvents,
 };
+use kintai_logic::fold_routes::AlcEventsRequest;
 use kintai_logic::unko_gaps::RpcResult;
 use serde_json::{json, Value};
 
@@ -608,4 +610,140 @@ fn alc_events_get_passes_the_dates_through() {
 #[test]
 fn fail_displays_its_body() {
     assert_eq!(Fail::new(502, "boom").to_string(), "boom");
+}
+
+// ── 診断の口 (1 人ぶんの alc の行と勤務) ──
+
+fn alc_events_req() -> AlcEventsRequest {
+    AlcEventsRequest {
+        driver: 12,
+        from: FROM.into(),
+        to: TO.into(),
+    }
+}
+
+/// 名指しの乗務員の alc の行 (運行NO・車輌つき)・運行ごとの要約・fold と同じ組み方の勤務を返す。
+/// 他の乗務員の行と、写しの他の乗務員の行は落とす。
+#[test]
+fn driver_alc_events_returns_the_driver_rows_operations_and_shifts() {
+    let log = Log::default();
+    let a = alc(&log);
+    let body = json!({
+        "drivers": [
+            {"operations": [{
+                "unko_no": "OP-12",
+                "headers": ["対象乗務員CD", "開始日時", "終了日時", "イベント名", "車輌名"],
+                "rows": [
+                    ["12", "2026/06/02 05:00:00", "2026/06/02 05:00:00", "運行開始", "帯広100け200"],
+                    ["12", "2026/06/02 05:00:00", "2026/06/02 08:00:00", "運転", "帯広100け200"],
+                    ["12", "2026/06/02 08:00:00", "2026/06/02 08:00:00", "運行終了", "帯広100け200"],
+                ],
+            }]},
+            {"operations": [{
+                "unko_no": "OP-13",
+                "headers": ["対象乗務員CD", "開始日時", "イベント名"],
+                "rows": [["13", "2026/06/02 06:00:00", "運行開始"]],
+            }]},
+        ],
+        "warnings": ["w"],
+    });
+    *a.events.borrow_mut() = vec![Ok(res(200, &body.to_string()))];
+    let m = pushed_all(
+        &log,
+        Ok(vec![copy_row(
+            "2026-06-02 06:00:00",
+            13,
+            "timecard",
+            "始業",
+        )]),
+    );
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let got = block_on(driver_alc_events(&w, &alc_events_req())).unwrap();
+    assert_eq!(got["driver"], 12);
+    assert_eq!(
+        (got["from"].as_str(), got["to"].as_str()),
+        (Some(FROM), Some(TO))
+    );
+    assert_eq!(got["alc_only"], true);
+    assert_eq!(
+        got["shifts"],
+        json!([{"start": "2026-06-02 05:00:00", "end": "2026-06-02 08:00:00", "minutes": 180}])
+    );
+    assert_eq!(
+        got["operations"],
+        json!([{
+            "unko_no": "OP-12",
+            "first": "2026-06-02 05:00:00",
+            "last": "2026-06-02 08:00:00",
+            "events": 3,
+            "states": {"運行開始": 1, "運行終了": 1, "運転": 1},
+            "vehicle": "帯広100け200",
+        }])
+    );
+    assert_eq!(got["events"].as_array().unwrap().len(), 3);
+    assert_eq!(got["events"][0]["unko_no"], "OP-12");
+    assert_eq!(got["borrowed"], json!([]));
+    assert_eq!(got["warnings"], json!(["w"]));
+}
+
+/// 行が 1 件も無ければ勤務も運行も空 (alc だけの乗務員でもない)。
+#[test]
+fn driver_alc_events_of_no_rows_is_empty() {
+    let log = Log::default();
+    let a = alc(&log);
+    let m = pushed_all(&log, Ok(vec![]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let got = block_on(driver_alc_events(&w, &alc_events_req())).unwrap();
+    assert_eq!(got["alc_only"], false);
+    assert_eq!(got["shifts"], json!([]));
+    assert_eq!(got["operations"], json!([]));
+}
+
+/// alc の読みと写しの読みの失敗はそのまま返す。
+#[test]
+fn driver_alc_events_passes_read_failures_through() {
+    let log = Log::default();
+    let a = alc(&log);
+    *a.events.borrow_mut() = vec![Ok(res(500, "boom"))];
+    let m = pushed(&log);
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    assert_eq!(
+        block_on(driver_alc_events(&w, &alc_events_req()))
+            .unwrap_err()
+            .status,
+        502
+    );
+    let a = alc(&log);
+    let m = pushed_all(&log, Err(Fail::new(502, "kintai push db failed: x")));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    assert_eq!(
+        block_on(driver_alc_events(&w, &alc_events_req()))
+            .unwrap_err()
+            .status,
+        502
+    );
+    let bad = AlcEventsRequest {
+        from: "x".into(),
+        ..alc_events_req()
+    };
+    assert_eq!(
+        block_on(driver_alc_events(&w, &bad)).unwrap_err().status,
+        502
+    );
 }
