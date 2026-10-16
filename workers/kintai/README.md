@@ -408,7 +408,7 @@ Worker に在るのは I/O の配線と HTTP の入出力だけ:
 | 読み (`FoldEventsIo`) | `HttpKintaiEventsRepo` (alc を reqwest + fallback の `PgKintaiEventsRepo` = relay が送った写し `kintai.kintai_events`。本番の設定は `http+pg`) | kintai-logic の `fold_events::WorkerFoldEvents` (alc は auth-worker の `KintaiAlcEntrypoint.dtakoEvents`・`dtakoEtags`、打刻と遡り起点は同じ写しを kintai-pg の `FoldStore` (`PushedEventsRead`) で。SQL と行の形は共有 crate の `kintai_kosoku::pushed_events`。**社内 MariaDB は読まない**) |
 | 書き (`FoldStoreIo`・`TimecardWindowIo`) | `KintaiPgStore` (sqlx の pool) | kintai-pg の `FoldStore` (Hyperdrive の 1 接続を 1 リクエストで 1 回開き、window は置き換えと畳み直しを同じ接続で回す) |
 | 時計 (`FoldClock`) | `SystemClock` (`Utc::now`・`Instant`) | `worker/src/fold.rs` の `WorkerClock` (`Date.now()` のミリ秒。`now_jst` は +09:00) |
-| `KosokuParams` | 設定ファイル (`[kosoku]` 節が無く既定値) | 既定値 (`kintai_logic::fold_routes::params`)。`logic_version` は本番と同じ `bdf1cdc9876aa40a` (`logic/tests/fold_routes.rs`) |
+| `KosokuParams` | 設定ファイル (`[kosoku]` 節が無く既定値) | 既定値 (`kintai_logic::fold_routes::params`)。`logic_version` は本番と同じ `15cd24a0775385e7` (`logic/tests/fold_routes.rs`) |
 | `code_sha` (応答の記録用) | root の `KINTAI_OUTPUT_SHA` | Worker の `KINTAI_WORKER_OUTPUT_SHA` (値は違う。版・指紋には入らない) |
 | 経路・検査・失敗の写し | axum の handler | `kintai_logic::fold_routes` (100% gate) と `worker/src/fold.rs`・`reads.rs` の `stale_months` |
 

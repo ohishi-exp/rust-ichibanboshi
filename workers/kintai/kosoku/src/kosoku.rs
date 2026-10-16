@@ -1095,11 +1095,19 @@ const ALC_DAY_MINUTES: i64 = 24 * 60;
 /// 戻り値は (休息 = [`ALC_SPLIT_REST_MINUTES`] 分以上, 休憩 = それ未満)。休息は拘束からも実働からも外し
 /// ([`restraint_rests`])、休憩は拘束に残して実働から外す ([`summarize`])。
 fn alc_gaps(events: &[Event]) -> (Spans, Spans) {
-    let mut all = rest_spans(events);
-    all.extend(outside_runs(events));
-    merge_intervals(all)
-        .into_iter()
-        .partition(|(s, e)| (*e - *s).num_minutes() >= ALC_SPLIT_REST_MINUTES)
+    let long =
+        |(s, e): &(NaiveDateTime, NaiveDateTime)| (*e - *s).num_minutes() >= ALC_SPLIT_REST_MINUTES;
+    // 短い運行の外 (運行間待機) は休息とつなげない — 休息明けに運行終了 → 次の運行開始までの空きがあっても、
+    // 始業は休息の終わり (実測: 乗務員 3 / 2026-06-29 の 08:01 運行終了 → 08:48 運行開始の 47 分は theearth では
+    // 拘束。休息とまとめると始業が 08:48 になり拘束が 47 分短かった)
+    let (long_out, short_out): (Spans, Spans) = outside_runs(events).into_iter().partition(long);
+    let mut rests = rest_spans(events);
+    rests.extend(long_out);
+    let (rests, short_rests): (Spans, Spans) = merge_intervals(rests).into_iter().partition(long);
+    let mut breaks = short_out;
+    breaks.extend(short_rests);
+    let breaks = subtract_intervals(&merge_intervals(breaks), &rests);
+    (rests, breaks)
 }
 
 /// 勤務の中で拘束から外す休息。[`alc_only`] の乗務員は [`alc_gaps`] の休息 (運行の外を含む)、ほかは休息イベント。
@@ -4758,6 +4766,24 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    #[test]
+    fn alc_only_short_gap_after_a_rest_is_not_merged_into_the_rest() {
+        // 乗務員 3 / 2026-06-29 の形: 休息が 08:01 の運行終了で明け、08:48 の運行開始までの 47 分は運行間待機
+        // (拘束)。休息とつなげると始業が 08:48 になる
+        let rows = vec![
+            ev("2026-06-28 15:30:00", "2026-06-29 08:01:00", "休息"),
+            alc("2026-06-29 08:01:00", "運行終了"),
+            alc("2026-06-29 08:48:00", "運行開始"),
+            ev("2026-06-29 08:48:00", "2026-06-29 20:03:00", "運転"),
+            ev("2026-06-29 20:03:00", "2026-06-30 08:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-06", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].start, "2026-06-29 08:01:00");
+        assert_eq!(days[0].restraint_minutes, 722);
+        assert_eq!(days[0].break_minutes, 47);
     }
 
     #[test]
