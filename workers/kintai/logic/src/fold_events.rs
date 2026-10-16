@@ -18,7 +18,7 @@
 //! `dtakoEvents` / `dtakoEtags` に渡すのは query の鍵 (`date_from`・`date_to`・`page_size`・`after_driver_cd`) だけで、
 //! path・method (GET)・tenant は auth-worker 側で固定される。
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime};
 use kintai_kosoku::alc_events::{
     fetch_all_events, fetch_dtako_month_read, merge_all_rows, AlcEventsError, AlcEventsGet,
     EventsPage, UpstreamAll, UpstreamEtags,
@@ -26,6 +26,7 @@ use kintai_kosoku::alc_events::{
 use kintai_kosoku::anchors::HeadAnchors;
 use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
 use kintai_kosoku::kintai_push::jst_at;
+use kintai_kosoku::kosoku::alc_open_shift_starts;
 use kintai_kosoku::window::{month_head_anchors, HeadPunch};
 
 use crate::common::Fail;
@@ -102,6 +103,37 @@ impl From<BadMonth> for Fail {
     }
 }
 
+/// [`WorkerFoldEvents::alc_head_anchors`] の遡りの暴走止め (日)。どこまで遡るかはデータで決める (#317 と同じく
+/// 日数では決めない) が、勤務が切れないまま何十日も続くデータで読みを止めないための上限。実データでは 1〜3 日で止まる。
+pub const ALC_HEAD_LOOKBACK_MAX_DAYS: i64 = 31;
+
+impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
+    /// 打刻を持たない乗務員 (行が全部 alc) の遡り起点 = **月初の時点で開いている勤務の始まり**
+    /// ([`alc_open_shift_starts`]、ユーザー決定 2026-10-16)。写しの起点 (#317) は運行・打刻の写しからしか作らない
+    /// ので、写しの無い会社はここで作る。
+    ///
+    /// 月初の前 1 日から月初の後 1 日までを読んで勤務を組み、月初をまたぐ勤務の始まりを起点にする。その始まりが読んだ
+    /// 範囲の端なら、勤務はもっと前から続いているかもしれないので 1 日ずつ遡って読み直す
+    /// ([`ALC_HEAD_LOOKBACK_MAX_DAYS`] まで)。読みは写しの行も合わせるので、打刻のある乗務員 (大石) は対象にならない。
+    async fn alc_head_anchors(
+        &self,
+        month_start: NaiveDateTime,
+    ) -> Result<std::collections::BTreeMap<u64, NaiveDateTime>, Fail> {
+        let fmt = |t: NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
+        let to = fmt(month_start + Duration::days(1));
+        let mut days = 1;
+        loop {
+            let from = month_start - Duration::days(days);
+            let (rows, _) = FoldEventsIo::all_events_between(self, &fmt(from), &to).await?;
+            let open = alc_open_shift_starts(rows, month_start);
+            if days >= ALC_HEAD_LOOKBACK_MAX_DAYS || !open.values().any(|s| *s <= from) {
+                return Ok(open);
+            }
+            days += 1;
+        }
+    }
+}
+
 impl<A: AlcRpc, P> AlcEventsGet for WorkerFoldEvents<'_, A, P> {
     type Error = Fail;
 
@@ -122,12 +154,21 @@ impl<A: AlcRpc, P> AlcEventsGet for WorkerFoldEvents<'_, A, P> {
 impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P> {
     type Error = Fail;
 
-    /// 遡り起点は写しだけ (alc に口が無い。root も fallback へ委譲する)。規則は root と同じ `month_head_anchors`。
+    /// 遡り起点。写しの 2 本 (規則は root と同じ `month_head_anchors`) に、**写しを持たない乗務員の起点を alc の行から**
+    /// 足す ([`WorkerFoldEvents::alc_head_anchors`])。両方あれば早いほう。
     async fn month_head_anchors(&self, month_start: &str, to: &str) -> Result<HeadAnchors, Fail> {
         let span = pushed_window(month_start, to)?;
         let runs = self.pushed.pushed_head_run_ends(span).await?;
         let punches = self.pushed.pushed_head_punches(span).await?;
-        Ok(month_head_anchors(month_start, &runs, &punches))
+        let mut anchors = month_head_anchors(month_start, &runs, &punches);
+        for (cd, at) in self.alc_head_anchors(span.0.naive_local()).await? {
+            let at = at.format("%Y-%m-%d %H:%M:%S").to_string();
+            let slot = anchors.entry(cd).or_insert_with(|| at.clone());
+            if at < *slot {
+                *slot = at;
+            }
+        }
+        Ok(anchors)
     }
 
     /// alc のページング → 写しの全員行 (root と同じ順)。写しからは alc に口が無い source だけを借りる。
