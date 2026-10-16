@@ -1069,46 +1069,81 @@ fn alc_only(events: &[Event]) -> bool {
             .any(|e| e.state == "運行開始" || e.state == "運行終了")
 }
 
-/// [`alc_only`] の乗務員の「休息とみなす運行の外」の長さ (分) — theearth の休息期間の定義
-/// (就業時間管理マスター F-MMS0810 の「連続休息 540 分以上」、北海大運・大石運輸倉庫とも同じ) に合わせる
-/// (ユーザー決定 2026-10-16)。
+/// [`alc_only`] の乗務員の休息期間の定義 — theearth の就業時間管理マスター (F-MMS0810) の「休息期間の定義」
+/// (北海大運、令和 6 年 4 月改正基準) に合わせる (ユーザー決定 2026-10-17)。
 ///
-/// 以前は 8 時間 (`RUN_GAP_REST_MINUTES`) を超えたら終業にしていた。実測 (乗務員 12 / 2026-07): 6/30 20:18 帰庫 →
-/// 7/1 05:09 出庫の 531 分を休息とみなして 7/1 朝の勤務を 7 月に数えたが、theearth は 540 分に届かないので
-/// 6/30 からの勤務の続き (6 月) に数えていた (+147 分)。**24 時間を超えた勤務を割る `RUN_GAP_REST_MINUTES`
-/// (大石を含む全員) とは別の値。**
+/// - 連続休息: [`ALC_REST_MINUTES`] 分以上
+/// - 分割休息: 1 回 [`ALC_SPLIT_REST_MINUTES`] 分以上の休息を、2 分割なら累計 [`ALC_SPLIT2_TOTAL_MINUTES`] 分以上、
+///   3 分割なら累計 [`ALC_SPLIT3_TOTAL_MINUTES`] 分以上
+/// - カード未挿入時間 (= 運行の外、[`outside_runs`]) は 180 分以上なら休息、それ未満は運行間待機
+/// - 日締めは休息期間の開始時刻。休息期間が取れなければ始業 (集計開始時刻) の 24 時間後
+///
+/// 以前は休息イベントがあるたびに勤務を切っていた。実測 (乗務員 10 / 2026-06): 5/31 07:48 始業、5/31 20:23 → 6/1
+/// 04:28 の休息 485 分は分割の相手が無く休息期間にならないので、theearth は 6/1 07:48 (始業の 24 時間後) で日締めし
+/// 6/1 04:28〜07:48 の実働 153 分を 5 月に数えていた (6 月の実働 +153 分)。
 const ALC_REST_MINUTES: i64 = 540;
+/// 分割休息の 1 回あたりの下限 (分)。これより短い休息イベント・運行の外は休憩として数える ([`alc_gaps`])。
+const ALC_SPLIT_REST_MINUTES: i64 = 180;
+/// 2 分割の休息期間の累計の下限 (分)。
+const ALC_SPLIT2_TOTAL_MINUTES: i64 = 600;
+/// 3 分割の休息期間の累計の下限 (分)。
+const ALC_SPLIT3_TOTAL_MINUTES: i64 = 720;
+/// 休息期間が取れないときの日締め (始業からの分)。
+const ALC_DAY_MINUTES: i64 = 24 * 60;
 
-/// 運行の外が休息 (= 運行終了が終業) か。[`ALC_REST_MINUTES`] 以上。
-fn is_alc_rest(s: NaiveDateTime, e: NaiveDateTime) -> bool {
-    (e - s).num_minutes() >= ALC_REST_MINUTES
+/// [`alc_only`] の乗務員の休みの区間 — 休息イベント ([`rest_spans`]) と運行の外 ([`outside_runs`]) を合わせたもの。
+/// 戻り値は (休息 = [`ALC_SPLIT_REST_MINUTES`] 分以上, 休憩 = それ未満)。休息は拘束からも実働からも外し
+/// ([`restraint_rests`])、休憩は拘束に残して実働から外す ([`summarize`])。
+fn alc_gaps(events: &[Event]) -> (Spans, Spans) {
+    let mut all = rest_spans(events);
+    all.extend(outside_runs(events));
+    merge_intervals(all)
+        .into_iter()
+        .partition(|(s, e)| (*e - *s).num_minutes() >= ALC_SPLIT_REST_MINUTES)
 }
 
-/// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、休息とみなす ([`is_alc_rest`]) 運行の外
-/// ([`outside_runs`]) を勤務から外す (= 運行終了が終業)。それより短い空きは勤務に残し、
-/// 休憩として数える ([`summarize`])。
-fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
-    let parts = split_long_shift(shift, events);
-    if !alc_only(events) {
-        return parts;
+/// 勤務の中で拘束から外す休息。[`alc_only`] の乗務員は [`alc_gaps`] の休息 (運行の外を含む)、ほかは休息イベント。
+fn restraint_rests(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    match alc_only(events) {
+        true => alc_gaps(events).0,
+        false => rest_spans(events),
     }
-    let outside: Vec<_> = outside_runs(events)
-        .into_iter()
-        .filter(|(s, e)| is_alc_rest(*s, *e))
-        .collect();
-    parts
-        .into_iter()
-        .flat_map(|s| {
-            subtract_intervals(&[(s.start, s.end)], &outside)
-                .into_iter()
-                .map(move |(start, end)| Shift {
-                    start,
-                    end,
-                    source: s.source,
-                })
-        })
-        .filter(|s| s.end > s.start)
-        .collect()
+}
+
+/// 始業 `start` の勤務の日締め — `(勤務の終わり, 次の勤務を探し始める時刻)`。休息期間 (連続、または分割の組が揃った
+/// 最後の休息) の開始で締め、次は休息の終わりから。始業の 24 時間後までに休息期間が始まらなければ 24 時間後で締め、
+/// 次はそこから (仕事が続いていれば同じ時刻が次の始業)。
+fn alc_day_close(
+    start: NaiveDateTime,
+    rests: &[(NaiveDateTime, NaiveDateTime)],
+) -> (NaiveDateTime, NaiveDateTime) {
+    let limit = start + Duration::minutes(ALC_DAY_MINUTES);
+    let mut parts: Vec<i64> = Vec::new();
+    for (s, e) in rests.iter().filter(|(s, _)| *s > start && *s < limit) {
+        let len = (*e - *s).num_minutes();
+        if len >= ALC_REST_MINUTES {
+            return (*s, *e);
+        }
+        parts.push(len);
+        let total: i64 = parts.iter().sum();
+        let split = match parts.len() {
+            2 => total >= ALC_SPLIT2_TOTAL_MINUTES,
+            3 => total >= ALC_SPLIT3_TOTAL_MINUTES,
+            _ => false,
+        };
+        if split {
+            return (*s, *e);
+        }
+    }
+    (limit, limit)
+}
+
+/// [`alc_only`] の乗務員は [`shifts_from_alc`] が日締めまで済ませているので割らない。
+fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
+    if alc_only(events) {
+        return vec![shift.clone()];
+    }
+    split_long_shift(shift, events)
 }
 
 /// 分割前の勤務。打刻の勤務と休息の勤務を合わせる ([`merge_shifts`])。[`alc_only`] の乗務員だけは
@@ -1132,8 +1167,10 @@ fn base_shifts(events: &[Event]) -> Vec<Shift> {
 ///   (theearth 07-23 実働 239 分)
 ///
 /// 運行開始・運行終了・休息はどれも運行 (KUDGIVT) に入っている時刻なので、「データに無い時間を拘束に
-/// 入れない」(#392) と同じ線で組める。休息とみなさない ([`is_alc_rest`]) 運行間の空きは勤務に残る
-/// (休憩に数える、[`summarize`])。
+/// 入れない」(#392) と同じ線で組める。
+///
+/// 勤務の区切り (日締め) は theearth の休息期間の定義どおり ([`alc_day_close`]、ユーザー決定 2026-10-17)。
+/// 休息期間にならない休息 (分割の相手が無い 180〜539 分) は勤務に残し、拘束から外す ([`restraint_rests`])。
 fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
     let (Some(first), Some(last)) = (
         events.iter().map(|e| e.start).min(),
@@ -1141,18 +1178,27 @@ fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
     ) else {
         return Vec::new();
     };
-    let mut cut: Vec<(NaiveDateTime, NaiveDateTime)> = outside_runs(events)
-        .into_iter()
-        .filter(|(s, e)| is_alc_rest(*s, *e))
-        .collect();
-    cut.extend(rest_spans(events));
-    subtract_intervals(&[(first, last)], &merge_intervals(cut))
-        .into_iter()
-        .map(|(start, end)| Shift {
+    let rests = alc_gaps(events).0;
+    let mut out = Vec::new();
+    let mut cursor = first;
+    while cursor < last {
+        // 休息の中なら休息の終わりが始業 (休息は時刻順で、重なりはまとめてある)
+        let start = rests
+            .iter()
+            .find(|(s, e)| *s <= cursor && cursor < *e)
+            .map_or(cursor, |(_, e)| *e);
+        if start >= last {
+            break;
+        }
+        let (end, next) = alc_day_close(start, &rests);
+        out.push(Shift {
             start,
-            end,
+            end: end.min(last),
             source: ShiftSource::Rest,
-        })
+        });
+        cursor = next;
+    }
+    out.into_iter()
         // 運行のイベントが 1 件も無い区間 (休息と休息の間に何も記録が無い等) は勤務にしない — データが無い。
         // 始端と同時刻の運行開始は証拠に数える (日帰りの勤務はそこから始まる)
         .filter(|s| {
@@ -1177,12 +1223,10 @@ fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
 ///   には使わない ([`alc_only`]) — 勤務は打刻が閉じ、継ぎ目は紙も数える (#123)
 /// - 空白の中にイベントが 1 件でも始まっていれば外さない (データがある)
 /// - 最後の運行終了の後に運行開始が無ければ、その後ろ (イベントが無い間) は外
-/// - **長さで扱いが分かれる** (ユーザー決定 2026-10-16「運行間が 8 時間超える場合、運行終了＝終業
-///   そのほかは拘束」、同日のうちに theearth の休息期間の定義に合わせて 540 分以上に変更)。休息とみなす
-///   空き ([`is_alc_rest`]) と帰庫したままの尻尾は勤務から外し ([`split_shift`])、それより短い空きは勤務に
-///   残して休憩に数える ([`summarize`])。theearth の
-///   拘束時間管理表も昼に帰庫して出直す間を拘束に入れ、実働には入れていない (2026-07 の実測:
-///   全部外すと実働は theearth と一致したまま、拘束だけ 7〜800 分短かった)
+/// - **長さで扱いが分かれる** (ユーザー決定 2026-10-17、theearth のカード未挿入時間の定義)。180 分以上は休息
+///   (休息期間の判定 [`alc_day_close`] に入り、勤務に残っても拘束から外す)、それ未満は運行間待機として勤務に
+///   残して休憩に数える ([`alc_gaps`]・[`summarize`])。theearth の拘束時間管理表も昼に帰庫して出直す間を
+///   拘束に入れ、実働には入れていない
 fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     let mut bounds: Vec<(NaiveDateTime, bool)> = events
         .iter()
@@ -1629,7 +1673,7 @@ fn close_rest_at_run_start(
 fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     // 休息は打刻で切り詰めた後の区間を使う ([`rest_spans`]) — 切り詰め前で引くと、
     // 勤務の終わりを終業打刻まで伸ばした分 (休息開始→打刻) をここで引き戻してしまう
-    let out: Vec<(NaiveDateTime, NaiveDateTime)> = rest_spans(events)
+    let out: Vec<(NaiveDateTime, NaiveDateTime)> = restraint_rests(events)
         .into_iter()
         .map(|(s, e)| (floor_min(s), floor_min(e)))
         .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
@@ -1642,7 +1686,7 @@ fn rests_in(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTim
 /// 生のまま勤務内へ切り詰める — 紙の区分丸めは秒を見て切り捨てるので、先に分へ
 /// 落とすと丸めの向きが変わってしまう。
 fn rests_in_raw(events: &[Event], shift: &Shift) -> Vec<(NaiveDateTime, NaiveDateTime)> {
-    let out: Vec<(NaiveDateTime, NaiveDateTime)> = rest_spans(events)
+    let out: Vec<(NaiveDateTime, NaiveDateTime)> = restraint_rests(events)
         .into_iter()
         .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
         .filter(|(s, e)| e > s)
@@ -1897,12 +1941,12 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     let has_op = has_operation(events, &walk);
     let (breaks, break_kind) = if has_op {
         let mut breaks = breaks_in(events, &walk, p.break_threshold_minutes);
-        // 勤務に残した短い運行の外 (昼休み等) は休憩 ([`outside_runs`])
+        // 勤務に残した短い運行の外・休息イベント (昼休み等、180 分未満) は休憩 ([`alc_gaps`])
         if alc_only(events) {
             breaks.extend(
-                outside_runs(events)
+                alc_gaps(events)
+                    .1
                     .into_iter()
-                    .filter(|(s, e)| !is_alc_rest(*s, *e))
                     .map(|(s, e)| (floor_min(s).max(walk.start), floor_min(e).min(walk.end)))
                     .filter(|(s, e)| e > s),
             );
@@ -2290,23 +2334,33 @@ fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
 ///
 /// 勤務の組み方は fold と同じ ([`final_shifts_aligned`])。月初をまたぐ勤務 (始まり < 月初 < 終わり) が無ければ
 /// 起点は無い。打刻・社内 MariaDB の運行イベントを持つ乗務員は見ない (#317 の起点がある)。
+///
+/// 2 つ目の戻り値は「最初の勤務が `from` (読んだ範囲の始まり) 以前から始まる乗務員がいる」— 勤務の途中から読んで
+/// いるので、呼び手は 1 日遡って読み直す ([`ALC_DAY_MINUTES`] の日締めは始業から数えるので、始業が見えるまで)。
 pub fn alc_open_shift_starts(
     rows: Vec<serde_json::Value>,
     month_start: NaiveDateTime,
-) -> BTreeMap<u64, NaiveDateTime> {
-    split_by_driver(rows)
+    from: NaiveDateTime,
+) -> (BTreeMap<u64, NaiveDateTime>, bool) {
+    let mut at_edge = false;
+    let open = split_by_driver(rows)
         .into_iter()
         .filter_map(|(cd, rows)| {
             let events = parse_events(&rows);
             if !alc_only(&events) {
                 return None;
             }
-            final_shifts_aligned(&events)
+            let shifts = final_shifts_aligned(&events);
+            // 最初の勤務が読んだ範囲の端 (以前) から始まる = 勤務の途中から読んでいる。日締め (24 時間) の起点が
+            // もっと前にあるかもしれない
+            at_edge |= shifts.first().is_some_and(|s| s.start <= from);
+            shifts
                 .into_iter()
                 .find(|s| s.start < month_start && s.end > month_start)
                 .map(|s| (cd, s.start))
         })
-        .collect()
+        .collect();
+    (open, at_edge)
 }
 
 /// 1 人ぶんの行から、**fold と同じ組み方の勤務** ([`final_shifts_aligned`]) と、alc だけの乗務員か ([`alc_only`]) を返す
@@ -4640,8 +4694,9 @@ mod tests {
     }
 
     #[test]
-    fn alc_only_gap_shorter_than_540_minutes_stays_in_the_shift() {
-        // 539 分は休息に届かないので終業にしない (拘束に残し休憩に数える)。theearth の連続休息 540 分
+    fn alc_only_rest_without_a_partner_stays_in_the_shift_off_the_restraint() {
+        // 539 分の運行の外は休息 (180 分以上) だが、分割の相手が無いので休息期間にならない — 日締めせず勤務に残し、
+        // 拘束からは外す (theearth の休息期間の定義)
         let rows = vec![
             ev("2026-07-01 20:00:00", "2026-07-02 05:00:00", "休息"),
             alc("2026-07-02 05:00:00", "運行開始"),
@@ -4652,20 +4707,126 @@ mod tests {
         ];
         let days = daily_summary(&rows, "2026-07", &KosokuParams::default());
         assert_eq!(days.len(), 1);
-        assert_eq!(days[0].restraint_minutes, 13 * 60);
-        assert_eq!(days[0].break_minutes, 539);
-        // 540 分ちょうどで休息 = 運行終了で終業
+        assert_eq!(days[0].restraint_minutes, 13 * 60 - 539);
+        assert_eq!(days[0].break_minutes, 0);
+        // 540 分ちょうどは連続休息 = 運行終了で日締め
         let mut longer = rows.clone();
         longer[3] = alc("2026-07-02 17:00:00", "運行開始");
-        let days = daily_summary(&longer, "2026-07", &KosokuParams::default());
         assert_eq!(
-            days.iter()
-                .map(|d| (d.start.as_str(), d.end.as_str()))
-                .collect::<Vec<_>>(),
+            shift_spans(&longer),
             vec![
-                ("2026-07-02 05:00:00", "2026-07-02 08:00:00"),
-                ("2026-07-02 17:00:00", "2026-07-02 18:00:00"),
+                (
+                    "2026-07-02 05:00:00".to_string(),
+                    "2026-07-02 08:00:00".to_string()
+                ),
+                (
+                    "2026-07-02 17:00:00".to_string(),
+                    "2026-07-02 18:00:00".to_string()
+                ),
             ],
+        );
+    }
+
+    #[test]
+    fn alc_only_gap_shorter_than_180_minutes_is_a_break() {
+        // 180 分未満の運行の外は運行間待機 — 拘束に残し、休憩に数える
+        let rows = vec![
+            alc("2026-07-02 05:00:00", "運行開始"),
+            alc("2026-07-02 08:00:00", "運行終了"),
+            alc("2026-07-02 10:59:00", "運行開始"),
+            alc("2026-07-02 12:00:00", "運行終了"),
+        ];
+        let days = daily_summary(&rows, "2026-07", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].restraint_minutes, 7 * 60);
+        assert_eq!(days[0].break_minutes, 179);
+    }
+
+    #[test]
+    fn alc_only_two_split_rests_close_the_day_at_the_second_one() {
+        // 乗務員 3 / 2026-06 の形: 5/31 19:41 始業、316 分 + 454 分 (累計 770 ≥ 600) の 2 分割で 6/1 10:52 に日締め
+        let rows = vec![
+            alc("2026-05-31 19:41:00", "運行開始"),
+            ev("2026-05-31 19:50:00", "2026-06-01 01:06:00", "休息"),
+            ev("2026-06-01 01:06:00", "2026-06-01 10:52:00", "運転"),
+            ev("2026-06-01 10:52:00", "2026-06-01 18:26:00", "休息"),
+            ev("2026-06-01 18:26:00", "2026-06-01 22:00:00", "運転"),
+            alc("2026-06-01 22:00:00", "運行終了"),
+        ];
+        let at = |s: &str| NaiveDateTime::parse_from_str(s, FMT).unwrap();
+        let (_, shifts) = driver_shifts(&rows);
+        assert_eq!(
+            shifts,
+            vec![
+                (at("2026-05-31 19:41:00"), at("2026-06-01 10:52:00")),
+                (at("2026-06-01 18:26:00"), at("2026-06-01 22:00:00")),
+            ],
+        );
+        // 2 分割で累計 600 分に届かなければ締めない (3 回目で 720 分に届けば締める)
+        let rows = vec![
+            alc("2026-06-01 00:00:00", "運行開始"),
+            ev("2026-06-01 01:00:00", "2026-06-01 04:00:00", "休息"),
+            ev("2026-06-01 06:00:00", "2026-06-01 10:00:00", "休息"),
+            ev("2026-06-01 12:00:00", "2026-06-01 17:00:00", "休息"),
+            alc("2026-06-01 20:00:00", "運行終了"),
+        ];
+        assert_eq!(
+            driver_shifts(&rows).1,
+            vec![
+                (at("2026-06-01 00:00:00"), at("2026-06-01 12:00:00")),
+                (at("2026-06-01 17:00:00"), at("2026-06-01 20:00:00")),
+            ],
+        );
+        // 3 分割でも 720 分に届かなければ締めない (24 時間後まで続く)
+        let mut short = rows.clone();
+        short[3] = ev("2026-06-01 12:00:00", "2026-06-01 15:00:00", "休息");
+        assert_eq!(
+            driver_shifts(&short).1,
+            vec![(at("2026-06-01 00:00:00"), at("2026-06-01 20:00:00"))],
+        );
+    }
+
+    #[test]
+    fn alc_only_day_without_a_rest_period_closes_24_hours_after_the_start() {
+        // 乗務員 10 / 2026-06 の形: 5/31 07:48 始業、485 分の休息は相手が無く休息期間にならない →
+        // 6/1 07:48 (24 時間後) で日締めし、続きは同じ時刻から次の勤務
+        let rows = vec![
+            alc("2026-05-31 07:48:00", "運行開始"),
+            ev("2026-05-31 20:23:00", "2026-06-01 04:28:00", "休息"),
+            ev("2026-06-01 04:28:00", "2026-06-01 16:37:00", "運転"),
+            alc("2026-06-01 16:37:00", "運行終了"),
+        ];
+        let at = |s: &str| NaiveDateTime::parse_from_str(s, FMT).unwrap();
+        assert_eq!(
+            driver_shifts(&rows).1,
+            vec![
+                (at("2026-05-31 07:48:00"), at("2026-06-01 07:48:00")),
+                (at("2026-06-01 07:48:00"), at("2026-06-01 16:37:00")),
+            ],
+        );
+        // 24 時間後に休息の中なら、次の始業は休息の終わり
+        let rows = vec![
+            alc("2026-06-01 06:00:00", "運行開始"),
+            ev("2026-06-01 10:00:00", "2026-06-01 14:00:00", "休息"),
+            ev("2026-06-02 05:00:00", "2026-06-02 08:00:00", "休息"),
+            alc("2026-06-02 09:00:00", "運行終了"),
+        ];
+        assert_eq!(
+            driver_shifts(&rows).1,
+            vec![
+                (at("2026-06-01 06:00:00"), at("2026-06-02 06:00:00")),
+                (at("2026-06-02 08:00:00"), at("2026-06-02 09:00:00")),
+            ],
+        );
+        // 24 時間後が最後の休息の中で、その後にデータが無ければ次の勤務は無い
+        let rows = vec![
+            alc("2026-06-01 06:00:00", "運行開始"),
+            ev("2026-06-01 10:00:00", "2026-06-01 14:00:00", "休息"),
+            ev("2026-06-02 05:00:00", "2026-06-02 09:00:00", "休息"),
+        ];
+        assert_eq!(
+            driver_shifts(&rows).1,
+            vec![(at("2026-06-01 06:00:00"), at("2026-06-02 06:00:00"))],
         );
     }
 
@@ -4703,7 +4864,7 @@ mod tests {
         let at = |s: &str| dt(s);
         let mut rows = vec![
             // 乗務員 12: 6/30 16:50 の休息明け → 20:18 帰庫 → 7/1 05:09 出庫 (531 分、休息に届かない) で勤務が
-            // つながる (実データの形。運行開始は 6/27 で読みの外)
+            // つながり、7/1 08:25 からの 575 分の休息で日締め (実データの形。運行開始は 6/27 で読みの外)
             ev("2026-06-29 19:24:00", "2026-06-30 16:50:00", "休息"),
             ev("2026-06-30 16:50:00", "2026-06-30 20:18:00", "運転"),
             alc("2026-06-30 20:18:00", "運行終了"),
@@ -4734,11 +4895,21 @@ mod tests {
         }
         rows.extend(closed);
         rows.extend(borrowed);
-        let got = alc_open_shift_starts(rows, at("2026-07-01 00:00:00"));
+        let (got, at_edge) = alc_open_shift_starts(
+            rows.clone(),
+            at("2026-07-01 00:00:00"),
+            at("2026-06-30 00:00:00"),
+        );
         assert_eq!(
             got.into_iter().collect::<Vec<_>>(),
             vec![(12, at("2026-06-30 16:50:00"))]
         );
+        // どの乗務員も最初の勤務が読んだ範囲の始まりより後から始まる → 遡らない
+        assert!(!at_edge);
+        // 読んだ範囲の始まりが勤務の途中 (乗務員 12 の 16:50 始業より後) なら遡る
+        let (_, at_edge) =
+            alc_open_shift_starts(rows, at("2026-07-01 00:00:00"), at("2026-06-30 17:00:00"));
+        assert!(at_edge);
     }
 
     #[test]
