@@ -2309,6 +2309,19 @@ pub fn alc_open_shift_starts(
         .collect()
 }
 
+/// 1 人ぶんの行から、**fold と同じ組み方の勤務** ([`final_shifts_aligned`]) と、alc だけの乗務員か ([`alc_only`]) を返す
+/// — 診断の口 (`GET /api/kintai/alc-events`) が「勤怠 Worker が読んだ行からどう勤務を組んだか」を見せるのに使う。
+///
+/// fold は月の読み窓 (遡り起点・翌月 2 日まで) で組むので、渡す行の範囲が違えば端の勤務は fold の勤務と違いうる。
+pub fn driver_shifts(rows: &[serde_json::Value]) -> (bool, Vec<(NaiveDateTime, NaiveDateTime)>) {
+    let events = parse_events(rows);
+    let shifts = final_shifts_aligned(&events)
+        .into_iter()
+        .map(|s| (s.start, s.end))
+        .collect();
+    (alc_only(&events), shifts)
+}
+
 /// 勤務が**覆っている**区間 (分に揃えた span、Refs #182 フォローアップ)。
 ///
 /// 紙が勤務の外で数えている分 ([`crate::kosoku_paper::paper_outside_by_date`]) を
@@ -4654,6 +4667,29 @@ mod tests {
                 ("2026-07-02 17:00:00", "2026-07-02 18:00:00"),
             ],
         );
+    }
+
+    #[test]
+    fn driver_shifts_returns_the_fold_shifts_and_whether_the_driver_is_alc_only() {
+        let at = |s: &str| NaiveDateTime::parse_from_str(s, FMT).unwrap();
+        let rows = vec![
+            alc("2026-07-02 05:00:00", "運行開始"),
+            alc("2026-07-02 08:00:00", "運行終了"),
+            alc("2026-07-02 17:00:00", "運行開始"),
+            alc("2026-07-02 18:00:00", "運行終了"),
+        ];
+        let (alc_only, shifts) = driver_shifts(&rows);
+        assert!(alc_only);
+        assert_eq!(
+            shifts,
+            vec![
+                (at("2026-07-02 05:00:00"), at("2026-07-02 08:00:00")),
+                (at("2026-07-02 17:00:00"), at("2026-07-02 18:00:00")),
+            ],
+        );
+        // 休息だけの行は alc だけの乗務員ではない (休息から組む)
+        let rest = vec![ev("2026-07-01 20:00:00", "2026-07-02 05:00:00", "休息")];
+        assert!(!driver_shifts(&rest).0);
     }
 
     #[test]

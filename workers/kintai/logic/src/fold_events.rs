@@ -20,16 +20,17 @@
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime};
 use kintai_kosoku::alc_events::{
-    fetch_all_events, fetch_dtako_month_read, merge_all_rows, AlcEventsError, AlcEventsGet,
-    EventsPage, UpstreamAll, UpstreamEtags,
+    event_to_json, fetch_all_events, fetch_dtako_month_read, merge_all_rows, AlcEventsError,
+    AlcEventsGet, EventsPage, RawEvent, UpstreamAll, UpstreamEtags,
 };
 use kintai_kosoku::anchors::HeadAnchors;
 use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
 use kintai_kosoku::kintai_push::jst_at;
-use kintai_kosoku::kosoku::alc_open_shift_starts;
+use kintai_kosoku::kosoku::{alc_open_shift_starts, driver_shifts};
 use kintai_kosoku::window::{month_head_anchors, HeadPunch};
 
 use crate::common::Fail;
+use crate::fold_routes::AlcEventsRequest;
 use crate::unko_gaps::{etags_search_between, read_etags_body, RpcResult};
 
 /// auth-worker の `KintaiAlcEntrypoint` の 2 メソッド。どちらも失敗を throw せず `{status, body}` で返す
@@ -132,6 +133,85 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
             days += 1;
         }
     }
+}
+
+/// 運行 1 本ぶんの行の要約 (診断の口の `operations[]`)。
+fn operation_summary(unko_no: &str, events: &[&RawEvent]) -> serde_json::Value {
+    let fmt = |t: NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut states: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in events {
+        *states
+            .entry(e.state.clone().unwrap_or_default())
+            .or_default() += 1;
+    }
+    let first = events.iter().map(|e| e.start).min().map(fmt);
+    let last = events
+        .iter()
+        .map(|e| e.end.unwrap_or(e.start))
+        .max()
+        .map(fmt);
+    serde_json::json!({
+        "unko_no": unko_no,
+        "vehicle": events.first().and_then(|e| e.vehicle.clone()),
+        "first": first,
+        "last": last,
+        "events": events.len(),
+        "states": states,
+    })
+}
+
+/// `GET /api/kintai/alc-events` (診断。書かない): fold と同じ読み ([`fetch_all_events`] + 写しの借りる行) の
+/// **1 人ぶん**と、その行から fold と同じ組み方で作った勤務 ([`driver_shifts`])。
+///
+/// 応答: `driver`・`from`・`to` (`[from, to)`)・`alc_only`・`shifts[]` (`start`・`end`・`minutes`)・
+/// `operations[]` (運行NO ごとの最初と最後の時刻・行数・`イベント名` ごとの行数)・`events[]` (alc の行。運行NO・車輌つき)・
+/// `borrowed[]` (写しから借りた打刻・運行の確定イベント)・`warnings[]` (上流の警告)。
+pub async fn driver_alc_events<A: AlcRpc, P: PushedEventsRead>(
+    io: &WorkerFoldEvents<'_, A, P>,
+    req: &AlcEventsRequest,
+) -> Result<serde_json::Value, Fail> {
+    let fmt = |t: NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
+    let (events, warnings) = fetch_all_events(io, &req.from, &req.to).await?;
+    let driver = req.driver as i64;
+    let mine: Vec<RawEvent> = events
+        .into_iter()
+        .filter(|e| e.driver_id == Some(driver))
+        .collect();
+    let borrowed: Vec<serde_json::Value> = io
+        .pushed
+        .pushed_all_events(pushed_window(&req.from, &req.to)?)
+        .await?
+        .into_iter()
+        .filter(|r| r["driver_id"].as_i64() == Some(driver))
+        .collect();
+    let rows = merge_all_rows(mine.clone(), Some(borrowed.clone()));
+    let (alc_only, shifts) = driver_shifts(&rows);
+    let mut by_op: std::collections::BTreeMap<String, Vec<&RawEvent>> = Default::default();
+    for e in &mine {
+        by_op
+            .entry(e.unko_no.clone().unwrap_or_default())
+            .or_default()
+            .push(e);
+    }
+    let operations: Vec<_> = by_op
+        .iter()
+        .map(|(u, evs)| operation_summary(u, evs))
+        .collect();
+    let shifts: Vec<_> = shifts
+        .into_iter()
+        .map(|(s, e)| serde_json::json!({"start": fmt(s), "end": fmt(e), "minutes": (e - s).num_minutes()}))
+        .collect();
+    Ok(serde_json::json!({
+        "driver": req.driver,
+        "from": req.from,
+        "to": req.to,
+        "alc_only": alc_only,
+        "shifts": shifts,
+        "operations": operations,
+        "events": mine.into_iter().map(event_to_json).collect::<Vec<_>>(),
+        "borrowed": borrowed,
+        "warnings": warnings.into_iter().map(|w| w.text).collect::<Vec<_>>(),
+    }))
 }
 
 impl<A: AlcRpc, P> AlcEventsGet for WorkerFoldEvents<'_, A, P> {

@@ -1,4 +1,5 @@
-//! fold の 4 口 (Refs #322): `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months`。
+//! fold の口 (Refs #322): `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months`・
+//! 診断の `GET /api/kintai/alc-events` (fold が読む 1 人ぶんの alc の行と勤務)。
 //!
 //! 段取り (遡り起点 → 月ゲート → 畳み → 封 → 応答、打刻の置き換え、窓の畳み直し) は共有 crate の
 //! `kintai_kosoku::route_flow` (root と同じもの)。ここは I/O の配線と HTTP の入出力だけ:
@@ -20,9 +21,10 @@ use kintai_kosoku::fold_flow::FoldClock;
 use kintai_kosoku::kintai_push::TimecardWindow;
 use kintai_kosoku::route_flow::{apply_timecard_window, fold_into, recalc_page, RecalcRequest};
 use kintai_logic::common::Fail;
-use kintai_logic::fold_events::WorkerFoldEvents;
+use kintai_logic::fold_events::{driver_alc_events, WorkerFoldEvents};
 use kintai_logic::fold_routes::{
-    fold_ctx, jst_from_ms, parse_recalc_body, parse_recalc_query, parse_window, FoldRoute, DB_WHAT,
+    fold_ctx, jst_from_ms, parse_alc_events_query, parse_recalc_body, parse_recalc_query,
+    parse_window, read_failed, AlcEventsRequest, FoldRoute, DB_WHAT,
 };
 use kintai_logic::mariadb_reads::jst_today;
 use kintai_logic::write_auth::{authorize, WRITE_TOKEN_HEADER};
@@ -88,7 +90,23 @@ pub(crate) async fn serve(
             window(parse_window(content_type.as_deref(), &body)?, env, tenants).await
         }
         FoldRoute::StaleMonths => stale_months(query, env, tenants).await,
+        FoldRoute::AlcEvents => alc_events(parse_alc_events_query(query)?, env, tenants).await,
     }
+}
+
+/// 診断: fold が読む 1 人ぶんの alc の行と、そこから組んだ勤務 (書かない)。読みの失敗は recalc と同じ 502 (種別だけ)。
+async fn alc_events(
+    req: AlcEventsRequest,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
+    let (pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let store = FoldStore::new(pg, tenancy.tenant);
+    let alc = EnvAlc::new(env, &tenancy);
+    let repo = fold_events(&alc, &store);
+    driver_alc_events(&repo, &req)
+        .await
+        .map_err(|f| read_failed(&f))
 }
 
 /// 全量再計算の 1 ページ (GET は `apply` を持たないので書かない)。

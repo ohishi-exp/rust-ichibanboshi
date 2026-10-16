@@ -1,5 +1,5 @@
-//! 勤怠 Worker の fold の 4 口 (`GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・
-//! `GET /api/kintai/stale-months`) の HTTP の殻の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
+//! 勤怠 Worker の fold の口 (`GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・
+//! `GET /api/kintai/stale-months`・診断の `GET /api/kintai/alc-events`) の HTTP の殻の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
 //!
 //! 段取り (月ゲート → 畳み → 封 → 応答、打刻の置き換え、窓の畳み直し) は共有 crate の `kintai_kosoku::route_flow`
 //! (root と同じもの)。ここに在るのは root の殻 (`src/routes/kintai_recalc.rs`・`kintai_timecard.rs` の `receive_window`・
@@ -8,18 +8,20 @@
 
 use std::sync::OnceLock;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use kintai_kosoku::fold_flow::{FoldClock, FoldCtx};
 use kintai_kosoku::kintai_fold;
 use kintai_kosoku::kintai_push::TimecardWindow;
 use kintai_kosoku::kosoku::KosokuParams;
 use kintai_kosoku::route_flow::{RecalcQuery, RecalcRequest};
+use serde::Deserialize;
 
 use crate::common::{bad_request, is_valid_month, parse_json, parse_query, Fail};
 
 const RECALC: &str = "/api/kintai/recalc";
 const WINDOW: &str = "/api/kintai/timecard/window";
 const STALE_MONTHS: &str = "/api/kintai/stale-months";
+const ALC_EVENTS: &str = "/api/kintai/alc-events";
 
 /// 4 口。`Recalc` と `TimecardWindow` が書き込みの口 (`X-Kintai-Write-Token` を照合する)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,8 @@ pub enum FoldRoute {
     TimecardWindow,
     /// `GET /api/kintai/stale-months` — 月ごとの stale 乗務員数 (認可なし)
     StaleMonths,
+    /// `GET /api/kintai/alc-events` — fold が読む 1 人ぶんの alc の行と、そこから組んだ勤務 (診断。認可なし・書かない)
+    AlcEvents,
 }
 
 impl FoldRoute {
@@ -43,7 +47,8 @@ impl FoldRoute {
             (RECALC, "POST") => Self::Recalc,
             (WINDOW, "POST") => Self::TimecardWindow,
             (STALE_MONTHS, "GET") => Self::StaleMonths,
-            (RECALC | WINDOW | STALE_MONTHS, _) => return Some(None),
+            (ALC_EVENTS, "GET") => Self::AlcEvents,
+            (RECALC | WINDOW | STALE_MONTHS | ALC_EVENTS, _) => return Some(None),
             _ => return None,
         };
         Some(Some(route))
@@ -61,6 +66,7 @@ impl FoldRoute {
             Self::Recalc => "recalc",
             Self::TimecardWindow => "timecard/window",
             Self::StaleMonths => "stale-months",
+            Self::AlcEvents => "alc-events",
         }
     }
 }
@@ -95,6 +101,49 @@ pub fn parse_window(content_type: Option<&str>, body: &[u8]) -> Result<TimecardW
         return Err(bad_request(format!("month は YYYY-MM です: {bad}")));
     }
     Ok(window)
+}
+
+/// `GET /api/kintai/alc-events` の入力 (`driver`・`from`・`to`。日付は JST の `YYYY-MM-DD`、`to` の日を含む)。
+#[derive(Debug, Deserialize)]
+struct AlcEventsQuery {
+    driver: u64,
+    from: String,
+    to: String,
+}
+
+/// 検査済みの [`AlcEventsQuery`]。`from`・`to` は fold の読みと同じ `[from, to)` の壁時計 (`to` は翌日の 0 時)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlcEventsRequest {
+    pub driver: u64,
+    pub from: String,
+    pub to: String,
+}
+
+/// 1 回で読む日数の上限。fold の 1 か月の読み窓 (遡りと翌月 2 日を含む) が入る長さ。
+pub const ALC_EVENTS_MAX_DAYS: i64 = 62;
+
+/// `GET /api/kintai/alc-events` のクエリ。Query → 日付 (`YYYY-MM-DD`) → `from <= to` → 日数の上限。
+pub fn parse_alc_events_query(query: &str) -> Result<AlcEventsRequest, Fail> {
+    let q: AlcEventsQuery = parse_query(query)?;
+    let date = |name: &str, s: &str| {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| bad_request(format!("{name} は YYYY-MM-DD で指定してください")))
+    };
+    let (from, to) = (date("from", &q.from)?, date("to", &q.to)?);
+    if from > to {
+        return Err(bad_request("from は to 以前にしてください"));
+    }
+    if (to - from).num_days() >= ALC_EVENTS_MAX_DAYS {
+        return Err(bad_request(format!(
+            "期間は {ALC_EVENTS_MAX_DAYS} 日までにしてください"
+        )));
+    }
+    let at = |d: NaiveDate| format!("{} 00:00:00", d.format("%Y-%m-%d"));
+    Ok(AlcEventsRequest {
+        driver: q.driver,
+        from: at(from),
+        to: at(to + chrono::Duration::days(1)),
+    })
 }
 
 /// 502 の本文の頭 (root の `KintaiPushError::Db` の `kintai push db failed: …`)。後ろは kit の `kind` だけ。
