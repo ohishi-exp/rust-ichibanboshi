@@ -2442,6 +2442,20 @@ pub(crate) fn restraint_spans_and_diagnostics(events: &[Event]) -> (Spans, Spans
 /// 拘束を丸ごと当月に載せる。
 pub fn daily_summary(rows: &[serde_json::Value], month: &str, p: &KosokuParams) -> Vec<DaySummary> {
     let events = parse_events(rows);
+    // alc だけの乗務員は theearth と同じ丸め — 両端を分に切り捨てて引く ([`RestraintRounding::FloorEndpoints`]、
+    // ユーザー決定 2026-10-17「最終的には誤差なくしたい」)。実測 (北海 2026-06): 紙の区分丸めでは拘束が 1〜8 分短く、
+    // これで乗務員 9 人が theearth の拘束時間管理表と 0 分差になった。紙の区分丸め (既定) は紙のタイムカード表に
+    // 合わせるもので、打刻の無い会社に紙は無い
+    let alc_params;
+    let p = if alc_only(&events) {
+        alc_params = KosokuParams {
+            restraint_rounding: RestraintRounding::FloorEndpoints,
+            ..*p
+        };
+        &alc_params
+    } else {
+        p
+    };
     let shifts = base_shifts(&events);
     // 先に勤務の一覧を確定させる — run_head の重なり判定 (summarize の siblings) は
     // 分割後の勤務どうしで見る
