@@ -305,8 +305,8 @@ impl FoldClock for Fixed {
 #[test]
 fn the_worker_fold_ctx_has_the_production_logic_version() {
     let ctx = fold_ctx("worker-sha", &Fixed);
-    assert_eq!(root_logic_version(ctx.params), "206465aa6bcc64eb");
-    assert_eq!(logic_version(), "206465aa6bcc64eb");
+    assert_eq!(root_logic_version(ctx.params), "0c879aa4dad44a44");
+    assert_eq!(logic_version(), "0c879aa4dad44a44");
     assert_eq!(
         format!("{:?}", params()),
         format!("{:?}", KosokuParams::default())

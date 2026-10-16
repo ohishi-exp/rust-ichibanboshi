@@ -1069,8 +1069,23 @@ fn alc_only(events: &[Event]) -> bool {
             .any(|e| e.state == "運行開始" || e.state == "運行終了")
 }
 
-/// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、[`RUN_GAP_REST_MINUTES`] を**超える**
-/// 運行の外 ([`outside_runs`]) を勤務から外す (= 運行終了が終業)。それ以下は勤務に残し、
+/// [`alc_only`] の乗務員の「休息とみなす運行の外」の長さ (分) — theearth の休息期間の定義
+/// (就業時間管理マスター F-MMS0810 の「連続休息 540 分以上」、北海大運・大石運輸倉庫とも同じ) に合わせる
+/// (ユーザー決定 2026-10-16)。
+///
+/// 以前は 8 時間 (`RUN_GAP_REST_MINUTES`) を超えたら終業にしていた。実測 (乗務員 12 / 2026-07): 6/30 20:18 帰庫 →
+/// 7/1 05:09 出庫の 531 分を休息とみなして 7/1 朝の勤務を 7 月に数えたが、theearth は 540 分に届かないので
+/// 6/30 からの勤務の続き (6 月) に数えていた (+147 分)。**24 時間を超えた勤務を割る `RUN_GAP_REST_MINUTES`
+/// (大石を含む全員) とは別の値。**
+const ALC_REST_MINUTES: i64 = 540;
+
+/// 運行の外が休息 (= 運行終了が終業) か。[`ALC_REST_MINUTES`] 以上。
+fn is_alc_rest(s: NaiveDateTime, e: NaiveDateTime) -> bool {
+    (e - s).num_minutes() >= ALC_REST_MINUTES
+}
+
+/// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、休息とみなす ([`is_alc_rest`]) 運行の外
+/// ([`outside_runs`]) を勤務から外す (= 運行終了が終業)。それより短い空きは勤務に残し、
 /// 休憩として数える ([`summarize`])。
 fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     let parts = split_long_shift(shift, events);
@@ -1079,7 +1094,7 @@ fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     }
     let outside: Vec<_> = outside_runs(events)
         .into_iter()
-        .filter(|(s, e)| (*e - *s).num_minutes() > RUN_GAP_REST_MINUTES)
+        .filter(|(s, e)| is_alc_rest(*s, *e))
         .collect();
     parts
         .into_iter()
@@ -1117,7 +1132,8 @@ fn base_shifts(events: &[Event]) -> Vec<Shift> {
 ///   (theearth 07-23 実働 239 分)
 ///
 /// 運行開始・運行終了・休息はどれも運行 (KUDGIVT) に入っている時刻なので、「データに無い時間を拘束に
-/// 入れない」(#392) と同じ線で組める。運行間が 8 時間以下の空きは勤務に残る (休憩に数える、[`summarize`])。
+/// 入れない」(#392) と同じ線で組める。休息とみなさない ([`is_alc_rest`]) 運行間の空きは勤務に残る
+/// (休憩に数える、[`summarize`])。
 fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
     let (Some(first), Some(last)) = (
         events.iter().map(|e| e.start).min(),
@@ -1127,7 +1143,7 @@ fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
     };
     let mut cut: Vec<(NaiveDateTime, NaiveDateTime)> = outside_runs(events)
         .into_iter()
-        .filter(|(s, e)| (*e - *s).num_minutes() > RUN_GAP_REST_MINUTES)
+        .filter(|(s, e)| is_alc_rest(*s, *e))
         .collect();
     cut.extend(rest_spans(events));
     subtract_intervals(&[(first, last)], &merge_intervals(cut))
@@ -1162,8 +1178,9 @@ fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
 /// - 空白の中にイベントが 1 件でも始まっていれば外さない (データがある)
 /// - 最後の運行終了の後に運行開始が無ければ、その後ろ (イベントが無い間) は外
 /// - **長さで扱いが分かれる** (ユーザー決定 2026-10-16「運行間が 8 時間超える場合、運行終了＝終業
-///   そのほかは拘束」)。[`RUN_GAP_REST_MINUTES`] を超える空き (と帰庫したままの尻尾) は勤務から
-///   外し ([`split_shift`])、それ以下は勤務に残して休憩に数える ([`summarize`])。theearth の
+///   そのほかは拘束」、同日のうちに theearth の休息期間の定義に合わせて 540 分以上に変更)。休息とみなす
+///   空き ([`is_alc_rest`]) と帰庫したままの尻尾は勤務から外し ([`split_shift`])、それより短い空きは勤務に
+///   残して休憩に数える ([`summarize`])。theearth の
 ///   拘束時間管理表も昼に帰庫して出直す間を拘束に入れ、実働には入れていない (2026-07 の実測:
 ///   全部外すと実働は theearth と一致したまま、拘束だけ 7〜800 分短かった)
 fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
@@ -1885,7 +1902,7 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
             breaks.extend(
                 outside_runs(events)
                     .into_iter()
-                    .filter(|(s, e)| (*e - *s).num_minutes() <= RUN_GAP_REST_MINUTES)
+                    .filter(|(s, e)| !is_alc_rest(*s, *e))
                     .map(|(s, e)| (floor_min(s).max(walk.start), floor_min(e).min(walk.end)))
                     .filter(|(s, e)| e > s),
             );
@@ -2260,6 +2277,35 @@ fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
             source: s.source,
         })
         .filter(|s| s.end > s.start)
+        .collect()
+}
+
+/// [`alc_only`] の乗務員ごとに、**`month_start` の時点で開いている勤務の始まり** — fold の読み窓の遡り起点
+/// (#317 の打刻の起点「月初時点で開いている始業」の、打刻の無い会社の分。ユーザー決定 2026-10-16)。
+///
+/// #317 の起点は社内 MariaDB の写し (運行・打刻) からしか作らないので、写しの無い会社 (北海大運) は
+/// 月初から読んでいた。前月末から続く勤務の途中 (休息に届かない空きの後の運行開始) から別の勤務を作り、
+/// 前月の fold が持つ勤務と同じ時間を二重に数えていた。実測 (乗務員 12 / 2026-07): 6/30 20:18 帰庫 →
+/// 7/1 05:09 出庫 (531 分) の 7/1 05:09〜08:25 が 6 月と 7 月の両方に入った (theearth は 6 月だけ)。
+///
+/// 勤務の組み方は fold と同じ ([`final_shifts_aligned`])。月初をまたぐ勤務 (始まり < 月初 < 終わり) が無ければ
+/// 起点は無い。打刻・社内 MariaDB の運行イベントを持つ乗務員は見ない (#317 の起点がある)。
+pub fn alc_open_shift_starts(
+    rows: Vec<serde_json::Value>,
+    month_start: NaiveDateTime,
+) -> BTreeMap<u64, NaiveDateTime> {
+    split_by_driver(rows)
+        .into_iter()
+        .filter_map(|(cd, rows)| {
+            let events = parse_events(&rows);
+            if !alc_only(&events) {
+                return None;
+            }
+            final_shifts_aligned(&events)
+                .into_iter()
+                .find(|s| s.start < month_start && s.end > month_start)
+                .map(|s| (cd, s.start))
+        })
         .collect()
 }
 
@@ -4581,23 +4627,23 @@ mod tests {
     }
 
     #[test]
-    fn alc_only_gap_of_exactly_8h_stays_in_the_shift() {
-        // 8 時間ちょうどは「超える」に当たらないので終業にしない (拘束に残し休憩に数える)
+    fn alc_only_gap_shorter_than_540_minutes_stays_in_the_shift() {
+        // 539 分は休息に届かないので終業にしない (拘束に残し休憩に数える)。theearth の連続休息 540 分
         let rows = vec![
             ev("2026-07-01 20:00:00", "2026-07-02 05:00:00", "休息"),
             alc("2026-07-02 05:00:00", "運行開始"),
             alc("2026-07-02 08:00:00", "運行終了"),
-            alc("2026-07-02 16:00:00", "運行開始"),
+            alc("2026-07-02 16:59:00", "運行開始"),
             alc("2026-07-02 18:00:00", "運行終了"),
             ev("2026-07-02 18:00:00", "2026-07-03 06:00:00", "休息"),
         ];
         let days = daily_summary(&rows, "2026-07", &KosokuParams::default());
         assert_eq!(days.len(), 1);
         assert_eq!(days[0].restraint_minutes, 13 * 60);
-        assert_eq!(days[0].break_minutes, 8 * 60);
-        // 1 分でも超えれば運行終了で終業
+        assert_eq!(days[0].break_minutes, 539);
+        // 540 分ちょうどで休息 = 運行終了で終業
         let mut longer = rows.clone();
-        longer[3] = alc("2026-07-02 16:01:00", "運行開始");
+        longer[3] = alc("2026-07-02 17:00:00", "運行開始");
         let days = daily_summary(&longer, "2026-07", &KosokuParams::default());
         assert_eq!(
             days.iter()
@@ -4605,7 +4651,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("2026-07-02 05:00:00", "2026-07-02 08:00:00"),
-                ("2026-07-02 16:01:00", "2026-07-02 18:00:00"),
+                ("2026-07-02 17:00:00", "2026-07-02 18:00:00"),
             ],
         );
     }
@@ -4614,6 +4660,49 @@ mod tests {
     fn shifts_from_alc_of_no_events_is_empty() {
         // alc_only を通ったあとはイベントが必ずあるが、空でも落ちない
         assert!(shifts_from_alc(&[]).is_empty());
+    }
+
+    #[test]
+    fn alc_open_shift_starts_finds_the_shift_open_at_the_month_start() {
+        let at = |s: &str| dt(s);
+        let mut rows = vec![
+            // 乗務員 12: 6/30 16:50 の休息明け → 20:18 帰庫 → 7/1 05:09 出庫 (531 分、休息に届かない) で勤務が
+            // つながる (実データの形。運行開始は 6/27 で読みの外)
+            ev("2026-06-29 19:24:00", "2026-06-30 16:50:00", "休息"),
+            ev("2026-06-30 16:50:00", "2026-06-30 20:18:00", "運転"),
+            alc("2026-06-30 20:18:00", "運行終了"),
+            alc("2026-07-01 05:09:00", "運行開始"),
+            ev("2026-07-01 05:09:00", "2026-07-01 08:25:00", "運転"),
+            ev("2026-07-01 08:25:00", "2026-07-01 18:00:00", "休息"),
+        ];
+        for r in rows.iter_mut() {
+            r["driver_id"] = json!(12);
+        }
+        // 乗務員 13: 月初の前に 540 分以上空いて終わっている (開いている勤務は無い)
+        let mut closed = vec![
+            alc("2026-06-30 08:00:00", "運行開始"),
+            ev("2026-06-30 08:00:00", "2026-06-30 12:00:00", "運転"),
+            alc("2026-06-30 12:00:00", "運行終了"),
+            alc("2026-07-01 06:00:00", "運行開始"),
+        ];
+        // 乗務員 14: 社内 MariaDB の運行イベント (大石) は見ない
+        let mut borrowed = vec![
+            dtako("2026-06-30 20:00:00", "運行開始"),
+            ev("2026-06-30 20:00:00", "2026-07-01 03:00:00", "運転"),
+            dtako("2026-07-01 03:00:00", "運行終了"),
+        ];
+        for (cd, set) in [(13, &mut closed), (14, &mut borrowed)] {
+            for r in set.iter_mut() {
+                r["driver_id"] = json!(cd);
+            }
+        }
+        rows.extend(closed);
+        rows.extend(borrowed);
+        let got = alc_open_shift_starts(rows, at("2026-07-01 00:00:00"));
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            vec![(12, at("2026-06-30 16:50:00"))]
+        );
     }
 
     #[test]

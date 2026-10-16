@@ -97,7 +97,8 @@ impl Pushed<'_> {
 impl PushedEventsRead for Pushed<'_> {
     async fn pushed_all_events(&self, span: Span) -> Result<Vec<Value>, Fail> {
         self.note("pushed all", span);
-        self.all.borrow_mut().take().expect("全員行は 1 回")
+        // 1 回目は仕込んだ値、2 回目以降 (遡り起点の読み) は空
+        self.all.borrow_mut().take().unwrap_or(Ok(Vec::new()))
     }
 
     async fn pushed_head_run_ends(&self, span: Span) -> Result<Vec<(u64, String)>, Fail> {
@@ -321,8 +322,9 @@ fn events_search_encodes_the_page_like_a_query_string() {
 
 // ── 遡り起点 ──
 
-/// 遡り起点は写しの 2 本だけ (alc は読まない)。運行終了 → 打刻の姿の順で、窓は fold の `month_range` そのまま。
-/// 規則は root と同じ `month_head_anchors` (運行NO の先頭 12 桁が月初より前なら、その開始時刻まで遡る)。
+/// 遡り起点は写しの 2 本 (運行終了 → 打刻の姿の順、窓は fold の `month_range` そのまま) と、写しを持たない乗務員の
+/// alc の行 (月初の前後を読む)。規則は root と同じ `month_head_anchors` (運行NO の先頭 12 桁が月初より前なら、
+/// その開始時刻まで遡る)。
 #[test]
 fn month_head_anchors_reads_the_two_head_queries_from_the_copy() {
     let log = Log::default();
@@ -341,11 +343,16 @@ fn month_head_anchors_reads_the_two_head_queries_from_the_copy() {
         Some("2026-05-31 21:39:47")
     );
     assert_eq!(
-        *log.borrow(),
-        vec![
+        log.borrow()[..2],
+        [
             format!("pushed runs {SPAN}"),
             format!("pushed punches {SPAN}")
         ]
+    );
+    // 続けて月初の前後 1 日 ([5/31, 6/2)) を alc と写しから読む (行が無いので alc の起点は無い)
+    assert_eq!(
+        log.borrow().last().map(String::as_str),
+        Some("pushed all 2026-05-31T00:00:00+09:00..2026-06-02T00:00:00+09:00")
     );
 
     // 月が壊れていれば読む前に落とす (fold の BadMonth → 502)
@@ -406,6 +413,95 @@ fn month_head_anchors_uses_the_punches_too() {
     assert_eq!(
         got.get(&1101).map(String::as_str),
         Some("2026-05-31 20:00:00")
+    );
+}
+
+/// alc の運行 1 本ぶんの応答 (開始・終了・イベント名)。
+fn alc_rows_body(driver: &str, rows: &[(&str, &str, &str)]) -> String {
+    let rows: Vec<Value> = rows
+        .iter()
+        .map(|(start, end, state)| json!([driver, start, end, state]))
+        .collect();
+    json!({
+        "drivers": [{"operations": [{
+            "unko_no": format!("OP-{driver}"),
+            "headers": ["対象乗務員CD", "開始日時", "終了日時", "イベント名"],
+            "rows": rows,
+        }]}],
+    })
+    .to_string()
+}
+
+/// 写しを持たない乗務員は、**月初の時点で開いている勤務の始まり**まで遡る (alc の行で勤務を組む)。
+/// 写しの起点より早ければそちらを使う。
+#[test]
+fn month_head_anchors_adds_the_open_shift_start_from_alc_rows() {
+    let log = Log::default();
+    let a = alc(&log);
+    *a.events.borrow_mut() = vec![Ok(res(
+        200,
+        &alc_rows_body(
+            "12",
+            &[
+                ("2026/05/31 20:00:00", "2026/05/31 20:00:00", "運行開始"),
+                ("2026/05/31 20:00:00", "2026/06/01 03:00:00", "運転"),
+                ("2026/06/01 03:00:00", "2026/06/01 03:00:00", "運行終了"),
+            ],
+        ),
+    ))];
+    let m = pushed(&log);
+    // 写しの起点 (同じ乗務員、alc より遅い) は alc の起点に置き換わる
+    *m.runs.borrow_mut() = Some(Ok(vec![(12, "26053122000000000000121".into())]));
+    *m.punches.borrow_mut() = Some(Ok(vec![]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let got = block_on(w.month_head_anchors(FROM, TO)).unwrap();
+    assert_eq!(
+        got.get(&12).map(String::as_str),
+        Some("2026-05-31 20:00:00")
+    );
+}
+
+/// 開いている勤務の始まりが読んだ範囲の端なら、1 日ずつ遡って読み直す (日数はデータで決める)。
+#[test]
+fn month_head_anchors_reads_further_back_while_the_open_shift_starts_at_the_edge() {
+    let log = Log::default();
+    let a = alc(&log);
+    let edge = alc_rows_body(
+        "12",
+        &[
+            ("2026/05/31 00:00:00", "2026/06/01 03:00:00", "運転"),
+            ("2026/06/01 03:00:00", "2026/06/01 03:00:00", "運行終了"),
+        ],
+    );
+    let earlier = alc_rows_body(
+        "12",
+        &[
+            ("2026/05/30 22:00:00", "2026/05/30 22:00:00", "運行開始"),
+            ("2026/05/30 22:00:00", "2026/06/01 03:00:00", "運転"),
+            ("2026/06/01 03:00:00", "2026/06/01 03:00:00", "運行終了"),
+        ],
+    );
+    *a.events.borrow_mut() = vec![Ok(res(200, &edge)), Ok(res(200, &earlier))];
+    let m = pushed(&log);
+    *m.runs.borrow_mut() = Some(Ok(vec![]));
+    *m.punches.borrow_mut() = Some(Ok(vec![]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+    };
+    let got = block_on(w.month_head_anchors(FROM, TO)).unwrap();
+    assert_eq!(
+        got.get(&12).map(String::as_str),
+        Some("2026-05-30 22:00:00")
+    );
+    assert_eq!(
+        log.borrow().last().map(String::as_str),
+        Some("pushed all 2026-05-30T00:00:00+09:00..2026-06-02T00:00:00+09:00")
     );
 }
 

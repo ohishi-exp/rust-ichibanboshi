@@ -106,6 +106,10 @@ fn upstream(mode: Mode, path: &str, q: &[(String, String)]) -> (u16, String) {
                 ]}],
                 "warnings": ["NoSuchKey: 2/KUDGIVT.csv"],
             }),
+            // 遡り起点の読み (月初の前後 1 日 [05-31, 06-02) を 2 日遡って 05-29..06-01)。alc の行は無い
+            (Some("2026-05-29"), None) => {
+                json!({"drivers": [], "next_after_driver_cd": null, "warnings": []})
+            }
             other => panic!("想定外の要求 {other:?}"),
         };
         return (200, page.to_string());
@@ -434,7 +438,11 @@ async fn month_head_anchors_read_the_copy() {
         pairs,
         vec![(1104, "2026-05-31 20:00:00"), (1105, "2026-05-31 22:00:00")]
     );
-    assert!(alc.seen.lock().unwrap().is_empty(), "alc は読まない");
+    // alc は遡り起点の読み (月初の前後 1 日) の 1 回だけ。写しを持つ乗務員は alc の起点を作らない
+    let seen = alc.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].0, "events");
+    assert_eq!(query_value(&seen[0].1, "date_from"), Some("2026-05-29"));
 }
 
 /// dtako の指紋: etags の期間 (遡り起点まで下げる)・指紋・控え・warnings の分類 (写しは読まない)。
