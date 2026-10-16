@@ -1055,8 +1055,9 @@ fn alc_only(events: &[Event]) -> bool {
     events.iter().all(|e| e.source == "dtako_events")
 }
 
-/// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、**長い**運行の外 ([`outside_runs`]) を
-/// 勤務から外す。短い運行の外 (昼休み等) は勤務に残し、休憩として数える ([`summarize`])。
+/// [`split_long_shift`] のあと、[`alc_only`] の乗務員だけ、[`RUN_GAP_REST_MINUTES`] を**超える**
+/// 運行の外 ([`outside_runs`]) を勤務から外す (= 運行終了が終業)。それ以下は勤務に残し、
+/// 休憩として数える ([`summarize`])。
 fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     let parts = split_long_shift(shift, events);
     if !alc_only(events) {
@@ -1064,7 +1065,7 @@ fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
     }
     let outside: Vec<_> = outside_runs(events)
         .into_iter()
-        .filter(|(s, e)| (*e - *s).num_minutes() >= RUN_GAP_REST_MINUTES)
+        .filter(|(s, e)| (*e - *s).num_minutes() > RUN_GAP_REST_MINUTES)
         .collect();
     parts
         .into_iter()
@@ -1094,11 +1095,11 @@ fn split_shift(shift: &Shift, events: &[Event]) -> Vec<Shift> {
 ///   には使わない ([`alc_only`]) — 勤務は打刻が閉じ、継ぎ目は紙も数える (#123)
 /// - 空白の中にイベントが 1 件でも始まっていれば外さない (データがある)
 /// - 最後の運行終了の後に運行開始が無ければ、その後ろ (イベントが無い間) は外
-/// - **長さで扱いが分かれる** (ユーザー指摘 2026-10-16「昼休みじゃないのか？」)。
-///   [`RUN_GAP_REST_MINUTES`] 以上 (と帰庫したままの尻尾) は勤務から外し ([`split_shift`])、
-///   それ未満は休息期間に届かないので勤務に残して休憩に数える ([`summarize`])。
-///   theearth の拘束時間管理表は昼に帰庫して出直す間を拘束・休憩に入れている
-///   (2026-07 の実測: 全部外すと実働は theearth と一致したまま拘束だけ 7〜800 分短かった)
+/// - **長さで扱いが分かれる** (ユーザー決定 2026-10-16「運行間が 8 時間超える場合、運行終了＝終業
+///   そのほかは拘束」)。[`RUN_GAP_REST_MINUTES`] を超える空き (と帰庫したままの尻尾) は勤務から
+///   外し ([`split_shift`])、それ以下は勤務に残して休憩に数える ([`summarize`])。theearth の
+///   拘束時間管理表も昼に帰庫して出直す間を拘束に入れ、実働には入れていない (2026-07 の実測:
+///   全部外すと実働は theearth と一致したまま、拘束だけ 7〜800 分短かった)
 fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     let mut bounds: Vec<(NaiveDateTime, bool)> = events
         .iter()
@@ -1818,7 +1819,7 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
             breaks.extend(
                 outside_runs(events)
                     .into_iter()
-                    .filter(|(s, e)| (*e - *s).num_minutes() < RUN_GAP_REST_MINUTES)
+                    .filter(|(s, e)| (*e - *s).num_minutes() <= RUN_GAP_REST_MINUTES)
                     .map(|(s, e)| (floor_min(s).max(walk.start), floor_min(e).min(walk.end)))
                     .filter(|(s, e)| e > s),
             );
@@ -4510,6 +4511,36 @@ mod tests {
         assert_eq!(days[0].start, "2026-07-02 13:55:00");
         assert_eq!(days[0].end, "2026-07-03 10:23:00");
         assert_eq!(days[0].break_minutes, 120 + 30);
+    }
+
+    #[test]
+    fn alc_only_gap_of_exactly_8h_stays_in_the_shift() {
+        // 8 時間ちょうどは「超える」に当たらないので終業にしない (拘束に残し休憩に数える)
+        let rows = vec![
+            ev("2026-07-01 20:00:00", "2026-07-02 05:00:00", "休息"),
+            alc("2026-07-02 05:00:00", "運行開始"),
+            alc("2026-07-02 08:00:00", "運行終了"),
+            alc("2026-07-02 16:00:00", "運行開始"),
+            alc("2026-07-02 18:00:00", "運行終了"),
+            ev("2026-07-02 18:00:00", "2026-07-03 06:00:00", "休息"),
+        ];
+        let days = daily_summary(&rows, "2026-07", &KosokuParams::default());
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].restraint_minutes, 13 * 60);
+        assert_eq!(days[0].break_minutes, 8 * 60);
+        // 1 分でも超えれば運行終了で終業
+        let mut longer = rows.clone();
+        longer[3] = alc("2026-07-02 16:01:00", "運行開始");
+        let days = daily_summary(&longer, "2026-07", &KosokuParams::default());
+        assert_eq!(
+            days.iter()
+                .map(|d| (d.start.as_str(), d.end.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-07-02 05:00:00", "2026-07-02 08:00:00"),
+                ("2026-07-02 16:01:00", "2026-07-02 18:00:00"),
+            ],
+        );
     }
 
     #[test]
