@@ -113,8 +113,8 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
     /// ([`alc_open_shift_starts`]、ユーザー決定 2026-10-16)。写しの起点 (#317) は運行・打刻の写しからしか作らない
     /// ので、写しの無い会社はここで作る。
     ///
-    /// 月初の前 1 日から月初の後 1 日までを読んで勤務を組み、月初をまたぐ勤務の始まりを起点にする。その始まりが読んだ
-    /// 範囲の端なら、勤務はもっと前から続いているかもしれないので 1 日ずつ遡って読み直す
+    /// 月初の前 1 日から月初の後 1 日までを読んで勤務を組み、月初をまたぐ勤務の始まりを起点にする。最初の勤務が読んだ
+    /// 範囲の端から始まる乗務員がいれば、勤務 (日締めの起点) はもっと前から続いているかもしれないので 1 日ずつ遡って読み直す
     /// ([`ALC_HEAD_LOOKBACK_MAX_DAYS`] まで)。読みは写しの行も合わせるので、打刻のある乗務員 (大石) は対象にならない。
     async fn alc_head_anchors(
         &self,
@@ -126,8 +126,8 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
         loop {
             let from = month_start - Duration::days(days);
             let (rows, _) = FoldEventsIo::all_events_between(self, &fmt(from), &to).await?;
-            let open = alc_open_shift_starts(rows, month_start);
-            if days >= ALC_HEAD_LOOKBACK_MAX_DAYS || !open.values().any(|s| *s <= from) {
+            let (open, at_edge) = alc_open_shift_starts(rows, month_start, from);
+            if days >= ALC_HEAD_LOOKBACK_MAX_DAYS || !at_edge {
                 return Ok(open);
             }
             days += 1;
