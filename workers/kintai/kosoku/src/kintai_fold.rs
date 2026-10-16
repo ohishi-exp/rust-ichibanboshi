@@ -221,7 +221,7 @@ pub const LOGIC_VERSION_LEN: usize = 16;
 ///
 /// 初期値は 560d21d まで版の材料だったソースのハッシュ (`KINTAI_OUTPUT_SHA`) の値 — 手で上げる定数に替えた
 /// 時点で保存済みの版が stale にならないよう、同じ値から始めた (Refs #322)。
-pub const LOGIC_BASE: &str = "e84b3628a33af733";
+pub const LOGIC_BASE: &str = "e66deae439816868";
 
 /// 保存行に焼く「ロジック + 設定」の印 (16 桁 hex) = `sha256(LOGIC_BASE | KosokuParams の Debug)` の先頭 16 桁。
 ///
@@ -1187,10 +1187,11 @@ mod tests {
     /// - `8c8ccb14dcf1838f` → `8afe30c2223c40aa`: そのうち 8 時間以下の運行の外は勤務に残し休憩に数えた (2026-10-16)
     /// - `8f3f81002a00b287` → `4b3752a95e519674`: alc だけの会社は運行のデータで勤務を組む (休息の無い日帰り) (2026-10-16)
     /// - `e84b3628a33af733` → `6a1a77dbb45d2a60`: alc だけの会社の勤務に計上日 (運行開始の日) を持たせた (2026-10-16)
+    /// - `e66deae439816868` → `206465aa6bcc64eb`: 計上日の付け方を外した (常に NULL、値は 4b3752a95e519674 と同じ) (2026-10-16)
     #[test]
     fn the_logic_version_is_the_one_in_production() {
-        assert_eq!(LOGIC_BASE, "e84b3628a33af733");
-        assert_eq!(logic_version(&KosokuParams::default()), "6a1a77dbb45d2a60");
+        assert_eq!(LOGIC_BASE, "e66deae439816868");
+        assert_eq!(logic_version(&KosokuParams::default()), "206465aa6bcc64eb");
     }
 
     /// 版の材料は [`LOGIC_BASE`] と設定だけ。ソースのハッシュは引数にも無い (コメント 1 文字では動かない)。
