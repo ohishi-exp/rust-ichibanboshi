@@ -541,6 +541,7 @@ mod tests {
             run_head_minutes: n,
             lunch_overlap_minutes: n,
             non_working: vec![],
+            count_date: None,
         }
     }
 

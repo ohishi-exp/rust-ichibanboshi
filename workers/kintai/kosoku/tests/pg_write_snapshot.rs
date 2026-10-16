@@ -74,7 +74,7 @@ const SQLS: [(&str, &str, &str); 14] = [
     (
         "INSERT_DAY_SUMMARIES_SQL",
         INSERT_DAY_SUMMARIES_SQL,
-        "948b0cc719d44dedc231df9f36d6de11916e47097002481d3c17b55cfb9de79c",
+        "94684943683646d94919f0b4cce192a75bc1856b0220feacb34f28a6201aabf1",
     ),
     (
         "INSERT_DAY_PARTS_SQL",
@@ -205,6 +205,12 @@ fn the_bind_columns_are_identical_to_the_base() {
         fx_sha(&s),
         "3d3f4715fb8c60566b4f38d442c63d917ffed419ac5ea669df03285561e2ee50"
     );
+    // 計上日 (migration 010) は上の基点に無い列なので別に縛る: NULL = 始業の日、値 = 運行開始の日
+    let counts: Vec<_> = day_summary_columns(&unit)
+        .iter()
+        .flat_map(|c| c.count_date.clone())
+        .collect();
+    assert_eq!(counts, vec![None, Some(fx_d("2026-06-01"))]);
     let s: String = day_part_columns(&unit)
         .iter()
         .map(|c| {
@@ -334,6 +340,7 @@ fn fx_unit() -> FoldUnit {
                     end: "2026-06-01 13:00:00".to_string(),
                     kind: NonWorkingKind::LunchWindow,
                 }],
+                count_date: None,
             },
             DaySummaryRow {
                 driver_cd: 1130,
@@ -352,6 +359,8 @@ fn fx_unit() -> FoldUnit {
                 overtime_night_minutes: 0,
                 legal_holiday_night_minutes: 0,
                 non_working: vec![],
+                // 前日に始まった運行の続き (打刻の無い会社) — 計上日は運行開始の日
+                count_date: Some(fx_d("2026-06-01")),
             },
         ],
         day_parts: vec![

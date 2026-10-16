@@ -17,9 +17,14 @@ use crate::common::{
 pub const DB_WHAT: &str = "kintai.day_summaries read";
 
 /// 突合スクリプトがそのまま使えるよう、オンプレ基準ファイルと同じ 12 列を書く。
+///
+/// **`date` は計上日** (`COALESCE(count_date, date)`、migration 010)。月の絞りと応答の暦日の両方で使う —
+/// 打刻の無い会社では、前月に始まった運行の続き (翌月の暦日に始まる勤務) を運行開始の日に数える
+/// (theearth の拘束時間管理表の「運行単位で、集計開始月に計上」)。打刻のある会社は `count_date` が
+/// NULL なので従来どおり始業の日。行を持つ fold (月の書き換え範囲) は始業の日のまま変えない。
 pub const SELECT_SQL: &str = r#"
 SELECT driver_cd,
-       to_char(date, 'YYYY-MM-DD') AS date,
+       to_char(COALESCE(count_date, date), 'YYYY-MM-DD') AS date,
        to_char(shift_start_at AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') AS shift_start_at,
        shift_source,
        restraint_minutes,
@@ -35,9 +40,9 @@ SELECT driver_cd,
        legal_holiday_night_minutes
   FROM kintai.day_summaries
  WHERE tenant_id = $1
-   AND date >= $2 AND date < $3
+   AND COALESCE(count_date, date) >= $2 AND COALESCE(count_date, date) < $3
    AND ($4::bigint IS NULL OR driver_cd = $4)
- ORDER BY driver_cd, date, shift_start_at
+ ORDER BY driver_cd, COALESCE(count_date, date), shift_start_at
 "#;
 
 /// 11 個の分数の列 (応答のキーと同じ名前・同じ並び)。

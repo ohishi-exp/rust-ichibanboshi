@@ -75,7 +75,12 @@ fn canonical(units: &[FoldUnit]) -> String {
                 d.legal_holiday_night_minutes,
             ];
             let (cd, date, at, src) = (d.driver_cd, d.date, d.shift_start_at, d.shift_source);
-            writeln!(out, "day|{cd}|{date}|{at}|{src}|{m:?}|{nw}").unwrap();
+            // 計上日は値があるときだけ足す — 打刻のある会社 (固定入力) の出力を変えない
+            let count = d
+                .count_date
+                .map(|c| format!("|count={c}"))
+                .unwrap_or_default();
+            writeln!(out, "day|{cd}|{date}|{at}|{src}|{m:?}|{nw}{count}").unwrap();
         }
         for p in &u.day_parts {
             let m = [p.restraint_minutes, p.working_minutes, p.night_minutes];

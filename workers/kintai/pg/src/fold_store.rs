@@ -253,6 +253,7 @@ impl FoldStoreIo for FoldStore {
                         params.push((m, Type::INT4_ARRAY));
                     }
                     params.push((&c.non_working, Type::JSONB_ARRAY));
+                    params.push((&c.count_date, Type::DATE_ARRAY));
                     params.push((&fp, Type::TEXT));
                     params.push((&ver, Type::TEXT));
                     tx.execute_typed(INSERT_DAY_SUMMARIES_SQL, &params).await?;
