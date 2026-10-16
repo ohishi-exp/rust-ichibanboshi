@@ -221,7 +221,7 @@ pub const LOGIC_VERSION_LEN: usize = 16;
 ///
 /// 初期値は 560d21d まで版の材料だったソースのハッシュ (`KINTAI_OUTPUT_SHA`) の値 — 手で上げる定数に替えた
 /// 時点で保存済みの版が stale にならないよう、同じ値から始めた (Refs #322)。
-pub const LOGIC_BASE: &str = "91930891464ff454";
+pub const LOGIC_BASE: &str = "5d99611057d86289";
 
 /// 保存行に焼く「ロジック + 設定」の印 (16 桁 hex) = `sha256(LOGIC_BASE | KosokuParams の Debug)` の先頭 16 桁。
 ///
@@ -1192,10 +1192,11 @@ mod tests {
     /// - `9c14650d0ebe16be` → `b74441d08d35b906`: alc だけの会社の勤務の区切りを theearth の休息期間の定義 (連続 540 分・分割 180 分以上で累計 600 / 720 分・無ければ始業の 24 時間後) に合わせる (2026-10-17)
     /// - `d1c5f026c4ffa346` → `178efec3ceacfe54`: alc だけの会社の勤務の範囲を作業・運行の境界・休息の行だけで決める (重ねの行で始業をずらさない、2026-10-17)
     /// - `91930891464ff454` → `bdf1cdc9876aa40a`: alc の行に運行の境界が無い乗務員 (何日も続く運行の途中) も月初の遡りを続ける (2026-10-17)
+    /// - `5d99611057d86289` → `15cd24a0775385e7`: alc だけの会社の 180 分未満の運行の外を休息とつなげない (運行間待機は拘束、2026-10-17)
     #[test]
     fn the_logic_version_is_the_one_in_production() {
-        assert_eq!(LOGIC_BASE, "91930891464ff454");
-        assert_eq!(logic_version(&KosokuParams::default()), "bdf1cdc9876aa40a");
+        assert_eq!(LOGIC_BASE, "5d99611057d86289");
+        assert_eq!(logic_version(&KosokuParams::default()), "15cd24a0775385e7");
     }
 
     /// 版の材料は [`LOGIC_BASE`] と設定だけ。ソースのハッシュは引数にも無い (コメント 1 文字では動かない)。
