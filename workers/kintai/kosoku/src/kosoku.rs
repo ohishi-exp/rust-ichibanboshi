@@ -200,6 +200,8 @@ pub struct Event {
     pub end: Option<NaiveDateTime>,
     pub source: String,
     pub state: String,
+    /// 運行NO (alc の行だけ持つ)。[`alc_only`] の乗務員の運行の区切り ([`run_bounds`]) に使う。
+    pub unko_no: Option<String>,
 }
 
 /// 勤務 1 回。
@@ -484,6 +486,10 @@ pub fn parse_events(rows: &[serde_json::Value]) -> Vec<Event> {
             end,
             source: source.to_string(),
             state: state.to_string(),
+            unko_no: row
+                .get("unko_no")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         });
     }
     out.sort_by(|a, b| event_order(a).cmp(&event_order(b)));
@@ -497,14 +503,30 @@ pub fn parse_events(rows: &[serde_json::Value]) -> Vec<Event> {
 /// 同時刻では**閉じる状態 (`終業` / `運行終了`) を開く状態 (`始業` / `運行開始`) より前**に置く。
 /// [`shifts_from_timecard`] は前の始業を閉じる終業が先に来ないと勤務を落とし、
 /// [`in_run_at`] は同時刻の境界の後ろ側を「直前」と読む (運行終了 → 次の運行開始の順)。
-/// 残りは状態名・source の文字列順、`end` は `None` が先。
-fn event_order(e: &Event) -> (NaiveDateTime, u8, &str, &str, Option<NaiveDateTime>) {
+/// 残りは状態名・source の文字列順、`end` は `None` が先、最後に運行NO (`None` が先)。
+fn event_order(
+    e: &Event,
+) -> (
+    NaiveDateTime,
+    u8,
+    &str,
+    &str,
+    Option<NaiveDateTime>,
+    Option<&str>,
+) {
     let rank = match e.state.as_str() {
         "終業" | "運行終了" => 0,
         "始業" | "運行開始" => 2,
         _ => 1,
     };
-    (e.start, rank, &e.state, &e.source, e.end)
+    (
+        e.start,
+        rank,
+        &e.state,
+        &e.source,
+        e.end,
+        e.unko_no.as_deref(),
+    )
 }
 
 /// 秒を切り捨てて分に丸める。拘束・実働は分単位で出すので、境界も分に揃える。
@@ -1246,16 +1268,13 @@ fn shifts_from_alc(events: &[Event]) -> Vec<Shift> {
 ///   には使わない ([`alc_only`]) — 勤務は打刻が閉じ、継ぎ目は紙も数える (#123)
 /// - 空白の中にイベントが 1 件でも始まっていれば外さない (データがある)
 /// - 最後の運行終了の後に運行開始が無ければ、その後ろ (イベントが無い間) は外
+/// - 運行開始・運行終了の行が無い運行は、その運行の最初・最後の行を区切りにする ([`run_bounds`])
 /// - **長さで扱いが分かれる** (ユーザー決定 2026-10-17、theearth のカード未挿入時間の定義)。180 分以上は休息
 ///   (休息期間の判定 [`alc_day_close`] に入り、勤務に残っても拘束から外す)、それ未満は運行間待機として勤務に
 ///   残して休憩に数える ([`alc_gaps`]・[`summarize`])。theearth の拘束時間管理表も昼に帰庫して出直す間を
 ///   拘束に入れ、実働には入れていない
 fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
-    let mut bounds: Vec<(NaiveDateTime, bool)> = events
-        .iter()
-        .filter(|e| e.state == "運行開始" || e.state == "運行終了")
-        .map(|e| (e.start, e.state == "運行終了"))
-        .collect();
+    let mut bounds = run_bounds(events);
     // 同じ時刻なら運行開始を先に並べる — 継ぎ目 0 分で勤務を割らない
     bounds.sort_by_key(|(t, is_end)| (*t, *is_end));
     let far = NaiveDateTime::MAX;
@@ -1281,6 +1300,45 @@ fn outside_runs(events: &[Event]) -> Vec<(NaiveDateTime, NaiveDateTime)> {
         }
     }
     merge_intervals(out)
+}
+
+/// [`outside_runs`] が見る運行の区切り — `(時刻, 運行の終わりか)`。運行開始・運行終了の行に加えて、
+/// **運行開始 (運行終了) の行が無い運行は、その運行の最初 (最後) の行を区切りにする**。行は勤務の範囲に入れる行
+/// ([`is_alc_span_event`]) だけを見る (何日も続く重ねの行で区切りをずらさない)。
+///
+/// 運行開始・運行終了・運転の無い運行 (休憩・積み・降し・休息だけ) や、運行終了の無い運行がある。実測 (乗務員 12 /
+/// 2026-09): 運行 …0200 は運行終了が無く 9/17 05:06 → 9/23 03:38 の休息 (= 運行のデータの終わり) で終わり、
+/// 次の運行 …0226 は運行開始も運行終了も無く 9/23 11:54 の休憩で始まり 9/25 14:30 の休憩で終わる。theearth は
+/// 9/17 05:06 に終業して 9/23 11:54 を始業にし、9/25 は 14:30 で終業する。運行開始・運行終了の行だけを区切りに
+/// すると運行と運行の間が運行の外にならず、9/23 03:38 を始業にし、9/25 06:29 からは 24 時間で日締めしていた。
+fn run_bounds(events: &[Event]) -> Vec<(NaiveDateTime, bool)> {
+    let mut bounds: Vec<(NaiveDateTime, bool)> = events
+        .iter()
+        .filter(|e| e.state == "運行開始" || e.state == "運行終了")
+        .map(|e| (e.start, e.state == "運行終了"))
+        .collect();
+    // 運行NO → (運行開始がある, 運行終了がある, 最初の行の始まり, 最後の行の終わり)
+    let mut runs: BTreeMap<&str, (bool, bool, NaiveDateTime, NaiveDateTime)> = BTreeMap::new();
+    for e in events.iter().filter(|e| is_alc_span_event(e)) {
+        let Some(no) = e.unko_no.as_deref() else {
+            continue;
+        };
+        let end = e.end.unwrap_or(e.start);
+        let run = runs.entry(no).or_insert((false, false, e.start, end));
+        run.0 |= e.state == "運行開始";
+        run.1 |= e.state == "運行終了";
+        run.2 = run.2.min(e.start);
+        run.3 = run.3.max(end);
+    }
+    for (has_start, has_end, first, last) in runs.into_values() {
+        if !has_start {
+            bounds.push((first, false));
+        }
+        if !has_end {
+            bounds.push((last, true));
+        }
+    }
+    bounds
 }
 
 /// 休息と見なす「運行終了 → 次の運行開始」の空き (分)。
@@ -4697,6 +4755,91 @@ mod tests {
             .collect()
     }
 
+    /// alc の区間の行 (運行NO つき)。
+    fn run(start: &str, end: &str, state: &str, unko_no: &str) -> serde_json::Value {
+        json!({"datetime": start, "end_datetime": end, "source": "dtako_events", "state": state, "unko_no": unko_no})
+    }
+
+    /// 乗務員 12 / 2026-09 の形: 運行終了の無い運行 A、運行開始も運行終了も無い運行 B・C、両方ある運行 D。
+    fn runs_without_bounds() -> Vec<serde_json::Value> {
+        vec![
+            run(
+                "2026-09-16 03:38:14",
+                "2026-09-16 03:38:14",
+                "運行開始",
+                "A",
+            ),
+            run("2026-09-16 03:38:14", "2026-09-16 17:24:21", "運転", "A"),
+            run("2026-09-16 17:24:21", "2026-09-17 04:09:29", "休息", "A"),
+            run("2026-09-17 04:09:29", "2026-09-17 05:06:28", "運転", "A"),
+            // 運行のデータの終わりまで続く休息 (運行終了の行は無い)
+            run("2026-09-17 05:06:28", "2026-09-23 03:38:13", "休息", "A"),
+            run("2026-09-23 11:54:07", "2026-09-23 12:48:58", "休憩", "B"),
+            run("2026-09-23 12:48:58", "2026-09-23 13:44:22", "積み", "B"),
+            run("2026-09-23 13:44:22", "2026-09-23 18:48:40", "休憩", "B"),
+            run("2026-09-23 18:48:40", "2026-09-24 05:16:49", "休息", "B"),
+            run("2026-09-24 05:16:49", "2026-09-24 17:56:09", "降し", "B"),
+            run("2026-09-24 17:56:09", "2026-09-25 06:29:07", "休息", "B"),
+            run("2026-09-25 06:29:07", "2026-09-25 11:29:59", "降し", "B"),
+            run("2026-09-25 11:29:59", "2026-09-25 14:30:10", "休憩", "B"),
+            run("2026-09-26 02:35:43", "2026-09-26 05:44:42", "休憩", "C"),
+            run("2026-09-26 05:44:42", "2026-09-26 19:18:54", "積み", "C"),
+            run(
+                "2026-09-28 12:50:10",
+                "2026-09-28 12:50:10",
+                "運行開始",
+                "D",
+            ),
+            run("2026-09-28 12:50:10", "2026-09-28 18:56:52", "運転", "D"),
+            run("2026-09-28 18:56:52", "2026-09-29 04:16:11", "休息", "D"),
+            run("2026-09-29 04:16:11", "2026-09-29 15:57:13", "運転", "D"),
+            run(
+                "2026-09-29 15:57:13",
+                "2026-09-29 15:57:13",
+                "運行終了",
+                "D",
+            ),
+        ]
+    }
+
+    fn spans_in(rows: &[serde_json::Value], month: &str) -> Vec<(String, String)> {
+        daily_summary(rows, month, &KosokuParams::default())
+            .iter()
+            .map(|d| (d.start[5..16].to_string(), d.end[5..16].to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn alc_only_run_without_bounds_uses_its_first_and_last_rows() {
+        // 運行開始 (運行終了) の行が無い運行は最初 (最後) の行が区切り。運行と運行の間は運行の外 (theearth と同じ)
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            spans_in(&runs_without_bounds(), "2026-09"),
+            vec![
+                s("09-16 03:38", "09-16 17:24"),
+                s("09-17 04:09", "09-17 05:06"),
+                s("09-23 11:54", "09-23 18:48"),
+                s("09-24 05:16", "09-24 17:56"),
+                s("09-25 06:29", "09-25 14:30"),
+                s("09-26 02:35", "09-26 19:18"),
+                s("09-28 12:50", "09-28 18:56"),
+                s("09-29 04:16", "09-29 15:57"),
+            ],
+        );
+        // 陰性対照: 運行NO が無いと区切りは運行開始・運行終了の行だけ — 休息の終わり (データの終わり) が始業になり、
+        // 休息期間の無い 09-25 からは 24 時間で日締めする (修正前の値)
+        let bare: Vec<serde_json::Value> = runs_without_bounds()
+            .into_iter()
+            .map(|mut r| {
+                r.as_object_mut().unwrap().remove("unko_no");
+                r
+            })
+            .collect();
+        let old = spans_in(&bare, "2026-09");
+        assert_eq!(old[2], s("09-23 03:38", "09-23 18:48"));
+        assert_eq!(old[4], s("09-25 06:29", "09-26 06:29"));
+    }
+
     #[test]
     fn alc_only_shift_is_cut_between_run_end_and_next_run_start() {
         // 乗務員 4 / 2026-07-02 の形: 休息明けに走って帰庫し、休息の無いまま翌朝出庫。
@@ -5737,6 +5880,7 @@ mod tests {
             end: None,
             source: "timecard".into(),
             state: "始業".into(),
+            unko_no: None,
         };
         assert_eq!(e.clone(), e);
         assert!(format!("{e:?}").contains("始業"));

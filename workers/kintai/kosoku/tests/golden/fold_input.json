@@ -1,5 +1,5 @@
 {
-  "_comment": "logic_golden.rs の固定入力 (手で作った架空の 3 名・2026-06)。打刻と休憩・休息で割る長距離・深夜・日曜・残業・日跨ぎ・月末跨ぎ・打刻無し (休息で決める勤務)・重複行・終業だけの打刻を通す。足すのはよいが、足したら出力が変わるので LOGIC_BASE の行を追記し直すことになる (既存行は書き換えない)",
+  "_comment": "logic_golden.rs の固定入力 (手で作った架空の 3 名・2026-06)。打刻と休憩・休息で割る長距離・深夜・日曜・残業・日跨ぎ・月末跨ぎ・打刻無し (休息で決める勤務)・重複行・終業だけの打刻・alc だけの会社 (1004、運行開始・運行終了の行が無い運行) を通す。足すのはよいが、足したら出力が変わるので LOGIC_BASE の行を追記し直すことになる (既存行は書き換えない)",
   "month": "2026-06",
   "drivers": {
     "1001": [
@@ -55,6 +55,20 @@
       {"datetime": "2026-06-21 06:00:00", "end_datetime": null, "source": "dtako", "state": "運行開始"},
       {"datetime": "2026-06-21 12:00:00", "end_datetime": "2026-06-21 12:50:00", "source": "dtako_events", "state": "休憩"},
       {"datetime": "2026-06-21 22:30:00", "end_datetime": null, "source": "dtako", "state": "運行終了"}
+    ],
+    "1004": [
+      {"datetime": "2026-06-16 03:38:14", "end_datetime": "2026-06-16 03:38:14", "source": "dtako_events", "state": "運行開始", "unko_no": "A"},
+      {"datetime": "2026-06-16 03:38:14", "end_datetime": "2026-06-16 17:24:21", "source": "dtako_events", "state": "運転", "unko_no": "A"},
+      {"datetime": "2026-06-16 17:24:21", "end_datetime": "2026-06-17 04:09:29", "source": "dtako_events", "state": "休息", "unko_no": "A"},
+      {"datetime": "2026-06-17 04:09:29", "end_datetime": "2026-06-17 05:06:28", "source": "dtako_events", "state": "運転", "unko_no": "A"},
+      {"datetime": "2026-06-17 05:06:28", "end_datetime": "2026-06-23 03:38:13", "source": "dtako_events", "state": "休息", "unko_no": "A"},
+      {"datetime": "2026-06-23 11:54:07", "end_datetime": "2026-06-23 13:44:22", "source": "dtako_events", "state": "積み", "unko_no": "B"},
+      {"datetime": "2026-06-23 13:44:22", "end_datetime": "2026-06-23 18:48:40", "source": "dtako_events", "state": "休憩", "unko_no": "B"},
+      {"datetime": "2026-06-23 18:48:40", "end_datetime": "2026-06-24 05:16:49", "source": "dtako_events", "state": "休息", "unko_no": "B"},
+      {"datetime": "2026-06-24 05:16:49", "end_datetime": "2026-06-24 14:30:10", "source": "dtako_events", "state": "降し", "unko_no": "B"},
+      {"datetime": "2026-06-26 02:35:43", "end_datetime": "2026-06-26 02:35:43", "source": "dtako_events", "state": "運行開始", "unko_no": "C"},
+      {"datetime": "2026-06-26 02:35:43", "end_datetime": "2026-06-26 12:00:00", "source": "dtako_events", "state": "運転", "unko_no": "C"},
+      {"datetime": "2026-06-26 12:00:00", "end_datetime": "2026-06-26 12:00:00", "source": "dtako_events", "state": "運行終了", "unko_no": "C"}
     ]
   }
 }
