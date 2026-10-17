@@ -1,5 +1,6 @@
 //! 勤怠 Worker の fold の口 (`GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・
-//! `GET /api/kintai/stale-months`・診断の `GET /api/kintai/alc-events`) の HTTP の殻の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
+//! `GET /api/kintai/stale-months`・診断の `GET /api/kintai/alc-events`・休息の開始の補正の
+//! `GET`/`PUT /api/kintai/rest-start-overrides`) の HTTP の殻の純粋部分 (Refs ohishi-exp/rust-ichibanboshi#322)。
 //!
 //! 段取り (月ゲート → 畳み → 封 → 応答、打刻の置き換え、窓の畳み直し) は共有 crate の `kintai_kosoku::route_flow`
 //! (root と同じもの)。ここに在るのは root の殻 (`src/routes/kintai_recalc.rs`・`kintai_timecard.rs` の `receive_window`・
@@ -22,8 +23,9 @@ const RECALC: &str = "/api/kintai/recalc";
 const WINDOW: &str = "/api/kintai/timecard/window";
 const STALE_MONTHS: &str = "/api/kintai/stale-months";
 const ALC_EVENTS: &str = "/api/kintai/alc-events";
+const REST_START_OVERRIDES: &str = "/api/kintai/rest-start-overrides";
 
-/// 4 口。`Recalc` と `TimecardWindow` が書き込みの口 (`X-Kintai-Write-Token` を照合する)。
+/// fold の口。`Recalc`・`TimecardWindow`・`RestStartOverridesPut` が書き込みの口 (`X-Kintai-Write-Token` を照合する)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldRoute {
     /// `GET /api/kintai/recalc` — 1 行も書かずに畳み直しの結果を返す (認可なし)
@@ -36,6 +38,10 @@ pub enum FoldRoute {
     StaleMonths,
     /// `GET /api/kintai/alc-events` — fold が読む 1 人ぶんの alc の行と、そこから組んだ勤務 (診断。認可なし・書かない)
     AlcEvents,
+    /// `GET /api/kintai/rest-start-overrides` — 休息の開始の補正の一覧 (認可なし・書かない)
+    RestStartOverridesList,
+    /// `PUT /api/kintai/rest-start-overrides` — 休息の開始の補正を書く (同じ鍵は置き換え。畳み直しは別に recalc を叩く)
+    RestStartOverridesPut,
 }
 
 impl FoldRoute {
@@ -48,7 +54,11 @@ impl FoldRoute {
             (WINDOW, "POST") => Self::TimecardWindow,
             (STALE_MONTHS, "GET") => Self::StaleMonths,
             (ALC_EVENTS, "GET") => Self::AlcEvents,
-            (RECALC | WINDOW | STALE_MONTHS | ALC_EVENTS, _) => return Some(None),
+            (REST_START_OVERRIDES, "GET") => Self::RestStartOverridesList,
+            (REST_START_OVERRIDES, "PUT") => Self::RestStartOverridesPut,
+            (RECALC | WINDOW | STALE_MONTHS | ALC_EVENTS | REST_START_OVERRIDES, _) => {
+                return Some(None)
+            }
             _ => return None,
         };
         Some(Some(route))
@@ -56,7 +66,10 @@ impl FoldRoute {
 
     /// 書き込みの口か (認可の照合が要る)。
     pub fn is_write(self) -> bool {
-        matches!(self, Self::Recalc | Self::TimecardWindow)
+        matches!(
+            self,
+            Self::Recalc | Self::TimecardWindow | Self::RestStartOverridesPut
+        )
     }
 
     /// ログに出す名前。
@@ -67,6 +80,8 @@ impl FoldRoute {
             Self::TimecardWindow => "timecard/window",
             Self::StaleMonths => "stale-months",
             Self::AlcEvents => "alc-events",
+            Self::RestStartOverridesList => "rest-start-overrides (list)",
+            Self::RestStartOverridesPut => "rest-start-overrides (put)",
         }
     }
 }

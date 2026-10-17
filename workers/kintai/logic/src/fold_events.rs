@@ -32,6 +32,7 @@ use kintai_kosoku::window::{month_head_anchors, HeadPunch};
 
 use crate::common::Fail;
 use crate::fold_routes::AlcEventsRequest;
+use crate::rest_overrides::{apply_rest_start_overrides, override_json, RestStartOverride};
 use crate::unko_gaps::{etags_search_between, read_etags_body, RpcResult};
 
 /// auth-worker の `KintaiAlcEntrypoint` の 2 メソッド。どちらも失敗を throw せず `{status, body}` で返す
@@ -57,6 +58,8 @@ pub trait PushedEventsRead {
     async fn pushed_head_run_ends(&self, span: Span) -> Result<Vec<(u64, String)>, Fail>;
     /// `HEAD_PUNCHES_SQL` の月初時点の打刻の姿。
     async fn pushed_head_punches(&self, span: Span) -> Result<Vec<HeadPunch>, Fail>;
+    /// 休息の開始の補正 (`kintai.rest_start_overrides`、`rest_overrides::LIST_SQL`)。休息の開始が `span` の中の行。
+    async fn rest_start_overrides(&self, span: Span) -> Result<Vec<RestStartOverride>, Fail>;
 }
 
 /// 勤怠 Worker の fold の読み。`today` は月ゲートの末尾検知の切り下げに使う (JST の日付。呼び手が時計から作る)。
@@ -166,7 +169,8 @@ fn operation_summary(unko_no: &str, events: &[&RawEvent]) -> serde_json::Value {
 ///
 /// 応答: `driver`・`from`・`to` (`[from, to)`)・`alc_only`・`shifts[]` (`start`・`end`・`minutes`)・
 /// `operations[]` (運行NO ごとの最初と最後の時刻・行数・`イベント名` ごとの行数)・`events[]` (alc の行。運行NO・車輌つき)・
-/// `borrowed[]` (写しから借りた打刻・運行の確定イベント)・`warnings[]` (上流の警告)。
+/// `borrowed[]` (写しから借りた打刻・運行の確定イベント)・`rest_start_overrides[]` (当てた休息の開始の補正)・
+/// `warnings[]` (上流の警告)。
 pub async fn driver_alc_events<A: AlcRpc, P: PushedEventsRead>(
     io: &WorkerFoldEvents<'_, A, P>,
     req: &AlcEventsRequest,
@@ -187,7 +191,15 @@ pub async fn driver_alc_events<A: AlcRpc, P: PushedEventsRead>(
         .into_iter()
         .filter(|r| r["driver_id"].as_i64() == Some(driver))
         .collect();
-    let rows = merge_all_rows(mine.clone(), Some(borrowed.clone()));
+    let overrides: Vec<RestStartOverride> = io
+        .pushed
+        .rest_start_overrides(pushed_window(&req.from, &req.to)?)
+        .await?
+        .into_iter()
+        .filter(|o| o.driver_cd == driver)
+        .collect();
+    let mut rows = merge_all_rows(mine.clone(), Some(borrowed.clone()));
+    apply_rest_start_overrides(&mut rows, &overrides);
     let (alc_only, shifts) = driver_shifts(&rows);
     let mut by_op: std::collections::BTreeMap<String, Vec<&RawEvent>> = Default::default();
     for e in &mine {
@@ -213,6 +225,7 @@ pub async fn driver_alc_events<A: AlcRpc, P: PushedEventsRead>(
         "operations": operations,
         "events": mine.into_iter().map(event_to_json).collect::<Vec<_>>(),
         "borrowed": borrowed,
+        "rest_start_overrides": overrides.iter().map(override_json).collect::<Vec<_>>(),
         "warnings": warnings.into_iter().map(|w| w.text).collect::<Vec<_>>(),
     }))
 }
@@ -263,11 +276,12 @@ impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P>
         let (events, mut warnings) = fetch_all_events(self, from, to).await?;
         // 2 台の運行が同じ時間に重なっていたらエラーとして出す (勤務と実働が正しく出ない)
         warnings.extend(overlapping_operations(&events));
-        let borrowed = self
-            .pushed
-            .pushed_all_events(pushed_window(from, to)?)
-            .await?;
-        Ok((merge_all_rows(events, Some(borrowed)), warnings))
+        let span = pushed_window(from, to)?;
+        let borrowed = self.pushed.pushed_all_events(span).await?;
+        let mut rows = merge_all_rows(events, Some(borrowed));
+        // 休息の直前の運転を、速度データで最後に車が動いた時刻で終える (theearth の管理表と同じ、rest_overrides)
+        apply_rest_start_overrides(&mut rows, &self.pushed.rest_start_overrides(span).await?);
+        Ok((rows, warnings))
     }
 
     async fn dtako_month_read_since(

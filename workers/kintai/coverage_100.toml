@@ -135,6 +135,10 @@ path = "workers/kintai/logic/src/unko_gaps.rs"
 [[files]]
 path = "workers/kintai/logic/src/fold_events.rs"
 
+# 休息の開始の補正 (migration 011) の検査・SQL・当て方。テストは workers/kintai/logic/tests/rest_overrides.rs
+[[files]]
+path = "workers/kintai/logic/src/rest_overrides.rs"
+
 # ── kintai-kosoku (拘束・休息の純粋ロジックと MariaDB の SQL。repo ルートの package と共有) ──
 # root の coverage_100.toml から移した (Refs #322)。テストは各ファイルの単体テスト。
 # lib.rs は mod 宣言だけ・sql.rs は SQL 定数だけ (実行行 0) なので登録しない。

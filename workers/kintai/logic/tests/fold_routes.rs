@@ -384,3 +384,24 @@ fn the_clock_is_jst_from_epoch_millis() {
     assert_eq!(t.offset().local_minus_utc(), 9 * 3600);
     assert_eq!(Fixed.now_jst().to_rfc3339(), "1970-01-01T09:00:00+09:00");
 }
+
+/// 休息の開始の補正: GET は読みの口 (認可なし)、PUT は書き込みの口、それ以外は 405。
+#[test]
+fn rest_start_overrides_is_a_get_read_and_a_put_write() {
+    const P: &str = "/api/kintai/rest-start-overrides";
+    let list = FoldRoute::from_request("GET", P);
+    assert_eq!(list, Some(Some(FoldRoute::RestStartOverridesList)));
+    assert!(!FoldRoute::RestStartOverridesList.is_write());
+    let put = FoldRoute::from_request("PUT", P);
+    assert_eq!(put, Some(Some(FoldRoute::RestStartOverridesPut)));
+    assert!(FoldRoute::RestStartOverridesPut.is_write());
+    assert_eq!(FoldRoute::from_request("POST", P), Some(None));
+    assert_eq!(
+        FoldRoute::RestStartOverridesList.as_str(),
+        "rest-start-overrides (list)"
+    );
+    assert_eq!(
+        FoldRoute::RestStartOverridesPut.as_str(),
+        "rest-start-overrides (put)"
+    );
+}
