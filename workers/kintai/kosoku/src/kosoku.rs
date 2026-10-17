@@ -1568,15 +1568,24 @@ fn merge_shifts(timecard: Vec<Shift>, rest: Vec<Shift>) -> Vec<Shift> {
 ///
 /// 閾値の判定は**切り詰める前の長さ**で行う — 勤務の端に半分だけ掛かった 30 分の
 /// 休憩を「10 分未満だから無視」にしないため。
+///
+/// `chained` (alc だけの会社) なら、**隙間なく続く休憩の行をまとめてから**閾値で判定する (theearth の拘束時間管理表と
+/// 同じ)。実測 (乗務員 12 / 2026-09-24): 運転の無い日に休憩が 15:42→17:05→17:33→17:40→17:50→17:56 と細かい行で
+/// 続き、1 行ずつ判定すると 17:33→17:40 (7 分)・17:50→17:56 (6 分) が実働に落ちて、theearth より実働が 29 分多かった。
 fn breaks_in(
     events: &[Event],
     shift: &Shift,
     threshold: i64,
+    chained: bool,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
-    let out: Vec<(NaiveDateTime, NaiveDateTime)> = events
+    let rows: Vec<(NaiveDateTime, NaiveDateTime)> = events
         .iter()
         .filter(|e| e.state == "休憩")
         .filter_map(|e| e.end.map(|end| (floor_min(e.start), floor_min(end))))
+        .collect();
+    let rows = if chained { merge_intervals(rows) } else { rows };
+    let out: Vec<(NaiveDateTime, NaiveDateTime)> = rows
+        .into_iter()
         .filter(|(s, e)| (*e - *s).num_minutes() >= threshold)
         .map(|(s, e)| (s.max(shift.start), e.min(shift.end)))
         .filter(|(s, e)| e > s)
@@ -2021,9 +2030,10 @@ fn summarize(shift: &Shift, siblings: &[Shift], events: &[Event], p: &KosokuPara
     // 休憩はデジタコのイベントから出る — 両方を足すと昼を二重に引くので排他にする
     let has_op = has_operation(events, &walk);
     let (breaks, break_kind) = if has_op {
-        let mut breaks = breaks_in(events, &walk, p.break_threshold_minutes);
+        let alc = alc_only(events);
+        let mut breaks = breaks_in(events, &walk, p.break_threshold_minutes, alc);
         // 勤務に残した短い運行の外・休息イベント (昼休み等、180 分未満) は休憩 ([`alc_gaps`])
-        if alc_only(events) {
+        if alc {
             breaks.extend(
                 alc_gaps(events)
                     .1
@@ -4807,6 +4817,43 @@ mod tests {
             .iter()
             .map(|d| (d.start[5..16].to_string(), d.end[5..16].to_string()))
             .collect()
+    }
+
+    #[test]
+    fn alc_only_short_break_rows_in_a_chain_are_breaks() {
+        // 乗務員 12 / 2026-09-24 の形: 運転の無い日に休憩が細かい行で隙間なく続く。続きをまとめてから 10 分で判定し、
+        // 7 分・6 分の行も休憩 (theearth と同じ)。運転に挟まれた 10 分未満の休憩は今までどおり実働
+        let rows = vec![
+            run(
+                "2026-09-24 05:00:00",
+                "2026-09-24 05:00:00",
+                "運行開始",
+                "B",
+            ),
+            run("2026-09-24 05:00:00", "2026-09-24 08:00:00", "降し", "B"),
+            run("2026-09-24 08:00:00", "2026-09-24 08:30:00", "休憩", "B"),
+            run("2026-09-24 08:30:00", "2026-09-24 08:37:00", "休憩", "B"),
+            run("2026-09-24 08:37:00", "2026-09-24 08:43:00", "休憩", "B"),
+            run("2026-09-24 08:43:00", "2026-09-24 10:00:00", "運転", "B"),
+            run("2026-09-24 10:00:00", "2026-09-24 10:07:00", "休憩", "B"),
+            run("2026-09-24 10:07:00", "2026-09-24 12:00:00", "運転", "B"),
+            run(
+                "2026-09-24 12:00:00",
+                "2026-09-24 12:00:00",
+                "運行終了",
+                "B",
+            ),
+        ];
+        let d = &daily_summary(&rows, "2026-09", &KosokuParams::default())[0];
+        assert_eq!(d.restraint_minutes, 7 * 60);
+        assert_eq!(d.break_minutes, 43);
+        assert_eq!(d.working_minutes, 7 * 60 - 43);
+        // 陰性対照: 打刻のある会社 (alc だけでない) は 1 行ずつ判定する — 08:00→08:30 だけが休憩
+        let mut mixed = rows.clone();
+        mixed.push(json!({"datetime": "2026-09-24 05:00:00", "end_datetime": null, "source": "timecard", "state": "始業"}));
+        mixed.push(json!({"datetime": "2026-09-24 12:00:00", "end_datetime": null, "source": "timecard", "state": "終業"}));
+        let d = &daily_summary(&mixed, "2026-09", &KosokuParams::default())[0];
+        assert_eq!(d.break_minutes, 30);
     }
 
     #[test]
