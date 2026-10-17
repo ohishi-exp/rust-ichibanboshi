@@ -274,7 +274,7 @@ impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P>
         to: &str,
     ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), Fail> {
         let (events, mut warnings) = fetch_all_events(self, from, to).await?;
-        // 2 台の運行が同じ時間に重なっていたらエラーとして出す (勤務と実働が正しく出ない)
+        // 2 台の運行が同じ時間に重なっていたら重複として出す (重なった時間の勤務と実働は theearth と合わないことがある)
         warnings.extend(overlapping_operations(&events));
         let span = pushed_window(from, to)?;
         let borrowed = self.pushed.pushed_all_events(span).await?;

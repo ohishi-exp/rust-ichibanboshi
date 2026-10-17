@@ -761,9 +761,9 @@ fn driver_alc_events_passes_read_failures_through() {
     );
 }
 
-/// 同じ乗務員の 2 台の運行が重なっていたら、全員の読みにも 1 人ぶんの読みにもエラーの warning が出る (封は止めない)。
+/// 同じ乗務員の 2 台の運行が重なっていたら、全員の読みにも 1 人ぶんの読みにも重複の warning が出る (封は止めない)。
 #[test]
-fn overlapping_operations_come_back_as_an_error_warning() {
+fn overlapping_operations_come_back_as_a_duplicate_warning() {
     let body = json!({
         "drivers": [{"operations": [
             {
@@ -790,9 +790,9 @@ fn overlapping_operations_come_back_as_an_error_warning() {
     };
     let (_, warnings) = block_on(FoldEventsIo::all_events_between(&w, FROM, TO)).unwrap();
     assert_eq!(warnings.len(), 1);
-    assert!(warnings[0]
-        .text
-        .starts_with("エラー: 2 台の運行が同じ時間に重なっています — 乗務員 15 の OP-245"));
+    assert!(warnings[0].text.starts_with(
+        "重複: 乗務員 15 の 2 台の運行が 2026-06-03 03:26:45〜2026-06-03 16:55:46 (809 分)"
+    ));
     assert!(!warnings[0].blocks_seal);
 
     let a = alc(&log);
