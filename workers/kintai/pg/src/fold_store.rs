@@ -40,6 +40,9 @@ use kintai_kosoku::window::HeadPunch;
 use kintai_logic::common::{db_fail, Fail};
 use kintai_logic::fold_events::{PushedEventsRead, Span};
 use kintai_logic::fold_routes::{not_configured, read_failed, DB_WHAT};
+use kintai_logic::rest_overrides::{
+    override_from_row, RestStartOverride, LIST_SQL, SOURCE_NET780, UPSERT_SQL,
+};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Error, Row};
 use uuid::Uuid;
@@ -614,6 +617,71 @@ impl PushedEventsRead for FoldStore {
         });
         out.await.map_err(pushed_fail)
     }
+
+    async fn rest_start_overrides(&self, span: Span) -> Result<Vec<RestStartOverride>, Fail> {
+        let (tenant, (from, to)) = (self.tenant, span);
+        let out = self.tx(move |tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_typed(LIST_SQL, &window_params(&tenant, &from, &to))
+                    .await?;
+                let row = |r: &Row| -> Result<_, Error> {
+                    let (start, last): (String, String) =
+                        (r.try_get("rest_start")?, r.try_get("last_move")?);
+                    Ok(override_from_row(
+                        r.try_get("driver_cd")?,
+                        &start,
+                        &last,
+                        r.try_get("unko_no")?,
+                    ))
+                };
+                rows.iter().map(row).collect::<Result<Vec<_>, _>>()
+            })
+        });
+        let rows = out.await.map_err(overrides_fail)?;
+        Ok(rows.into_iter().flatten().collect())
+    }
+}
+
+impl FoldStore {
+    /// 休息の開始の補正を書く (`PUT /api/kintai/rest-start-overrides`。同じ鍵は置き換え、1 transaction)。書いた件数を返す。
+    pub async fn put_rest_start_overrides(
+        &self,
+        items: Vec<RestStartOverride>,
+    ) -> Result<usize, Fail> {
+        let tenant = self.tenant;
+        let out = self.tx(move |tx| {
+            Box::pin(async move {
+                let fmt = |t: chrono::NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
+                for o in &items {
+                    let (start, last, source) =
+                        (fmt(o.rest_start), fmt(o.last_move), SOURCE_NET780);
+                    tx.execute_typed(
+                        UPSERT_SQL,
+                        &[
+                            (&tenant, Type::UUID),
+                            (&o.driver_cd, Type::INT8),
+                            (&start, Type::TEXT),
+                            (&last, Type::TEXT),
+                            (&o.unko_no, Type::TEXT),
+                            (&source, Type::TEXT),
+                        ],
+                    )
+                    .await?;
+                }
+                Ok(items.len())
+            })
+        });
+        out.await.map_err(overrides_fail)
+    }
+}
+
+/// 補正の読み書きの失敗の本文の頭。
+pub const OVERRIDES_WHAT: &str = "kintai.rest_start_overrides";
+
+/// 補正の読み書きの失敗 (502、種別だけ)。
+fn overrides_fail(e: Error) -> Fail {
+    db_fail(OVERRIDES_WHAT, &kind(&e))
 }
 
 /// 遡り起点の 2 本の bind (`$1` テナント・`$2`/`$3` 窓)。

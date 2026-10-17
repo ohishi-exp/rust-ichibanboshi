@@ -21,6 +21,7 @@ use kintai_logic::fold_events::{
     WorkerFoldEvents,
 };
 use kintai_logic::fold_routes::AlcEventsRequest;
+use kintai_logic::rest_overrides::RestStartOverride;
 use kintai_logic::unko_gaps::RpcResult;
 use serde_json::{json, Value};
 
@@ -87,6 +88,7 @@ struct Pushed<'a> {
     all: Once<Vec<Value>>,
     runs: Once<Vec<(u64, String)>>,
     punches: Once<Vec<HeadPunch>>,
+    overrides: RefCell<Vec<RestStartOverride>>,
 }
 
 impl Pushed<'_> {
@@ -111,6 +113,11 @@ impl PushedEventsRead for Pushed<'_> {
     async fn pushed_head_punches(&self, span: Span) -> Result<Vec<HeadPunch>, Fail> {
         self.note("pushed punches", span);
         self.punches.borrow_mut().take().expect("打刻の姿は 1 回")
+    }
+
+    async fn rest_start_overrides(&self, span: Span) -> Result<Vec<RestStartOverride>, Fail> {
+        self.note("overrides", span);
+        Ok(self.overrides.borrow().clone())
     }
 }
 
@@ -195,6 +202,7 @@ fn all_events_reads_alc_pages_then_the_pushed_copy() {
                 .to_string(),
             "events?date_from=2026-06-30&date_to=2026-07-01&page_size=50".to_string(),
             format!("pushed all {SPAN}"),
+            format!("overrides {SPAN}"),
         ]
     );
     let got: Vec<(i64, &str, &str)> = rows
@@ -354,7 +362,7 @@ fn month_head_anchors_reads_the_two_head_queries_from_the_copy() {
     // 続けて月初の前後 1 日 ([5/31, 6/2)) を alc と写しから読む (行が無いので alc の起点は無い)
     assert_eq!(
         log.borrow().last().map(String::as_str),
-        Some("pushed all 2026-05-31T00:00:00+09:00..2026-06-02T00:00:00+09:00")
+        Some("overrides 2026-05-31T00:00:00+09:00..2026-06-02T00:00:00+09:00")
     );
 
     // 月が壊れていれば読む前に落とす (fold の BadMonth → 502)
@@ -508,7 +516,7 @@ fn month_head_anchors_reads_further_back_while_the_open_shift_starts_at_the_edge
     );
     assert_eq!(
         log.borrow().last().map(String::as_str),
-        Some("pushed all 2026-05-30T00:00:00+09:00..2026-06-02T00:00:00+09:00")
+        Some("overrides 2026-05-30T00:00:00+09:00..2026-06-02T00:00:00+09:00")
     );
 }
 
@@ -802,4 +810,60 @@ fn overlapping_operations_come_back_as_an_error_warning() {
     };
     let got = block_on(driver_alc_events(&w, &req)).unwrap();
     assert_eq!(got["warnings"].as_array().unwrap().len(), 1);
+}
+
+/// 休息の開始の補正があれば、fold の読みで `休息` の行の開始を最後の動きに差し替える (勤務の終わりが 1 分前の分になる)。
+/// 北海 2026-06-17 乗務員 6 の形 (最後の動き 19:52:59 / 休息 19:53:00)。補正は応答にも載る。
+#[test]
+fn rest_start_overrides_move_the_rest_start_in_the_fold_read() {
+    let body = json!({
+        "drivers": [{"operations": [{
+            "unko_no": "OP-12",
+            "headers": ["対象乗務員CD", "開始日時", "終了日時", "イベント名"],
+            "rows": [
+                ["12", "2026/06/17 11:25:56", "2026/06/17 11:25:56", "運行開始"],
+                ["12", "2026/06/17 11:25:56", "2026/06/17 19:53:00", "運転"],
+                ["12", "2026/06/17 19:53:00", "2026/06/18 05:25:53", "休息"],
+                ["12", "2026/06/18 05:25:53", "2026/06/18 07:00:00", "運転"],
+                ["12", "2026/06/18 07:00:00", "2026/06/18 07:00:00", "運行終了"],
+            ],
+        }]}],
+    })
+    .to_string();
+    let run = |with: bool| {
+        let log = Log::default();
+        let a = alc(&log);
+        *a.events.borrow_mut() = vec![Ok(res(200, &body))];
+        let m = pushed_all(&log, Ok(vec![]));
+        if with {
+            *m.overrides.borrow_mut() = vec![RestStartOverride {
+                driver_cd: 12,
+                rest_start: chrono::NaiveDate::from_ymd_opt(2026, 6, 17)
+                    .unwrap()
+                    .and_hms_opt(19, 53, 0)
+                    .unwrap(),
+                last_move: chrono::NaiveDate::from_ymd_opt(2026, 6, 17)
+                    .unwrap()
+                    .and_hms_opt(19, 52, 59)
+                    .unwrap(),
+                unko_no: "2606171125560000000237".into(),
+            }];
+        }
+        let w = WorkerFoldEvents {
+            alc: &a,
+            pushed: &m,
+            today: TODAY,
+        };
+        block_on(driver_alc_events(&w, &alc_events_req())).unwrap()
+    };
+    let before = run(false);
+    assert_eq!(before["shifts"][0]["end"], "2026-06-17 19:53:00");
+    assert_eq!(before["rest_start_overrides"], json!([]));
+    let after = run(true);
+    // 勤務の端は分に揃うので、1 分短くなる (theearth の管理表の 19:52 と同じ)
+    assert_eq!(after["shifts"][0]["end"], "2026-06-17 19:52:00");
+    assert_eq!(
+        after["rest_start_overrides"],
+        json!([{"driver_cd": 12, "rest_start_at": "2026-06-17 19:53:00", "last_move_at": "2026-06-17 19:52:59", "unko_no": "2606171125560000000237"}])
+    );
 }

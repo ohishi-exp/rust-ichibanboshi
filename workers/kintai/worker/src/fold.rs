@@ -1,5 +1,6 @@
 //! fold の口 (Refs #322): `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months`・
-//! 診断の `GET /api/kintai/alc-events` (fold が読む 1 人ぶんの alc の行と勤務)。
+//! 診断の `GET /api/kintai/alc-events` (fold が読む 1 人ぶんの alc の行と勤務)・休息の開始の補正の
+//! `GET`/`PUT /api/kintai/rest-start-overrides`。
 //!
 //! 段取り (遡り起点 → 月ゲート → 畳み → 封 → 応答、打刻の置き換え、窓の畳み直し) は共有 crate の
 //! `kintai_kosoku::route_flow` (root と同じもの)。ここは I/O の配線と HTTP の入出力だけ:
@@ -27,6 +28,9 @@ use kintai_logic::fold_routes::{
     parse_window, read_failed, AlcEventsRequest, FoldRoute, DB_WHAT,
 };
 use kintai_logic::mariadb_reads::jst_today;
+use kintai_logic::rest_overrides::{
+    override_json, parse_list_query, parse_put_body, ListRequest, RestStartOverride,
+};
 use kintai_logic::write_auth::{authorize, WRITE_TOKEN_HEADER};
 use kintai_pg::FoldStore;
 use worker::{console_log, Date, Env, Request};
@@ -91,6 +95,14 @@ pub(crate) async fn serve(
         }
         FoldRoute::StaleMonths => stale_months(query, env, tenants).await,
         FoldRoute::AlcEvents => alc_events(parse_alc_events_query(query)?, env, tenants).await,
+        FoldRoute::RestStartOverridesList => {
+            rest_start_overrides_list(parse_list_query(query)?, env, tenants).await
+        }
+        FoldRoute::RestStartOverridesPut => {
+            let (content_type, body) = read_body(req).await?;
+            let items = parse_put_body(content_type.as_deref(), &body)?;
+            rest_start_overrides_put(items, env, tenants).await
+        }
     }
 }
 
@@ -107,6 +119,38 @@ async fn alc_events(
     driver_alc_events(&repo, &req)
         .await
         .map_err(|f| read_failed(&f))
+}
+
+/// 休息の開始の補正の一覧 (書かない)。読みの失敗は 502 (種別だけ)。
+async fn rest_start_overrides_list(
+    req: ListRequest,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
+    use kintai_logic::fold_events::{pushed_window, PushedEventsRead};
+    let (pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let store = FoldStore::new(pg, tenancy.tenant);
+    let fmt = |t: chrono::NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
+    let span = pushed_window(&fmt(req.from), &fmt(req.to))?;
+    let rows = store.rest_start_overrides(span).await?;
+    Ok(serde_json::json!({
+        "from": fmt(req.from),
+        "to": fmt(req.to),
+        "overrides": rows.iter().map(override_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// 休息の開始の補正を書く (同じ鍵は置き換え)。畳み直しはしない — 呼び手が続けて recalc を叩く。
+async fn rest_start_overrides_put(
+    items: Vec<RestStartOverride>,
+    env: &Env,
+    tenants: &Tenants,
+) -> Result<serde_json::Value, Fail> {
+    let (pg, tenancy) = open_db(env, tenants, DB_WHAT, true).await?;
+    let store = FoldStore::new(pg, tenancy.tenant);
+    let written = store.put_rest_start_overrides(items).await?;
+    console_log!("kintai rest-start-overrides: written {written}");
+    Ok(serde_json::json!({ "written": written }))
 }
 
 /// 全量再計算の 1 ページ (GET は `apply` を持たないので書かない)。

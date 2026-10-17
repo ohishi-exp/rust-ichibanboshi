@@ -187,22 +187,23 @@ expect_eq "kintai_reader は NOINHERIT" \
 expect_eq "kintai_reader は superuser ではない" \
   "$(as "$SUPER_URL" "SELECT rolsuper FROM pg_roles WHERE rolname='kintai_reader'")" "f"
 
-echo "== RLS が 9 表とも有効で、テナント分離ポリシーが 1 本ずつある"
+echo "== RLS が 10 表とも有効で、テナント分離ポリシーが 1 本ずつある"
 # 6 -> 7 は 004 (kintai.fold_gate、Refs #205 実装計画 13) を足した分。
 # 7 -> 8 は 006 (kintai.wage_snapshot、Refs #291) を足した分。
 # 8 -> 9 は 008 (kintai.event_changes、Refs ohishi-exp/nuxt-dtako-admin#1133) を足した分。
+# 9 -> 10 は 011 (kintai.rest_start_overrides、Refs #322) を足した分。
 #
 # **表を足したらこの 3 つの数を上げる。** 数え上げを動的 (「RLS 無効の表が 0 件」)
 # にすると、RLS を付け忘れた表が 0 件のまま通ってしまう — この検査は「表の数だけ
 # ポリシーがある」ことを人が意識して更新することで成り立っている。
 expect_eq "relrowsecurity = true の表の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "9"
+       WHERE n.nspname='kintai' AND c.relkind='r' AND c.relrowsecurity")" "10"
 expect_eq "policy の数" \
-  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "9"
+  "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies WHERE schemaname='kintai'")" "10"
 expect_eq "WITH CHECK を明示していない (= USING が WITH CHECK として効く) policy の数" \
   "$(as "$SUPER_URL" "SELECT count(*) FROM pg_policies
-       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "9"
+       WHERE schemaname='kintai' AND with_check IS NULL AND cmd='ALL'")" "10"
 
 # ── 3. reader / writer で実際に繋ぐ ────────────────────────────────────
 # migration はパスワードを持たないので、検証用にここで付ける (テスト scaffolding)。
@@ -299,6 +300,30 @@ VALUES ('$TENANT_A', 1194, '2026-02-07', NULL, NULL);" \
 expect_eq "reader は event_changes も自テナントしか見えない" \
   "$(as "$READER_URL" "SET app.current_tenant_id = '$TENANT_A'; SELECT count(DISTINCT tenant_id) FROM kintai.event_changes")" "1"
 as "$SUPER_URL" "DELETE FROM kintai.event_changes" >/dev/null
+
+# 休息の開始の補正 (011)。relay が速度データから書き、fold が読む。
+echo "== rest_start_overrides も writer で往復でき、休息の後ろ・1 時間より前の最後の動きは CHECK で止まる"
+expect_ok_sql "writer が rest_start_overrides を INSERT" "$WRITER_URL" "
+INSERT INTO kintai.rest_start_overrides (tenant_id, driver_cd, rest_start_at, last_move_at, unko_no, source)
+VALUES ('$TENANT_A', 11, '2026-07-17 16:46:09+09', '2026-07-17 16:45:46+09', '2607150330460000000233', 'net780'),
+       ('$TENANT_B', 11, '2026-07-17 16:46:09+09', '2026-07-17 16:45:46+09', '2607150330460000000233', 'net780');"
+expect_eq "writer が rest_start_overrides を SELECT" \
+  "$(as "$WRITER_URL" "SELECT count(*) FROM kintai.rest_start_overrides WHERE tenant_id='$TENANT_A'")" "1"
+expect_err "最後の動きが休息の開始より後なら入らない" "$WRITER_URL" "
+INSERT INTO kintai.rest_start_overrides (tenant_id, driver_cd, rest_start_at, last_move_at, unko_no, source)
+VALUES ('$TENANT_A', 12, '2026-07-17 16:46:09+09', '2026-07-17 16:46:10+09', '2607150330460000000233', 'net780');" \
+  "rest_start_overrides_before_rest"
+expect_err "1 時間より前の最後の動きは入らない" "$WRITER_URL" "
+INSERT INTO kintai.rest_start_overrides (tenant_id, driver_cd, rest_start_at, last_move_at, unko_no, source)
+VALUES ('$TENANT_A', 12, '2026-07-17 16:46:09+09', '2026-07-17 15:46:08+09', '2607150330460000000233', 'net780');" \
+  "rest_start_overrides_before_rest"
+expect_err "source は net780 だけ" "$WRITER_URL" "
+INSERT INTO kintai.rest_start_overrides (tenant_id, driver_cd, rest_start_at, last_move_at, unko_no, source)
+VALUES ('$TENANT_A', 12, '2026-07-17 16:46:09+09', '2026-07-17 16:45:46+09', '2607150330460000000233', 'manual');" \
+  "rest_start_overrides_source"
+expect_eq "reader は rest_start_overrides も自テナントしか見えない" \
+  "$(as "$READER_URL" "SET app.current_tenant_id = '$TENANT_A'; SELECT count(DISTINCT tenant_id) FROM kintai.rest_start_overrides")" "1"
+as "$SUPER_URL" "DELETE FROM kintai.rest_start_overrides" >/dev/null
 
 # paper_drift だけ writer で 1 度も触られていなかった (他 6 表は下で触る)。
 # 「触っていない表は権限が壊れていても気付けない」を残さない。
