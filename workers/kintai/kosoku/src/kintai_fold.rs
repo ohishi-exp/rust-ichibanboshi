@@ -1193,10 +1193,11 @@ mod tests {
     /// - `d1c5f026c4ffa346` → `178efec3ceacfe54`: alc だけの会社の勤務の範囲を作業・運行の境界・休息の行だけで決める (重ねの行で始業をずらさない、2026-10-17)
     /// - `91930891464ff454` → `bdf1cdc9876aa40a`: alc の行に運行の境界が無い乗務員 (何日も続く運行の途中) も月初の遡りを続ける (2026-10-17)
     /// - `5d99611057d86289` → `15cd24a0775385e7`: alc だけの会社の 180 分未満の運行の外を休息とつなげない (運行間待機は拘束、2026-10-17)
+    /// - `c2021df35dc90701` → `d9be7d58d164f300`: alc だけの会社は運行開始・運行終了の行が無い運行を最初と最後の行で区切る (2026-10-17)
     #[test]
     fn the_logic_version_is_the_one_in_production() {
-        assert_eq!(LOGIC_BASE, "5d99611057d86289");
-        assert_eq!(logic_version(&KosokuParams::default()), "15cd24a0775385e7");
+        assert_eq!(LOGIC_BASE, "c2021df35dc90701");
+        assert_eq!(logic_version(&KosokuParams::default()), "d9be7d58d164f300");
     }
 
     /// 版の材料は [`LOGIC_BASE`] と設定だけ。ソースのハッシュは引数にも無い (コメント 1 文字では動かない)。
