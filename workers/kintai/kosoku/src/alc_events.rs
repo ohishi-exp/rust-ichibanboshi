@@ -250,8 +250,8 @@ pub fn event_to_json(ev: RawEvent) -> serde_json::Value {
     })
 }
 
-/// 全乗務員版の 1 行。`unko_no` / `vehicle` を**キーごと出さない** — `all_row_to_json` が「読んでいない列は `null` に
-/// しない」としているのに揃える。
+/// 全乗務員版の 1 行。`vehicle` を**キーごと出さない** — `all_row_to_json` が「読んでいない列は `null` に
+/// しない」としているのに揃える。`unko_no` は出す — alc だけの会社は運行の区切りに使う (`kosoku::run_bounds`)。
 pub fn event_to_all_json(ev: RawEvent) -> serde_json::Value {
     serde_json::json!({
         "datetime": fmt_dt(ev.start),
@@ -259,6 +259,7 @@ pub fn event_to_all_json(ev: RawEvent) -> serde_json::Value {
         "driver_id": ev.driver_id,
         "source": SOURCE_DTAKO_EVENTS,
         "state": ev.state,
+        "unko_no": ev.unko_no,
     })
 }
 
@@ -1136,9 +1137,9 @@ mod tests {
         assert_eq!(single["unko_no"], "OP-1");
         assert_eq!(single["vehicle"], "帯広100け272");
 
-        // 全乗務員版は読んでいない列をキーごと出さない
+        // 全乗務員版は読んでいない列をキーごと出さない (運行NO は運行の区切りに使うので出す)
         let all = event_to_all_json(e);
-        assert!(all.get("unko_no").is_none());
+        assert_eq!(all["unko_no"], "OP-1");
         assert!(all.get("vehicle").is_none());
         assert_eq!(all["state"], "休憩");
     }

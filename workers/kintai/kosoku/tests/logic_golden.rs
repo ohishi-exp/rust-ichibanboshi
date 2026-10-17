@@ -200,6 +200,16 @@ fn the_input_goes_through_every_branch() {
         units.iter().any(|u| u.shifts.len() >= 3),
         "休息で割った長距離"
     );
+    let alc_start = |at: &str| {
+        units
+            .iter()
+            .flat_map(|u| &u.shifts)
+            .any(|s| s.driver_cd == 1004 && s.start_at.to_string() == at)
+    };
+    assert!(
+        alc_start("2026-06-23 11:54:00"),
+        "運行開始の無い運行の最初の行が始業 (alc だけ)"
+    );
 }
 
 // ── 対応表の扱い (陰性対照) ──

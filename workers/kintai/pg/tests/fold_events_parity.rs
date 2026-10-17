@@ -362,47 +362,52 @@ async fn all_events_between_reads_the_copy_and_merges() {
         json!({"datetime": at, "driver_id": driver, "end_datetime": end,
                "source": source, "state": state})
     };
+    // alc の行は運行NO を持つ (alc だけの会社の運行の区切りに使う)
+    let alc = |at: &str, driver: i64, end: Option<&str>, state: &str, unko_no: &str| {
+        json!({"datetime": at, "driver_id": driver, "end_datetime": end,
+               "source": "dtako_events", "state": state, "unko_no": unko_no})
+    };
     assert_eq!(
         rows,
         vec![
-            row(
+            alc(
                 "2026-05-31 20:00:00",
                 1101,
                 Some("2026-06-01 06:00:00"),
-                "dtako_events",
-                "休息"
+                "休息",
+                "26053120000000000011011"
             ),
             row("2026-06-01 07:30:00", 1101, None, "timecard", "始業"),
             row("2026-06-01 08:00:00", 1101, None, "dtako", "運行開始"),
-            row(
+            alc(
                 "2026-06-01 08:00:00",
                 1101,
                 None,
-                "dtako_events",
-                "運行開始"
+                "運行開始",
+                "26060108000000000011011"
             ),
             row("2026-06-01 12:00:00", 1101, None, "dtako", "休息開始"),
-            row(
+            alc(
                 "2026-06-01 12:00:00",
                 1101,
                 Some("2026-06-01 13:00:00"),
-                "dtako_events",
-                "休憩"
+                "休憩",
+                "26060108000000000011011"
             ),
-            row(
+            alc(
                 "2026-06-15 09:00:00",
                 1102,
                 None,
-                "dtako_events",
-                "運行開始"
+                "運行開始",
+                "26061509000000000011022"
             ),
             row("2026-06-15 18:00:00", 1102, None, "dtako", "運行終了"),
-            row(
+            alc(
                 "2026-07-01 08:00:00",
                 1103,
                 None,
-                "dtako_events",
-                "運行開始"
+                "運行開始",
+                "26070108000000000011033"
             ),
             row("2026-06-01 05:00:00", 1104, None, "dtako", "運行終了"),
             row("2026-06-01 06:00:00", 1105, None, "timecard", "終業"),
