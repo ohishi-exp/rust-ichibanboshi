@@ -314,12 +314,16 @@ const OPERATION_SPAN_STATES: [&str; 8] = [
     "運行終了",
 ];
 
-/// **同じ乗務員の 2 つの運行が時間で重なっている** (2 台が同時に動いている) ものを、エラーの warning にする
-/// (ユーザー決定 2026-10-17「2 台かぶりはわかるように出してくれたらいい、エラーとして処理」)。
+/// **同じ乗務員の 2 つの運行が時間で重なっている**ものを、「重複」の warning にする。重なった時間帯と分数を出す
+/// (ユーザー決定 2026-10-17「2 台かぶりはわかるように出してくれたらいい」「重なりは重複で警告だせ」)。
 ///
-/// 1 人が同時に 2 台を運転することはできないので、乗務員CD の付け間違い等のデータの誤り。勤務は 2 本の行を 1 本の
-/// 時間の流れとして組むので、両方の休息で切れて実働が正しく出ない。実測 (北海 乗務員 15 / 2026-06-03): 車輌 245
-/// (03:07 出庫) と 226 (03:26 出庫〜16:55 帰庫) が重なり、theearth より実働が 482 分少なかった。
+/// 乗務員CD の付け間違いのほか、車輌の乗り換えでも起きる。勤務は 2 本の行を 1 本の時間の流れとして組むので、
+/// 重なった時間の勤務と実働は theearth と合わないことがある。実測:
+///
+/// - 北海 乗務員 15 / 2026-06-03: 車輌 245 (03:07 出庫) と 226 (03:26 出庫〜16:55 帰庫) が重なり、theearth より
+///   実働が 482 分少なかった
+/// - 北海 乗務員 16 / 2026-09-18: 5506 を 16:46 に休息で止めたまま (運行終了 21:16) 237 で 17:24 から走った (1 人乗務の
+///   乗り換え)。実働は theearth と一致し、拘束は theearth が 134 分多い
 ///
 /// 運行の時間帯は [`OPERATION_SPAN_STATES`] の行の最初の始まりから最後の終わりまで。封は止めない (入力の欠けではない)。
 pub fn overlapping_operations(events: &[RawEvent]) -> Vec<Warning> {
@@ -353,9 +357,13 @@ pub fn overlapping_operations(events: &[RawEvent]) -> Vec<Warning> {
         list.sort_by_key(|(u, (s, _, _))| (*s, u.clone()));
         for (i, (ua, a)) in list.iter().enumerate() {
             for (ub, b) in list.iter().skip(i + 1).take_while(|(_, b)| b.0 < a.1) {
-                tracing::warn!(driver, a = %ua, b = %ub, "2 台の運行が重なっている");
+                tracing::warn!(driver, a = %ua, b = %ub, "2 台の運行の重複");
+                let (from, to) = (b.0, a.1.min(b.1));
+                let minutes = (to - from).num_minutes();
                 out.push(Warning::diagnostic(format!(
-                    "エラー: 2 台の運行が同じ時間に重なっています — 乗務員 {driver} の {} と {}。勤務と実働が正しく出ません (乗務員CD の付け間違いの疑い)",
+                    "重複: 乗務員 {driver} の 2 台の運行が {}〜{} ({minutes} 分) 重なっています — {} と {}。重なった時間の勤務と実働は theearth と合わないことがあります",
+                    fmt(from),
+                    fmt(to),
                     label(ua, a),
                     label(ub, b)
                 )));
@@ -958,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_operations_of_one_driver_are_an_error() {
+    fn overlapping_operations_of_one_driver_are_a_duplicate() {
         // 乗務員 15 / 2026-06-03 の形: 245 (03:07〜6/6) と 226 (03:26〜16:55) が重なる
         let events = vec![
             op_ev(
@@ -1010,7 +1018,7 @@ mod tests {
         assert!(!got[0].blocks_seal);
         assert_eq!(
             got[0].text,
-            "エラー: 2 台の運行が同じ時間に重なっています — 乗務員 15 の OP245 (車245、2026-06-03 03:07:33〜2026-06-06 12:02:12) と OP226 (車226、2026-06-03 03:26:45〜2026-06-03 16:55:46)。勤務と実働が正しく出ません (乗務員CD の付け間違いの疑い)"
+            "重複: 乗務員 15 の 2 台の運行が 2026-06-03 03:26:45〜2026-06-03 16:55:46 (809 分) 重なっています — OP245 (車245、2026-06-03 03:07:33〜2026-06-06 12:02:12) と OP226 (車226、2026-06-03 03:26:45〜2026-06-03 16:55:46)。重なった時間の勤務と実働は theearth と合わないことがあります"
         );
     }
 
@@ -1077,6 +1085,10 @@ mod tests {
         );
         let got = overlapping_operations(&[a, b]);
         assert!(got[0].text.contains("OPA (車輌不明、"), "{}", got[0].text);
+        // 後の運行が先に終わらなければ、重なりは後の運行の始まり〜先の運行の終わり
+        let want = "2026-06-03 09:00:00〜2026-06-03 10:00:00 (60 分)";
+        let text = &got[0].text;
+        assert!(text.contains(want), "{text}");
     }
 
     fn ev(start: &str, end: Option<&str>) -> RawEvent {
