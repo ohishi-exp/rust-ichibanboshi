@@ -41,7 +41,8 @@ use kintai_logic::common::{db_fail, Fail};
 use kintai_logic::fold_events::{PushedEventsRead, Span};
 use kintai_logic::fold_routes::{not_configured, read_failed, DB_WHAT};
 use kintai_logic::rest_overrides::{
-    override_from_row, RestStartOverride, LIST_SQL, SOURCE_NET780, UPSERT_SQL,
+    months_to_reopen, override_from_row, RestStartOverride, LIST_SQL, REOPEN_GATE_SQL,
+    SOURCE_NET780, UPSERT_SQL,
 };
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Error, Row};
@@ -645,6 +646,7 @@ impl PushedEventsRead for FoldStore {
 
 impl FoldStore {
     /// 休息の開始の補正を書く (`PUT /api/kintai/rest-start-overrides`。同じ鍵は置き換え、1 transaction)。書いた件数を返す。
+    /// 同じ transaction で、補正の月 (と前の月) の月ゲートを消す (`REOPEN_GATE_SQL`)。
     pub async fn put_rest_start_overrides(
         &self,
         items: Vec<RestStartOverride>,
@@ -669,6 +671,13 @@ impl FoldStore {
                     )
                     .await?;
                 }
+                // 補正は alc の行の指紋を変えないので、月ゲートを開け直さないと recalc が読み直さない
+                let months = months_to_reopen(&items);
+                tx.execute_typed(
+                    REOPEN_GATE_SQL,
+                    &[(&tenant, Type::UUID), (&months, Type::TEXT_ARRAY)],
+                )
+                .await?;
                 Ok(items.len())
             })
         });

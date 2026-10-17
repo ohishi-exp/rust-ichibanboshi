@@ -79,3 +79,65 @@ async fn put_replaces_the_same_key_and_list_reads_the_range() {
         vec![ov(11, rest, at(17, 16, 45, 1))]
     );
 }
+
+/// 補正を書くと、その月と前の月の月ゲートが消える (他の月・他のテナントは残る)。
+#[tokio::test]
+async fn put_reopens_the_month_gates() {
+    let tenant = Uuid::new_v4();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .expect("sqlx connect");
+    let s = store(tenant).await;
+    let other = Uuid::new_v4();
+    for (t, m) in [
+        (tenant, "2026-08"),
+        (tenant, "2026-09"),
+        (tenant, "2026-10"),
+        (other, "2026-10"),
+    ] {
+        sqlx::query(
+            "INSERT INTO kintai.fold_gate (tenant_id, month, dtako_digest, punch_digest, logic_version) VALUES ($1, $2, repeat('a', 64), repeat('b', 64), 'cccccccccccccccc')",
+        )
+        .bind(t)
+        .bind(m)
+        .execute(&pool)
+        .await
+        .expect("seed gate");
+    }
+    s.put_rest_start_overrides(vec![ov(9, at(17, 8, 39, 42), at(17, 8, 38, 54))])
+        .await
+        .unwrap();
+    // 7/17 の補正 → 2026-07 と 2026-06 を開ける。8〜10 月は残る
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT month FROM kintai.fold_gate WHERE tenant_id = $1 ORDER BY month",
+    )
+    .bind(tenant)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, ["2026-08", "2026-09", "2026-10"]);
+    let oct = NaiveDate::from_ymd_opt(2026, 10, 11)
+        .unwrap()
+        .and_hms_opt(8, 39, 42)
+        .unwrap();
+    s.put_rest_start_overrides(vec![ov(9, oct, oct - chrono::Duration::seconds(48))])
+        .await
+        .unwrap();
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT month FROM kintai.fold_gate WHERE tenant_id = $1 ORDER BY month",
+    )
+    .bind(tenant)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, ["2026-08"]);
+    let others: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM kintai.fold_gate WHERE tenant_id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(others, 1);
+}

@@ -12,7 +12,7 @@
 //!   `YYYY-MM-DD HH:MM:SS`。同じ (乗務員, 休息の開始) の行は置き換える
 //! - `GET` のクエリ: `from`・`to` (JST の `YYYY-MM-DD`、`to` の日を含む)。休息の開始がその範囲の行を返す
 
-use chrono::{Duration, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -152,6 +152,27 @@ VALUES ($1, $2, ($3::timestamp AT TIME ZONE 'Asia/Tokyo'), ($4::timestamp AT TIM
 ON CONFLICT (tenant_id, driver_cd, rest_start_at)
 DO UPDATE SET last_move_at = EXCLUDED.last_move_at, unko_no = EXCLUDED.unko_no,
               source = EXCLUDED.source, recorded_at = now()";
+
+/// 補正を書いた月の月ゲート (`kintai.fold_gate`) を消す。`$1` テナント・`$2` 月 (`YYYY-MM`) の配列。
+///
+/// 月ゲートは alc の行の指紋 (dtako の etags) が変わらなければ月の畳み直しを飛ばす。補正は alc の行を変えないので、
+/// ゲートが閉じた月に補正を書いても recalc が読み直さず効かない (北海 2026-10 で実測)。消せば次の recalc が月を
+/// 読み直し、補正を当てた行の指紋で乗務員を畳み直す (指紋は補正を当てた後の行から作るので、その乗務員だけ書き換わる)。
+pub const REOPEN_GATE_SQL: &str = "\
+DELETE FROM kintai.fold_gate WHERE tenant_id = $1 AND month = ANY($2)";
+
+/// 補正を書いたら月ゲートを開け直す月: 休息の開始の月と、その前の月 (月をまたぐ勤務は前の月の fold も
+/// その休息を読む)。重複なし・昇順。
+pub fn months_to_reopen(items: &[RestStartOverride]) -> Vec<String> {
+    let mut months = std::collections::BTreeSet::new();
+    for o in items {
+        let d = o.rest_start.date();
+        months.insert(d.format("%Y-%m").to_string());
+        let prev = d.with_day(1).unwrap() - Duration::days(1);
+        months.insert(prev.format("%Y-%m").to_string());
+    }
+    months.into_iter().collect()
+}
 
 /// 読んだ 1 行 (`LIST_SQL` の列) を補正に。時刻が読めない行は `None` (DB の書式なので通常は起きない)。
 pub fn override_from_row(

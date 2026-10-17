@@ -2,8 +2,9 @@
 
 use chrono::NaiveDateTime;
 use kintai_logic::rest_overrides::{
-    apply_rest_start_overrides, override_from_row, override_json, parse_list_query, parse_put_body,
-    RestStartOverride, LIST_SQL, MAX_ITEMS, SOURCE_NET780, UPSERT_SQL,
+    apply_rest_start_overrides, months_to_reopen, override_from_row, override_json,
+    parse_list_query, parse_put_body, RestStartOverride, LIST_SQL, MAX_ITEMS, REOPEN_GATE_SQL,
+    SOURCE_NET780, UPSERT_SQL,
 };
 use serde_json::{json, Value};
 
@@ -181,4 +182,20 @@ fn apply_replaces_only_matching_rest_rows() {
         ]
     );
     assert_eq!(apply_rest_start_overrides(&mut rows, &[]), 0);
+}
+
+/// 月ゲートを開け直す月: 休息の開始の月と前の月 (重複なし・昇順)。年をまたぐ月も。
+#[test]
+fn months_to_reopen_are_the_rest_month_and_the_one_before() {
+    let items = [
+        ov(9, "2026-10-11 08:39:42", "2026-10-11 08:38:54"),
+        ov(6, "2026-10-01 01:00:00", "2026-10-01 00:59:00"),
+        ov(11, "2026-01-05 10:00:00", "2026-01-05 09:59:00"),
+    ];
+    assert_eq!(
+        months_to_reopen(&items),
+        ["2025-12", "2026-01", "2026-09", "2026-10"]
+    );
+    assert!(months_to_reopen(&[]).is_empty());
+    assert!(REOPEN_GATE_SQL.contains("DELETE FROM kintai.fold_gate"));
 }
