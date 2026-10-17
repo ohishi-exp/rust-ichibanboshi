@@ -1086,13 +1086,9 @@ mod tests {
         let got = overlapping_operations(&[a, b]);
         assert!(got[0].text.contains("OPA (車輌不明、"), "{}", got[0].text);
         // 後の運行が先に終わらなければ、重なりは後の運行の始まり〜先の運行の終わり
-        assert!(
-            got[0]
-                .text
-                .contains("2026-06-03 09:00:00〜2026-06-03 10:00:00 (60 分)"),
-            "{}",
-            got[0].text
-        );
+        let want = "2026-06-03 09:00:00〜2026-06-03 10:00:00 (60 分)";
+        let text = &got[0].text;
+        assert!(text.contains(want), "{text}");
     }
 
     fn ev(start: &str, end: Option<&str>) -> RawEvent {
