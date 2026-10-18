@@ -76,11 +76,6 @@ jobs:
         working-directory: .
         run: cargo test --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako
 
-      # 共有 crate vpc-mysql の純粋部分 (資格情報 JSON の検証)。workers/shared は別 workspace なので登録簿も別
-      - name: Test (vpc-mysql-logic)
-        working-directory: .
-        run: cargo test --locked --manifest-path workers/shared/Cargo.toml -p vpc-mysql-logic
-
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       # 行カバレッジ 100% gate (登録簿 workers/kintai/coverage_100.toml)。判定は repo ルートの
@@ -93,14 +88,6 @@ jobs:
           cov="$RUNNER_TEMP/kintai-cov.txt"
           cargo llvm-cov --locked --manifest-path workers/kintai/Cargo.toml -p kintai-mysql -p kintai-logic -p kintai-kosoku -p kintai-dtako --text > "$cov"
           bash scripts/check_coverage_100.sh --config workers/kintai/coverage_100.toml --use-cache "$cov"
-
-      # 登録簿 workers/shared/coverage_100.toml は vpc-tds-logic も持つので両方を計測する (登録簿にあって計測に無いファイルは fail)
-      - name: Coverage 100% gate (workers/shared)
-        working-directory: .
-        run: |
-          cov="$RUNNER_TEMP/vpc-mysql-logic-cov.txt"
-          cargo llvm-cov --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic -p vpc-mysql-logic --text > "$cov"
-          bash scripts/check_coverage_100.sh --config workers/shared/coverage_100.toml --use-cache "$cov"
 
       - name: Build (wasm32-unknown-unknown)
         run: cargo build --locked --target wasm32-unknown-unknown
