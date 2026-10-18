@@ -1,8 +1,10 @@
 //! SQL の名前付き引数 (`:from`・`:driver` 等) をリテラルに展開する (COM_QUERY はテキストプロトコルで、
 //! prepared statement を持たないため)。
 //!
-//! - 受ける値は [`Value`] の 4 種だけ: 整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL・数字だけの文字列
-//!   ([`Digits`]。`'…'` で囲む。23 桁の運行NO のように `u64` に入らない数字の列のため)。
+//! - 受ける値は [`Value`] の 5 種だけ: 整数 (`u64`)・日時 (`'YYYY-MM-DD HH:MM:SS'`)・NULL・数字だけの文字列
+//!   ([`Digits`]。`'…'` で囲む。23 桁の運行NO のように `u64` に入らない数字の列のため)・
+//!   英数字と `-`・`_` だけの文字列 ([`Token`]。`'…'` で囲む。fuel worker の detail (`EP900-34`)・
+//!   car_id・type (`start`/`fuel`) のため)。
 //!   **任意の文字列を受ける口は作らない** (自由入力の文字列を SQL に入れる経路を持たない)
 //! - 字句: `'…'`・`"…"`・バッククォートの中は飛ばす (`\` のエスケープと、引用符の 2 連続のエスケープも考慮)。
 //!   `:` の直後が識別子の頭 (英字か `_`) でなければそのまま
@@ -20,6 +22,8 @@ pub enum Value {
     Null,
     /// `'0123…'` で書く (数字だけなので引用符の中に escape の要る文字は入らない)
     Digits(Digits),
+    /// `'EP900-34'` で書く (`A-Za-z0-9_-` だけなので `'`・`\`・`"` は入らず escape は要らない)
+    Token(Token),
 }
 
 /// 数字だけの文字列 (1〜32 文字の `0-9`)。[`Digits::new`] を通らなければ作れない。
@@ -53,6 +57,38 @@ impl Digits {
     }
 }
 
+/// 英数字・`-`・`_` だけの文字列 (1〜32 文字)。[`Token::new`] を通らなければ作れない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Token {
+    buf: [u8; Token::MAX],
+    len: u8,
+}
+
+impl Token {
+    /// 最大の長さ。
+    pub const MAX: usize = 32;
+
+    /// `^[A-Za-z0-9_-]{1,32}$` を満たさなければ `None`。
+    pub fn new(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        let ok = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-';
+        if b.is_empty() || b.len() > Self::MAX || !b.iter().all(ok) {
+            return None;
+        }
+        let mut buf = [0u8; Self::MAX];
+        buf[..b.len()].copy_from_slice(b);
+        Some(Self {
+            buf,
+            len: b.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // new が ASCII の英数字・`-`・`_` だけを入れている
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or_default()
+    }
+}
+
 impl Value {
     fn literal(&self) -> String {
         match self {
@@ -60,6 +96,7 @@ impl Value {
             Value::DateTime(dt) => format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S")),
             Value::Null => "NULL".to_string(),
             Value::Digits(d) => format!("'{}'", d.as_str()),
+            Value::Token(t) => format!("'{}'", t.as_str()),
         }
     }
 }
@@ -198,4 +235,36 @@ pub fn expand(sql: &str, params: &[(&str, Value)]) -> Result<String, BindError> 
         return Err(BindError::UnusedName(params[i].0.to_string()));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn token_accepts_safe_charset() {
+        for s in ["a", "EP900-34", "start", "fuel", "a_b-C9", "-", "_"] {
+            assert_eq!(Token::new(s).unwrap().as_str(), s);
+        }
+        let max = "a".repeat(32);
+        assert_eq!(Token::new(&max).unwrap().as_str(), max);
+    }
+
+    #[test]
+    fn token_rejects_empty_too_long_and_unsafe() {
+        assert!(Token::new("").is_none());
+        assert!(Token::new(&"a".repeat(33)).is_none());
+        for s in [
+            "a'b", "a b", "a;b", "a\\b", "a\"b", "a.b", "日本", "aé", "a\n",
+        ] {
+            assert!(Token::new(s).is_none(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn token_expands_quoted() {
+        let t = Token::new("EP900-34").unwrap();
+        let got = expand("SELECT :d, :d", &[("d", Value::Token(t))]).unwrap();
+        assert_eq!(got, "SELECT 'EP900-34', 'EP900-34'");
+    }
 }
