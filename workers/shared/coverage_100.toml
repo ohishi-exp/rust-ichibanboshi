@@ -6,7 +6,8 @@
 #   cargo llvm-cov --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic --text > cov.txt
 #   bash scripts/check_coverage_100.sh --config workers/shared/coverage_100.toml --use-cache cov.txt
 #
-# vpc-tds (wasm32 専用。Workers VPC の socket と tiberius のログイン) は native で計測できないので登録しない。
+# vpc-tds (wasm32 専用。Workers VPC の socket と tiberius のログイン) と vpc-mysql (同じく wasm32 専用の socket と Session) は
+# native で計測できないので登録しない。vpc-mysql-logic の test と gate は worker-kintai.yml が回す (使い手の側で検査する)。
 
 # 失敗の stage と種類 (旧 workers/kyuyo/logic/src/lib.rs と workers/ichiban/worker/src/probe_logic.rs の写し)
 [[files]]
@@ -15,3 +16,7 @@ path = "workers/shared/vpc-tds-logic/src/lib.rs"
 # 資格情報 JSON の検証・host:port の分解
 [[files]]
 path = "workers/shared/vpc-tds-logic/src/config.rs"
+
+# 資格情報 JSON の検証 (vpc-mysql の純粋部分。kintai の MariaDB の secret)
+[[files]]
+path = "workers/shared/vpc-mysql-logic/src/lib.rs"

@@ -43,13 +43,10 @@
 
 mod alc;
 mod cakephp;
-mod conn;
 mod fold;
 mod probe;
 mod reads;
 mod restraint;
-mod tcp;
-mod transport;
 mod writes;
 
 use std::future::Future;
@@ -70,12 +67,9 @@ use kintai_mysql::response::ResultSet;
 use kintai_mysql::retry::{should_retry, RETRY_DELAY_MS};
 use worker::{console_error, console_log, event, Context, Date, Delay, Env, Request, Response};
 
-use conn::Session;
-use probe::{
-    log_line, parse_creds, reply_for, reply_for_route, route, Creds, Failure, ProbeOk, Reply,
-    Route, Stage,
-};
+use probe::{log_line, reply_for, reply_for_route, route, Failure, ProbeOk, Reply, Route, Stage};
 use reads::Tenants;
+use vpc_mysql::{open as open_socket, parse_creds, Creds, Session};
 
 /// TCP を開くまでの上限。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -83,6 +77,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// クエリの上限。サーバー側の max_statement_time (60 秒) より少し長くする。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(65);
+
+/// 社内 MariaDB への Workers VPC の binding (wrangler.toml の `[[vpc_services]]`)。
+const MARIADB_VPC_BINDING: &str = "KINTAI_MARIADB_VPC";
+/// `connect()` に渡す名目のアドレス (VPC Service 側で宛先を固定するので使われない。社内のアドレスはコードに書かない)。
+const MARIADB_NOMINAL_ADDR: &str = "kintai-mariadb:3306";
 
 /// 社内 MariaDB の convoy 対策 (オンプレ版 src/kintai_repo.rs と同じ)。
 const SET_STATEMENT_TIME: &str = "SET SESSION max_statement_time=60";
@@ -429,7 +428,7 @@ async fn open(env: &Env, creds: &Creds) -> Result<Session, Failure> {
 /// 1 回ぶん: 接続 → handshake → 認証 → 打ち切り時間の設定。途中で失敗したら COM_QUIT を送って閉じる。
 async fn open_once(env: &Env, creds: &Creds) -> Result<Session, Failure> {
     let socket = step(Stage::Connect, CONNECT_TIMEOUT, async {
-        transport::open(env)
+        open_socket(env, MARIADB_VPC_BINDING, MARIADB_NOMINAL_ADDR)
             .await
             .map_err(|_| "transport".to_string())
     })

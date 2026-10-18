@@ -1,7 +1,7 @@
 // 勤怠 Worker の「応答を形づくるコード」の版 `KINTAI_WORKER_OUTPUT_SHA` を焼く (Refs ohishi-exp/rust-ichibanboshi#322)。
 //
 // `GET /api/kintai/version` の etag に畳む (オンプレ版の `KINTAI_OUTPUT_SHA` に当たる)。畳み方は repo ルートの build.rs と
-// 同じ関数 (`../output_sha.rs` を include!)。対象は workers/kintai の 4 crate (kosoku・logic・mysql・worker) の src の全 .rs —
+// 同じ関数 (`../output_sha.rs` を include!)。対象は workers/kintai の 4 crate (kosoku・logic・mysql・worker) と共有 crate vpc-mysql の src の全 .rs —
 // 応答を組むコードが worker の src にもあるため worker も入れる。dtako (day-events・worktime) は kosoku-daily と無関係なので
 // 入れない。オンプレ版の版とは値が違ってよい (対象のファイルもパスも違う)。
 
@@ -12,6 +12,8 @@ const GLOBS: &[(&str, &str)] = &[
     ("../kosoku/src", ""),
     ("../logic/src", ""),
     ("../mysql/src", ""),
+    // 接続の上のやり取り (handshake・認証・クエリ) は共有 crate に移した。失敗の種別が応答に載るので版に入れる
+    ("../../shared/vpc-mysql/src", ""),
     ("src", ""),
 ];
 
@@ -37,7 +39,8 @@ const REQUIRED: &[&str] = &[
     "../mysql/src/bind.rs",
     "../mysql/src/lib.rs",
     "../mysql/src/response.rs",
-    "src/conn.rs",
+    "../../shared/vpc-mysql/src/lib.rs",
+    "../../shared/vpc-mysql/src/session.rs",
     "src/lib.rs",
     "src/probe.rs",
 ];
