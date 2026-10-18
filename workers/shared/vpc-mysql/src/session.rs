@@ -13,12 +13,12 @@ use kintai_mysql::response::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::Socket;
 
-use crate::probe::Creds;
+use vpc_mysql_logic::Creds;
 
 /// Auth Switch に応じる回数の上限 (普通は 1 回。往復し続けるサーバーで止まらないように)。
 const MAX_AUTH_SWITCHES: usize = 2;
 
-pub(crate) struct Session {
+pub struct Session {
     socket: Socket,
     buf: PacketBuf,
 }
@@ -32,7 +32,7 @@ fn io(e: std::io::Error) -> String {
 }
 
 impl Session {
-    pub(crate) fn new(socket: Socket) -> Self {
+    pub fn new(socket: Socket) -> Self {
         Self {
             socket,
             buf: PacketBuf::new(),
@@ -61,14 +61,14 @@ impl Session {
     }
 
     /// サーバーの Initial Handshake を読む。返り値の seq は応答に使う。
-    pub(crate) async fn handshake(&mut self) -> Result<(u8, InitialHandshake), String> {
+    pub async fn handshake(&mut self) -> Result<(u8, InitialHandshake), String> {
         let packet = self.read().await?;
         let hs = parse_initial_handshake(&packet.payload).map_err(codec)?;
         Ok((packet.seq, hs))
     }
 
     /// HandshakeResponse41 を送り、mysql_native_password で認証する。
-    pub(crate) async fn authenticate(
+    pub async fn authenticate(
         &mut self,
         seq: u8,
         hs: &InitialHandshake,
@@ -93,7 +93,7 @@ impl Session {
     }
 
     /// COM_QUERY を 1 本流して結果を読む。結果セットを返さない文 (SET 等) は空の結果。
-    pub(crate) async fn query(&mut self, sql: &str) -> Result<ResultSet, String> {
+    pub async fn query(&mut self, sql: &str) -> Result<ResultSet, String> {
         self.send(0, &com_query(sql)).await?;
         let first = self.read().await?;
         let count = match parse_query_response(&first.payload).map_err(codec)? {
@@ -110,7 +110,7 @@ impl Session {
     }
 
     /// COM_QUIT を送って閉じる。失敗しても結果は変わらないので捨てる。
-    pub(crate) async fn quit(mut self) {
+    pub async fn quit(mut self) {
         let _ = self.send(0, &com_quit()).await;
         let _ = self.socket.close().await;
     }

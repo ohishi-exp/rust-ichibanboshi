@@ -1,0 +1,17 @@
+# Workers VPC の TCP で MariaDB (MySQL プロトコル) に繋ぐ部品 (Refs ohishi-exp/rust-ichibanboshi#322)。
+# socket を開く `open` と、1 本の接続の上のやり取り `Session` (handshake → 認証 → クエリ → COM_QUIT)。
+# binding 名と名目アドレスは呼び手が引数で渡す。プロトコルの読み書きは kintai-mysql (I/O 無し)。
+[package]
+name = "vpc-mysql"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+kintai-mysql = { path = "../../kintai/mysql" }
+# worker::Socket は tokio の AsyncRead/Write を持つ (kintai-mysql は I/O を持たないので compat は要らない)
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+vpc-mysql-logic = { path = "../vpc-mysql-logic" }
+wasm-bindgen = "0.2"
+worker = "=0.8.7"
+worker-sys = "=0.8.7"

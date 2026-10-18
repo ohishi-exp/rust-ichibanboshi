@@ -1,4 +1,4 @@
-//! 経路判定・失敗の段と応答の写像・資格情報 JSON の検証 (純粋ロジック)。
+//! 経路判定・失敗の段と応答の写像(純粋ロジック。資格情報 JSON の検証は vpc-mysql)。
 //! workers/ichiban の `worker/src/probe_logic.rs` の形を写している。
 
 use kintai_logic::cakephp_relay::CakephpRead;
@@ -10,7 +10,7 @@ use kintai_logic::mariadb_reads::MariadbRead;
 use kintai_mysql::retry::Phase;
 
 use crate::restraint::Restraint;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// 経路判定の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,24 +278,6 @@ pub(crate) fn reply_for_route(route: Route) -> Option<Reply> {
         status,
         body: r#"{"ok":false}"#.to_string(),
     })
-}
-
-/// 資格情報 (Secrets Store の JSON `{"user":…,"password":…,"database":…}`)。
-/// `Debug` を持たせない (うっかりログに出さない)。
-#[derive(Deserialize)]
-pub(crate) struct Creds {
-    pub(crate) user: String,
-    pub(crate) password: String,
-    pub(crate) database: String,
-}
-
-/// 資格情報の JSON を検証する。JSON が読めない・キー欠け・文字列でない・空は `None`。
-pub(crate) fn parse_creds(json: &str) -> Option<Creds> {
-    let creds: Creds = serde_json::from_str(json).ok()?;
-    if creds.user.is_empty() || creds.password.is_empty() || creds.database.is_empty() {
-        return None;
-    }
-    Some(creds)
 }
 
 /// `CURRENT_USER()` (`user@host`) の `@` より前が資格情報の user と一致するか。

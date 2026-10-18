@@ -1,8 +1,8 @@
 name: shared-vpc-tds
 
-# workers/shared (Workers VPC → SQL Server の TDS 接続の共有 crate、Refs #322)。
-#   - pull_request / main への push → vpc-tds-logic の test と 100% gate、vpc-tds の build・clippy (wasm32)
-# deploy は無い (使い手の worker-ichiban.yml / worker-kyuyo.yml がタグで出す。両方の paths に workers/shared/** がある)。
+# workers/shared (Workers VPC → SQL Server の TDS 接続の共有 crate、Refs #322)。MariaDB (MySQL) の vpc-mysql も同居する。
+#   - pull_request / main への push → vpc-tds-logic・vpc-mysql-logic の test と 100% gate、vpc-tds・vpc-mysql の build・clippy (wasm32)
+# deploy は無い (使い手の worker-ichiban.yml / worker-kyuyo.yml / worker-kintai.yml がタグで出す。vpc-mysql の使い手は worker-kintai.yml と今後の外部 repo rust-fuel-worker)。
 on:
   pull_request:
     branches: [main]
@@ -41,24 +41,24 @@ jobs:
           workspaces: workers/shared -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Test (vpc-tds-logic)
-        run: cargo test --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic
+      - name: Test (workers/shared)
+        run: cargo test --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic -p vpc-mysql-logic
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       # 行カバレッジ 100% gate (登録簿 workers/shared/coverage_100.toml)。判定は repo ルートの
       # check_coverage_100.sh を共用する
-      - name: Coverage 100% gate (vpc-tds-logic)
+      - name: Coverage 100% gate (workers/shared)
         run: |
           cov="$RUNNER_TEMP/vpc-tds-logic-cov.txt"
-          cargo llvm-cov --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic --text > "$cov"
+          cargo llvm-cov --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic -p vpc-mysql-logic --text > "$cov"
           bash scripts/check_coverage_100.sh --config workers/shared/coverage_100.toml --use-cache "$cov"
 
-      - name: Build (vpc-tds, wasm32-unknown-unknown)
-        run: cargo build --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds --target wasm32-unknown-unknown
+      - name: Build (vpc-tds・vpc-mysql, wasm32-unknown-unknown)
+        run: cargo build --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds -p vpc-mysql --target wasm32-unknown-unknown
 
       - name: Clippy (wasm32-unknown-unknown)
-        run: cargo clippy --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds -p vpc-mysql --target wasm32-unknown-unknown -- -D warnings
 
       - name: Clippy (vpc-tds-logic, native)
-        run: cargo clippy --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path workers/shared/Cargo.toml -p vpc-tds-logic -p vpc-mysql-logic --all-targets -- -D warnings

@@ -19,6 +19,9 @@ on:
     branches: [main]
     paths:
       - 'workers/kintai/**'
+      # 接続の部品 (socket・Session。worker が path 依存で使う)
+      - 'workers/shared/vpc-mysql/**'
+      - 'workers/shared/vpc-mysql-logic/**'
       - '.github/workflows/worker-kintai.yml'
       # pg-parity が実 DB に当てる Supabase の migration (tests/common/mod.rs が読む)
       - 'migrations/**'
@@ -28,6 +31,9 @@ on:
     tags: ['worker-kintai-v*']
     paths:
       - 'workers/kintai/**'
+      # 接続の部品 (socket・Session。worker が path 依存で使う)
+      - 'workers/shared/vpc-mysql/**'
+      - 'workers/shared/vpc-mysql-logic/**'
       - '.github/workflows/worker-kintai.yml'
       - 'migrations/**'
 
