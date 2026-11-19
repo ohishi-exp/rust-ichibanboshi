@@ -48,7 +48,7 @@ impl Route {
         Some(match self {
             Route::Read(_) | Route::Fold(_) => Reach::AnyAllowed,
             Route::Write(Write::Timecard | Write::WageSnapshot) => Reach::AnyAllowed,
-            Route::Write(Write::DtakoAutoload)
+            Route::Write(Write::DtakoAutoload | Write::DtakoAutoloadPending)
             | Route::Probe
             | Route::Cakephp(_)
             | Route::Mariadb(_)
@@ -109,6 +109,8 @@ pub(crate) enum Write {
     Timecard,
     WageSnapshot,
     DtakoAutoload,
+    /// zip を付けない autoload (取り込み口に残っている CSV を取り込む。dtako 管理画面のインタンクのボタン)
+    DtakoAutoloadPending,
 }
 
 impl Write {
@@ -118,6 +120,7 @@ impl Write {
             "/api/kintai/timecard" => Write::Timecard,
             "/api/kintai/wage-snapshot" => Write::WageSnapshot,
             "/api/dtako/autoload" => Write::DtakoAutoload,
+            "/api/dtako/autoload-pending" => Write::DtakoAutoloadPending,
             _ => return None,
         })
     }
@@ -128,6 +131,7 @@ impl Write {
             Write::Timecard => "timecard",
             Write::WageSnapshot => "wage-snapshot",
             Write::DtakoAutoload => "dtako/autoload",
+            Write::DtakoAutoloadPending => "dtako/autoload-pending",
         }
     }
 }
