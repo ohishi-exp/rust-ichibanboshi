@@ -170,6 +170,7 @@ CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart
 | `GET /api/kintai/daily?month=` | なし | Query → `month` | `GET /time-card/daily-json?month=` | CakePHP の JSON + `source: "live"`・`synced_at` (オンプレ版の `with_source_meta` と同じ形) |
 | `GET /api/kintai/pdf-json?month=[&driver=]` | なし | Query → `month` → `driver` (`driver=` の空は 400) | `GET /time-card/pdf-json?month=[&driver_id=]&recalc=0` | CakePHP の JSON をそのまま |
 | `POST /api/dtako/autoload?unko_no=&file_name=&preview=&reset_timecard=` | **`X-Kintai-Write-Token`** (`preview=true` も) | 認可 → Query → 本文の上限 (20 MiB) → `unko_no` (12 桁以上の数字) → 本文が空 | ② `POST /dtako-events/autoload` (multipart: `api=1`・`file[]` (`application/x-zip-compressed` 固定))。② が 2xx で `reset_timecard=true` なら ① 社内 MariaDB で材料を数え、1 件以上なら ③ `POST /time-card-dtako/resetby-unko-no/<unko_no>` (`api=1`) | オンプレ版と同じ JSON (`http_status`・`location`・`response_excerpt`・`reset_*`・`dtako_events_count`) |
+| `POST /api/dtako/autoload-pending` | **`X-Kintai-Write-Token`** | 認可だけ (Query・本文は読まない) | ② `POST /dtako-events/autoload` を zip 無し (multipart: `api=1` だけ) で。CakePHP は取り込み口 (`files/dtako_csv/`) に残っている CSV を取り込む (オンプレ側が許容している動き)。**`unko_no` で 1 件を名指ししない一括の口** — 押せるのは relay の `KINTAI_COMP_ID` の会社の閲覧者 (dtako 管理画面のインタンクのボタン) | `status`・`body_excerpt`・`location` (CakePHP の応答をそのまま。成否の証明にはならない) |
 
 | 結果 | status | 本文 (平文) | オンプレ版 |
 |---|---|---|---|
@@ -547,6 +548,7 @@ dtako の会社ごとに Supabase / alc のテナントが違う。呼び手 (re
 | `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` (fold) | Supabase + alc (`tenantId` 付き) | 通す |
 | `POST /api/kintai/{timecard,wage-snapshot}` | Supabase | 通す |
 | `POST /api/dtako/autoload` | 社内 CakePHP | **403** |
+| `POST /api/dtako/autoload-pending` | 社内 CakePHP | **403** |
 | `GET /api/kintai/{daily,pdf-json}` | 社内 CakePHP | **403** |
 | `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe,day-events}`・`GET /api/dtako/worktime` | 社内 MariaDB | **403** |
 | `GET /api/kintai/{kosoku-daily,version,timecard/drivers,timecard/events}` | 社内 MariaDB | **403** |
@@ -568,7 +570,7 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 
 - **読みの口 (GET 全部。`timecard/signatures`・`recalc` の preview・`stale-months` を含む) は認可なし** (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手の側
   (relay の共有 secret、kyuyo-mcp の OAuth)
-- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`・`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`POST /api/dtako/autoload`・`PUT /api/restraint/summaries`) は Worker が共有 secret を照合する** (ユーザー決定
+- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`・`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`POST /api/dtako/autoload`・`POST /api/dtako/autoload-pending`・`PUT /api/restraint/summaries`) は Worker が共有 secret を照合する** (ユーザー決定
   2026-10-10。autoload は CakePHP を通して `dtako_events`・`time_card_dtako` を書き換えるので書き込みの口として扱い、`preview=true` も照合する)。読みのために binding を持つ呼び手が POST を転送しても書けないようにするため。ヘッダー `X-Kintai-Write-Token` を
   Secrets Store の `KINTAI_WRITE_TOKEN` と照合し (両方を sha256 にして 32 バイトを定数時間で比べる。`logic/src/write_auth.rs`)、
   無い・違う = 403 (固定文言)、binding が無い・読めない・空 = 503。値は repo に書かない (GCP の Secret Manager が正本)

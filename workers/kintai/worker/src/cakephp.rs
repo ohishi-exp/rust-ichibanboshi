@@ -117,6 +117,21 @@ pub(crate) async fn autoload(req: &mut Request, env: &Env) -> Result<serde_json:
     run(&io, &request).await.map_err(autoload_fail)
 }
 
+/// autoload-pending。認可 (403 / 503) は [`crate::writes::serve`] が先に済ませる。入力は取らない → binding (503) →
+/// zip を付けない ② (`api=1` だけ)。送信の失敗は autoload と同じ 502 (待ちの打ち切りは「不明」の文言)。
+pub(crate) async fn autoload_pending(env: &Env) -> Result<serde_json::Value, Fail> {
+    let vpc = fetcher(env).ok_or_else(|| autoload_fail(CakephpError::NotConfigured))?;
+    // 本文は `api=1` だけ (③ と同じ形。zip の part を付けない)
+    let form = reset_multipart(&boundary());
+    let limit = Duration::from_secs(DTAKO_AUTOLOAD_TIMEOUT_SECS);
+    let reply = send(&vpc, Method::Post, AUTOLOAD_PATH, Some(form), limit).await;
+    let reply = reply.map_err(autoload_fail)?;
+    let text = String::from_utf8_lossy(&reply.body);
+    let res = autoload_response(reply.status, &text, reply.location);
+    // status で成否を判断しない (② と同じく 307 でも取り込みは走る)。届いたかの記録として素通しする
+    serde_json::to_value(res).map_err(|e| Fail::new(500, e.to_string()))
+}
+
 /// ② ③ は VPC の HTTP、① は社内 MariaDB (他の口と同じ接続・資格情報)。
 struct WorkerIo<'a> {
     vpc: Option<Fetcher>,

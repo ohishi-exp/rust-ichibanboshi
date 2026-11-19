@@ -3,6 +3,7 @@
 //! - `POST /api/kintai/timecard` — 打刻の差分の日だけを反映する (元は Cloud Run 版の `kintai_timecard::receive`)
 //! - `POST /api/kintai/wage-snapshot` — 賃金確定値の 1 か月ぶんを置き換え保存する (元は `wage_snapshot::put_wage_snapshot`)
 //! - `POST /api/dtako/autoload` — csvdata.zip を社内 CakePHP の取り込み口へ中継する (認可の後は [`crate::cakephp`])
+//! - `POST /api/dtako/autoload-pending` — zip を付けずに取り込み口を叩き、そこに残っている CSV を取り込ませる
 //!
 //! 検査の順は **認可 → 入力 → テナント → DB**:
 //! `X-Kintai-Write-Token` を Secrets Store の `KINTAI_WRITE_TOKEN` と照合 (無い・違う = 403、binding が無い・読めない = 503) →
@@ -45,6 +46,8 @@ pub(crate) async fn serve(
         }
         // 本文は zip (JSON ではない)。入力の検査と段取りは CakePHP の中継の側
         Write::DtakoAutoload => crate::cakephp::autoload(req, env).await,
+        // 本文も Query も読まない (取り込み口に残っている CSV を取り込む)
+        Write::DtakoAutoloadPending => crate::cakephp::autoload_pending(env).await,
     }
 }
 
