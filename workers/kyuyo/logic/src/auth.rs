@@ -8,6 +8,13 @@
 //! 認可済みの email は Worker → DO の内部ヘッダ [`EMAIL_HEADER`] で渡す。Worker は DO への
 //! リクエストを新しく組み立てる (外から来たヘッダを 1 つも写さない) ので、外から同名のヘッダを
 //! 送っても DO には届かない。
+//!
+//! 検証器はヘッダ [`AUTH_MODE_HEADER`] で選ぶ (Refs #414): 無し (か空) なら `authorize` (ブラウザ JWT)、
+//! `mcp` なら `authorizeMcp` (kyuyo-mcp の binding_jwt)。それ以外の値は 400 で、auth-worker を呼ばない
+//! (黙って `authorize` に落とさない)。どちらのメソッドも auth-worker 側で署名を検証するので、
+//! ヘッダは検証器を選ぶだけで認可を緩めない。流れは [`authorize_request`]。
+
+use std::future::Future;
 
 use serde::Deserialize;
 
@@ -25,6 +32,57 @@ pub fn bearer_token(authorization: Option<&str>) -> &str {
     authorization
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
+}
+
+/// 検証器を選ぶヘッダ (値 `mcp` のときだけ `authorizeMcp`)。
+pub const AUTH_MODE_HEADER: &str = "x-kyuyo-auth";
+
+/// auth-worker の `KyuyoAuthEntrypoint` のどのメソッドで token を検証するか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verifier {
+    /// `authorize(token)` — ブラウザ JWT
+    Browser,
+    /// `authorizeMcp(token)` — kyuyo-mcp の binding_jwt
+    Mcp,
+}
+
+impl Verifier {
+    /// RPC のメソッド名 (JS 側の名前)。
+    pub fn method(self) -> &'static str {
+        match self {
+            Verifier::Browser => "authorize",
+            Verifier::Mcp => "authorizeMcp",
+        }
+    }
+}
+
+/// [`AUTH_MODE_HEADER`] の値から検証器を選ぶ。無し・空は `Browser`、`mcp` は `Mcp`、それ以外は 400。
+pub fn select_verifier(mode: Option<&str>) -> Result<Verifier, Reply> {
+    match mode {
+        None | Some("") => Ok(Verifier::Browser),
+        Some("mcp") => Ok(Verifier::Mcp),
+        Some(_) => Err(error_reply(400, "bad_auth_mode")),
+    }
+}
+
+/// `/kyuyo/*` の認可の流れ。`mode` は [`AUTH_MODE_HEADER`]、`authorization` は `Authorization` ヘッダの値。
+/// `call` は選んだ検証器で auth-worker を 1 回呼び、`(status, body)` を返す (binding が無い・RPC が落ちた・
+/// メソッドが無いときは `None` → 503)。検証器が選べなければ `call` を呼ばずに 400。
+pub async fn authorize_request<'a, F, Fut>(
+    mode: Option<&str>,
+    authorization: Option<&'a str>,
+    call: F,
+) -> Result<String, Reply>
+where
+    F: FnOnce(Verifier, &'a str) -> Fut,
+    Fut: Future<Output = Option<(u16, String)>>,
+{
+    let verifier = select_verifier(mode)?;
+    let token = bearer_token(authorization);
+    match call(verifier, token).await {
+        Some((status, body)) => decide(status, &body),
+        None => Err(server_error()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -228,5 +286,116 @@ mod tests {
     #[test]
     fn header_is_lowercase() {
         assert_eq!(EMAIL_HEADER, EMAIL_HEADER.to_ascii_lowercase());
+        assert_eq!(AUTH_MODE_HEADER, AUTH_MODE_HEADER.to_ascii_lowercase());
+    }
+
+    use std::cell::RefCell;
+    use std::future::{ready, Ready};
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    const OK_BODY: &str = r#"{"allowed":true,"email":"a@example.com"}"#;
+
+    /// mock の呼び出しはすぐ返るので 1 回の poll で終わる。
+    fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
+        pin!(fut).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// 呼ばれた検証器と token を記録し、`reply` を返す mock の RPC で [`authorize_request`] を回す。
+    fn run(
+        mode: Option<&str>,
+        authorization: Option<&str>,
+        reply: Option<(u16, &str)>,
+    ) -> (Poll<Result<String, Reply>>, Vec<(Verifier, String)>) {
+        let calls = RefCell::new(Vec::new());
+        let call = |v: Verifier, token: &str| -> Ready<Option<(u16, String)>> {
+            calls.borrow_mut().push((v, token.to_string()));
+            ready(reply.map(|(s, b)| (s, b.to_string())))
+        };
+        let out = poll_once(authorize_request(mode, authorization, call));
+        (out, calls.into_inner())
+    }
+
+    #[test]
+    fn verifier_method_names() {
+        assert_eq!(Verifier::Browser.method(), "authorize");
+        assert_eq!(Verifier::Mcp.method(), "authorizeMcp");
+    }
+
+    #[test]
+    fn select_verifier_by_header() {
+        assert_eq!(select_verifier(None), Ok(Verifier::Browser));
+        assert_eq!(select_verifier(Some("")), Ok(Verifier::Browser));
+        assert_eq!(select_verifier(Some("mcp")), Ok(Verifier::Mcp));
+        for v in ["MCP", "browser", " mcp", "mcp "] {
+            let r = select_verifier(Some(v)).unwrap_err();
+            assert_eq!(
+                (r.status, r.body.as_str()),
+                (400, r#"{"error":"bad_auth_mode"}"#),
+                "{v}"
+            );
+        }
+    }
+
+    // ① ヘッダ無し → authorize だけ (authorizeMcp は呼ばれない)
+    #[test]
+    fn no_header_calls_authorize_only() {
+        let (out, calls) = run(None, Some("Bearer t1"), Some((200, OK_BODY)));
+        assert_eq!(out, Poll::Ready(Ok("a@example.com".to_string())));
+        assert_eq!(calls, vec![(Verifier::Browser, "t1".to_string())]);
+    }
+
+    // ② X-Kyuyo-Auth: mcp → authorizeMcp だけ
+    #[test]
+    fn mcp_header_calls_authorize_mcp_only() {
+        let (out, calls) = run(Some("mcp"), Some("Bearer t2"), Some((200, OK_BODY)));
+        assert_eq!(out, Poll::Ready(Ok("a@example.com".to_string())));
+        assert_eq!(calls, vec![(Verifier::Mcp, "t2".to_string())]);
+    }
+
+    // ③ 未知の値 → 400、auth-worker を呼ばない
+    #[test]
+    fn unknown_header_is_400_without_rpc() {
+        let (out, calls) = run(Some("jwt"), Some("Bearer t3"), Some((200, OK_BODY)));
+        let want = Reply {
+            status: 400,
+            body: r#"{"error":"bad_auth_mode"}"#.to_string(),
+        };
+        assert_eq!(out, Poll::Ready(Err(want)));
+        assert!(calls.is_empty());
+    }
+
+    // ④ authorizeMcp の 401 / 403 はそのまま返す
+    #[test]
+    fn mcp_rejection_is_forwarded() {
+        for (status, body) in [
+            (401, r#"{"error":"unauthorized"}"#),
+            (403, r#"{"error":"forbidden"}"#),
+        ] {
+            let (out, calls) = run(Some("mcp"), Some("Bearer t4"), Some((status, body)));
+            let want = Reply {
+                status,
+                body: body.to_string(),
+            };
+            assert_eq!(out, Poll::Ready(Err(want)));
+            assert_eq!(calls, vec![(Verifier::Mcp, "t4".to_string())]);
+        }
+    }
+
+    // authorizeMcp が auth-worker にまだ無い (RPC が「メソッドが無い」で落ちる) → 503 (fail-closed)
+    #[test]
+    fn rpc_failure_is_503() {
+        for mode in [None, Some("mcp")] {
+            let (out, calls) = run(mode, Some("Bearer t5"), None);
+            assert_eq!(out, Poll::Ready(Err(server_error())));
+            assert_eq!(calls.len(), 1);
+        }
+    }
+
+    // token の取り出し方は変えない (Bearer 無しは空文字で auth-worker へ渡す)
+    #[test]
+    fn token_extraction_unchanged() {
+        let (_, calls) = run(Some("mcp"), None, Some((401, "")));
+        assert_eq!(calls, vec![(Verifier::Mcp, String::new())]);
     }
 }
