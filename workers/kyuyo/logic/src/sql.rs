@@ -80,6 +80,77 @@ const SHUKEI_TOTALS_SQL: &str = "SELECT CAST(SHAIN AS int), \
              CAST(ISNULL(SHOKOUJO{nn}, 0) AS int) \
              FROM [{db}].dbo.SHUKEI1";
 
+/// スキーマ探索 (Refs #414) の候補テーブルの絞り込み。**固定**で、外から接頭辞もテーブル名も受けない。
+/// 賞与は `SHOYO` / `KAITEISHUKEI*` 系にあると #81 に書かれていて、`SHUKEI1` の支給回 (00..21) にも載りうる。
+const SCHEMA_TABLE_FILTER: &str =
+    "(t.name LIKE 'SHOYO%' OR t.name LIKE 'SHUKEI%' OR t.name LIKE 'KAITEI%')";
+
+/// 候補テーブルの (名前, 行数)。行数は `sys.partitions` のメタデータで、行そのものは読まない。
+const SCHEMA_TABLES_SQL: &str = "SELECT t.name, CAST(ISNULL(SUM(p.rows), 0) AS int) \
+             FROM [{db}].sys.tables t \
+             LEFT JOIN [{db}].sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) \
+             WHERE {filter} GROUP BY t.name ORDER BY t.name";
+
+/// 候補テーブルの (テーブル名, 列名, 型)。列の順は定義順。
+const SCHEMA_COLUMNS_SQL: &str = "SELECT t.name, c.name, ty.name \
+             FROM [{db}].sys.tables t \
+             JOIN [{db}].sys.columns c ON c.object_id = t.object_id \
+             JOIN [{db}].sys.types ty ON ty.user_type_id = c.user_type_id \
+             WHERE {filter} ORDER BY t.name, c.column_id";
+
+/// 指定 DB の候補テーブルの一覧と行数を読む SQL。列は 名前, 行数。
+pub fn schema_tables_sql(db: &str) -> Result<String, String> {
+    validate_db_name(db)?;
+    Ok(SCHEMA_TABLES_SQL
+        .replace("{filter}", SCHEMA_TABLE_FILTER)
+        .replace("{db}", db))
+}
+
+/// 指定 DB の候補テーブルの列を読む SQL。列は テーブル名, 列名, 型名。
+pub fn schema_columns_sql(db: &str) -> Result<String, String> {
+    validate_db_name(db)?;
+    Ok(SCHEMA_COLUMNS_SQL
+        .replace("{filter}", SCHEMA_TABLE_FILTER)
+        .replace("{db}", db))
+}
+
+/// テーブル名・列名の検証。英数字と `_` だけ、1〜128 文字 (SQL 文に `[…]` で埋め込むため)。
+pub fn validate_identifier(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("invalid identifier: {name}"))
+    }
+}
+
+/// [`value_counts_sql`] の本体と、値の式 (日付の列 / それ以外)。
+const VALUE_COUNTS_SQL: &str =
+    "SELECT {expr}, COUNT(*) FROM [{db}].dbo.[{table}] GROUP BY {expr} ORDER BY 1";
+const DATE_EXPR: &str = "CONVERT(varchar(10), [{column}], 120)";
+const TEXT_EXPR: &str = "CAST([{column}] AS varchar(30))";
+
+/// 列の値ごとの件数を読む SQL。列は 値 (文字列), 件数。日付の列は "YYYY-MM-DD" に寄せる。
+/// テーブル名・列名は DB のメタデータから来たものだが、念のため [`validate_identifier`] を通す。
+pub fn value_counts_sql(
+    db: &str,
+    table: &str,
+    column: &str,
+    is_date: bool,
+) -> Result<String, String> {
+    validate_db_name(db)?;
+    validate_identifier(table)?;
+    validate_identifier(column)?;
+    let expr = if is_date { DATE_EXPR } else { TEXT_EXPR };
+    let expr = expr.replace("{column}", column);
+    Ok(VALUE_COUNTS_SQL
+        .replace("{expr}", &expr)
+        .replace("{table}", table)
+        .replace("{db}", db))
+}
+
 /// DB 名の検証 (defense in depth)。`KYDATA0100_126C` / `KYCOMSTD` 形式 = 英数字と `_` だけ、1〜64 文字。
 /// DB 名は SQL 文に `[…]` で埋め込むので、これを通らない名前では SQL を組み立てない。
 /// `Err` の文言はオンプレ版の `KyuyoRepoError::QueryError` の中身と同じ。
@@ -261,6 +332,83 @@ mod tests {
         );
         assert_eq!(koumoku_sql("KYDATA0100_126C").unwrap(), want);
         assert!(koumoku_sql("").is_err());
+    }
+
+    #[test]
+    fn schema_tables() {
+        let want = concat!(
+            "SELECT t.name, CAST(ISNULL(SUM(p.rows), 0) AS int) ",
+            "FROM [KYDATA0100_126C].sys.tables t ",
+            "LEFT JOIN [KYDATA0100_126C].sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) ",
+            "WHERE (t.name LIKE 'SHOYO%' OR t.name LIKE 'SHUKEI%' OR t.name LIKE 'KAITEI%') ",
+            "GROUP BY t.name ORDER BY t.name"
+        );
+        assert_eq!(schema_tables_sql("KYDATA0100_126C").unwrap(), want);
+        assert!(schema_tables_sql("a]").is_err());
+    }
+
+    #[test]
+    fn schema_columns() {
+        let want = concat!(
+            "SELECT t.name, c.name, ty.name ",
+            "FROM [KYDATA0100_126C].sys.tables t ",
+            "JOIN [KYDATA0100_126C].sys.columns c ON c.object_id = t.object_id ",
+            "JOIN [KYDATA0100_126C].sys.types ty ON ty.user_type_id = c.user_type_id ",
+            "WHERE (t.name LIKE 'SHOYO%' OR t.name LIKE 'SHUKEI%' OR t.name LIKE 'KAITEI%') ",
+            "ORDER BY t.name, c.column_id"
+        );
+        assert_eq!(schema_columns_sql("KYDATA0100_126C").unwrap(), want);
+        assert!(schema_columns_sql("").is_err());
+    }
+
+    #[test]
+    fn identifiers() {
+        assert_eq!(validate_identifier("SHOYO"), Ok(()));
+        assert_eq!(validate_identifier("SHIKYUBI_00"), Ok(()));
+        assert_eq!(validate_identifier(&"A".repeat(128)), Ok(()));
+        assert!(validate_identifier(&"A".repeat(129)).is_err());
+        for bad in ["", "a]", "a b", "[a", "a'", "a;b", "ａ"] {
+            assert_eq!(
+                validate_identifier(bad),
+                Err(format!("invalid identifier: {bad}")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_counts() {
+        let want = concat!(
+            "SELECT CONVERT(varchar(10), [SHIKYUBI], 120), COUNT(*) ",
+            "FROM [KYDATA0100_126C].dbo.[SHOYO] ",
+            "GROUP BY CONVERT(varchar(10), [SHIKYUBI], 120) ORDER BY 1"
+        );
+        assert_eq!(
+            value_counts_sql("KYDATA0100_126C", "SHOYO", "SHIKYUBI", true).unwrap(),
+            want
+        );
+        let want = concat!(
+            "SELECT CAST([MONTH] AS varchar(30)), COUNT(*) ",
+            "FROM [KYDATA0100_126C].dbo.[SHOYO] ",
+            "GROUP BY CAST([MONTH] AS varchar(30)) ORDER BY 1"
+        );
+        assert_eq!(
+            value_counts_sql("KYDATA0100_126C", "SHOYO", "MONTH", false).unwrap(),
+            want
+        );
+        // DB 名 → テーブル名 → 列名の順で検証する
+        assert_eq!(
+            value_counts_sql("a b", "x]", "y]", true),
+            Err("invalid database name: a b".to_string())
+        );
+        assert_eq!(
+            value_counts_sql("KYDATA0100_126C", "x]", "y]", true),
+            Err("invalid identifier: x]".to_string())
+        );
+        assert_eq!(
+            value_counts_sql("KYDATA0100_126C", "SHOYO", "y]", false),
+            Err("invalid identifier: y]".to_string())
+        );
     }
 
     #[test]

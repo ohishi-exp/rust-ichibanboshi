@@ -104,6 +104,55 @@ pub struct AccessResponse {
     pub email: String,
 }
 
+/// `GET /kyuyo/schema` のテーブル 1 件 (Refs #414)。件数は `sys.partitions` のメタデータ (行は読まない)。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SchemaTable {
+    pub name: String,
+    pub row_count: i64,
+}
+
+/// `GET /kyuyo/schema` の列 1 件 (`INFORMATION_SCHEMA.COLUMNS`)。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SchemaColumn {
+    pub table: String,
+    pub column: String,
+    pub data_type: String,
+}
+
+/// `GET /kyuyo/schema` の項目マスタ 1 件 (`KOUMOKU`。個人の値は含まない)。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SchemaKoumoku {
+    pub taikeikouno: String,
+    pub name: String,
+    pub kazei: i32,
+    pub meisai: i32,
+    pub gengaku: i32,
+}
+
+/// `GET /kyuyo/schema` の「列の値ごとの件数」1 件。支給回 (`MONTH` 等) と支給日 (`SHIKYUBI*`) の列だけを数える。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SchemaValueCount {
+    pub table: String,
+    pub column: String,
+    pub value: String,
+    pub count: i64,
+}
+
+/// `GET /kyuyo/schema?company=&year=` (Refs #414)。賞与のテーブルを実物で特定するための読み取り専用の口。
+/// 対象は固定の候補テーブル (`SHOYO%` / `SHUKEI%` / `KAITEI%`) だけで、個人の行・氏名・金額は返さない。
+#[derive(Serialize, Debug)]
+pub struct SchemaResponse {
+    pub company: String,
+    /// 年度 (DB 名の `_{年度 - 1900}C`。12 月分の給与は翌年度 DB に入る)。
+    pub year: i32,
+    pub database: String,
+    pub tables: Vec<SchemaTable>,
+    pub columns: Vec<SchemaColumn>,
+    pub koumoku: Vec<SchemaKoumoku>,
+    pub value_counts: Vec<SchemaValueCount>,
+    pub warnings: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +275,47 @@ mod tests {
             email: s("a@example.com"),
         };
         assert_eq!(json(&v), r#"{"allowed":true,"email":"a@example.com"}"#);
+    }
+
+    #[test]
+    fn schema() {
+        let v = SchemaResponse {
+            company: s("0100"),
+            year: 2026,
+            database: s("KYDATA0100_126C"),
+            tables: vec![SchemaTable {
+                name: s("SHOYO"),
+                row_count: 3,
+            }],
+            columns: vec![SchemaColumn {
+                table: s("SHOYO"),
+                column: s("MONTH"),
+                data_type: s("smallint"),
+            }],
+            koumoku: vec![SchemaKoumoku {
+                taikeikouno: s("01098"),
+                name: s("n"),
+                kazei: 1,
+                meisai: 0,
+                gengaku: 0,
+            }],
+            value_counts: vec![SchemaValueCount {
+                table: s("SHOYO"),
+                column: s("MONTH"),
+                value: s("1"),
+                count: 3,
+            }],
+            warnings: vec![],
+        };
+        let want = concat!(
+            r#"{"company":"0100","year":2026,"database":"KYDATA0100_126C","#,
+            r#""tables":[{"name":"SHOYO","row_count":3}],"#,
+            r#""columns":[{"table":"SHOYO","column":"MONTH","data_type":"smallint"}],"#,
+            r#""koumoku":[{"taikeikouno":"01098","name":"n","kazei":1,"meisai":0,"gengaku":0}],"#,
+            r#""value_counts":[{"table":"SHOYO","column":"MONTH","value":"1","count":3}],"#,
+            r#""warnings":[]}"#
+        );
+        assert_eq!(json(&v), want);
     }
 
     #[test]

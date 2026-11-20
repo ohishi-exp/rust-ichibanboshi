@@ -11,6 +11,7 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `GET /kyuyo/databases` / `companies` | 実装済み。毎回 SQL Server を読む (オンプレ版と同じ応答) |
 | `GET /kyuyo/employees` / `payroll` (`?company=&month=`) | 実装済み。read-through: DO の SQLite にあれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` |
 | `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees を読み直して保存。保存に失敗したら 500 (sync 成功 = 保存が最新) |
+| `GET /kyuyo/schema` (`?company=&year=`) | 読み取り専用のスキーマ探索 (Refs #414、賞与のテーブルを実物で特定するため)。DB は `KYDATA{company}_{year-1900}C`。固定の候補テーブル (`SHOYO%` / `SHUKEI%` / `KAITEI%`) の行数 (メタデータ)・列・`KOUMOKU` 全行・支給回/支給日の列 (`MONTH` / `KAISU` / `SHIKYUBI*`) の値ごとの件数だけを返す。自由な SQL・テーブル名は受けず、個人の行・氏名・金額は返さない。キャッシュしない |
 
 パスに `/api` は付かない (呼び出し側の binding から見た path)。method が違えば 405、どの口でもなければ 404 (本文 `{"ok":false}`)。
 
@@ -24,13 +25,13 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `logic/src/auth.rs` | auth-worker の `authorize` の戻りの読み方 (200 だけ通す・fail-closed) と `/kyuyo/*` の応答 |
 | `logic/src/payroll.rs` | 給与明細を組み立てる純粋ロジック (オンプレ版も借りている) |
 | `logic/src/sql.rs` | 給与大臣に流す SQL 文と DB 名の検証。**オンプレ版の `src/kyuyo/repo.rs` と Worker が同じ文字列を流す** (CAST / CONVERT(…,120) はここ) |
-| `logic/src/service.rs` | SQL Server を開く 5 口の純粋部分: company / month の検証 (400)、失敗の写像 (オンプレ版の `map_repo_err` / `map_db_open_err`)、行の組み立て、store の行の encode / decode |
+| `logic/src/service.rs` | SQL Server を開く 6 口の純粋部分: company / month の検証 (400)、失敗の写像 (オンプレ版の `map_repo_err` / `map_db_open_err`)、行の組み立て、store の行の encode / decode |
 | `worker/` | crate `kyuyo-worker` (cdylib)。fetch は認可してから全リクエストを DO へ転送する |
 | `worker/src/state.rs` | Durable Object `KyuyoState` (SQLite)。SQL Server を開く処理はこの中のロックの中だけ |
 | `worker/src/auth.rs` | auth-worker の `KyuyoAuthEntrypoint.authorize(token)` (binding `AUTH_KYUYO`) への RPC |
 | `worker/src/probe.rs` | `POST /probe` の本体 (DO のロックの中で走る) |
 | `worker/src/repo.rs` | 繋ぎ先の指定 (`connect`、`/probe` と共用。資格情報・TCP・ログインの本体は共有 crate `workers/shared/vpc-tds`) と、`sql.rs` の文を流して `Raw*Row` に詰める読み取り (型が合わなければ空文字 / 0、オンプレ版と同じ) |
-| `worker/src/routes.rs` | 5 口の本体 (DO のロックの中で走る。1 リクエスト = 1 接続) |
+| `worker/src/routes.rs` | 6 口の本体 (DO のロックの中で走る。1 リクエスト = 1 接続) |
 | `worker/src/store.rs` | DO の SQLite の derived store の読み書き (オンプレ版 `src/kyuyo/store.rs` と同じ表・同じ中身) |
 | `scripts/check-exposure.sh` | `worker/wrangler.toml` の公開範囲の検査 (CI で毎回) |
 | `scripts/check-exposure-test.sh` | 上の陰性対照 |

@@ -9,14 +9,16 @@
 
 use std::time::Duration;
 
+use kyuyo_logic::api::{SchemaColumn, SchemaTable, SchemaValueCount};
 use kyuyo_logic::payroll::{
     normalize_company_code, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
     KINDATA_COLUMNS, MONEY_COLUMNS,
 };
-use kyuyo_logic::service::DbError;
+use kyuyo_logic::service::{CountTarget, DbError};
 use kyuyo_logic::sql::{
-    employees_sql, koumoku_sql, payroll_month_sql, shukei_totals_sql, COMPANY_NAMES_SQL,
-    DATABASES_WITH_ACCESS_SQL, DATABASE_NAMES_SQL,
+    employees_sql, koumoku_sql, payroll_month_sql, schema_columns_sql, schema_tables_sql,
+    shukei_totals_sql, value_counts_sql, COMPANY_NAMES_SQL, DATABASES_WITH_ACCESS_SQL,
+    DATABASE_NAMES_SQL,
 };
 use kyuyo_logic::{ErrKind, Stage};
 use tiberius::Row;
@@ -208,6 +210,53 @@ impl Db {
                 kazei: get_i32(r, 2),
                 meisai: get_i32(r, 3),
                 gengaku: get_i32(r, 4),
+            })
+            .collect())
+    }
+
+    /// スキーマ探索 (Refs #414): 候補テーブルの (名前, 行数)。行数はメタデータ。
+    pub(crate) async fn schema_tables(&mut self, db: &str) -> Result<Vec<SchemaTable>, DbError> {
+        let sql = schema_tables_sql(db).map_err(|_| fail(Stage::Query, ErrKind::Other))?;
+        let rows = self.simple(&sql).await?;
+        Ok(rows
+            .iter()
+            .map(|r| SchemaTable {
+                name: get_str(r, 0),
+                row_count: get_i32(r, 1) as i64,
+            })
+            .collect())
+    }
+
+    /// スキーマ探索: 候補テーブルの列。
+    pub(crate) async fn schema_columns(&mut self, db: &str) -> Result<Vec<SchemaColumn>, DbError> {
+        let sql = schema_columns_sql(db).map_err(|_| fail(Stage::Query, ErrKind::Other))?;
+        let rows = self.simple(&sql).await?;
+        Ok(rows
+            .iter()
+            .map(|r| SchemaColumn {
+                table: get_str(r, 0),
+                column: get_str(r, 1),
+                data_type: get_str(r, 2),
+            })
+            .collect())
+    }
+
+    /// スキーマ探索: 1 列の値ごとの件数 (支給回・支給日の列だけ。呼び出し側が選ぶ)。
+    pub(crate) async fn value_counts(
+        &mut self,
+        db: &str,
+        t: &CountTarget,
+    ) -> Result<Vec<SchemaValueCount>, DbError> {
+        let sql = value_counts_sql(db, &t.table, &t.column, t.is_date)
+            .map_err(|_| fail(Stage::Query, ErrKind::Other))?;
+        let rows = self.simple(&sql).await?;
+        Ok(rows
+            .iter()
+            .map(|r| SchemaValueCount {
+                table: t.table.clone(),
+                column: t.column.clone(),
+                value: get_str(r, 0),
+                count: get_i32(r, 1) as i64,
             })
             .collect())
     }

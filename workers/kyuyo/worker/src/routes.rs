@@ -1,20 +1,25 @@
-//! SQL Server を開く 5 口 (`databases` / `companies` / `employees` / `payroll` / `sync`) (Refs #322)。DO `KyuyoState` の
+//! SQL Server を開く 6 口 (`databases` / `companies` / `employees` / `payroll` / `sync` / `schema`) (Refs #322 / #414)。DO `KyuyoState` の
 //! ロックの中からだけ呼ぶ。挙動はオンプレ版 `src/routes/kyuyo.rs` の各ハンドラと同じ:
 //!
 //! - `databases` / `companies` — 毎回 SQL Server を読む。`companies` は会社名マスタが読めなくても warning を付けて返す
 //! - `employees` / `payroll` — read-through。DO の SQLite に (会社, 年度) / (会社, 月) があれば SQL Server を開かずに返す
 //!   (`source: "cache"`)。miss なら読んで put (put の失敗は warn して読みは返す、`source: "live"`)
 //! - `sync` — キャッシュに関わらず payroll と employees を読み直して put。**put の失敗は 500** (sync 成功 = 保存が最新)
+//! - `schema` — 読み取り専用のスキーマ探索 (Refs #414)。固定の候補テーブルの列・項目マスタ・支給回/支給日の件数だけ。
+//!   キャッシュしない
 //!
 //! 1 リクエスト = 1 接続。失敗ログは 1 行 (口の名前・stage・種類・所要ミリ秒だけ)。
 
-use kyuyo_logic::api::{DatabasesResponse, EmployeesResponse, PayrollResponse, SyncResponse};
+use kyuyo_logic::api::{
+    DatabasesResponse, EmployeesResponse, PayrollResponse, SchemaResponse, SyncResponse,
+};
 use kyuyo_logic::payroll::{
     build_employee_rows, kydata_db_name, month_period, nendo_for_month, EmployeeRow, PayrollRow,
 };
 use kyuyo_logic::service::{
-    companies_response, company_month_params, company_name, db_open_error_reply, month_indexes,
-    ok_reply, payroll_rows, repo_error_reply, store_write_error, validate_company_month, DbError,
+    companies_response, company_month_params, company_name, count_targets, count_warning,
+    db_open_error_reply, month_indexes, ok_reply, payroll_rows, repo_error_reply, schema_koumoku,
+    schema_target, store_write_error, validate_company_month, DbError,
 };
 use kyuyo_logic::{log_line_for, Endpoint, Reply};
 use worker::{console_error, console_log, console_warn, Date, Env, SqlStorage, Url};
@@ -22,7 +27,7 @@ use worker::{console_error, console_log, console_warn, Date, Env, SqlStorage, Ur
 use crate::repo::{open, Db};
 use crate::store;
 
-/// 5 口のどれかを走らせて応答を返す (`endpoint` は `opens_sql_server()` のもの)。
+/// 6 口のどれかを走らせて応答を返す (`endpoint` は `opens_sql_server()` のもの)。
 pub(crate) async fn run(env: &Env, sql: &SqlStorage, endpoint: Endpoint, url: &Url) -> Reply {
     let ctx = Ctx {
         env,
@@ -34,6 +39,7 @@ pub(crate) async fn run(env: &Env, sql: &SqlStorage, endpoint: Endpoint, url: &U
         Endpoint::Companies => ctx.companies().await,
         Endpoint::Employees => ctx.employees(url).await,
         Endpoint::Payroll => ctx.payroll(url).await,
+        Endpoint::Schema => ctx.schema(url).await,
         _ => ctx.sync(url).await,
     }
 }
@@ -332,6 +338,63 @@ impl Ctx<'_> {
             source: "live",
             synced_at,
         })
+    }
+
+    async fn schema(&self, url: &Url) -> Reply {
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        let (company, year, dbn) = match schema_target(&pairs) {
+            Ok(t) => t,
+            Err(reply) => return reply,
+        };
+        let mut db = match self.open("schema").await {
+            Ok(db) => db,
+            Err(reply) => return reply,
+        };
+        let fail = |e: DbError| {
+            self.log_fail("schema", &e);
+            repo_error_reply(&e)
+        };
+        let out = async {
+            // 開けない DB (4060) は 404 (payroll と同じ)
+            let tables = db.schema_tables(&dbn).await.map_err(|e| {
+                self.log_fail("schema", &e);
+                db_open_error_reply(&e, &dbn)
+            })?;
+            let columns = db.schema_columns(&dbn).await.map_err(fail)?;
+            let koumoku = schema_koumoku(db.koumoku(&dbn).await.map_err(fail)?);
+            let (targets, mut warnings) = count_targets(&columns);
+            let mut value_counts = Vec::new();
+            for t in &targets {
+                // 1 列が読めなくても残りは返す (warning を足す)
+                match db.value_counts(&dbn, t).await {
+                    Ok(v) => value_counts.extend(v),
+                    Err(e) => {
+                        let line = log_line_for("schema", e.stage, &e.kind, self.ms());
+                        console_warn!("{line} (value_counts)");
+                        warnings.push(count_warning(t));
+                    }
+                }
+            }
+            Ok::<_, Reply>(SchemaResponse {
+                company,
+                year,
+                database: dbn.clone(),
+                tables,
+                columns,
+                koumoku,
+                value_counts,
+                warnings,
+            })
+        }
+        .await;
+        db.close().await;
+        match out {
+            Ok(body) => {
+                self.log_ok("schema", "live");
+                ok_reply(&body)
+            }
+            Err(reply) => reply,
+        }
     }
 
     async fn sync(&self, url: &Url) -> Reply {
