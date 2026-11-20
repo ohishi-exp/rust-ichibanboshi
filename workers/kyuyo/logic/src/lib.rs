@@ -1,6 +1,7 @@
 //! 給与大臣 Worker (`kyuyo-worker`) の純粋部分: 経路判定 (`/probe` と `/kyuyo/*`)・失敗の応答の写像。
 //! Worker にも SQL Server にも依存しないので native で `cargo test` できる。
 //!
+//! - [`bonus`] — 賞与 (`SHOYO`) の行を組み立てる純粋ロジック (Refs #414)
 //! - [`payroll`] — 給与明細を組み立てる純粋ロジック。オンプレ版 (repo ルートの package) も並走期間だけ
 //!   path 依存で借りている (`src/kyuyo/mod.rs` の re-export)
 //! - [`api`] — `/api/kyuyo/*` の応答型。オンプレ版 (`src/routes/kyuyo.rs`) と Worker が同じ定義を使う
@@ -11,6 +12,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod bonus;
 pub mod payroll;
 pub mod service;
 pub mod sql;
@@ -24,7 +26,7 @@ pub use vpc_tds_logic::{ErrKind, Stage};
 pub enum Route {
     /// `POST /probe`
     Probe,
-    /// `/kyuyo/*` の 8 口 (method も合っている)
+    /// `/kyuyo/*` の 9 口 (method も合っている)
     Kyuyo(Endpoint),
     /// どの口でもない (404)
     NotFound,
@@ -44,6 +46,8 @@ pub enum Endpoint {
     Sync,
     /// 読み取り専用のスキーマ探索 (Refs #414。賞与のテーブルを実物で特定するため)
     Schema,
+    /// 賞与の支給回 (Refs #414)
+    Bonus,
 }
 
 impl Endpoint {
@@ -57,6 +61,7 @@ impl Endpoint {
             "/kyuyo/payroll" => (Endpoint::Payroll, "GET"),
             "/kyuyo/sync" => (Endpoint::Sync, "POST"),
             "/kyuyo/schema" => (Endpoint::Schema, "GET"),
+            "/kyuyo/bonus" => (Endpoint::Bonus, "GET"),
             _ => return None,
         };
         Some(e)
@@ -154,6 +159,7 @@ mod tests {
             ("GET", "/kyuyo/payroll", Endpoint::Payroll),
             ("POST", "/kyuyo/sync", Endpoint::Sync),
             ("GET", "/kyuyo/schema", Endpoint::Schema),
+            ("GET", "/kyuyo/bonus", Endpoint::Bonus),
         ];
         for (method, path, e) in cases {
             assert_eq!(route(method, path), Route::Kyuyo(e), "{path}");
@@ -166,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn opens_sql_server_only_for_the_six() {
+    fn opens_sql_server_only_for_the_seven() {
         assert!(!Endpoint::Access.opens_sql_server());
         assert!(!Endpoint::SyncedMonths.opens_sql_server());
         for e in [
@@ -176,6 +182,7 @@ mod tests {
             Endpoint::Payroll,
             Endpoint::Sync,
             Endpoint::Schema,
+            Endpoint::Bonus,
         ] {
             assert!(e.opens_sql_server(), "{e:?}");
         }

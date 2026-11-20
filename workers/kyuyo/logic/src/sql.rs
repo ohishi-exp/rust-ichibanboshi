@@ -10,6 +10,7 @@
 //! 日付は `CONVERT(varchar(10), _, 120)` で "YYYY-MM-DD" に寄せて datetime / smalldatetime の差を吸収する
 //! (SQL Server 2008 互換)。
 
+use crate::bonus::BONUS_MONEY_COLUMNS;
 use crate::payroll::{KINDATA_COLUMNS, MAX_MONTH_INDEX, MONEY_COLUMNS};
 
 /// `sys.databases` から KYDATA DB の (名前, HAS_DBACCESS)。HAS_DBACCESS: 1=可 / 0=不可 / NULL=DB名不正等。
@@ -142,6 +143,46 @@ pub fn value_counts_sql(
         .replace("{expr}", &expr)
         .replace("{table}", table)
         .replace("{db}", db))
+}
+
+/// [`bonus_sql`] の本体 (Refs #414)。`@P1` / `@P2` = 支給日の半開区間 (暦年)。
+const BONUS_SQL: &str = "SELECT CAST(b.SHAIN AS int), CAST(b.KAI AS int), \
+             CONVERT(varchar(10), b.SHIKYUBI, 120), \
+             s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), \
+             ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), {money} \
+             FROM [{db}].dbo.SHOYO b \
+             JOIN [{db}].dbo.SHAIN1 s1 ON s1.INCODE = b.SHAIN \
+             LEFT JOIN [{db}].dbo.SHOZOKU sz ON sz.INCODE = b.SHOZOKU \
+             WHERE b.SHIKYUBI >= @P1 AND b.SHIKYUBI < @P2 \
+             ORDER BY b.SHIKYUBI, b.SHAIN";
+
+/// 指定 DB の賞与 (`SHOYO` × `SHAIN1` × `SHOZOKU`) を支給日の半開区間 [@P1, @P2) で読む SQL。
+/// 列は `RawBonusRow` の順: SHAIN, KAI, 支給日, CODE, NAME, TAIKYU, SNAME, TAIKEI, MONEY00..49。
+pub fn bonus_sql(db: &str) -> Result<String, String> {
+    validate_db_name(db)?;
+    let money: Vec<String> = (0..BONUS_MONEY_COLUMNS)
+        .map(|n| format!("CAST(ISNULL(b.MONEY{n:02}, 0) AS int)"))
+        .collect();
+    Ok(BONUS_SQL
+        .replace("{money}", &money.join(", "))
+        .replace("{db}", db))
+}
+
+/// [`dated_shukei_sql`] の 1 回ぶんの列 (支給日と 5 つの集計)。`{nn}` に回のインデックスを差し込む。
+const DATED_SHUKEI_COLUMNS: &str = "ISNULL(CONVERT(varchar(10), SHIKYUBI{nn}, 120), ''), \
+             CAST(ISNULL(SOSHIKYU{nn}, 0) AS int), CAST(ISNULL(KAZEI{nn}, 0) AS int), \
+             CAST(ISNULL(HOKEN{nn}, 0) AS int), CAST(ISNULL(ZEI{nn}, 0) AS int), \
+             CAST(ISNULL(SHOKOUJO{nn}, 0) AS int)";
+
+/// 指定 DB の `SHUKEI1` を全支給回 (00..=[`MAX_MONTH_INDEX`]) ぶん 1 行で読む SQL (賞与の突き合わせ用、Refs #414)。
+/// 列は SHAIN と、回ごとに (支給日, SOSHIKYU, KAZEI, HOKEN, ZEI, SHOKOUJO) の 6 列 × 22 回。
+pub fn dated_shukei_sql(db: &str) -> Result<String, String> {
+    validate_db_name(db)?;
+    let cols: Vec<String> = (0..=MAX_MONTH_INDEX)
+        .map(|i| DATED_SHUKEI_COLUMNS.replace("{nn}", &format!("{i:02}")))
+        .collect();
+    let head = "SELECT CAST(SHAIN AS int), ";
+    Ok(head.to_string() + &cols.join(", ") + &format!(" FROM [{db}].dbo.SHUKEI1"))
 }
 
 /// DB 名の検証 (defense in depth)。`KYDATA0100_126C` / `KYCOMSTD` 形式 = 英数字と `_` だけ、1〜64 文字。
@@ -325,6 +366,56 @@ mod tests {
         );
         assert_eq!(koumoku_sql("KYDATA0100_126C").unwrap(), want);
         assert!(koumoku_sql("").is_err());
+    }
+
+    #[test]
+    fn bonus() {
+        let sql = bonus_sql("KYDATA0100_125C").unwrap();
+        let head = concat!(
+            "SELECT CAST(b.SHAIN AS int), CAST(b.KAI AS int), ",
+            "CONVERT(varchar(10), b.SHIKYUBI, 120), ",
+            "s1.CODE, s1.NAME, CAST(ISNULL(s1.TAIKYU, 0) AS int), ",
+            "ISNULL(sz.SNAME, ''), CAST(ISNULL(sz.TAIKEI, 0) AS int), ",
+            "CAST(ISNULL(b.MONEY00, 0) AS int), CAST(ISNULL(b.MONEY01, 0) AS int), "
+        );
+        assert!(sql.starts_with(head), "{sql}");
+        let end = concat!(
+            "CAST(ISNULL(b.MONEY49, 0) AS int) ",
+            "FROM [KYDATA0100_125C].dbo.SHOYO b ",
+            "JOIN [KYDATA0100_125C].dbo.SHAIN1 s1 ON s1.INCODE = b.SHAIN ",
+            "LEFT JOIN [KYDATA0100_125C].dbo.SHOZOKU sz ON sz.INCODE = b.SHOZOKU ",
+            "WHERE b.SHIKYUBI >= @P1 AND b.SHIKYUBI < @P2 ",
+            "ORDER BY b.SHIKYUBI, b.SHAIN"
+        );
+        assert!(sql.ends_with(end), "{sql}");
+        assert_eq!(sql.matches("MONEY").count(), BONUS_MONEY_COLUMNS);
+        assert_eq!(sql.matches("CAST(").count(), 4 + BONUS_MONEY_COLUMNS);
+        assert!(!sql.contains('{') && !sql.contains("  "), "{sql}");
+        assert!(bonus_sql("x]").is_err());
+    }
+
+    #[test]
+    fn dated_shukei() {
+        let sql = dated_shukei_sql("KYDATA0100_125C").unwrap();
+        let head = concat!(
+            "SELECT CAST(SHAIN AS int), ",
+            "ISNULL(CONVERT(varchar(10), SHIKYUBI00, 120), ''), ",
+            "CAST(ISNULL(SOSHIKYU00, 0) AS int), CAST(ISNULL(KAZEI00, 0) AS int), ",
+            "CAST(ISNULL(HOKEN00, 0) AS int), CAST(ISNULL(ZEI00, 0) AS int), ",
+            "CAST(ISNULL(SHOKOUJO00, 0) AS int), ",
+            "ISNULL(CONVERT(varchar(10), SHIKYUBI01, 120), ''), "
+        );
+        assert!(sql.starts_with(head), "{sql}");
+        let end = concat!(
+            "CAST(ISNULL(SHOKOUJO21, 0) AS int) ",
+            "FROM [KYDATA0100_125C].dbo.SHUKEI1"
+        );
+        assert!(sql.ends_with(end), "{sql}");
+        let n = (MAX_MONTH_INDEX + 1) as usize;
+        assert_eq!(sql.matches("SHIKYUBI").count(), n);
+        assert_eq!(sql.matches("CAST(").count(), 1 + 5 * n);
+        assert!(!sql.contains('{') && !sql.contains("  "), "{sql}");
+        assert!(dated_shukei_sql("").is_err());
     }
 
     #[test]

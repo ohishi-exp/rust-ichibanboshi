@@ -33,3 +33,7 @@ path = "workers/kyuyo/logic/src/sql.rs"
 
 [[files]]
 path = "workers/kyuyo/logic/src/service.rs"
+
+# bonus.rs は賞与 (SHOYO) の行の組み立て (Refs #414)。支給/控除の分け方は payroll.rs と共用。
+[[files]]
+path = "workers/kyuyo/logic/src/bonus.rs"

@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 
+use crate::bonus::BonusRow;
 use crate::payroll::{CompanyInfo, EmployeeRow, PayrollRow};
 
 /// エラーレスポンス本文。
@@ -102,6 +103,18 @@ pub struct AccessResponse {
     pub allowed: bool,
     /// 判定に使った email (認可の応答由来)。
     pub email: String,
+}
+
+/// `GET /kyuyo/bonus?company=&year=` (Refs #414)。暦年 `year` に支給した賞与 (`SHOYO`) の全支給回。
+#[derive(Serialize, Debug)]
+pub struct BonusResponse {
+    pub company: String,
+    /// 支給した暦年。
+    pub year: i32,
+    /// 参照した年度 DB 名 (`_{year - 1900}C`)。
+    pub database: String,
+    pub rows: Vec<BonusRow>,
+    pub warnings: Vec<String>,
 }
 
 /// `GET /kyuyo/schema` のテーブル 1 件 (Refs #414)。件数は `sys.partitions` のメタデータ (行は読まない)。
@@ -276,6 +289,22 @@ mod tests {
             email: s("a@example.com"),
         };
         assert_eq!(json(&v), r#"{"allowed":true,"email":"a@example.com"}"#);
+    }
+
+    #[test]
+    fn bonus() {
+        let v = BonusResponse {
+            company: s("0100"),
+            year: 2025,
+            database: s("KYDATA0100_125C"),
+            rows: vec![],
+            warnings: vec![s("w")],
+        };
+        let want = concat!(
+            r#"{"company":"0100","year":2025,"database":"KYDATA0100_125C","rows":[],"#,
+            r#""warnings":["w"]}"#
+        );
+        assert_eq!(json(&v), want);
     }
 
     #[test]

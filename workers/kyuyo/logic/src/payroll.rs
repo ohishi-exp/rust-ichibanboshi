@@ -102,7 +102,12 @@ pub fn month_period(year: i32, month: u32) -> (String, String) {
 /// `KOUMOKU.TAIKEIKOUNO` (体系 2 桁 + 項目番号 3 桁) を組み立てる。
 /// `money_index` は `MONEY{N}` の列番号 (0..=79)、項目番号は `18 + N`。
 pub fn taikeikouno(taikei: i32, money_index: usize) -> String {
-    format!("{:02}{:03}", taikei.clamp(0, 99), 18 + money_index)
+    item_taikeikouno(taikei, PAYROLL_FIRST_ITEM + money_index)
+}
+
+/// `KOUMOKU.TAIKEIKOUNO` (体系 2 桁 + 項目番号 3 桁) を項目番号から組み立てる。
+pub fn item_taikeikouno(taikei: i32, item_no: usize) -> String {
+    format!("{:02}{:03}", taikei.clamp(0, 99), item_no)
 }
 
 /// 勤怠系の `KOUMOKU.TAIKEIKOUNO` (Refs #103)。
@@ -291,6 +296,92 @@ const RATE_SCALE: f64 = 100.0;
 /// これは給与大臣 UI 側の表示書式で**格納スケールとは無関係**。値によらず一律 `/100`。
 const KINDATA_SCALE: f64 = 100.0;
 
+/// 月例給与 (`KYUYO.MONEY00..79`) の先頭の項目番号 (`MONEY00` = 018)。
+pub const PAYROLL_FIRST_ITEM: usize = 18;
+
+impl PayrollTotals {
+    /// `SHUKEI1` の 5 つの集計から合計を作る (控除合計・差引は #81 の式)。
+    pub fn from_shukei(soshikyu: i64, kazei: i64, hoken: i64, zei: i64, shokoujo: i64) -> Self {
+        let deduction_total = hoken + zei + shokoujo;
+        PayrollTotals {
+            soshikyu,
+            kazei,
+            hoken,
+            zei,
+            shokoujo,
+            deduction_total,
+            net_pay: soshikyu - deduction_total,
+        }
+    }
+}
+
+/// `MONEY{n}` の列を支給/控除/単価に分けた結果。
+pub(crate) struct MoneySplit {
+    pub(crate) payments: BTreeMap<String, i64>,
+    pub(crate) deductions: BTreeMap<String, i64>,
+    pub(crate) base_rate: Option<f64>,
+    pub(crate) overtime_rate: Option<f64>,
+}
+
+/// `MONEY{n}` の列を項目マスタで支給/控除/単価に分ける (月例給与と賞与で共通、規則は
+/// [`build_payroll_rows`] の docs)。`first_item` は `MONEY00` の項目番号 (月例 18 / 賞与 98)。
+pub(crate) fn split_money(
+    taikei: i32,
+    money: &[i64],
+    first_item: usize,
+    koumoku: &HashMap<String, RawKoumokuRow>,
+    warnings: &mut BTreeSet<String>,
+) -> MoneySplit {
+    let mut payments: BTreeMap<String, i64> = BTreeMap::new();
+    let mut deductions: BTreeMap<String, i64> = BTreeMap::new();
+    let mut base_rate: Option<f64> = None;
+    let mut overtime_rate: Option<f64> = None;
+    for (n, amount) in money.iter().enumerate() {
+        if *amount == 0 {
+            continue;
+        }
+        let key = item_taikeikouno(taikei, first_item + n);
+        let Some(item) = koumoku.get(&key).filter(|i| !i.name.is_empty()) else {
+            warnings.insert(format!(
+                "項目マスタ未解決: TAIKEIKOUNO={key} (体系{}, MONEY{n:02})",
+                taikei
+            ));
+            *payments.entry(format!("MONEY{n:02}")).or_insert(0) += amount;
+            continue;
+        };
+        if item.meisai == 1 {
+            // 単価項目。名前で基本単価/残業単価だけを拾う (通勤単価・休日単価は
+            // 消費側が使わないので落とす — 必要になったら足す)
+            let rate = *amount as f64 / RATE_SCALE;
+            match item.name.as_str() {
+                "基本単価" => base_rate = Some(rate),
+                "残業単価" => overtime_rate = Some(rate),
+                _ => {}
+            }
+            continue;
+        }
+        let bucket = if item.kazei == 0 {
+            &mut deductions
+        } else {
+            &mut payments
+        };
+        // 支給側の減額項目 (GENGAKU=1) は符号を反転する。SOSHIKYU は既に
+        // 差し引き済みなので、正のまま足すと差額の 2 倍ぶん過大になる
+        let signed = if item.gengaku == 1 && item.kazei != 0 {
+            -amount
+        } else {
+            *amount
+        };
+        *bucket.entry(item.name.clone()).or_insert(0) += signed;
+    }
+    MoneySplit {
+        payments,
+        deductions,
+        base_rate,
+        overtime_rate,
+    }
+}
+
 /// `KYUYO` 生行 + 項目マスタ + `SHUKEI1` 集計から給与行を組み立てる。
 ///
 /// - `koumoku`: `TAIKEIKOUNO` (trim 済み) → 項目マスタ行
@@ -319,48 +410,12 @@ pub fn build_payroll_rows(
     let mut rows: Vec<PayrollRow> = raw
         .iter()
         .map(|r| {
-            let mut payments: BTreeMap<String, i64> = BTreeMap::new();
-            let mut deductions: BTreeMap<String, i64> = BTreeMap::new();
-            let mut base_rate: Option<f64> = None;
-            let mut overtime_rate: Option<f64> = None;
-            for (n, amount) in r.money.iter().enumerate() {
-                if *amount == 0 {
-                    continue;
-                }
-                let key = taikeikouno(r.taikei, n);
-                let Some(item) = koumoku.get(&key).filter(|i| !i.name.is_empty()) else {
-                    warnings.insert(format!(
-                        "項目マスタ未解決: TAIKEIKOUNO={key} (体系{}, MONEY{n:02})",
-                        r.taikei
-                    ));
-                    *payments.entry(format!("MONEY{n:02}")).or_insert(0) += amount;
-                    continue;
-                };
-                if item.meisai == 1 {
-                    // 単価項目。名前で基本単価/残業単価だけを拾う (通勤単価・休日単価は
-                    // 消費側が使わないので落とす — 必要になったら足す)
-                    let rate = *amount as f64 / RATE_SCALE;
-                    match item.name.as_str() {
-                        "基本単価" => base_rate = Some(rate),
-                        "残業単価" => overtime_rate = Some(rate),
-                        _ => {}
-                    }
-                    continue;
-                }
-                let bucket = if item.kazei == 0 {
-                    &mut deductions
-                } else {
-                    &mut payments
-                };
-                // 支給側の減額項目 (GENGAKU=1) は符号を反転する。SOSHIKYU は既に
-                // 差し引き済みなので、正のまま足すと差額の 2 倍ぶん過大になる
-                let signed = if item.gengaku == 1 && item.kazei != 0 {
-                    -amount
-                } else {
-                    *amount
-                };
-                *bucket.entry(item.name.clone()).or_insert(0) += signed;
-            }
+            let MoneySplit {
+                payments,
+                deductions,
+                base_rate,
+                overtime_rate,
+            } = split_money(r.taikei, &r.money, PAYROLL_FIRST_ITEM, koumoku, &mut warnings);
 
             // 勤怠 (KINDATA*、Refs #103)。金額とは別の列・別の項目番号帯なので
             // payments/deductions には混ぜない。**0 は入れない** — 体系によって
@@ -395,16 +450,9 @@ pub fn build_payroll_rows(
                             r.shain, r.month_index, s.soshikyu
                         ));
                     }
-                    let deduction_total = s.hoken + s.zei + s.shokoujo;
-                    Some(PayrollTotals {
-                        soshikyu: s.soshikyu,
-                        kazei: s.kazei,
-                        hoken: s.hoken,
-                        zei: s.zei,
-                        shokoujo: s.shokoujo,
-                        deduction_total,
-                        net_pay: s.soshikyu - deduction_total,
-                    })
+                    Some(PayrollTotals::from_shukei(
+                        s.soshikyu, s.kazei, s.hoken, s.zei, s.shokoujo,
+                    ))
                 }
                 None => {
                     warnings.insert(format!(
