@@ -24,7 +24,7 @@ pub use vpc_tds_logic::{ErrKind, Stage};
 pub enum Route {
     /// `POST /probe`
     Probe,
-    /// `/kyuyo/*` の 7 口 (method も合っている)
+    /// `/kyuyo/*` の 8 口 (method も合っている)
     Kyuyo(Endpoint),
     /// どの口でもない (404)
     NotFound,
@@ -42,6 +42,8 @@ pub enum Endpoint {
     Employees,
     Payroll,
     Sync,
+    /// 読み取り専用のスキーマ探索 (Refs #414。賞与のテーブルを実物で特定するため)
+    Schema,
 }
 
 impl Endpoint {
@@ -54,6 +56,7 @@ impl Endpoint {
             "/kyuyo/employees" => (Endpoint::Employees, "GET"),
             "/kyuyo/payroll" => (Endpoint::Payroll, "GET"),
             "/kyuyo/sync" => (Endpoint::Sync, "POST"),
+            "/kyuyo/schema" => (Endpoint::Schema, "GET"),
             _ => return None,
         };
         Some(e)
@@ -150,6 +153,7 @@ mod tests {
             ("GET", "/kyuyo/employees", Endpoint::Employees),
             ("GET", "/kyuyo/payroll", Endpoint::Payroll),
             ("POST", "/kyuyo/sync", Endpoint::Sync),
+            ("GET", "/kyuyo/schema", Endpoint::Schema),
         ];
         for (method, path, e) in cases {
             assert_eq!(route(method, path), Route::Kyuyo(e), "{path}");
@@ -162,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn opens_sql_server_only_for_the_five() {
+    fn opens_sql_server_only_for_the_six() {
         assert!(!Endpoint::Access.opens_sql_server());
         assert!(!Endpoint::SyncedMonths.opens_sql_server());
         for e in [
@@ -171,6 +175,7 @@ mod tests {
             Endpoint::Employees,
             Endpoint::Payroll,
             Endpoint::Sync,
+            Endpoint::Schema,
         ] {
             assert!(e.opens_sql_server(), "{e:?}");
         }

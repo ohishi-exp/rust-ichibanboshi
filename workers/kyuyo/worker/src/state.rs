@@ -107,7 +107,7 @@ impl KyuyoState {
                     respond(store_error())
                 }
             },
-            // 残りの 5 口 (databases / companies / employees / payroll / sync)。SQL Server を開くのはこのロックの中だけ
+            // 残りの 6 口 (databases / companies / employees / payroll / sync / schema)。SQL Server を開くのはこのロックの中だけ
             // (employees / payroll の store 命中もロックの中: sync の put と読みが交差しない)
             _ => {
                 let url = req.url()?;

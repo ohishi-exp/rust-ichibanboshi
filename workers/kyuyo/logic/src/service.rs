@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::api::{CompaniesResponse, ErrorBody};
+use crate::api::{CompaniesResponse, ErrorBody, SchemaColumn, SchemaKoumoku};
 use crate::payroll::{
-    build_companies, build_payroll_rows, parse_month, PayrollRow, RawKoumokuRow, RawKyuyoRow,
-    RawShukeiRow, ALLOWED_COMPANIES,
+    build_companies, build_payroll_rows, kydata_db_name, parse_month, PayrollRow, RawKoumokuRow,
+    RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES,
 };
 use crate::{Reply, Stage};
 
@@ -118,6 +118,84 @@ pub fn payroll_rows(
         warnings.push(msg);
     }
     (rows, warnings)
+}
+
+/// `GET /kyuyo/schema` (Refs #414) の対象: (会社, 年度, DB 名)。`year` は年度 (DB 名の `_{year - 1900}C`)。
+/// company の検証は payroll と同じ。company / year が無ければ 400。
+pub fn schema_target(pairs: &[(String, String)]) -> Result<(String, i32, String), Reply> {
+    let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+    let (Some(company), Some(year)) = (get("company"), get("year")) else {
+        return Err(error_reply(400, "company と year を指定してください"));
+    };
+    // company の文言は payroll と同じものを使う (月は検証済みの固定値を渡す)
+    validate_company_month(&company, "2000-01")?;
+    let year = match year.parse::<i32>() {
+        Ok(y) if year.len() == 4 && (1990..=2999).contains(&y) => y,
+        _ => return Err(error_reply(400, "year は YYYY で指定してください")),
+    };
+    let db = kydata_db_name(&company, year - 1900);
+    Ok((company, year, db))
+}
+
+/// 値ごとの件数を数える列 (テーブル, 列, 日付か)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountTarget {
+    pub table: String,
+    pub column: String,
+    pub is_date: bool,
+}
+
+/// 値ごとの件数を数える列の上限 (給与大臣 PC への負荷を抑える)。超えた分は数えず、その列名を warning に出す。
+pub const MAX_COUNT_TARGETS: usize = 64;
+
+/// 値ごとの件数を数える列を全テーブルから選ぶ。支給回 (`MONTH` / `KAISU`) と支給日 (`SHIKYUBI` で始まる列) だけ —
+/// 氏名・金額の列は数えない。日付型 (`datetime` / `smalldatetime` / `date` / `datetime2`) は日付として数える。
+pub fn count_targets(columns: &[SchemaColumn]) -> (Vec<CountTarget>, Vec<String>) {
+    let mut targets: Vec<CountTarget> = columns
+        .iter()
+        .filter(|c| c.column == "MONTH" || c.column == "KAISU" || c.column.starts_with("SHIKYUBI"))
+        .map(|c| CountTarget {
+            table: c.table.clone(),
+            column: c.column.clone(),
+            is_date: matches!(
+                c.data_type.as_str(),
+                "datetime" | "smalldatetime" | "date" | "datetime2"
+            ),
+        })
+        .collect();
+    let mut warnings = Vec::new();
+    if targets.len() > MAX_COUNT_TARGETS {
+        let skipped: Vec<String> = targets
+            .split_off(MAX_COUNT_TARGETS)
+            .iter()
+            .map(|t| t.table.clone() + "." + &t.column)
+            .collect();
+        let skipped = skipped.join(", ");
+        let msg = format!("値の件数は先頭 {MAX_COUNT_TARGETS} 列だけ数えました。省略: {skipped}");
+        warnings.push(msg);
+    }
+    (targets, warnings)
+}
+
+/// 値の件数が読めなかった列の warning。
+pub fn count_warning(t: &CountTarget) -> String {
+    format!("{}.{} の値の件数を読めませんでした", t.table, t.column)
+}
+
+/// 項目マスタを応答の形にする (TAIKEIKOUNO の昇順)。
+pub fn schema_koumoku(rows: Vec<RawKoumokuRow>) -> Vec<SchemaKoumoku> {
+    let mut v: Vec<SchemaKoumoku> = rows
+        .into_iter()
+        .map(|r| SchemaKoumoku {
+            taikeikouno: r.taikeikouno,
+            name: r.name,
+            kazei: r.kazei,
+            meisai: r.meisai,
+            gengaku: r.gengaku,
+        })
+        .collect();
+    v.sort_by(|a, b| a.taikeikouno.cmp(&b.taikeikouno));
+    v
 }
 
 /// 会社名マスタが読めなかったときの warning (companies / employees 共通、オンプレ版と同じ文言)。
@@ -378,6 +456,137 @@ mod tests {
         assert_eq!(
             company_name(None, "0100"),
             (String::new(), vec![COMPANY_NAMES_WARNING.to_string()])
+        );
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn schema_targets() {
+        let got = schema_target(&pairs(&[("year", "2026"), ("company", "0100")]));
+        assert_eq!(
+            got,
+            Ok(("0100".to_string(), 2026, "KYDATA0100_126C".to_string()))
+        );
+        for bad in [
+            pairs(&[]),
+            pairs(&[("company", "0100")]),
+            pairs(&[("year", "2026")]),
+        ] {
+            let r = schema_target(&bad).unwrap_err();
+            assert_eq!(
+                (r.status, r.body.as_str()),
+                (400, r#"{"error":"company と year を指定してください"}"#)
+            );
+        }
+        let r = schema_target(&pairs(&[("company", "0500"), ("year", "2026")])).unwrap_err();
+        assert_eq!(
+            body(&r)["error"],
+            "company は 0100 / 0200 / 0300 / 0400 のいずれかで指定してください"
+        );
+        for y in ["26", "02026", "+202", "1989", "3000", "abcd", ""] {
+            let r = schema_target(&pairs(&[("company", "0100"), ("year", y)])).unwrap_err();
+            assert_eq!(
+                (r.status, r.body.as_str()),
+                (400, r#"{"error":"year は YYYY で指定してください"}"#),
+                "{y}"
+            );
+        }
+    }
+
+    fn col(table: &str, column: &str, data_type: &str) -> SchemaColumn {
+        SchemaColumn {
+            table: table.to_string(),
+            column: column.to_string(),
+            data_type: data_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn count_target_columns() {
+        let columns = vec![
+            col("SHOYO", "SHAIN", "int"),
+            col("SHOYO", "MONTH", "smallint"),
+            col("SHOYO", "KAISU", "smallint"),
+            col("SHOYO", "SHIKYUBI", "datetime"),
+            col("SHOYO", "MONEY00", "int"),
+            col("SHUKEI1", "SHIKYUBI00", "smalldatetime"),
+            col("SHUKEI1", "SHIKYUBI01", "date"),
+            col("SHUKEI1", "SHIKYUBI02", "datetime2"),
+            col("SHUKEI1", "SHIKYUBIX", "char"),
+            col("SHUKEI1", "NAME", "char"),
+        ];
+        let (targets, warnings) = count_targets(&columns);
+        let got: Vec<(&str, &str, bool)> = targets
+            .iter()
+            .map(|t| (t.table.as_str(), t.column.as_str(), t.is_date))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("SHOYO", "MONTH", false),
+                ("SHOYO", "KAISU", false),
+                ("SHOYO", "SHIKYUBI", true),
+                ("SHUKEI1", "SHIKYUBI00", true),
+                ("SHUKEI1", "SHIKYUBI01", true),
+                ("SHUKEI1", "SHIKYUBI02", true),
+                ("SHUKEI1", "SHIKYUBIX", false),
+            ]
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn count_targets_are_capped() {
+        let columns: Vec<SchemaColumn> = (0..MAX_COUNT_TARGETS + 3)
+            .map(|n| col("SHUKEI1", &format!("SHIKYUBI{n:02}"), "datetime"))
+            .collect();
+        let (targets, warnings) = count_targets(&columns);
+        assert_eq!(targets.len(), MAX_COUNT_TARGETS);
+        assert_eq!(targets[0].column, "SHIKYUBI00");
+        assert_eq!(targets[63].column, "SHIKYUBI63");
+        let want = "値の件数は先頭 64 列だけ数えました。省略: SHUKEI1.SHIKYUBI64, SHUKEI1.SHIKYUBI65, SHUKEI1.SHIKYUBI66";
+        assert_eq!(warnings, vec![want.to_string()]);
+    }
+
+    #[test]
+    fn count_warning_names_the_column() {
+        let t = CountTarget {
+            table: "SHOYO".to_string(),
+            column: "MONTH".to_string(),
+            is_date: false,
+        };
+        assert_eq!(
+            count_warning(&t),
+            "SHOYO.MONTH の値の件数を読めませんでした"
+        );
+    }
+
+    #[test]
+    fn koumoku_for_schema() {
+        let k = |no: &str, name: &str| RawKoumokuRow {
+            taikeikouno: no.to_string(),
+            name: name.to_string(),
+            kazei: 1,
+            meisai: 0,
+            gengaku: 0,
+        };
+        let got = schema_koumoku(vec![k("01098", "b"), k("01018", "a")]);
+        let nos: Vec<&str> = got.iter().map(|r| r.taikeikouno.as_str()).collect();
+        assert_eq!(nos, vec!["01018", "01098"]);
+        assert_eq!(
+            got[0],
+            SchemaKoumoku {
+                taikeikouno: "01018".to_string(),
+                name: "a".to_string(),
+                kazei: 1,
+                meisai: 0,
+                gengaku: 0,
+            }
         );
     }
 
