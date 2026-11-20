@@ -38,4 +38,6 @@ jobs:
       # `cond && '' || x` は '' が falsy で常に x になる (main が 'main-' になる) ので条件を反転して書く
       prefix: ${{ inputs.target != 'main' && format('{0}-', inputs.target) || '' }}
       bump: ${{ inputs.bump }}
-    secrets: inherit
+    # inherit は呼ぶ先が同じ org のときしか secret を渡さない (ippoan/ci-workflows は別 org) ので明示で渡す
+    secrets:
+      TAG_RELEASE_PAT: ${{ secrets.TAG_RELEASE_PAT }}
