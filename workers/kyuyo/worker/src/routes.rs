@@ -1,4 +1,4 @@
-//! SQL Server を開く 6 口 (`databases` / `companies` / `employees` / `payroll` / `sync` / `schema`) (Refs #322 / #414)。DO `KyuyoState` の
+//! SQL Server を開く 7 口 (`databases` / `companies` / `employees` / `payroll` / `sync` / `schema` / `bonus`) (Refs #322 / #414)。DO `KyuyoState` の
 //! ロックの中からだけ呼ぶ。挙動はオンプレ版 `src/routes/kyuyo.rs` の各ハンドラと同じ:
 //!
 //! - `databases` / `companies` — 毎回 SQL Server を読む。`companies` は会社名マスタが読めなくても warning を付けて返す
@@ -7,19 +7,22 @@
 //! - `sync` — キャッシュに関わらず payroll と employees を読み直して put。**put の失敗は 500** (sync 成功 = 保存が最新)
 //! - `schema` — 読み取り専用のスキーマ探索 (Refs #414)。全テーブルの列・項目マスタ・支給回/支給日の件数だけ。
 //!   キャッシュしない
+//! - `bonus` — 暦年の賞与 (`SHOYO`) の全支給回 (Refs #414)。payroll と同じ形の行。キャッシュしない
 //!
 //! 1 リクエスト = 1 接続。失敗ログは 1 行 (口の名前・stage・種類・所要ミリ秒だけ)。
 
 use kyuyo_logic::api::{
-    DatabasesResponse, EmployeesResponse, PayrollResponse, SchemaResponse, SyncResponse,
+    BonusResponse, DatabasesResponse, EmployeesResponse, PayrollResponse, SchemaResponse,
+    SyncResponse,
 };
+use kyuyo_logic::bonus::year_period;
 use kyuyo_logic::payroll::{
     build_employee_rows, kydata_db_name, month_period, nendo_for_month, EmployeeRow, PayrollRow,
 };
 use kyuyo_logic::service::{
-    companies_response, company_month_params, company_name, count_targets, count_warning,
-    db_open_error_reply, month_indexes, ok_reply, payroll_rows, repo_error_reply, schema_koumoku,
-    schema_target, store_write_error, validate_company_month, DbError,
+    bonus_rows, companies_response, company_month_params, company_name, company_year_target,
+    count_targets, count_warning, db_open_error_reply, month_indexes, ok_reply, payroll_rows,
+    repo_error_reply, schema_koumoku, store_write_error, validate_company_month, DbError,
 };
 use kyuyo_logic::{log_line_for, Endpoint, Reply};
 use worker::{console_error, console_log, console_warn, Date, Env, SqlStorage, Url};
@@ -27,7 +30,7 @@ use worker::{console_error, console_log, console_warn, Date, Env, SqlStorage, Ur
 use crate::repo::{open, Db};
 use crate::store;
 
-/// 6 口のどれかを走らせて応答を返す (`endpoint` は `opens_sql_server()` のもの)。
+/// 7 口のどれかを走らせて応答を返す (`endpoint` は `opens_sql_server()` のもの)。
 pub(crate) async fn run(env: &Env, sql: &SqlStorage, endpoint: Endpoint, url: &Url) -> Reply {
     let ctx = Ctx {
         env,
@@ -40,6 +43,7 @@ pub(crate) async fn run(env: &Env, sql: &SqlStorage, endpoint: Endpoint, url: &U
         Endpoint::Employees => ctx.employees(url).await,
         Endpoint::Payroll => ctx.payroll(url).await,
         Endpoint::Schema => ctx.schema(url).await,
+        Endpoint::Bonus => ctx.bonus(url).await,
         _ => ctx.sync(url).await,
     }
 }
@@ -342,7 +346,7 @@ impl Ctx<'_> {
 
     async fn schema(&self, url: &Url) -> Reply {
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-        let (company, year, dbn) = match schema_target(&pairs) {
+        let (company, year, dbn) = match company_year_target(&pairs) {
             Ok(t) => t,
             Err(reply) => return reply,
         };
@@ -392,6 +396,48 @@ impl Ctx<'_> {
             Ok(body) => {
                 self.log_ok("schema", "live");
                 ok_reply(&body)
+            }
+            Err(reply) => reply,
+        }
+    }
+
+    async fn bonus(&self, url: &Url) -> Reply {
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        let (company, year, dbn) = match company_year_target(&pairs) {
+            Ok(t) => t,
+            Err(reply) => return reply,
+        };
+        let mut db = match self.open("bonus").await {
+            Ok(db) => db,
+            Err(reply) => return reply,
+        };
+        let fail = |e: DbError| {
+            self.log_fail("bonus", &e);
+            repo_error_reply(&e)
+        };
+        let (from, to) = year_period(year);
+        let out = async {
+            // 開けない DB (4060) は 404 (payroll と同じ)
+            let raw = db.bonus(&dbn, &from, &to).await.map_err(|e| {
+                self.log_fail("bonus", &e);
+                db_open_error_reply(&e, &dbn)
+            })?;
+            let koumoku = db.koumoku(&dbn).await.map_err(fail)?;
+            let shukei = db.dated_shukei(&dbn).await.map_err(fail)?;
+            Ok::<_, Reply>(bonus_rows(&raw, koumoku, &shukei, &dbn, year))
+        }
+        .await;
+        db.close().await;
+        match out {
+            Ok((rows, warnings)) => {
+                self.log_ok("bonus", "live");
+                ok_reply(&BonusResponse {
+                    company,
+                    year,
+                    database: dbn,
+                    rows,
+                    warnings,
+                })
             }
             Err(reply) => reply,
         }

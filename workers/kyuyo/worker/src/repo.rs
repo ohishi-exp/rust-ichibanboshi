@@ -10,15 +10,16 @@
 use std::time::Duration;
 
 use kyuyo_logic::api::{SchemaColumn, SchemaTable, SchemaValueCount};
+use kyuyo_logic::bonus::{RawBonusRow, RawDatedShukeiRow, BONUS_MONEY_COLUMNS};
 use kyuyo_logic::payroll::{
     normalize_company_code, RawEmployeeRow, RawKoumokuRow, RawKyuyoRow, RawShukeiRow,
-    KINDATA_COLUMNS, MONEY_COLUMNS,
+    KINDATA_COLUMNS, MAX_MONTH_INDEX, MONEY_COLUMNS,
 };
 use kyuyo_logic::service::{CountTarget, DbError};
 use kyuyo_logic::sql::{
-    employees_sql, koumoku_sql, payroll_month_sql, schema_columns_sql, schema_tables_sql,
-    shukei_totals_sql, value_counts_sql, COMPANY_NAMES_SQL, DATABASES_WITH_ACCESS_SQL,
-    DATABASE_NAMES_SQL,
+    bonus_sql, dated_shukei_sql, employees_sql, koumoku_sql, payroll_month_sql, schema_columns_sql,
+    schema_tables_sql, shukei_totals_sql, value_counts_sql, COMPANY_NAMES_SQL,
+    DATABASES_WITH_ACCESS_SQL, DATABASE_NAMES_SQL,
 };
 use kyuyo_logic::{ErrKind, Stage};
 use tiberius::Row;
@@ -259,6 +260,64 @@ impl Db {
                 count: get_i32(r, 1) as i64,
             })
             .collect())
+    }
+
+    /// 指定 DB の賞与 (`SHOYO`) を支給日の半開区間 [from, to) で (Refs #414)。
+    pub(crate) async fn bonus(
+        &mut self,
+        db: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RawBonusRow>, DbError> {
+        let sql = bonus_sql(db).map_err(|_| fail(Stage::Query, ErrKind::Other))?;
+        let rows = self.with_period(&sql, from, to).await?;
+        Ok(rows
+            .iter()
+            .map(|r| RawBonusRow {
+                shain: get_i32(r, 0),
+                kai: get_i32(r, 1),
+                pay_date: get_str(r, 2),
+                employee_code: get_str(r, 3),
+                employee_name: get_str(r, 4),
+                taikyu: get_i32(r, 5),
+                department: get_str(r, 6),
+                taikei: get_i32(r, 7),
+                money: (0..BONUS_MONEY_COLUMNS)
+                    .map(|n| get_i32(r, 8 + n) as i64)
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// 指定 DB の `SHUKEI1` の全支給回を支給日つきで (賞与の突き合わせ用)。支給日が空の回は落とす。
+    pub(crate) async fn dated_shukei(
+        &mut self,
+        db: &str,
+    ) -> Result<Vec<RawDatedShukeiRow>, DbError> {
+        let sql = dated_shukei_sql(db).map_err(|_| fail(Stage::Query, ErrKind::Other))?;
+        let rows = self.simple(&sql).await?;
+        let mut out = Vec::new();
+        for r in &rows {
+            let shain = get_i32(r, 0);
+            for i in 0..=MAX_MONTH_INDEX {
+                let base = 1 + 6 * i as usize;
+                let pay_date = get_str(r, base);
+                if pay_date.is_empty() {
+                    continue;
+                }
+                out.push(RawDatedShukeiRow {
+                    shain,
+                    month_index: i,
+                    pay_date,
+                    soshikyu: get_i32(r, base + 1) as i64,
+                    kazei: get_i32(r, base + 2) as i64,
+                    hoken: get_i32(r, base + 3) as i64,
+                    zei: get_i32(r, base + 4) as i64,
+                    shokoujo: get_i32(r, base + 5) as i64,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// 指定 DB の `SHUKEI1` から支給回 `month_index` の集計。

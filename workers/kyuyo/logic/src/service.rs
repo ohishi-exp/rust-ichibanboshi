@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::api::{CompaniesResponse, ErrorBody, SchemaColumn, SchemaKoumoku};
+use crate::bonus::{build_bonus_rows, BonusRow, RawBonusRow, RawDatedShukeiRow};
 use crate::payroll::{
     build_companies, build_payroll_rows, kydata_db_name, parse_month, PayrollRow, RawKoumokuRow,
     RawKyuyoRow, RawShukeiRow, ALLOWED_COMPANIES,
@@ -120,9 +121,29 @@ pub fn payroll_rows(
     (rows, warnings)
 }
 
-/// `GET /kyuyo/schema` (Refs #414) の対象: (会社, 年度, DB 名)。`year` は年度 (DB 名の `_{year - 1900}C`)。
+/// 賞与の行を組み立てる (Refs #414)。行が無ければ warning を足す。
+pub fn bonus_rows(
+    raw: &[RawBonusRow],
+    koumoku: Vec<RawKoumokuRow>,
+    shukei: &[RawDatedShukeiRow],
+    db: &str,
+    year: i32,
+) -> (Vec<BonusRow>, Vec<String>) {
+    let koumoku: HashMap<String, RawKoumokuRow> = koumoku
+        .into_iter()
+        .map(|r| (r.taikeikouno.clone(), r))
+        .collect();
+    let (rows, mut warnings) = build_bonus_rows(raw, &koumoku, shukei);
+    if rows.is_empty() {
+        warnings.push(format!("{db} の {year} 年に賞与の支給回がありません"));
+    }
+    (rows, warnings)
+}
+
+/// `GET /kyuyo/schema` と `GET /kyuyo/bonus` (Refs #414) の対象: (会社, 年, DB 名)。DB は `_{year - 1900}C`。
+/// 賞与は 8 月・12 月とも支給した暦年の DB に入る (12 月分の月例給与が翌年度 DB に入るのとは違う。本番で確認)。
 /// company の検証は payroll と同じ。company / year が無ければ 400。
-pub fn schema_target(pairs: &[(String, String)]) -> Result<(String, i32, String), Reply> {
+pub fn company_year_target(pairs: &[(String, String)]) -> Result<(String, i32, String), Reply> {
     let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
     let (Some(company), Some(year)) = (get("company"), get("year")) else {
         return Err(error_reply(400, "company と year を指定してください"));
@@ -466,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_targets() {
-        let got = schema_target(&pairs(&[("year", "2026"), ("company", "0100")]));
+    fn company_year_targets() {
+        let got = company_year_target(&pairs(&[("year", "2026"), ("company", "0100")]));
         assert_eq!(
             got,
             Ok(("0100".to_string(), 2026, "KYDATA0100_126C".to_string()))
@@ -477,19 +498,19 @@ mod tests {
             pairs(&[("company", "0100")]),
             pairs(&[("year", "2026")]),
         ] {
-            let r = schema_target(&bad).unwrap_err();
+            let r = company_year_target(&bad).unwrap_err();
             assert_eq!(
                 (r.status, r.body.as_str()),
                 (400, r#"{"error":"company と year を指定してください"}"#)
             );
         }
-        let r = schema_target(&pairs(&[("company", "0500"), ("year", "2026")])).unwrap_err();
+        let r = company_year_target(&pairs(&[("company", "0500"), ("year", "2026")])).unwrap_err();
         assert_eq!(
             body(&r)["error"],
             "company は 0100 / 0200 / 0300 / 0400 のいずれかで指定してください"
         );
         for y in ["26", "02026", "+202", "1989", "3000", "abcd", ""] {
-            let r = schema_target(&pairs(&[("company", "0100"), ("year", y)])).unwrap_err();
+            let r = company_year_target(&pairs(&[("company", "0100"), ("year", y)])).unwrap_err();
             assert_eq!(
                 (r.status, r.body.as_str()),
                 (400, r#"{"error":"year は YYYY で指定してください"}"#),
@@ -588,6 +609,46 @@ mod tests {
                 gengaku: 0,
             }
         );
+    }
+
+    #[test]
+    fn bonus_rows_warn_when_empty() {
+        let (rows, warnings) = bonus_rows(&[], vec![], &[], "KYDATA0100_125C", 2025);
+        assert!(rows.is_empty());
+        let want = "KYDATA0100_125C の 2025 年に賞与の支給回がありません";
+        assert_eq!(warnings, vec![want.to_string()]);
+
+        let raw = RawBonusRow {
+            shain: 1,
+            kai: 1,
+            pay_date: "2025-08-12".into(),
+            employee_code: "0001".into(),
+            employee_name: "試験 花子".into(),
+            taikyu: 0,
+            department: "本社".into(),
+            taikei: 1,
+            money: vec![0; crate::bonus::BONUS_MONEY_COLUMNS],
+        };
+        let shukei = RawDatedShukeiRow {
+            shain: 1,
+            month_index: 13,
+            pay_date: "2025-08-12".into(),
+            soshikyu: 0,
+            kazei: 0,
+            hoken: 0,
+            zei: 0,
+            shokoujo: 0,
+        };
+        let koumoku = vec![RawKoumokuRow {
+            taikeikouno: "01098".into(),
+            name: "賞与".into(),
+            kazei: 1,
+            meisai: 0,
+            gengaku: 0,
+        }];
+        let (rows, warnings) = bonus_rows(&[raw], koumoku, &[shukei], "db", 2025);
+        assert_eq!((rows.len(), rows[0].month_index), (1, Some(13)));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
