@@ -11,8 +11,10 @@
 
 use serde::Deserialize;
 
-use crate::api::{AccessResponse, ErrorBody, SyncedMonthEntry, SyncedMonthsResponse};
-use crate::store_keys::parse_payroll_scope;
+use crate::api::{
+    AccessResponse, ErrorBody, SyncedBonusEntry, SyncedMonthEntry, SyncedMonthsResponse,
+};
+use crate::store_keys::{parse_bonus_scope, parse_payroll_scope};
 use crate::Reply;
 
 /// Worker → DO の内部ヘッダ (認可済みの email)。外から来た同名ヘッダは DO に届かない。
@@ -77,9 +79,12 @@ pub fn access_reply(email: &str) -> Reply {
     }
 }
 
+/// 賞与の sync 済み 1 行 (`store_keys::BONUS_SYNCED_SQL` の scope, synced_at, pay_date, row_count)。
+pub type BonusSyncedRow = (String, String, Option<String>, i64);
+
 /// `GET /kyuyo/synced-months` の 200 応答。`rows` は `store_keys::PAYROLL_SYNCED_SQL` の
-/// (scope, synced_at, row_count)。scope の形が合わない行は捨てる (オンプレ版と同じ)。
-pub fn synced_months_reply(rows: Vec<(String, String, i64)>) -> Reply {
+/// (scope, synced_at, row_count)、`bonus` は [`BonusSyncedRow`]。scope の形が合わない行は捨てる (オンプレ版と同じ)。
+pub fn synced_months_reply(rows: Vec<(String, String, i64)>, bonus: Vec<BonusSyncedRow>) -> Reply {
     let entries = rows
         .into_iter()
         .filter_map(|(scope, synced_at, row_count)| {
@@ -92,9 +97,22 @@ pub fn synced_months_reply(rows: Vec<(String, String, i64)>) -> Reply {
             })
         })
         .collect();
+    let bonus = bonus
+        .into_iter()
+        .filter_map(|(scope, synced_at, pay_date, row_count)| {
+            let (company, year) = parse_bonus_scope(&scope)?;
+            Some(SyncedBonusEntry {
+                company,
+                year,
+                pay_date,
+                synced_at,
+                row_count,
+            })
+        })
+        .collect();
     Reply {
         status: 200,
-        body: to_json(&SyncedMonthsResponse { entries }),
+        body: to_json(&SyncedMonthsResponse { entries, bonus }),
     }
 }
 
@@ -176,16 +194,33 @@ mod tests {
 
     #[test]
     fn synced_months() {
-        let r = synced_months_reply(vec![]);
-        assert_eq!((r.status, r.body.as_str()), (200, r#"{"entries":[]}"#));
-        let r = synced_months_reply(vec![
-            ("payroll:0100:2026-05".into(), "t1".into(), 3),
-            ("payroll".into(), "t2".into(), 1),
-            ("payroll:0200:2026-06".into(), "t3".into(), 0),
-        ]);
+        let r = synced_months_reply(vec![], vec![]);
+        assert_eq!(
+            (r.status, r.body.as_str()),
+            (200, r#"{"entries":[],"bonus":[]}"#)
+        );
+        let r = synced_months_reply(
+            vec![
+                ("payroll:0100:2026-05".into(), "t1".into(), 3),
+                ("payroll".into(), "t2".into(), 1),
+                ("payroll:0200:2026-06".into(), "t3".into(), 0),
+            ],
+            vec![
+                (
+                    "bonus:0100:2025".into(),
+                    "t4".into(),
+                    Some("2025-08-08".into()),
+                    2,
+                ),
+                ("bonus:0100:x".into(), "t5".into(), None, 0),
+                ("bonus:0200:2024".into(), "t6".into(), None, 0),
+            ],
+        );
         let want = concat!(
             r#"{"entries":[{"company":"0100","month":"2026-05","synced_at":"t1","row_count":3},"#,
-            r#"{"company":"0200","month":"2026-06","synced_at":"t3","row_count":0}]}"#
+            r#"{"company":"0200","month":"2026-06","synced_at":"t3","row_count":0}],"#,
+            r#""bonus":[{"company":"0100","year":2025,"pay_date":"2025-08-08","synced_at":"t4","row_count":2},"#,
+            r#"{"company":"0200","year":2024,"pay_date":null,"synced_at":"t6","row_count":0}]}"#
         );
         assert_eq!(r.body, want);
     }

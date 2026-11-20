@@ -4,10 +4,13 @@
 //! - `databases` / `companies` — 毎回 SQL Server を読む。`companies` は会社名マスタが読めなくても warning を付けて返す
 //! - `employees` / `payroll` — read-through。DO の SQLite に (会社, 年度) / (会社, 月) があれば SQL Server を開かずに返す
 //!   (`source: "cache"`)。miss なら読んで put (put の失敗は warn して読みは返す、`source: "live"`)
-//! - `sync` — キャッシュに関わらず payroll と employees を読み直して put。**put の失敗は 500** (sync 成功 = 保存が最新)
+//! - `sync` — キャッシュに関わらず payroll と employees と賞与 (month を含む暦年、Refs #419) を読み直して put。
+//!   **月例の put の失敗は 500** (sync 成功 = 保存が最新)。賞与の読み・保存の失敗は warning に落とし
+//!   `bonus_rows: null` で返す (月例が主で、賞与で月例の sync を巻き込まない)
 //! - `schema` — 読み取り専用のスキーマ探索 (Refs #414)。全テーブルの列・項目マスタ・支給回/支給日の件数だけ。
 //!   キャッシュしない
-//! - `bonus` — 暦年の賞与 (`SHOYO`) の全支給回 (Refs #414)。payroll と同じ形の行。キャッシュしない
+//! - `bonus` — 暦年の賞与 (`SHOYO`) の全支給回 (Refs #414)。payroll と同じ形の行。read-through (Refs #419):
+//!   (会社, 暦年) が保存済みなら SQL Server を開かずに返す (`source: "cache"`)。規約は payroll と同じ
 //!
 //! 1 リクエスト = 1 接続。失敗ログは 1 行 (口の名前・stage・種類・所要ミリ秒だけ)。
 
@@ -15,14 +18,15 @@ use kyuyo_logic::api::{
     BonusResponse, DatabasesResponse, EmployeesResponse, PayrollResponse, SchemaResponse,
     SyncResponse,
 };
-use kyuyo_logic::bonus::year_period;
+use kyuyo_logic::bonus::{year_period, BonusRow};
 use kyuyo_logic::payroll::{
     build_employee_rows, kydata_db_name, month_period, nendo_for_month, EmployeeRow, PayrollRow,
 };
 use kyuyo_logic::service::{
-    bonus_rows, companies_response, company_month_params, company_name, company_year_target,
-    count_targets, count_warning, db_open_error_reply, month_indexes, ok_reply, payroll_rows,
-    repo_error_reply, schema_koumoku, store_write_error, validate_company_month, DbError,
+    bonus_read_warning, bonus_rows, bonus_store_warning, companies_response, company_month_params,
+    company_name, company_year_target, count_targets, count_warning, db_open_error_reply,
+    month_indexes, ok_reply, payroll_rows, repo_error_reply, schema_koumoku, store_write_error,
+    validate_company_month, DbError,
 };
 use kyuyo_logic::{log_line_for, Endpoint, Reply};
 use worker::{console_error, console_log, console_warn, Date, Env, SqlStorage, Url};
@@ -100,6 +104,18 @@ struct EmployeesLive {
 struct PayrollLive {
     rows: Vec<PayrollRow>,
     warnings: Vec<String>,
+}
+
+/// 賞与 (暦年) の live 読み結果 (Refs #419)。
+struct BonusLive {
+    rows: Vec<BonusRow>,
+    warnings: Vec<String>,
+}
+
+/// 賞与の読みの失敗。`opening` は本体クエリ (`SHOYO`) での失敗 — 単体の口はこのときだけ 4060 を 404 にする。
+struct BonusFail {
+    e: DbError,
+    opening: bool,
 }
 
 impl Ctx<'_> {
@@ -401,46 +417,81 @@ impl Ctx<'_> {
         }
     }
 
+    /// SQL Server から暦年 `year` の賞与を読む (Refs #414)。`dbn` は `KYDATA{company}_{year-1900}C`。
+    /// 失敗はログ 1 行を出して [`BonusFail`] で返す (応答への写像は呼び出し側: 単体の口は status、sync は warning)。
+    async fn bonus_live(
+        &self,
+        db: &mut Db,
+        what: &str,
+        dbn: &str,
+        year: i32,
+    ) -> Result<BonusLive, BonusFail> {
+        let fail = |opening: bool| {
+            move |e: DbError| {
+                self.log_fail(what, &e);
+                BonusFail { e, opening }
+            }
+        };
+        let (from, to) = year_period(year);
+        let raw = db.bonus(dbn, &from, &to).await.map_err(fail(true))?;
+        let koumoku = db.koumoku(dbn).await.map_err(fail(false))?;
+        let shukei = db.dated_shukei(dbn).await.map_err(fail(false))?;
+        let (rows, warnings) = bonus_rows(&raw, koumoku, &shukei, dbn, year);
+        Ok(BonusLive { rows, warnings })
+    }
+
     async fn bonus(&self, url: &Url) -> Reply {
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         let (company, year, dbn) = match company_year_target(&pairs) {
             Ok(t) => t,
             Err(reply) => return reply,
         };
+        let sql = self.sql;
+        match store::get_bonus(sql, &company, year) {
+            Ok(Some(cached)) => {
+                self.log_ok("bonus", "cache");
+                return ok_reply(&BonusResponse {
+                    company,
+                    year,
+                    database: dbn,
+                    rows: cached.rows,
+                    warnings: cached.warnings,
+                    source: "cache",
+                    synced_at: cached.synced_at,
+                });
+            }
+            Ok(None) => {}
+            Err(_) => console_warn!("kyuyo bonus: store read failed, live fallback"),
+        }
+
         let mut db = match self.open("bonus").await {
             Ok(db) => db,
             Err(reply) => return reply,
         };
-        let fail = |e: DbError| {
-            self.log_fail("bonus", &e);
-            repo_error_reply(&e)
-        };
-        let (from, to) = year_period(year);
-        let out = async {
-            // 開けない DB (4060) は 404 (payroll と同じ)
-            let raw = db.bonus(&dbn, &from, &to).await.map_err(|e| {
-                self.log_fail("bonus", &e);
-                db_open_error_reply(&e, &dbn)
-            })?;
-            let koumoku = db.koumoku(&dbn).await.map_err(fail)?;
-            let shukei = db.dated_shukei(&dbn).await.map_err(fail)?;
-            Ok::<_, Reply>(bonus_rows(&raw, koumoku, &shukei, &dbn, year))
-        }
-        .await;
+        let live = self.bonus_live(&mut db, "bonus", &dbn, year).await;
         db.close().await;
-        match out {
-            Ok((rows, warnings)) => {
-                self.log_ok("bonus", "live");
-                ok_reply(&BonusResponse {
-                    company,
-                    year,
-                    database: dbn,
-                    rows,
-                    warnings,
-                })
-            }
-            Err(reply) => reply,
+        let live = match live {
+            Ok(live) => live,
+            // 開けない DB (4060) は本体クエリだけ 404 (payroll と同じ)
+            Err(f) if f.opening => return db_open_error_reply(&f.e, &dbn),
+            Err(f) => return repo_error_reply(&f.e),
+        };
+        let synced_at = now_rfc3339();
+        let put = store::put_bonus(sql, &company, year, &live.rows, &live.warnings, &synced_at);
+        if put.is_err() {
+            // live 応答はそのまま返す — キャッシュ書き込み失敗で読みを殺さない
+            console_warn!("kyuyo bonus: store write failed");
         }
+        self.log_ok("bonus", "live");
+        ok_reply(&BonusResponse {
+            company,
+            year,
+            database: dbn,
+            rows: live.rows,
+            warnings: live.warnings,
+            source: "live",
+            synced_at,
+        })
     }
 
     async fn sync(&self, url: &Url) -> Reply {
@@ -452,15 +503,18 @@ impl Ctx<'_> {
             Ok(db) => db,
             Err(reply) => return reply,
         };
-        // 給与明細 → 社員マスタの順 (オンプレ版と同じ)。どちらかが失敗したらその応答を返す
+        // 給与明細 → 社員マスタ → 賞与 (month を含む暦年、Refs #419) の順。月例が失敗したらその応答を返す。
+        // 賞与は付け足し: 読めなくても月例の sync は成功させ、warning に段と種別を残す (bonus_rows は null)
+        let bonus_db = kydata_db_name(&t.company, t.year - 1900);
         let live = async {
             let payroll = self.payroll_live(&mut db, "sync", &t).await?;
             let employees = self.employees_live(&mut db, "sync", &t).await?;
-            Ok::<_, Reply>((payroll, employees))
+            let bonus = self.bonus_live(&mut db, "sync", &bonus_db, t.year).await;
+            Ok::<_, Reply>((payroll, employees, bonus))
         }
         .await;
         db.close().await;
-        let (payroll, employees) = match live {
+        let (payroll, employees, bonus) = match live {
             Ok(live) => live,
             Err(reply) => return reply,
         };
@@ -493,18 +547,50 @@ impl Ctx<'_> {
             console_error!("kyuyo sync: store write failed (employees)");
             return store_write_error("employees");
         }
+        let (bonus_rows, bonus_warnings) = self.sync_bonus(&t, bonus, &synced_at);
 
         self.log_ok("sync", "live");
         let mut warnings = payroll.warnings;
         warnings.extend(employees.warnings);
+        warnings.extend(bonus_warnings);
         ok_reply(&SyncResponse {
             company: t.company,
             month: t.month,
             database: t.db,
             payroll_rows: payroll.rows.len(),
             employees: employees.employees.len(),
+            bonus_year: t.year,
+            bonus_rows,
             synced_at,
             warnings,
         })
+    }
+
+    /// sync の賞与の後半: 読めていれば保存する。読み・保存の失敗は warning (段と種別) に落とし、行数は `None`。
+    fn sync_bonus(
+        &self,
+        t: &Target,
+        bonus: Result<BonusLive, BonusFail>,
+        synced_at: &str,
+    ) -> (Option<usize>, Vec<String>) {
+        let bonus = match bonus {
+            Ok(bonus) => bonus,
+            Err(f) => return (None, vec![bonus_read_warning(t.year, &f.e)]),
+        };
+        let put = store::put_bonus(
+            self.sql,
+            &t.company,
+            t.year,
+            &bonus.rows,
+            &bonus.warnings,
+            synced_at,
+        );
+        if put.is_err() {
+            console_warn!("kyuyo sync: store write failed (bonus)");
+            let mut warnings = bonus.warnings;
+            warnings.push(bonus_store_warning(t.year));
+            return (None, warnings);
+        }
+        (Some(bonus.rows.len()), bonus.warnings)
     }
 }

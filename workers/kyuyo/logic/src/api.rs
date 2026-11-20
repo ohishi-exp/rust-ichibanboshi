@@ -71,10 +71,25 @@ pub struct SyncedMonthEntry {
     pub row_count: i64,
 }
 
+/// `GET /kyuyo/synced-months` の賞与 1 件 (Refs #419)。1 件 = (会社, 暦年, 支給日)。
+#[derive(Serialize, Debug)]
+pub struct SyncedBonusEntry {
+    pub company: String,
+    /// 支給した暦年。
+    pub year: i32,
+    /// 支給日 ("YYYY-MM-DD")。取り込んだが賞与が 0 件の年は null (`row_count` 0) の 1 件だけ。
+    pub pay_date: Option<String>,
+    pub synced_at: String,
+    /// その支給日の行数 (社員 × 支給回)。
+    pub row_count: i64,
+}
+
 /// `GET /api/kyuyo/synced-months`。
 #[derive(Serialize, Debug)]
 pub struct SyncedMonthsResponse {
     pub entries: Vec<SyncedMonthEntry>,
+    /// 保存済みの賞与 (Refs #419)。`entries` の形は変えずに別キーで足す。
+    pub bonus: Vec<SyncedBonusEntry>,
 }
 
 /// `POST /api/kyuyo/sync`。
@@ -87,6 +102,11 @@ pub struct SyncResponse {
     pub payroll_rows: usize,
     /// 保存した社員マスタの人数。
     pub employees: usize,
+    /// 取り直した賞与の暦年 (`month` を含む年、Refs #419)。
+    pub bonus_year: i32,
+    /// 保存した賞与の行数 (社員 × 支給回)。賞与を読めない・保存できなければ null (warning に段と種別)。
+    /// 賞与の失敗で sync 全体は失敗にしない (月例が主)。
+    pub bonus_rows: Option<usize>,
     pub synced_at: String,
     pub warnings: Vec<String>,
 }
@@ -115,6 +135,10 @@ pub struct BonusResponse {
     pub database: String,
     pub rows: Vec<BonusRow>,
     pub warnings: Vec<String>,
+    /// このデータの出どころ (Refs #419): "cache" = DO の SQLite / "live" = 給与大臣の直読み (保存済み)。
+    pub source: &'static str,
+    /// 保存の鮮度 (RFC3339)。live 読みでは今回の取得時刻。
+    pub synced_at: String,
 }
 
 /// `GET /kyuyo/schema` のテーブル 1 件 (Refs #414)。件数は `sys.partitions` のメタデータ (行は読まない)。
@@ -255,13 +279,34 @@ mod tests {
                 synced_at: s("t"),
                 row_count: 3,
             }],
+            bonus: vec![
+                SyncedBonusEntry {
+                    company: s("0100"),
+                    year: 2025,
+                    pay_date: Some(s("2025-08-08")),
+                    synced_at: s("t"),
+                    row_count: 2,
+                },
+                SyncedBonusEntry {
+                    company: s("0100"),
+                    year: 2024,
+                    pay_date: None,
+                    synced_at: s("t"),
+                    row_count: 0,
+                },
+            ],
         };
         let want = concat!(
-            r#"{"entries":[{"company":"0100","month":"2026-06","synced_at":"t","row_count":3}]}"#
+            r#"{"entries":[{"company":"0100","month":"2026-06","synced_at":"t","row_count":3}],"#,
+            r#""bonus":[{"company":"0100","year":2025,"pay_date":"2025-08-08","synced_at":"t","row_count":2},"#,
+            r#"{"company":"0100","year":2024,"pay_date":null,"synced_at":"t","row_count":0}]}"#
         );
         assert_eq!(json(&v), want);
-        let empty = SyncedMonthsResponse { entries: vec![] };
-        assert_eq!(json(&empty), r#"{"entries":[]}"#);
+        let empty = SyncedMonthsResponse {
+            entries: vec![],
+            bonus: vec![],
+        };
+        assert_eq!(json(&empty), r#"{"entries":[],"bonus":[]}"#);
     }
 
     #[test]
@@ -272,14 +317,23 @@ mod tests {
             database: s("KYDATA0100_008C"),
             payroll_rows: 2,
             employees: 1,
+            bonus_year: 2026,
+            bonus_rows: Some(4),
             synced_at: s("t"),
             warnings: vec![],
         };
         let want = concat!(
             r#"{"company":"0100","month":"2026-06","database":"KYDATA0100_008C","#,
-            r#""payroll_rows":2,"employees":1,"synced_at":"t","warnings":[]}"#
+            r#""payroll_rows":2,"employees":1,"bonus_year":2026,"bonus_rows":4,"#,
+            r#""synced_at":"t","warnings":[]}"#
         );
         assert_eq!(json(&v), want);
+        let failed = SyncResponse {
+            bonus_rows: None,
+            warnings: vec![s("w")],
+            ..v
+        };
+        assert!(json(&failed).contains(r#""bonus_year":2026,"bonus_rows":null,"#));
     }
 
     #[test]
@@ -299,10 +353,12 @@ mod tests {
             database: s("KYDATA0100_125C"),
             rows: vec![],
             warnings: vec![s("w")],
+            source: "cache",
+            synced_at: s("t"),
         };
         let want = concat!(
             r#"{"company":"0100","year":2025,"database":"KYDATA0100_125C","rows":[],"#,
-            r#""warnings":["w"]}"#
+            r#""warnings":["w"],"source":"cache","synced_at":"t"}"#
         );
         assert_eq!(json(&v), want);
     }

@@ -263,6 +263,18 @@ pub fn store_write_error(what: &str) -> Reply {
     error_reply(500, format!("キャッシュへの保存に失敗しました ({what})"))
 }
 
+/// sync の中で賞与を読めなかったときの warning (Refs #419)。sync は月例が主なので、賞与の失敗で 500 にしない。
+/// 段 (`read`) と stage・種類だけを載せる (メッセージ本文は載せない)。
+pub fn bonus_read_warning(year: i32, e: &DbError) -> String {
+    let (stage, kind) = (e.stage.as_str(), e.kind.label());
+    format!("賞与 ({year} 年) を取り直せませんでした: read stage={stage} kind={kind}")
+}
+
+/// sync の中で賞与を保存できなかったときの warning (Refs #419)。段は `store`。
+pub fn bonus_store_warning(year: i32) -> String {
+    format!("賞与 ({year} 年) を保存できませんでした: store kind=write")
+}
+
 /// derived store の row_json に行を詰める (応答配列の順のまま)。
 pub fn encode_rows<T: Serialize>(rows: &[T]) -> Result<Vec<String>, String> {
     rows.iter()
@@ -296,6 +308,22 @@ mod tests {
 
     fn db_err(stage: Stage, kind: ErrKind) -> DbError {
         DbError { stage, kind }
+    }
+
+    #[test]
+    fn bonus_sync_warnings() {
+        let e = db_err(Stage::Query, ErrKind::Timeout);
+        let w = bonus_read_warning(2025, &e);
+        let tail = format!("read stage=query kind={}", ErrKind::Timeout.label());
+        assert!(
+            w.starts_with("賞与 (2025 年) を取り直せませんでした: "),
+            "{w}"
+        );
+        assert!(w.ends_with(&tail), "{w}");
+        assert_eq!(
+            bonus_store_warning(2026),
+            "賞与 (2026 年) を保存できませんでした: store kind=write"
+        );
     }
 
     fn server(code: u32) -> ErrKind {
