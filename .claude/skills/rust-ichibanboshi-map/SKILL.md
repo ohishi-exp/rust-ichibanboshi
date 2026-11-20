@@ -40,6 +40,7 @@ root package (`src/`) は **RDP 中継 `rdp-relay` だけ** (オンプレの sys
 - `ci.yml`: root package (rdp-relay) の fmt・clippy・test・100% gate、kintai migration の検証と適用、
   main push で `deploy` (rdp-relay だけをオンプレへ。下記「デプロイ」節)。
 - Worker ごとの workflow は `worker-<名前>.yml` (Worker の deploy はタグで、merge では出ない)。
+  タグは手で `git push` しなくてよい: `Tag Release` workflow を `target: worker-<名前>` 付きで起動 (MCP `create_tag_release` から可) すると `worker-<名前>-v*` を採番して push する。
 - `coverage_100.toml`: `cf_access.rs` / `rdp_defaults.rs` / `rdp_nego.rs` を 100% 維持
   (wiremock / 純粋関数テストで DB 不要)。`scripts/check_coverage_100.sh` で検証。
 - `deploy/` は rdp-relay の unit (`rdp-relay.service`・`rdp-relay-lan.service`・`rdp-relay-watcher.{path,service}`) と env の雛形。

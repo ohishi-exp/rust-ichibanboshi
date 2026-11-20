@@ -1,7 +1,32 @@
+# target ごとに打たれる tag と、その tag の push で起きる workflow (MCP create_tag_release { target } からも起動できる):
+#   main           -> v{semver}                 -> (release のみ。Worker の deploy は起きない)
+#   worker-kyuyo   -> worker-kyuyo-v{semver}    -> worker-kyuyo.yml (本番 wrangler deploy)
+#   worker-kintai  -> worker-kintai-v{semver}   -> worker-kintai.yml (本番 wrangler deploy)
+#   worker-ichiban -> worker-ichiban-v{semver}  -> worker-ichiban.yml (本番 wrangler deploy)
+#   worker-uriage  -> worker-uriage-v{semver}   -> worker-uriage.yml (本番 wrangler deploy)
 name: Tag Release
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "打つ tag の系統 (main = v*、worker-<名前> = worker-<名前>-v*)"
+        type: choice
+        options:
+          - main
+          - worker-kyuyo
+          - worker-kintai
+          - worker-ichiban
+          - worker-uriage
+        default: main
+      bump:
+        description: "semver の上げ方"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
 
 permissions:
   contents: write
@@ -9,4 +34,8 @@ permissions:
 jobs:
   release:
     uses: ippoan/ci-workflows/.github/workflows/tag-release.yml@main
+    with:
+      # `cond && '' || x` は '' が falsy で常に x になる (main が 'main-' になる) ので条件を反転して書く
+      prefix: ${{ inputs.target != 'main' && format('{0}-', inputs.target) || '' }}
+      bump: ${{ inputs.bump }}
     secrets: inherit
