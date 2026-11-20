@@ -19,7 +19,7 @@ mod routes;
 mod state;
 mod store;
 
-use kyuyo_logic::auth::{bearer_token, decide, server_error};
+use kyuyo_logic::auth::{authorize_request, Verifier, AUTH_MODE_HEADER};
 use kyuyo_logic::{reply_for_route, route, Reply, Route};
 use worker::{console_error, event, Context, Env, Request, Response};
 
@@ -33,16 +33,22 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response
     }
     let email = match route {
         Route::Kyuyo(_) => {
+            let mode = req.headers().get(AUTH_MODE_HEADER)?;
             let header = req.headers().get("authorization")?;
-            let token = bearer_token(header.as_deref());
-            let result = match auth::authorize(&env, token).await {
-                Ok(result) => result,
-                Err(_) => {
-                    console_error!("kyuyo auth: rpc failed");
-                    return respond(server_error());
+            let env = &env;
+            let call = |verifier: Verifier, token: &str| {
+                let token = token.to_string();
+                async move {
+                    match auth::call(env, verifier, &token).await {
+                        Ok(r) => Some((r.status, r.body)),
+                        Err(_) => {
+                            console_error!("kyuyo auth: rpc failed ({})", verifier.method());
+                            None
+                        }
+                    }
                 }
             };
-            match decide(result.status, &result.body) {
+            match authorize_request(mode.as_deref(), header.as_deref(), call).await {
                 Ok(email) => Some(email),
                 Err(reply) => return respond(reply),
             }
