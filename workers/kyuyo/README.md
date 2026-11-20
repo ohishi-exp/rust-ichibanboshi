@@ -247,6 +247,7 @@ CI は `.github/workflows/worker-kyuyo.yml`。PR と main への push は build 
 2. [x] Secrets Store に資格情報の JSON (`{"user":"…","pass":"…"}`、secret 名 `KYUYO_SQL`) を入れ、`store_id` / `secret_name` を入れた
 3. [x] 実接続確認: `wrangler dev --remote` で `POST /probe` が `{"ok":true}` を返す
 4. [ ] タグ deploy: `worker-kyuyo-v*` を push (`wrangler deploy --tag`。org secret `CLOUDFLARE_API_TOKEN`)
+   (`Tag Release` workflow を `target: worker-kyuyo` 付きで起動すれば採番と push をする。MCP `create_tag_release` から可)
 5. [ ] 呼び出し側 worker に Service Binding を宣言し、`POST /probe` が `{"ok":true}` を返すことを見る
 6. [x] 認可 (auth-worker の `KyuyoAuthEntrypoint`)・DO `KyuyoState`・`/kyuyo/access`・`/kyuyo/synced-months` を足した
 7. [x] 残りの 5 口 (`databases` / `companies` / `employees` / `payroll` / `sync`) を DO のロックの中に実装した。
