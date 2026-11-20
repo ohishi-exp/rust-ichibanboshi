@@ -139,7 +139,8 @@ pub struct SchemaValueCount {
 }
 
 /// `GET /kyuyo/schema?company=&year=` (Refs #414)。賞与のテーブルを実物で特定するための読み取り専用の口。
-/// 対象は固定の候補テーブル (`SHOYO%` / `SHUKEI%` / `KAITEI%`) だけで、個人の行・氏名・金額は返さない。
+/// 返すのは指定 DB の全テーブル・全列のメタデータ、項目マスタ、支給回/支給日の列の値ごとの件数だけで、
+/// 個人の行・氏名・金額は返さない。
 #[derive(Serialize, Debug)]
 pub struct SchemaResponse {
     pub company: String,

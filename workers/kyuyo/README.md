@@ -11,7 +11,7 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `GET /kyuyo/databases` / `companies` | 実装済み。毎回 SQL Server を読む (オンプレ版と同じ応答) |
 | `GET /kyuyo/employees` / `payroll` (`?company=&month=`) | 実装済み。read-through: DO の SQLite にあれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` |
 | `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees を読み直して保存。保存に失敗したら 500 (sync 成功 = 保存が最新) |
-| `GET /kyuyo/schema` (`?company=&year=`) | 読み取り専用のスキーマ探索 (Refs #414、賞与のテーブルを実物で特定するため)。DB は `KYDATA{company}_{year-1900}C`。固定の候補テーブル (`SHOYO%` / `SHUKEI%` / `KAITEI%`) の行数 (メタデータ)・列・`KOUMOKU` 全行・支給回/支給日の列 (`MONTH` / `KAISU` / `SHIKYUBI*`) の値ごとの件数だけを返す。自由な SQL・テーブル名は受けず、個人の行・氏名・金額は返さない。キャッシュしない |
+| `GET /kyuyo/schema` (`?company=&year=`) | 読み取り専用のスキーマ探索 (Refs #414、賞与のテーブルを実物で特定するため)。DB は `KYDATA{company}_{year-1900}C`。全テーブルの行数 (メタデータ)・全列 (名前・型・定義順)・`KOUMOKU` 全行・支給回/支給日の列 (全テーブルの `MONTH` / `KAISU` / `SHIKYUBI*`、上限 64 列で超えた列名は warning) の値ごとの件数だけを返す。テーブル名では絞らない (名前に個人情報は無く、絞ると別名のテーブルを見落とす)。自由な SQL は受けず、個人の行・氏名・金額は返さない。キャッシュしない |
 
 パスに `/api` は付かない (呼び出し側の binding から見た path)。method が違えば 405、どの口でもなければ 404 (本文 `{"ok":false}`)。
 

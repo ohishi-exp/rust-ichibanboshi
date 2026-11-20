@@ -145,10 +145,10 @@ pub struct CountTarget {
     pub is_date: bool,
 }
 
-/// 値ごとの件数を数える列の上限 (給与大臣 PC への負荷を抑える)。超えた分は数えずに warning を出す。
+/// 値ごとの件数を数える列の上限 (給与大臣 PC への負荷を抑える)。超えた分は数えず、その列名を warning に出す。
 pub const MAX_COUNT_TARGETS: usize = 64;
 
-/// 値ごとの件数を数える列を選ぶ。支給回 (`MONTH` / `KAISU`) と支給日 (`SHIKYUBI` で始まる列) だけ —
+/// 値ごとの件数を数える列を全テーブルから選ぶ。支給回 (`MONTH` / `KAISU`) と支給日 (`SHIKYUBI` で始まる列) だけ —
 /// 氏名・金額の列は数えない。日付型 (`datetime` / `smalldatetime` / `date` / `datetime2`) は日付として数える。
 pub fn count_targets(columns: &[SchemaColumn]) -> (Vec<CountTarget>, Vec<String>) {
     let mut targets: Vec<CountTarget> = columns
@@ -165,10 +165,14 @@ pub fn count_targets(columns: &[SchemaColumn]) -> (Vec<CountTarget>, Vec<String>
         .collect();
     let mut warnings = Vec::new();
     if targets.len() > MAX_COUNT_TARGETS {
-        let skipped = targets.len() - MAX_COUNT_TARGETS;
-        let msg = format!("値の件数は先頭 {MAX_COUNT_TARGETS} 列だけ ({skipped} 列は省略)");
+        let skipped: Vec<String> = targets
+            .split_off(MAX_COUNT_TARGETS)
+            .iter()
+            .map(|t| t.table.clone() + "." + &t.column)
+            .collect();
+        let skipped = skipped.join(", ");
+        let msg = format!("値の件数は先頭 {MAX_COUNT_TARGETS} 列だけ数えました。省略: {skipped}");
         warnings.push(msg);
-        targets.truncate(MAX_COUNT_TARGETS);
     }
     (targets, warnings)
 }
@@ -544,10 +548,9 @@ mod tests {
         let (targets, warnings) = count_targets(&columns);
         assert_eq!(targets.len(), MAX_COUNT_TARGETS);
         assert_eq!(targets[0].column, "SHIKYUBI00");
-        assert_eq!(
-            warnings,
-            vec!["値の件数は先頭 64 列だけ (3 列は省略)".to_string()]
-        );
+        assert_eq!(targets[63].column, "SHIKYUBI63");
+        let want = "値の件数は先頭 64 列だけ数えました。省略: SHUKEI1.SHIKYUBI64, SHUKEI1.SHIKYUBI65, SHUKEI1.SHIKYUBI66";
+        assert_eq!(warnings, vec![want.to_string()]);
     }
 
     #[test]

@@ -214,7 +214,7 @@ impl Db {
             .collect())
     }
 
-    /// スキーマ探索 (Refs #414): 候補テーブルの (名前, 行数)。行数はメタデータ。
+    /// スキーマ探索 (Refs #414): 全テーブルの (名前, 行数)。行数はメタデータ。
     pub(crate) async fn schema_tables(&mut self, db: &str) -> Result<Vec<SchemaTable>, DbError> {
         let sql = schema_tables_sql(db).map_err(|_| fail(Stage::Query, ErrKind::Other))?;
         let rows = self.simple(&sql).await?;
@@ -227,7 +227,7 @@ impl Db {
             .collect())
     }
 
-    /// スキーマ探索: 候補テーブルの列。
+    /// スキーマ探索: 全テーブルの列。
     pub(crate) async fn schema_columns(&mut self, db: &str) -> Result<Vec<SchemaColumn>, DbError> {
         let sql = schema_columns_sql(db).map_err(|_| fail(Stage::Query, ErrKind::Other))?;
         let rows = self.simple(&sql).await?;

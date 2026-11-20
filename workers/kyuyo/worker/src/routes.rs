@@ -5,7 +5,7 @@
 //! - `employees` / `payroll` — read-through。DO の SQLite に (会社, 年度) / (会社, 月) があれば SQL Server を開かずに返す
 //!   (`source: "cache"`)。miss なら読んで put (put の失敗は warn して読みは返す、`source: "live"`)
 //! - `sync` — キャッシュに関わらず payroll と employees を読み直して put。**put の失敗は 500** (sync 成功 = 保存が最新)
-//! - `schema` — 読み取り専用のスキーマ探索 (Refs #414)。固定の候補テーブルの列・項目マスタ・支給回/支給日の件数だけ。
+//! - `schema` — 読み取り専用のスキーマ探索 (Refs #414)。全テーブルの列・項目マスタ・支給回/支給日の件数だけ。
 //!   キャッシュしない
 //!
 //! 1 リクエスト = 1 接続。失敗ログは 1 行 (口の名前・stage・種類・所要ミリ秒だけ)。

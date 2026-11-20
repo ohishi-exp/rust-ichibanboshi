@@ -80,38 +80,31 @@ const SHUKEI_TOTALS_SQL: &str = "SELECT CAST(SHAIN AS int), \
              CAST(ISNULL(SHOKOUJO{nn}, 0) AS int) \
              FROM [{db}].dbo.SHUKEI1";
 
-/// スキーマ探索 (Refs #414) の候補テーブルの絞り込み。**固定**で、外から接頭辞もテーブル名も受けない。
-/// 賞与は `SHOYO` / `KAITEISHUKEI*` 系にあると #81 に書かれていて、`SHUKEI1` の支給回 (00..21) にも載りうる。
-const SCHEMA_TABLE_FILTER: &str =
-    "(t.name LIKE 'SHOYO%' OR t.name LIKE 'SHUKEI%' OR t.name LIKE 'KAITEI%')";
-
-/// 候補テーブルの (名前, 行数)。行数は `sys.partitions` のメタデータで、行そのものは読まない。
+/// スキーマ探索 (Refs #414): 指定 DB の全ユーザーテーブルの (名前, 行数)。テーブル名で絞らない
+/// (名前・列名に個人情報は無く、絞ると賞与が別名のテーブルに入っていたときに見落とす)。
+/// 行数は `sys.partitions` のメタデータで、行そのものは読まない。
 const SCHEMA_TABLES_SQL: &str = "SELECT t.name, CAST(ISNULL(SUM(p.rows), 0) AS int) \
              FROM [{db}].sys.tables t \
              LEFT JOIN [{db}].sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) \
-             WHERE {filter} GROUP BY t.name ORDER BY t.name";
+             GROUP BY t.name ORDER BY t.name";
 
-/// 候補テーブルの (テーブル名, 列名, 型)。列の順は定義順。
+/// 全ユーザーテーブルの (テーブル名, 列名, 型)。列の順は定義順。
 const SCHEMA_COLUMNS_SQL: &str = "SELECT t.name, c.name, ty.name \
              FROM [{db}].sys.tables t \
              JOIN [{db}].sys.columns c ON c.object_id = t.object_id \
              JOIN [{db}].sys.types ty ON ty.user_type_id = c.user_type_id \
-             WHERE {filter} ORDER BY t.name, c.column_id";
+             ORDER BY t.name, c.column_id";
 
-/// 指定 DB の候補テーブルの一覧と行数を読む SQL。列は 名前, 行数。
+/// 指定 DB の全テーブルの一覧と行数を読む SQL。列は 名前, 行数。
 pub fn schema_tables_sql(db: &str) -> Result<String, String> {
     validate_db_name(db)?;
-    Ok(SCHEMA_TABLES_SQL
-        .replace("{filter}", SCHEMA_TABLE_FILTER)
-        .replace("{db}", db))
+    Ok(SCHEMA_TABLES_SQL.replace("{db}", db))
 }
 
-/// 指定 DB の候補テーブルの列を読む SQL。列は テーブル名, 列名, 型名。
+/// 指定 DB の全テーブルの列を読む SQL。列は テーブル名, 列名, 型名。
 pub fn schema_columns_sql(db: &str) -> Result<String, String> {
     validate_db_name(db)?;
-    Ok(SCHEMA_COLUMNS_SQL
-        .replace("{filter}", SCHEMA_TABLE_FILTER)
-        .replace("{db}", db))
+    Ok(SCHEMA_COLUMNS_SQL.replace("{db}", db))
 }
 
 /// テーブル名・列名の検証。英数字と `_` だけ、1〜128 文字 (SQL 文に `[…]` で埋め込むため)。
@@ -340,7 +333,6 @@ mod tests {
             "SELECT t.name, CAST(ISNULL(SUM(p.rows), 0) AS int) ",
             "FROM [KYDATA0100_126C].sys.tables t ",
             "LEFT JOIN [KYDATA0100_126C].sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) ",
-            "WHERE (t.name LIKE 'SHOYO%' OR t.name LIKE 'SHUKEI%' OR t.name LIKE 'KAITEI%') ",
             "GROUP BY t.name ORDER BY t.name"
         );
         assert_eq!(schema_tables_sql("KYDATA0100_126C").unwrap(), want);
@@ -354,7 +346,6 @@ mod tests {
             "FROM [KYDATA0100_126C].sys.tables t ",
             "JOIN [KYDATA0100_126C].sys.columns c ON c.object_id = t.object_id ",
             "JOIN [KYDATA0100_126C].sys.types ty ON ty.user_type_id = c.user_type_id ",
-            "WHERE (t.name LIKE 'SHOYO%' OR t.name LIKE 'SHUKEI%' OR t.name LIKE 'KAITEI%') ",
             "ORDER BY t.name, c.column_id"
         );
         assert_eq!(schema_columns_sql("KYDATA0100_126C").unwrap(), want);
