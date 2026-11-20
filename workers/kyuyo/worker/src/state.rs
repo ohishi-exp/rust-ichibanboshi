@@ -4,8 +4,8 @@
 //! - **SQL Server を開く処理はここ (`sql_server` のロックの中) だけ**。DO は await 中に次のリクエストが
 //!   割り込むので明示のロックで直列化し、給与大臣 PC への同時接続を 1 本に保つ (オンプレ版の
 //!   `KyuyoLimiter` と同じ役目)。`POST /probe` と `/kyuyo/*` の 5 口 ([`crate::routes`]) がこれを通る
-//! - 保存先は `kyuyo_logic::store_keys` の DDL の 3 表 (オンプレ版の derived store と同じ形) +
-//!   自前の `schema_version` 表 (PRAGMA user_version は使わない)。版が違えば 3 表を drop → 再作成
+//! - 保存先は `kyuyo_logic::store_keys` の DDL の 4 表 (オンプレ版の derived store と同じ形) +
+//!   自前の `schema_version` 表 (PRAGMA user_version は使わない)。版が違えば 4 表を drop → 再作成
 //!   (derived なので migration しない)
 //! - `/kyuyo/*` の認可は Worker 側で済んでいる。email は内部ヘッダ `EMAIL_HEADER` で届く
 //!   (Worker は DO へのリクエストを新しく組み立てるので、外から来た同名ヘッダは届かない)。
@@ -14,10 +14,10 @@
 use std::cell::Cell;
 
 use kyuyo_logic::auth::{
-    access_reply, server_error, store_error, synced_months_reply, EMAIL_HEADER,
+    access_reply, server_error, store_error, synced_months_reply, BonusSyncedRow, EMAIL_HEADER,
 };
 use kyuyo_logic::store_keys::{
-    CREATE_TABLES_SQL, DROP_TABLES_SQL, PAYROLL_SYNCED_SQL, SCHEMA_VERSION,
+    BONUS_SYNCED_SQL, CREATE_TABLES_SQL, DROP_TABLES_SQL, PAYROLL_SYNCED_SQL, SCHEMA_VERSION,
 };
 use kyuyo_logic::{reply_for_route, route, Endpoint, Route};
 use serde::Deserialize;
@@ -91,6 +91,14 @@ struct SyncedRow {
     row_count: i64,
 }
 
+#[derive(Deserialize)]
+struct BonusSyncedSqlRow {
+    scope: String,
+    synced_at: String,
+    pay_date: Option<String>,
+    row_count: i64,
+}
+
 impl KyuyoState {
     async fn kyuyo(&self, endpoint: Endpoint, email: &str, req: &Request) -> Result<Response> {
         match endpoint {
@@ -100,8 +108,11 @@ impl KyuyoState {
                 res.headers().set("cache-control", "no-store")?;
                 Ok(res)
             }
-            Endpoint::SyncedMonths => match self.payroll_synced() {
-                Ok(rows) => respond(synced_months_reply(rows)),
+            Endpoint::SyncedMonths => match self.payroll_synced().and_then(|p| {
+                let b = self.bonus_synced()?;
+                Ok((p, b))
+            }) {
+                Ok((rows, bonus)) => respond(synced_months_reply(rows, bonus)),
                 Err(_) => {
                     console_error!("kyuyo state: synced-months read failed");
                     respond(store_error())
@@ -147,6 +158,14 @@ impl KyuyoState {
         Ok(rows
             .into_iter()
             .map(|r| (r.scope, r.synced_at, r.row_count))
+            .collect())
+    }
+
+    fn bonus_synced(&self) -> Result<Vec<BonusSyncedRow>> {
+        let rows: Vec<BonusSyncedSqlRow> = self.sql.exec(BONUS_SYNCED_SQL, None)?.to_array()?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.scope, r.synced_at, r.pay_date, r.row_count))
             .collect())
     }
 }

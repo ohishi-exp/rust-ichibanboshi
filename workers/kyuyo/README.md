@@ -7,12 +7,12 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 |---|---|
 | `POST /probe` | ログインと `SELECT 1` だけ (認可なし。データは返さない) |
 | `GET /kyuyo/access` | 実装済み。認可の結果の email で `{"allowed":true,"email":…}`、`Cache-Control: no-store`。SQL Server を開かない |
-| `GET /kyuyo/synced-months` | 実装済み。DO の SQLite の sync 済み月 (`{"entries":[…]}`、オンプレ版と同じ形)。SQL Server を開かない |
+| `GET /kyuyo/synced-months` | 実装済み。DO の SQLite の sync 済み月 (`{"entries":[…],"bonus":[…]}`)。`entries` はオンプレ版と同じ形。`bonus` (Refs #419) は保存済みの賞与で、1 件 = (会社, 暦年, 支給日) の `{company, year, pay_date, synced_at, row_count}`。保存したが賞与が 0 件の年は `pay_date: null`・`row_count: 0` の 1 件 (未取得とは区別できる)。SQL Server を開かない |
 | `GET /kyuyo/databases` / `companies` | 実装済み。毎回 SQL Server を読む (オンプレ版と同じ応答) |
 | `GET /kyuyo/employees` / `payroll` (`?company=&month=`) | 実装済み。read-through: DO の SQLite にあれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` |
-| `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees を読み直して保存。保存に失敗したら 500 (sync 成功 = 保存が最新) |
+| `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees と賞与 (`month` を含む暦年、Refs #419) を読み直して保存。応答に `bonus_year` と `bonus_rows` (賞与の行数)。保存に失敗したら 500 (sync 成功 = 保存が最新) |
 | `GET /kyuyo/schema` (`?company=&year=`) | 読み取り専用のスキーマ探索 (Refs #414、賞与のテーブルを実物で特定するため)。DB は `KYDATA{company}_{year-1900}C`。全テーブルの行数 (メタデータ)・全列 (名前・型・定義順)・`KOUMOKU` 全行・支給回/支給日の列 (全テーブルの `MONTH` / `KAISU` / `SHIKYUBI*`、上限 64 列で超えた列名は warning) の値ごとの件数だけを返す。テーブル名では絞らない (名前に個人情報は無く、絞ると別名のテーブルを見落とす)。自由な SQL は受けず、個人の行・氏名・金額は返さない。キャッシュしない |
-| `GET /kyuyo/bonus` (`?company=&year=`) | 賞与 (Refs #414)。`year` は支給した暦年で、DB は `KYDATA{company}_{year-1900}C` (8 月・12 月ともこの DB)。`SHOYO` を支給日で暦年に絞り、1 行 = 社員 × 支給回。キーは payroll の行に揃える (`employee_code` / `employee_code_key` / `employee_name` / `department` / `taikei` / `kai` / `month_index` / `pay_date` / `retired` / `payments` / `deductions` / `totals`)。`MONEY{n}` は項目番号 `098+n`、支給/控除の分け方は payroll と同じ。`totals` は `SHUKEI1` の回を社員 × 支給日で突き合わせる。キャッシュしない |
+| `GET /kyuyo/bonus` (`?company=&year=`) | 賞与 (Refs #414)。`year` は支給した暦年で、DB は `KYDATA{company}_{year-1900}C` (8 月・12 月ともこの DB)。`SHOYO` を支給日で暦年に絞り、1 行 = 社員 × 支給回。キーは payroll の行に揃える (`employee_code` / `employee_code_key` / `employee_name` / `department` / `taikei` / `kai` / `month_index` / `pay_date` / `retired` / `payments` / `deductions` / `totals`)。`MONEY{n}` は項目番号 `098+n`、支給/控除の分け方は payroll と同じ。`totals` は `SHUKEI1` の回を社員 × 支給日で突き合わせる。read-through (Refs #419): DO の SQLite に (会社, 暦年) があれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` (保存の失敗は読みを殺さない)。応答に `source` と `synced_at` (payroll と同じ意味) |
 
 パスに `/api` は付かない (呼び出し側の binding から見た path)。method が違えば 405、どの口でもなければ 404 (本文 `{"ok":false}`)。
 
@@ -22,7 +22,7 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 |---|---|
 | `logic/` | crate `kyuyo-logic`。Worker に依存しない純粋ロジック (経路判定・失敗の stage と応答の写像・資格情報 JSON の検証)。std のみで `cargo test` できる |
 | `logic/src/api.rs` | `/api/kyuyo/*` の応答型。**オンプレ版と Worker が同じ定義を使う** (JSON のキーと順は unit test が固定) |
-| `logic/src/store_keys.rs` | derived store の DDL (3 表)・版・scope の鍵。**オンプレ版の `src/kyuyo/store.rs` と DO が共有** |
+| `logic/src/store_keys.rs` | derived store の DDL (4 表)・版・scope の鍵。**オンプレ版の `src/kyuyo/store.rs` と DO が共有** |
 | `logic/src/auth.rs` | auth-worker の `authorize` の戻りの読み方 (200 だけ通す・fail-closed) と `/kyuyo/*` の応答 |
 | `logic/src/payroll.rs` | 給与明細を組み立てる純粋ロジック (オンプレ版も借りている) |
 | `logic/src/bonus.rs` | 賞与 (`SHOYO`) の行を組み立てる純粋ロジック (Refs #414)。支給/控除の分け方は `payroll.rs` の `split_money` を共用 |
@@ -45,7 +45,7 @@ Service Binding を宣言した worker
   └─ ichibanboshi-kyuyo (fetch)
        ├─ /kyuyo/* は先に AUTH_KYUYO (auth-worker の KyuyoAuthEntrypoint).authorize(token)
        └─ 全リクエストを DO KyuyoState (idFromName("kyuyo") の 1 インスタンス) へ転送
-            ├─ SQLite: kyuyo_payroll / kyuyo_employees / kyuyo_sync_state + schema_version
+            ├─ SQLite: kyuyo_payroll / kyuyo_employees / kyuyo_bonus / kyuyo_sync_state + schema_version
             └─ ロックの中だけで SQL Server を開く
                  ├─ KYUYO_SQL (Secrets Store): JSON {"user","pass"}
                  └─ KYUYO_VPC (Workers VPC の VPC Service) ── Tunnel ── 社内の給与大臣 SQL Server
@@ -77,12 +77,14 @@ Service Binding で繋ぐ (下の「ローカル検証」)。
 
 - インスタンスは `idFromName("kyuyo")` の 1 つだけ。`POST /probe` を含む全リクエストがここを通る
 - SQLite に `store_keys` の DDL で 3 表 (オンプレ版の derived store と同じ形) と自前の `schema_version` 表
-  (`PRAGMA user_version` は使わない)。版 (`store_keys::SCHEMA_VERSION`) が違えば 3 表を drop → 再作成する
+  (`PRAGMA user_version` は使わない)。版 (`store_keys::SCHEMA_VERSION`) が違えば 4 表を drop → 再作成する
   (derived なので migration しない。源泉から作り直せる)
 - DO は await 中に次のリクエストが割り込むので、SQL Server を開く区間は `tokio::sync::Mutex` で直列化する
   (給与大臣 PC への同時接続を増やさない。オンプレ版の `KyuyoLimiter` と同じ役目)。`/probe` と 5 口がこのロックを通る
 - `access` と `synced-months` は SQL Server を開かない (ロックを取らない)
-- 5 口はロックの中で走る (employees / payroll のキャッシュ命中もロックの中なので、sync の保存と読みが交差しない)。
+- 表を足すときは版を上げずに `CREATE TABLE IF NOT EXISTS` を足す (毎回流れるので既存の DO にも出来る)。
+  `kyuyo_bonus` (Refs #419) はこれで足した — 版を上げると月例のキャッシュまで全部消える
+- 5 口はロックの中で走る (employees / payroll / bonus のキャッシュ命中もロックの中なので、sync の保存と読みが交差しない)。
   保存は await を挟まずに文を続けて流すので、DO の暗黙のトランザクションで一度に確定する。途中の文が失敗したら
   その scope の `kyuyo_sync_state` を消して、行の欠けたキャッシュを命中させない
 
@@ -98,7 +100,7 @@ Service Binding で繋ぐ (下の「ローカル検証」)。
 | TCP・ログインの失敗 (20 秒) | 503 | `給与 DB に接続できません (給与大臣 PC の稼働を確認してください)` |
 | employees / payroll の本体クエリで SQL Server error **4060** | 404 | `{DB 名} を開けません (…)` |
 | それ以外のクエリの失敗・60 秒の時間切れ | 500 | `給与 DB クエリに失敗しました` |
-| sync の保存の失敗 | 500 | `キャッシュへの保存に失敗しました (payroll)` / `(employees)` |
+| sync の保存の失敗 | 500 | `キャッシュへの保存に失敗しました (payroll)` / `(employees)` / `(bonus)` |
 
 - 404 の判定はオンプレ版 (文言 "Cannot open database" か "4060") と同じことをエラー番号 4060 で行う。
   **SQL Server 2022 (docker) では、存在しない年度 DB は 208 (Invalid object name)、権限の無い DB は 916 になり、

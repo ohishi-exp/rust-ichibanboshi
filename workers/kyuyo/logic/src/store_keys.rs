@@ -10,12 +10,14 @@
 /// sync で埋まり直す (derived store)。
 pub const SCHEMA_VERSION: i32 = 1;
 
-/// 3 表を消す。版が違うときだけ流す。
+/// 4 表を消す。版が違うときだけ流す。
 pub const DROP_TABLES_SQL: &str = "DROP TABLE IF EXISTS kyuyo_payroll;
                  DROP TABLE IF EXISTS kyuyo_employees;
+                 DROP TABLE IF EXISTS kyuyo_bonus;
                  DROP TABLE IF EXISTS kyuyo_sync_state;";
 
-/// 3 表を作る (既にあれば何もしない)。
+/// 4 表を作る (既にあれば何もしない)。`kyuyo_bonus` (Refs #419) は後から足した表で、版は上げていない —
+/// `CREATE TABLE IF NOT EXISTS` は毎回流れるので既存の DO にもそのまま出来る (月例のキャッシュは消さない)。
 pub const CREATE_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS kyuyo_payroll (
                company TEXT NOT NULL,
                month   TEXT NOT NULL,
@@ -30,6 +32,13 @@ pub const CREATE_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS kyuyo_payroll (
                row_json TEXT NOT NULL,
                PRIMARY KEY (company, nendo, seq)
              );
+             CREATE TABLE IF NOT EXISTS kyuyo_bonus (
+               company TEXT NOT NULL,
+               year    INTEGER NOT NULL,   -- 支給した暦年
+               seq     INTEGER NOT NULL,
+               row_json TEXT NOT NULL,
+               PRIMARY KEY (company, year, seq)
+             );
              CREATE TABLE IF NOT EXISTS kyuyo_sync_state (
                scope TEXT NOT NULL PRIMARY KEY,
                synced_at TEXT NOT NULL,
@@ -43,6 +52,16 @@ pub const CREATE_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS kyuyo_payroll (
 pub const PAYROLL_SYNCED_SQL: &str = "SELECT scope, synced_at, row_count FROM kyuyo_sync_state
                      WHERE scope LIKE 'payroll:%'
                      ORDER BY scope ASC";
+
+/// sync 済み賞与 (bonus scope) の一覧 (Refs #419)。列は scope, synced_at, pay_date, row_count の順で、
+/// 1 行 = (scope, 支給日)。行の無い scope (賞与 0 件の年) は pay_date NULL・row_count 0 の 1 行。
+/// scope は [`parse_bonus_scope`] で (会社, 年) に分ける。
+pub const BONUS_SYNCED_SQL: &str = "SELECT s.scope AS scope, s.synced_at AS synced_at, \
+     json_extract(b.row_json, '$.pay_date') AS pay_date, COUNT(b.seq) AS row_count \
+     FROM kyuyo_sync_state s LEFT JOIN kyuyo_bonus b \
+     ON s.scope = 'bonus:' || b.company || ':' || b.year \
+     WHERE s.scope LIKE 'bonus:%' \
+     GROUP BY s.scope, s.synced_at, pay_date ORDER BY s.scope ASC, pay_date ASC";
 
 // ── 行の読み書き (Worker の DO 用。プレースホルダは `?` の位置指定) ─────────────────────────
 // オンプレ版 (`src/kyuyo/store.rs`、rusqlite の `?1`) と同じ文。DO はこれらを await を挟まずに続けて流すので、
@@ -66,7 +85,7 @@ pub const PAYROLL_DELETE_SQL: &str = "DELETE FROM kyuyo_payroll WHERE company = 
 pub const PAYROLL_INSERT_SQL: &str =
     "INSERT INTO kyuyo_payroll (company, month, seq, row_json) VALUES (?, ?, ?, ?)";
 
-/// 給与明細の sync_state (company_name は使わないので '' のまま)。引数: scope, synced_at, row_count, warnings_json。
+/// 給与明細と賞与の sync_state (company_name は使わないので '' のまま)。引数: scope, synced_at, row_count, warnings_json。
 pub const PAYROLL_SYNC_STATE_UPSERT_SQL: &str =
     "INSERT INTO kyuyo_sync_state (scope, synced_at, row_count, company_name, warnings_json) \
      VALUES (?, ?, ?, '', ?) \
@@ -93,6 +112,17 @@ pub const EMPLOYEES_SYNC_STATE_UPSERT_SQL: &str =
      row_count = excluded.row_count, company_name = excluded.company_name, \
      warnings_json = excluded.warnings_json";
 
+/// 賞与の row_json (応答配列の順)。引数: company, year。
+pub const BONUS_ROWS_SQL: &str =
+    "SELECT row_json FROM kyuyo_bonus WHERE company = ? AND year = ? ORDER BY seq ASC";
+
+/// 賞与を消す (put の最初)。引数: company, year。
+pub const BONUS_DELETE_SQL: &str = "DELETE FROM kyuyo_bonus WHERE company = ? AND year = ?";
+
+/// 賞与 1 行。引数: company, year, seq, row_json。
+pub const BONUS_INSERT_SQL: &str =
+    "INSERT INTO kyuyo_bonus (company, year, seq, row_json) VALUES (?, ?, ?, ?)";
+
 /// 給与明細 (会社×月) の sync_state の鍵。
 pub fn payroll_scope(company: &str, month: &str) -> String {
     format!("payroll:{company}:{month}")
@@ -101,6 +131,17 @@ pub fn payroll_scope(company: &str, month: &str) -> String {
 /// 社員マスタ (会社×年度) の sync_state の鍵。
 pub fn employees_scope(company: &str, nendo: i32) -> String {
     format!("employees:{company}:{nendo}")
+}
+
+/// 賞与 (会社×暦年) の sync_state の鍵 (Refs #419)。
+pub fn bonus_scope(company: &str, year: i32) -> String {
+    format!("bonus:{company}:{year}")
+}
+
+/// [`bonus_scope`] の逆 (`bonus:{company}:{year}` → (company, year))。形が合わない・年が数でなければ `None`。
+pub fn parse_bonus_scope(scope: &str) -> Option<(String, i32)> {
+    let (company, year) = parse_payroll_scope(scope)?;
+    Some((company, year.parse().ok()?))
 }
 
 /// [`payroll_scope`] の逆 (`payroll:{company}:{month}` → (company, month))。形が合わなければ `None`。
@@ -121,6 +162,15 @@ mod tests {
     fn scopes() {
         assert_eq!(payroll_scope("0100", "2026-06"), "payroll:0100:2026-06");
         assert_eq!(employees_scope("0100", 8), "employees:0100:8");
+        assert_eq!(bonus_scope("0100", 2025), "bonus:0100:2025");
+    }
+
+    #[test]
+    fn parse_bonus() {
+        let scope = bonus_scope("0100", 2025);
+        assert_eq!(parse_bonus_scope(&scope), Some(("0100".to_string(), 2025)));
+        assert_eq!(parse_bonus_scope("bonus:0100:x"), None);
+        assert_eq!(parse_bonus_scope("bonus:0100"), None);
     }
 
     #[test]
@@ -160,6 +210,10 @@ mod tests {
             (EMPLOYEES_DELETE_SQL, "kyuyo_employees", 2),
             (EMPLOYEES_INSERT_SQL, "kyuyo_employees", 4),
             (EMPLOYEES_SYNC_STATE_UPSERT_SQL, "kyuyo_sync_state", 5),
+            (BONUS_ROWS_SQL, "kyuyo_bonus", 2),
+            (BONUS_DELETE_SQL, "kyuyo_bonus", 2),
+            (BONUS_INSERT_SQL, "kyuyo_bonus", 4),
+            (BONUS_SYNCED_SQL, "kyuyo_bonus", 0),
         ];
         for (sql, table, params) in cases {
             assert!(sql.contains(table), "{sql}");
@@ -168,19 +222,27 @@ mod tests {
         }
         assert!(PAYROLL_ROWS_SQL.ends_with("ORDER BY seq ASC"));
         assert!(EMPLOYEES_ROWS_SQL.ends_with("ORDER BY seq ASC"));
+        assert!(BONUS_ROWS_SQL.ends_with("ORDER BY seq ASC"));
         // payroll の upsert は company_name を触らない。employees は上書きする
         assert!(!PAYROLL_SYNC_STATE_UPSERT_SQL.contains("company_name = excluded"));
         assert!(EMPLOYEES_SYNC_STATE_UPSERT_SQL.contains("company_name = excluded.company_name"));
     }
 
     #[test]
-    fn ddl_names_three_tables() {
-        for t in ["kyuyo_payroll", "kyuyo_employees", "kyuyo_sync_state"] {
+    fn ddl_names_four_tables() {
+        for t in [
+            "kyuyo_payroll",
+            "kyuyo_employees",
+            "kyuyo_bonus",
+            "kyuyo_sync_state",
+        ] {
             assert!(CREATE_TABLES_SQL.contains(&format!("CREATE TABLE IF NOT EXISTS {t} (")));
             assert!(DROP_TABLES_SQL.contains(&format!("DROP TABLE IF EXISTS {t};")));
         }
         assert!(!CREATE_TABLES_SQL.contains("PRAGMA"));
         assert!(PAYROLL_SYNCED_SQL.contains("'payroll:%'"));
+        assert!(BONUS_SYNCED_SQL.contains("'bonus:%'"));
+        assert!(BONUS_SYNCED_SQL.contains("LEFT JOIN kyuyo_bonus"));
         assert_eq!(SCHEMA_VERSION, 1);
     }
 }

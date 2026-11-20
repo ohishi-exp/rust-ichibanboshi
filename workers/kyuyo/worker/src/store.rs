@@ -5,10 +5,12 @@
 //! put は await を挟まずに文を続けて流す (DO の暗黙のトランザクションで一度に確定する)。途中の文が失敗したら
 //! その scope の sync_state を消して、行の欠けたキャッシュを命中させない。
 
+use kyuyo_logic::bonus::BonusRow;
 use kyuyo_logic::payroll::{EmployeeRow, PayrollRow};
 use kyuyo_logic::service::{decode_rows, decode_warnings, encode_rows, encode_warnings};
 use kyuyo_logic::store_keys::{
-    employees_scope, payroll_scope, EMPLOYEES_DELETE_SQL, EMPLOYEES_INSERT_SQL, EMPLOYEES_ROWS_SQL,
+    bonus_scope, employees_scope, payroll_scope, BONUS_DELETE_SQL, BONUS_INSERT_SQL,
+    BONUS_ROWS_SQL, EMPLOYEES_DELETE_SQL, EMPLOYEES_INSERT_SQL, EMPLOYEES_ROWS_SQL,
     EMPLOYEES_SYNC_STATE_UPSERT_SQL, PAYROLL_DELETE_SQL, PAYROLL_INSERT_SQL, PAYROLL_ROWS_SQL,
     PAYROLL_SYNC_STATE_UPSERT_SQL, SYNC_STATE_DELETE_SQL, SYNC_STATE_SELECT_SQL,
 };
@@ -97,7 +99,17 @@ pub(crate) fn get_employees(
     get(sql, &scope, EMPLOYEES_ROWS_SQL, key)
 }
 
-/// 1 回の put の書き込み。`key` は (company, month) または (company, nendo)。
+pub(crate) fn get_bonus(
+    sql: &SqlStorage,
+    company: &str,
+    year: i32,
+) -> Result<Option<Cached<BonusRow>>, StoreError> {
+    let scope = bonus_scope(company, year);
+    let key = vec![v(company), SqlStorageValue::from(year)];
+    get(sql, &scope, BONUS_ROWS_SQL, key)
+}
+
+/// 1 回の put の書き込み。`key` は (company, month)・(company, nendo)・(company, year) のどれか。
 struct Put<'a> {
     delete_sql: &'a str,
     insert_sql: &'a str,
@@ -177,6 +189,32 @@ pub(crate) fn put_employees(
         upsert_sql: EMPLOYEES_SYNC_STATE_UPSERT_SQL,
         scope: employees_scope(company, nendo),
         key: vec![v(company), SqlStorageValue::from(nendo)],
+        state,
+    };
+    put(sql, p, &encoded)
+}
+
+/// 賞与 (会社×暦年) を保存する (Refs #419)。sync_state は給与明細と同じ upsert (company_name は '')。
+pub(crate) fn put_bonus(
+    sql: &SqlStorage,
+    company: &str,
+    year: i32,
+    rows: &[BonusRow],
+    warnings: &[String],
+    synced_at: &str,
+) -> Result<(), StoreError> {
+    let encoded = encode_rows(rows)?;
+    let state = vec![
+        v(synced_at),
+        SqlStorageValue::from(encoded.len() as i64),
+        v(&encode_warnings(warnings)),
+    ];
+    let p = Put {
+        delete_sql: BONUS_DELETE_SQL,
+        insert_sql: BONUS_INSERT_SQL,
+        upsert_sql: PAYROLL_SYNC_STATE_UPSERT_SQL,
+        scope: bonus_scope(company, year),
+        key: vec![v(company), SqlStorageValue::from(year)],
         state,
     };
     put(sql, p, &encoded)
