@@ -248,7 +248,7 @@ TAIKEIKOUNO = RIGHT('0' + CAST(SHOZOKU.TAIKEI AS varchar), 2)
 - 合計は `SHUKEI1` の支給回インデックス 13 / 14 (`SHIKYUBI13` / `SHIKYUBI14` が上の 2 日と件数まで一致)。
   00〜11 は月例。給与大臣 Worker の `GET /kyuyo/bonus` は回の番号を決め打ちせず、社員 × 支給日で突き合わせる
 - 給与大臣 Worker は賞与を (会社, 暦年) 単位で DO の SQLite (`kyuyo_bonus`) に保存する (Refs #419)。
-  `GET /kyuyo/bonus` は保存済みなら給与大臣 DB を開かない。`POST /kyuyo/sync` は `month` を含む暦年の賞与も取り直し、
+  `GET /kyuyo/bonus` は保存済みなら給与大臣 DB を開かない。`POST /kyuyo/sync` は `month` を含む暦年の賞与も取り直し (失敗しても月例の sync は成功させ warning に残す)、
   `GET /kyuyo/synced-months` の `bonus` に (会社, 暦年, 支給日, 件数, synced_at) が出る
 
 ## 支給合計・控除合計・差引支給 → `SHUKEI1`

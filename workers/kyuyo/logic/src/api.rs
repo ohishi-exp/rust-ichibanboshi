@@ -104,8 +104,9 @@ pub struct SyncResponse {
     pub employees: usize,
     /// 取り直した賞与の暦年 (`month` を含む年、Refs #419)。
     pub bonus_year: i32,
-    /// 保存した賞与の行数 (社員 × 支給回)。
-    pub bonus_rows: usize,
+    /// 保存した賞与の行数 (社員 × 支給回)。賞与を読めない・保存できなければ null (warning に段と種別)。
+    /// 賞与の失敗で sync 全体は失敗にしない (月例が主)。
+    pub bonus_rows: Option<usize>,
     pub synced_at: String,
     pub warnings: Vec<String>,
 }
@@ -317,7 +318,7 @@ mod tests {
             payroll_rows: 2,
             employees: 1,
             bonus_year: 2026,
-            bonus_rows: 4,
+            bonus_rows: Some(4),
             synced_at: s("t"),
             warnings: vec![],
         };
@@ -327,6 +328,12 @@ mod tests {
             r#""synced_at":"t","warnings":[]}"#
         );
         assert_eq!(json(&v), want);
+        let failed = SyncResponse {
+            bonus_rows: None,
+            warnings: vec![s("w")],
+            ..v
+        };
+        assert!(json(&failed).contains(r#""bonus_year":2026,"bonus_rows":null,"#));
     }
 
     #[test]

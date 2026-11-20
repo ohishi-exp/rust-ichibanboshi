@@ -10,7 +10,7 @@ Cloudflare Worker (Refs #322)。給与大臣 (`/api/kyuyo/*`) を Worker + Worke
 | `GET /kyuyo/synced-months` | 実装済み。DO の SQLite の sync 済み月 (`{"entries":[…],"bonus":[…]}`)。`entries` はオンプレ版と同じ形。`bonus` (Refs #419) は保存済みの賞与で、1 件 = (会社, 暦年, 支給日) の `{company, year, pay_date, synced_at, row_count}`。保存したが賞与が 0 件の年は `pay_date: null`・`row_count: 0` の 1 件 (未取得とは区別できる)。SQL Server を開かない |
 | `GET /kyuyo/databases` / `companies` | 実装済み。毎回 SQL Server を読む (オンプレ版と同じ応答) |
 | `GET /kyuyo/employees` / `payroll` (`?company=&month=`) | 実装済み。read-through: DO の SQLite にあれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` |
-| `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees と賞与 (`month` を含む暦年、Refs #419) を読み直して保存。応答に `bonus_year` と `bonus_rows` (賞与の行数)。保存に失敗したら 500 (sync 成功 = 保存が最新) |
+| `POST /kyuyo/sync` (`?company=&month=`) | 実装済み。payroll と employees と賞与 (`month` を含む暦年、Refs #419) を読み直して保存。応答に `bonus_year` と `bonus_rows` (賞与の行数)。月例の保存に失敗したら 500 (sync 成功 = 保存が最新)。**賞与は付け足し**で、読み・保存に失敗しても sync は月例の結果どおり 200 で返し、`bonus_rows: null` と warning (段 `read` / `store` と種別) を付ける |
 | `GET /kyuyo/schema` (`?company=&year=`) | 読み取り専用のスキーマ探索 (Refs #414、賞与のテーブルを実物で特定するため)。DB は `KYDATA{company}_{year-1900}C`。全テーブルの行数 (メタデータ)・全列 (名前・型・定義順)・`KOUMOKU` 全行・支給回/支給日の列 (全テーブルの `MONTH` / `KAISU` / `SHIKYUBI*`、上限 64 列で超えた列名は warning) の値ごとの件数だけを返す。テーブル名では絞らない (名前に個人情報は無く、絞ると別名のテーブルを見落とす)。自由な SQL は受けず、個人の行・氏名・金額は返さない。キャッシュしない |
 | `GET /kyuyo/bonus` (`?company=&year=`) | 賞与 (Refs #414)。`year` は支給した暦年で、DB は `KYDATA{company}_{year-1900}C` (8 月・12 月ともこの DB)。`SHOYO` を支給日で暦年に絞り、1 行 = 社員 × 支給回。キーは payroll の行に揃える (`employee_code` / `employee_code_key` / `employee_name` / `department` / `taikei` / `kai` / `month_index` / `pay_date` / `retired` / `payments` / `deductions` / `totals`)。`MONEY{n}` は項目番号 `098+n`、支給/控除の分け方は payroll と同じ。`totals` は `SHUKEI1` の回を社員 × 支給日で突き合わせる。read-through (Refs #419): DO の SQLite に (会社, 暦年) があれば SQL Server を開かず `source:"cache"`、無ければ読んで保存して `source:"live"` (保存の失敗は読みを殺さない)。応答に `source` と `synced_at` (payroll と同じ意味) |
 
@@ -100,7 +100,7 @@ Service Binding で繋ぐ (下の「ローカル検証」)。
 | TCP・ログインの失敗 (20 秒) | 503 | `給与 DB に接続できません (給与大臣 PC の稼働を確認してください)` |
 | employees / payroll の本体クエリで SQL Server error **4060** | 404 | `{DB 名} を開けません (…)` |
 | それ以外のクエリの失敗・60 秒の時間切れ | 500 | `給与 DB クエリに失敗しました` |
-| sync の保存の失敗 | 500 | `キャッシュへの保存に失敗しました (payroll)` / `(employees)` / `(bonus)` |
+| sync の保存の失敗 | 500 | `キャッシュへの保存に失敗しました (payroll)` / `(employees)` (賞与の失敗は 500 にせず warning、`bonus_rows: null`) |
 
 - 404 の判定はオンプレ版 (文言 "Cannot open database" か "4060") と同じことをエラー番号 4060 で行う。
   **SQL Server 2022 (docker) では、存在しない年度 DB は 208 (Invalid object name)、権限の無い DB は 916 になり、
