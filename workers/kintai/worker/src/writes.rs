@@ -48,6 +48,8 @@ pub(crate) async fn serve(
         Write::DtakoAutoload => crate::cakephp::autoload(req, env).await,
         // 本文も Query も読まない (取り込み口に残っている CSV を取り込む)
         Write::DtakoAutoloadPending => crate::cakephp::autoload_pending(env).await,
+        // 本文は JSON (`{"ids":[…]}`)。検査は CakePHP の中継の側
+        Write::DtakoMakecsv => crate::cakephp::makecsv(req, env).await,
     }
 }
 

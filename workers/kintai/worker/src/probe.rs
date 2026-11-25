@@ -22,7 +22,7 @@ pub(crate) enum Route {
     /// `POST /api/kintai/{timecard,wage-snapshot}` — Supabase に書く 2 本、`POST /api/dtako/autoload` — 社内 CakePHP の
     /// 取り込み口への中継 (どれも共有 secret の照合あり)
     Write(Write),
-    /// `GET /api/kintai/{daily,pdf-json}` — 社内 CakePHP (Workers VPC の HTTP) を中継する 2 本
+    /// `GET /api/kintai/{daily,pdf-json,ichiban-check}` — 社内 CakePHP (Workers VPC の HTTP) を中継する 3 本
     Cakephp(CakephpRead),
     /// `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe}` — 社内 MariaDB を直接読む 4 本
     Mariadb(MariadbRead),
@@ -48,7 +48,9 @@ impl Route {
         Some(match self {
             Route::Read(_) | Route::Fold(_) => Reach::AnyAllowed,
             Route::Write(Write::Timecard | Write::WageSnapshot) => Reach::AnyAllowed,
-            Route::Write(Write::DtakoAutoload | Write::DtakoAutoloadPending)
+            Route::Write(
+                Write::DtakoAutoload | Write::DtakoAutoloadPending | Write::DtakoMakecsv,
+            )
             | Route::Probe
             | Route::Cakephp(_)
             | Route::Mariadb(_)
@@ -111,6 +113,8 @@ pub(crate) enum Write {
     DtakoAutoload,
     /// zip を付けない autoload (取り込み口に残っている CSV を取り込む。dtako 管理画面のインタンクのボタン)
     DtakoAutoloadPending,
+    /// 合わない運行の CSV を社内 CakePHP に ichizip へ書き出させる (dtako 管理画面の一番星突合)
+    DtakoMakecsv,
 }
 
 impl Write {
@@ -121,6 +125,7 @@ impl Write {
             "/api/kintai/wage-snapshot" => Write::WageSnapshot,
             "/api/dtako/autoload" => Write::DtakoAutoload,
             "/api/dtako/autoload-pending" => Write::DtakoAutoloadPending,
+            "/api/dtako/makecsv" => Write::DtakoMakecsv,
             _ => return None,
         })
     }
@@ -132,6 +137,7 @@ impl Write {
             Write::WageSnapshot => "wage-snapshot",
             Write::DtakoAutoload => "dtako/autoload",
             Write::DtakoAutoloadPending => "dtako/autoload-pending",
+            Write::DtakoMakecsv => "dtako/makecsv",
         }
     }
 }
