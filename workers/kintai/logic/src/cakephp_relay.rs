@@ -31,6 +31,10 @@ pub const NOT_CONFIGURED: &str = "CakePHP の VPC binding (KINTAI_CAKEPHP_VPC) �
 /// autoload (②) は `cakephp::DTAKO_AUTOLOAD_TIMEOUT_SECS` (120 秒)。
 pub const TIMEOUT_SECS: u64 = 30;
 
+/// 一番星突合 (ichiban-check) の待ちの上限 (秒)。CakePHP 側の計算が本番で 30〜38 秒かかる (経費の SQL Server と
+/// dtako の UNION が約 19 秒、勤怠が約 10 秒。HTML 版と同じ計算) ので、30 秒では毎回打ち切ってしまう。
+pub const ICHIBAN_CHECK_TIMEOUT_SECS: u64 = 90;
+
 /// 待ちを打ち切ったときの `CakephpError::RequestFailed` の中身 (種別の名前だけ。宛先は載せない)。
 pub const TIMEOUT: &str = "timeout";
 
@@ -63,6 +67,14 @@ impl CakephpRead {
             "/api/kintai/pdf-json" => Some(Self::PdfJson),
             "/api/kintai/ichiban-check" => Some(Self::IchibanCheck),
             _ => None,
+        }
+    }
+
+    /// 待ちの上限 (秒)。突合だけ [`ICHIBAN_CHECK_TIMEOUT_SECS`]、ほかは [`TIMEOUT_SECS`]。
+    pub fn timeout_secs(self) -> u64 {
+        match self {
+            Self::IchibanCheck => ICHIBAN_CHECK_TIMEOUT_SECS,
+            Self::Daily | Self::PdfJson => TIMEOUT_SECS,
         }
     }
 

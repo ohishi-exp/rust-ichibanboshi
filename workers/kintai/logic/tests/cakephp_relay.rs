@@ -6,8 +6,9 @@ use kintai_logic::cakephp::{CakephpError, DTAKO_AUTOLOAD_TIMEOUT_SECS};
 use kintai_logic::cakephp_relay::{
     autoload_fail, makecsv_fail, map_cakephp_err, material_count, material_fail, material_sql,
     parse_autoload, parse_makecsv, synced_at, with_source_meta, CakephpRead, ReadRequest,
-    AUTOLOAD_TIMEOUT, BODY_TOO_LARGE, CAKEPHP_VPC_BINDING, DRIVER_INVALID, MAKECSV_IDS_INVALID,
-    MAKECSV_MAX_IDS, MAKECSV_TIMEOUT, MONTH_INVALID, NOT_CONFIGURED, TIMEOUT, TIMEOUT_SECS,
+    AUTOLOAD_TIMEOUT, BODY_TOO_LARGE, CAKEPHP_VPC_BINDING, DRIVER_INVALID,
+    ICHIBAN_CHECK_TIMEOUT_SECS, MAKECSV_IDS_INVALID, MAKECSV_MAX_IDS, MAKECSV_TIMEOUT,
+    MONTH_INVALID, NOT_CONFIGURED, TIMEOUT, TIMEOUT_SECS,
 };
 use kintai_logic::common::Fail;
 use kintai_logic::dtako_autoload::{MaterialQuery, MAX_ZIP_BYTES, UNKO_NO_INVALID};
@@ -288,4 +289,15 @@ fn makecsv_timeout_is_unknown_and_safe_to_resend() {
         makecsv_fail(CakephpError::NotConfigured),
         fail(503, NOT_CONFIGURED)
     );
+}
+
+#[test]
+fn only_ichiban_check_waits_longer_than_30_seconds() {
+    assert_eq!(
+        CakephpRead::IchibanCheck.timeout_secs(),
+        ICHIBAN_CHECK_TIMEOUT_SECS
+    );
+    assert_eq!(ICHIBAN_CHECK_TIMEOUT_SECS, 90);
+    assert_eq!(CakephpRead::Daily.timeout_secs(), TIMEOUT_SECS);
+    assert_eq!(CakephpRead::PdfJson.timeout_secs(), TIMEOUT_SECS);
 }
