@@ -196,7 +196,7 @@ CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart
   `api` の無い分岐の先 (autoload は `/`、③ は最大 100 運行ぶんの書き込みが走る `TimeCardDtako::index()`) に入りうるうえ、307 の先が
   200 で返ってオンプレ版では止まる ③ が走る。オンプレ版も POST は 3xx を追わない client で送る。3xx は失敗ではない — ② の 307 は
   `http_ok: false` (③ は打たない) と `location` を返す (取り込みは redirect の判定より前に走っている)
-- **待ちの上限**: daily・pdf-json・ichiban-check と ③ は 30 秒 (オンプレ版の `[cakephp] timeout_secs` の既定)、② と makecsv は 120 秒
+- **待ちの上限**: daily・pdf-json と ③ は 30 秒 (オンプレ版の `[cakephp] timeout_secs` の既定)、ichiban-check は 90 秒 (CakePHP 側の計算が本番で 30〜38 秒かかる)、② と makecsv は 120 秒
   (`DTAKO_AUTOLOAD_TIMEOUT_SECS`、オンプレ版と同じ)。Worker は fetch を `Delay` との競争で打ち切る。Service Binding で呼ばれる
   Worker の実行時間 (wall clock) に上限は無く、待ちは CPU 時間に数えない。Workers VPC の HTTP 側に 120 秒より短い上限がある場合は
   そちらが先に来て `fetch` (502) になる — `wrangler dev --remote` で 120 秒近い取り込みを測って確かめる

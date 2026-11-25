@@ -99,7 +99,7 @@ async fn send(
 /// daily・pdf-json。検査 (400) → binding (503) → fetch (502) → 応答。
 pub(crate) async fn read(req: ReadRequest, env: &Env) -> Result<Bytes, Fail> {
     let vpc = fetcher(env).ok_or_else(|| map_cakephp_err(CakephpError::NotConfigured))?;
-    let limit = Duration::from_secs(TIMEOUT_SECS);
+    let limit = Duration::from_secs(req.read.timeout_secs());
     let reply = send(&vpc, Method::Get, &req.path, None, limit).await;
     let reply = reply.map_err(map_cakephp_err)?;
     if !is_success(reply.status) {
