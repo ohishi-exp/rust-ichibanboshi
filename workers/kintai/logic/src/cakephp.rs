@@ -137,6 +137,19 @@ pub fn pdf_json_path(month: &str, driver: Option<u64>) -> String {
     }
 }
 
+/// `/dtako-ichizip-kintai/dtako-ichiban-check-json?month=YYYY-MM` (一番星×デジタコの突合。合わない運行の
+/// `dtako_rows.id` と項目ごとの差分の JSON)。読むだけ。
+pub fn ichiban_check_path(month: &str) -> String {
+    format!("{ICHIBAN_CHECK_PATH}?month={}", urlencode(month))
+}
+
+/// [`ichiban_check_path`] の Query の手前まで。
+pub const ICHIBAN_CHECK_PATH: &str = "/dtako-ichizip-kintai/dtako-ichiban-check-json";
+
+/// 合わない運行の CSV を ichizip の取り込みフォルダへ書き出す口 (本文 `{"ids":[…]}` の JSON)。**書き込み**。
+/// 同じ id を送り直すと同じファイルを上書きする。
+pub const MAKECSV_PATH: &str = "/dtako-rows/makecsv-json";
+
 /// ③ の相対パス。URL は CakePHP の `postLink` が生成するものと同じ形。**DashedRoute なので
 /// action は `resetby-unko-no`** (controller は `time-card-dtako`)。`unko_no` は呼び出し前に
 /// 数字のみと確定済みなので percent-encode は不要。

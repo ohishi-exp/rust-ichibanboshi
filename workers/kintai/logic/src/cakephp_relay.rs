@@ -46,11 +46,13 @@ pub const DRIVER_INVALID: &str = "driver は乗務員CD (数字) で指定して
 /// 本文が上限を超えたときの 413 の本文 (axum の `DefaultBodyLimit` と同じ文言)。
 pub const BODY_TOO_LARGE: &str = "Failed to buffer the request body: length limit exceeded";
 
-/// CakePHP を読む 2 本。
+/// CakePHP を読む 3 本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CakephpRead {
     Daily,
     PdfJson,
+    /// 一番星×デジタコの突合 (`?month=` だけ。CakePHP の JSON を素通し)
+    IchibanCheck,
 }
 
 impl CakephpRead {
@@ -59,6 +61,7 @@ impl CakephpRead {
         match path {
             "/api/kintai/daily" => Some(Self::Daily),
             "/api/kintai/pdf-json" => Some(Self::PdfJson),
+            "/api/kintai/ichiban-check" => Some(Self::IchibanCheck),
             _ => None,
         }
     }
@@ -68,6 +71,7 @@ impl CakephpRead {
         match self {
             Self::Daily => "daily",
             Self::PdfJson => "pdf-json",
+            Self::IchibanCheck => "ichiban-check",
         }
     }
 }
@@ -114,6 +118,10 @@ impl CakephpRead {
                 };
                 crate::cakephp::pdf_json_path(&month, driver)
             }
+            Self::IchibanCheck => {
+                let q: DailyQuery = parse_query(query)?;
+                crate::cakephp::ichiban_check_path(&valid_month(q.month)?)
+            }
         };
         Ok(ReadRequest { read: self, path })
     }
@@ -137,7 +145,7 @@ impl ReadRequest {
                 let resp = with_source_meta(resp, "live", &synced_at(now_ms));
                 Ok(serde_json::to_vec(&resp).unwrap_or_default())
             }
-            CakephpRead::PdfJson => {
+            CakephpRead::PdfJson | CakephpRead::IchibanCheck => {
                 let resp: serde_json::Value = parse_json(body).map_err(map_cakephp_err)?;
                 Ok(serde_json::to_vec(&resp).unwrap_or_default())
             }
@@ -225,4 +233,42 @@ pub fn material_count(rows: &[Row]) -> Result<i64, String> {
 /// 材料を数えられなかったときの文言 (オンプレ版の `KintaiRepoError::QueryFailed` の Display と同じ頭)。
 pub fn material_fail(kind: &str) -> String {
     mariadb_fail(kind).body
+}
+
+/// makecsv の本文で受ける id の数の上限 (1 か月の突合で合わない運行は多くても数十件。桁違いの量は誤操作とみなす)。
+pub const MAKECSV_MAX_IDS: usize = 500;
+
+/// makecsv の本文が不正なときの 400 の本文。
+pub const MAKECSV_IDS_INVALID: &str =
+    "ids は dtako_rows の id (12〜24 桁の数字) を 1〜500 件の配列で指定してください";
+
+/// makecsv の待ちを打ち切ったときの 502 の本文。
+pub const MAKECSV_TIMEOUT: &str = "CSV の書き出しの応答待ちを打ち切りました (timeout)。書き出しは応答より前に走るので、書かれたかどうかは不明です (同じ id を送り直すと同じファイルを上書きするだけなので、送り直してよい)";
+
+#[derive(Deserialize)]
+struct MakecsvBody {
+    ids: Vec<String>,
+}
+
+/// `POST /api/dtako/makecsv` の本文 (`{"ids":["<dtako_rows.id>", …]}`) を検査し、CakePHP へ送る JSON にする。
+/// 空・桁が範囲外・数字以外・上限超えは 400 ([`MAKECSV_IDS_INVALID`])。
+pub fn parse_makecsv(body: &[u8]) -> Result<Vec<u8>, Fail> {
+    let parsed: MakecsvBody =
+        serde_json::from_slice(body).map_err(|_| bad_request(MAKECSV_IDS_INVALID))?;
+    let ok = |id: &String| (12..=24).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit());
+    let n = parsed.ids.len();
+    if n == 0 || n > MAKECSV_MAX_IDS || !parsed.ids.iter().all(ok) {
+        return Err(bad_request(MAKECSV_IDS_INVALID));
+    }
+    Ok(serde_json::json!({ "ids": parsed.ids })
+        .to_string()
+        .into_bytes())
+}
+
+/// makecsv の送信・応答の失敗を status と本文へ。待ちの打ち切りは [`MAKECSV_TIMEOUT`]、それ以外は読みの口と同じ。
+pub fn makecsv_fail(e: CakephpError) -> Fail {
+    if matches!(&e, CakephpError::RequestFailed(m) if m == TIMEOUT) {
+        return Fail::new(502, MAKECSV_TIMEOUT);
+    }
+    map_cakephp_err(e)
 }

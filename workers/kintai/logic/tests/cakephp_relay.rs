@@ -4,9 +4,10 @@
 
 use kintai_logic::cakephp::{CakephpError, DTAKO_AUTOLOAD_TIMEOUT_SECS};
 use kintai_logic::cakephp_relay::{
-    autoload_fail, map_cakephp_err, material_count, material_fail, material_sql, parse_autoload,
-    synced_at, with_source_meta, CakephpRead, ReadRequest, AUTOLOAD_TIMEOUT, BODY_TOO_LARGE,
-    CAKEPHP_VPC_BINDING, DRIVER_INVALID, MONTH_INVALID, NOT_CONFIGURED, TIMEOUT, TIMEOUT_SECS,
+    autoload_fail, makecsv_fail, map_cakephp_err, material_count, material_fail, material_sql,
+    parse_autoload, parse_makecsv, synced_at, with_source_meta, CakephpRead, ReadRequest,
+    AUTOLOAD_TIMEOUT, BODY_TOO_LARGE, CAKEPHP_VPC_BINDING, DRIVER_INVALID, MAKECSV_IDS_INVALID,
+    MAKECSV_MAX_IDS, MAKECSV_TIMEOUT, MONTH_INVALID, NOT_CONFIGURED, TIMEOUT, TIMEOUT_SECS,
 };
 use kintai_logic::common::Fail;
 use kintai_logic::dtako_autoload::{MaterialQuery, MAX_ZIP_BYTES, UNKO_NO_INVALID};
@@ -219,5 +220,72 @@ fn material_count_reads_one_integer() {
     assert_eq!(
         material_fail("query:timeout"),
         "MariaDB query failed: query:timeout"
+    );
+}
+
+#[test]
+fn ichiban_check_checks_only_the_month_and_is_relayed_as_is() {
+    let read = CakephpRead::from_path("/api/kintai/ichiban-check").unwrap();
+    assert_eq!(read, CakephpRead::IchibanCheck);
+    assert_eq!(read.as_str(), "ichiban-check");
+    let r = read.parse("month=2026-10").unwrap();
+    assert_eq!(
+        r.path,
+        "/dtako-ichizip-kintai/dtako-ichiban-check-json?month=2026-10"
+    );
+    for q in ["", "month=2026-13", "month=x"] {
+        assert_eq!(read.parse(q), Err(fail(400, MONTH_INVALID)), "{q}");
+    }
+    let out = r.respond(br#"{"idds":["1"]}"#, 0).unwrap();
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(out, json!({"idds": ["1"]}));
+    assert_eq!(r.respond(b"<html>", 0).unwrap_err().status, 502);
+}
+
+#[test]
+fn makecsv_accepts_1_to_500_digit_ids_and_resends_only_ids() {
+    let body = format!(r#"{{"ids":["{U}"],"extra":1}}"#);
+    let out = parse_makecsv(body.as_bytes()).unwrap();
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(out, json!({ "ids": [U] }), "ids 以外は送らない");
+    let many = vec![U; MAKECSV_MAX_IDS];
+    assert!(parse_makecsv(json!({ "ids": many }).to_string().as_bytes()).is_ok());
+}
+
+#[test]
+fn makecsv_rejects_empty_bad_digits_or_too_many() {
+    let bad = fail(400, MAKECSV_IDS_INVALID);
+    let too_many = vec![U; MAKECSV_MAX_IDS + 1];
+    let cases = [
+        json!({ "ids": [] }),
+        json!({ "ids": ["12345678901"] }),
+        json!({ "ids": ["1234567890123456789012345"] }),
+        json!({ "ids": ["2606050753300000004286x"] }),
+        json!({ "ids": too_many }),
+        json!({ "id": [U] }),
+        json!({ "ids": [1] }),
+    ];
+    for c in cases {
+        assert_eq!(
+            parse_makecsv(c.to_string().as_bytes()),
+            Err(bad.clone()),
+            "{c}"
+        );
+    }
+    assert_eq!(parse_makecsv(b"not json"), Err(bad));
+}
+
+#[test]
+fn makecsv_timeout_is_unknown_and_safe_to_resend() {
+    let f = makecsv_fail(CakephpError::RequestFailed(TIMEOUT.into()));
+    assert_eq!(f, fail(502, MAKECSV_TIMEOUT));
+    assert!(f.body.contains("不明") && f.body.contains("送り直してよい"));
+    assert_eq!(
+        makecsv_fail(CakephpError::RequestFailed("fetch".into())),
+        fail(502, "CakePHP fetch failed: fetch")
+    );
+    assert_eq!(
+        makecsv_fail(CakephpError::NotConfigured),
+        fail(503, NOT_CONFIGURED)
     );
 }

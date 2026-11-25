@@ -3,6 +3,8 @@
 //!
 //! - `GET /api/kintai/daily?month=` — 認可なし。毎回 CakePHP の daily-json を中継する (キャッシュなし、`source` は常に `live`)
 //! - `GET /api/kintai/pdf-json?month=[&driver=]` — 認可なし。`recalc=0` 固定で中継
+//! - `GET /api/kintai/ichiban-check?month=` — 認可なし。一番星×デジタコの突合の JSON を中継
+//! - `POST /api/dtako/makecsv` — **書き込みの口**。本文 `{"ids":[…]}` で、合わない運行の CSV を ichizip へ書き出させる
 //! - `POST /api/dtako/autoload?unko_no=&file_name=&preview=&reset_timecard=` — **書き込みの口** (`preview=true` も)。
 //!   順は **認可 → 入力 → binding → 段取り** (② autoload → ② が 2xx なら ① MariaDB で材料を数える → 1 件以上なら ③ reset)
 //!
@@ -17,13 +19,14 @@ use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use kintai_logic::cakephp::{
-    autoload_multipart, autoload_response, is_success, join, reset_multipart, reset_timecard_path,
-    status_error, CakephpError, DtakoAutoloadResponse, Multipart, ResetTimecardResponse,
-    AUTOLOAD_PATH, DTAKO_AUTOLOAD_TIMEOUT_SECS,
+    autoload_multipart, autoload_response, is_success, join, parse_json, reset_multipart,
+    reset_timecard_path, status_error, CakephpError, DtakoAutoloadResponse, Multipart,
+    ResetTimecardResponse, AUTOLOAD_PATH, DTAKO_AUTOLOAD_TIMEOUT_SECS, MAKECSV_PATH,
 };
 use kintai_logic::cakephp_relay::{
-    autoload_fail, map_cakephp_err, material_count, material_fail, material_sql, parse_autoload,
-    ReadRequest, CAKEPHP_VPC_BINDING, TIMEOUT, TIMEOUT_SECS, VPC_ORIGIN,
+    autoload_fail, makecsv_fail, map_cakephp_err, material_count, material_fail, material_sql,
+    parse_autoload, parse_makecsv, ReadRequest, CAKEPHP_VPC_BINDING, TIMEOUT, TIMEOUT_SECS,
+    VPC_ORIGIN,
 };
 use kintai_logic::common::{mariadb_unconfigured, Fail};
 use kintai_logic::dtako_autoload::{run, AutoloadIo, MaterialQuery};
@@ -42,6 +45,14 @@ fn fetcher(env: &Env) -> Option<Fetcher> {
     Some(value.unchecked_into())
 }
 
+/// 送る本文 (`Content-Type` の値とバイト列)。multipart (② ③) も JSON (makecsv) もこの形で渡す。
+type Body<'a> = (&'a str, &'a [u8]);
+
+/// multipart の本文を [`send`] に渡す形へ。
+fn multipart(form: &Multipart) -> Option<Body<'_>> {
+    Some((&form.content_type, &form.body))
+}
+
 /// CakePHP の応答 (status・Location・本文)。
 struct Reply {
     status: u16,
@@ -55,17 +66,17 @@ async fn send(
     vpc: &Fetcher,
     method: Method,
     path: &str,
-    form: Option<Multipart>,
+    body: Option<Body<'_>>,
     limit: Duration,
 ) -> Result<Reply, CakephpError> {
     let mut init = RequestInit::new();
     init.with_method(method)
         .with_redirect(RequestRedirect::Manual);
-    if let Some(form) = form {
+    if let Some((content_type, bytes)) = body {
         let headers = worker::Headers::new();
-        let ok = headers.set("content-type", &form.content_type);
+        let ok = headers.set("content-type", content_type);
         ok.map_err(|_| CakephpError::RequestFailed("headers".into()))?;
-        let body = js_sys::Uint8Array::from(form.body.as_slice());
+        let body = js_sys::Uint8Array::from(bytes);
         init.with_headers(headers).with_body(Some(body.into()));
     }
     let url = join(VPC_ORIGIN, path);
@@ -124,12 +135,33 @@ pub(crate) async fn autoload_pending(env: &Env) -> Result<serde_json::Value, Fai
     // 本文は `api=1` だけ (③ と同じ形。zip の part を付けない)
     let form = reset_multipart(&boundary());
     let limit = Duration::from_secs(DTAKO_AUTOLOAD_TIMEOUT_SECS);
-    let reply = send(&vpc, Method::Post, AUTOLOAD_PATH, Some(form), limit).await;
+    let reply = send(&vpc, Method::Post, AUTOLOAD_PATH, multipart(&form), limit).await;
     let reply = reply.map_err(autoload_fail)?;
     let text = String::from_utf8_lossy(&reply.body);
     let res = autoload_response(reply.status, &text, reply.location);
     // status で成否を判断しない (② と同じく 307 でも取り込みは走る)。届いたかの記録として素通しする
     serde_json::to_value(res).map_err(|e| Fail::new(500, e.to_string()))
+}
+
+/// makecsv (合わない運行の CSV を ichizip へ書き出す)。認可 (403 / 503) は [`crate::writes::serve`] が先に済ませる →
+/// 本文の検査 (400) → binding (503) → JSON で POST (待ちは autoload と同じ 120 秒。打ち切りは「不明」の文言) →
+/// 非 2xx は 502、2xx は CakePHP の JSON (id ごとの結果) を素通し。
+pub(crate) async fn makecsv(req: &mut Request, env: &Env) -> Result<serde_json::Value, Fail> {
+    let body = req
+        .bytes()
+        .await
+        .map_err(|_| Fail::new(400, "Failed to buffer the request body"))?;
+    let payload = parse_makecsv(&body)?;
+    let vpc = fetcher(env).ok_or_else(|| makecsv_fail(CakephpError::NotConfigured))?;
+    let limit = Duration::from_secs(DTAKO_AUTOLOAD_TIMEOUT_SECS);
+    let json = Some(("application/json", payload.as_slice()));
+    let reply = send(&vpc, Method::Post, MAKECSV_PATH, json, limit).await;
+    let reply = reply.map_err(makecsv_fail)?;
+    if !is_success(reply.status) {
+        let text = String::from_utf8_lossy(&reply.body);
+        return Err(makecsv_fail(status_error(reply.status, &text)));
+    }
+    parse_json(&reply.body).map_err(makecsv_fail)
 }
 
 /// ② ③ は VPC の HTTP、① は社内 MariaDB (他の口と同じ接続・資格情報)。
@@ -148,7 +180,7 @@ impl AutoloadIo for WorkerIo<'_> {
         let vpc = self.vpc.as_ref().ok_or(CakephpError::NotConfigured)?;
         let form = autoload_multipart(&boundary(), file_name, &self.body);
         let limit = Duration::from_secs(DTAKO_AUTOLOAD_TIMEOUT_SECS);
-        let reply = send(vpc, Method::Post, AUTOLOAD_PATH, Some(form), limit).await?;
+        let reply = send(vpc, Method::Post, AUTOLOAD_PATH, multipart(&form), limit).await?;
         let text = String::from_utf8_lossy(&reply.body);
         Ok(autoload_response(reply.status, &text, reply.location))
     }
@@ -167,7 +199,7 @@ impl AutoloadIo for WorkerIo<'_> {
         let form = reset_multipart(&boundary());
         let limit = Duration::from_secs(TIMEOUT_SECS);
         let path = reset_timecard_path(unko_no);
-        let reply = send(vpc, Method::Post, &path, Some(form), limit).await?;
+        let reply = send(vpc, Method::Post, &path, multipart(&form), limit).await?;
         Ok(ResetTimecardResponse {
             status: reply.status,
             location: reply.location,

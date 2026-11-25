@@ -4,7 +4,7 @@
 
 - 社内 MariaDB (打刻・デジタコの生行) — 到達の確認 (PoC) の `POST /probe` と、直接読む GET の 10 本 (`/api/kintai/*` の 9 本と `/api/dtako/worktime`。オンプレ版から移した。下記)
 - Supabase の勤怠スキーマ (`kintai.*`) — 読む `GET /api/kintai/*` の 7 本 (`unko-gaps` は auth-worker の RPC で alc の etags も読む) と、書く `POST /api/kintai/{timecard,wage-snapshot}` の 2 本 (Cloud Run 版から移した。下記)
-- 社内 CakePHP (nginx) — 中継する `GET /api/kintai/{daily,pdf-json}` と `POST /api/dtako/autoload` (③ resetby-unko-no を含む) の 3 本 (オンプレ版から移した。下記)
+- 社内 CakePHP (nginx) — 中継する `GET /api/kintai/{daily,pdf-json,ichiban-check}` と `POST /api/dtako/{autoload,autoload-pending,makecsv}` (autoload は ③ resetby-unko-no を含む) (daily・pdf-json・autoload はオンプレ版から移した。下記)
 - D1 (`KINTAI_RESTRAINT_DB`) — 拘束サマリの `PUT /api/restraint/summaries` と `GET /api/restraint/{wage-source,synced-months}` (オンプレ版の SQLite から移した。下記)
 - fold (Supabase + auth-worker の RPC。社内 MariaDB は読まない) — `GET`/`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`GET /api/kintai/stale-months` の 4 本 (Cloud Run 版から移した。下記) と、診断の `GET /api/kintai/alc-events` (fold が読む 1 人ぶんの alc の行と勤務)・休息の開始の補正の `GET`/`PUT /api/kintai/rest-start-overrides` (theearth の管理表に合わせ、休息直前の運転を速度データの最後の動きで終える。migration 011)
 
@@ -157,7 +157,7 @@ Service Binding を持つ Worker からだけ呼べる。実機の確認は `wra
 
 - `timecard/diff` (POST)
 
-## 社内 CakePHP を中継する 3 本 (`GET /api/kintai/{daily,pdf-json}`・`POST /api/dtako/autoload`)
+## 社内 CakePHP を中継する口 (`GET /api/kintai/{daily,pdf-json,ichiban-check}`・`POST /api/dtako/{autoload,autoload-pending,makecsv}`)
 
 オンプレ版 (root の `src/routes/kintai.rs` の `daily`・`pdf_json`、`src/routes/dtako_autoload.rs` の `autoload`) の口を移した。CakePHP へは
 Workers VPC の VPC Service (HTTP、binding `KINTAI_CAKEPHP_VPC`) で直接届く (中継の持ち手がオンプレ版の rust から Worker に変わるだけで、
@@ -170,20 +170,24 @@ CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart
 | `GET /api/kintai/daily?month=` | なし | Query → `month` | `GET /time-card/daily-json?month=` | CakePHP の JSON + `source: "live"`・`synced_at` (オンプレ版の `with_source_meta` と同じ形) |
 | `GET /api/kintai/pdf-json?month=[&driver=]` | なし | Query → `month` → `driver` (`driver=` の空は 400) | `GET /time-card/pdf-json?month=[&driver_id=]&recalc=0` | CakePHP の JSON をそのまま |
 | `POST /api/dtako/autoload?unko_no=&file_name=&preview=&reset_timecard=` | **`X-Kintai-Write-Token`** (`preview=true` も) | 認可 → Query → 本文の上限 (20 MiB) → `unko_no` (12 桁以上の数字) → 本文が空 | ② `POST /dtako-events/autoload` (multipart: `api=1`・`file[]` (`application/x-zip-compressed` 固定))。② が 2xx で `reset_timecard=true` なら ① 社内 MariaDB で材料を数え、1 件以上なら ③ `POST /time-card-dtako/resetby-unko-no/<unko_no>` (`api=1`) | オンプレ版と同じ JSON (`http_status`・`location`・`response_excerpt`・`reset_*`・`dtako_events_count`) |
+| `GET /api/kintai/ichiban-check?month=` | なし | Query → `month` | `GET /dtako-ichizip-kintai/dtako-ichiban-check-json?month=` (一番星×デジタコの突合。オンプレ版には無い口) | CakePHP の JSON をそのまま |
+| `POST /api/dtako/makecsv` | **`X-Kintai-Write-Token`** | 認可 → 本文 `{"ids":[…]}` (`dtako_rows.id` = 12〜24 桁の数字、1〜500 件。`ids` 以外のキーは送らない) | `POST /dtako-rows/makecsv-json` (本文は JSON)。CakePHP が合わない運行の CSV を ichizip の取り込みフォルダへ書き出す (同じ id は同じファイルを上書き)。**CakePHP 側は認証も CSRF も免除で、担保は網 (VPC) とこの token だけ** | CakePHP の JSON (id ごとの結果) をそのまま |
 | `POST /api/dtako/autoload-pending` | **`X-Kintai-Write-Token`** | 認可だけ (Query・本文は読まない) | ② `POST /dtako-events/autoload` を zip 無し (multipart: `api=1` だけ) で。CakePHP は取り込み口 (`files/dtako_csv/`) に残っている CSV を取り込む (オンプレ側が許容している動き)。**`unko_no` で 1 件を名指ししない一括の口** — 押せるのは relay の `KINTAI_COMP_ID` の会社の閲覧者 (dtako 管理画面のインタンクのボタン) | `status`・`body_excerpt`・`location` (CakePHP の応答をそのまま。成否の証明にはならない) |
 
 | 結果 | status | 本文 (平文) | オンプレ版 |
 |---|---|---|---|
 | `month` が不正 | 400 | `month は YYYY-MM で指定してください` | 同じ |
 | `driver` が不正 (pdf-json) | 400 | `driver は乗務員CD (数字) で指定してください` | 同じ |
+| 本文が不正 (makecsv) | 400 | `ids は dtako_rows の id (12〜24 桁の数字) を 1〜500 件の配列で指定してください` | **無い** |
+| **makecsv の応答待ちの打ち切り** | 502 | `CSV の書き出しの応答待ちを打ち切りました (timeout)。… 送り直してよい` (書き出しは上書きなので再送は安全) | **無い** |
 | `unko_no` が無い・不正 / 本文が空 (autoload) | 400 | `unko_no は対象を1件、数字だけで指定してください (一括取り込みは不可)` / `body が空です。csvdata.zip の中身を送ってください` | 同じ |
 | Query として読めない (`preview=1` 等) | 400 | axum と同じ `Failed to deserialize query string: …` | 同じ |
 | 本文が 20 MiB を超えた (autoload) | 413 | `Failed to buffer the request body: length limit exceeded` | 同じ (axum の `DefaultBodyLimit`) |
 | `X-Kintai-Write-Token` が無い・違う (autoload) | 403 | `書き込みの口には正しい X-Kintai-Write-Token が要ります` | **無い** (#362 と同じ部品) |
 | `KINTAI_WRITE_TOKEN` が読めない (autoload) | 503 | `書き込みの認可の設定 (KINTAI_WRITE_TOKEN) が読めません` | **無い** |
 | `KINTAI_CAKEPHP_VPC` が無い | 503 | `CakePHP の VPC binding (KINTAI_CAKEPHP_VPC) が無い` (autoload の `preview` は 200 で `configured: false`) | `CakePHP base_url が未設定` / `… (CAKEPHP_BASE_URL)` |
-| CakePHP に届かない (daily・pdf-json) | 502 | `CakePHP fetch failed: fetch` / `… timeout` | `CakePHP fetch failed: <reqwest の文言>` |
-| CakePHP が非 2xx (daily・pdf-json。**3xx を含む**) | 502 | `CakePHP returned <status>: <本文の先頭 500 文字>` | 同じ (ただしオンプレ版の GET は 3xx を追う) |
+| CakePHP に届かない (daily・pdf-json・ichiban-check・makecsv) | 502 | `CakePHP fetch failed: fetch` / `… timeout` | `CakePHP fetch failed: <reqwest の文言>` |
+| CakePHP が非 2xx (daily・pdf-json・ichiban-check・makecsv。**3xx を含む**) | 502 | `CakePHP returned <status>: <本文の先頭 500 文字>` | 同じ (ただしオンプレ版の GET は 3xx を追う) |
 | CakePHP の JSON が読めない | 502 | `CakePHP response parse failed: <serde の文言>` | 同じ頭 (文言は reqwest の) |
 | ② に届かない (autoload) | 502 | `nginx への接続に失敗: fetch` | `nginx への接続に失敗: <reqwest の文言>` |
 | **② の応答待ちの打ち切り** (autoload) | 502 | `nginx の応答待ちを打ち切りました (timeout)。取り込みは応答より前に走るので、取り込まれたかどうかは不明です …` | `nginx への接続に失敗: <reqwest の timeout の文言>` |
@@ -192,7 +196,7 @@ CakePHP は使い続ける)。URL・クエリ (`recalc=0` の固定)・multipart
   `api` の無い分岐の先 (autoload は `/`、③ は最大 100 運行ぶんの書き込みが走る `TimeCardDtako::index()`) に入りうるうえ、307 の先が
   200 で返ってオンプレ版では止まる ③ が走る。オンプレ版も POST は 3xx を追わない client で送る。3xx は失敗ではない — ② の 307 は
   `http_ok: false` (③ は打たない) と `location` を返す (取り込みは redirect の判定より前に走っている)
-- **待ちの上限**: daily・pdf-json と ③ は 30 秒 (オンプレ版の `[cakephp] timeout_secs` の既定)、② は 120 秒
+- **待ちの上限**: daily・pdf-json・ichiban-check と ③ は 30 秒 (オンプレ版の `[cakephp] timeout_secs` の既定)、② と makecsv は 120 秒
   (`DTAKO_AUTOLOAD_TIMEOUT_SECS`、オンプレ版と同じ)。Worker は fetch を `Delay` との競争で打ち切る。Service Binding で呼ばれる
   Worker の実行時間 (wall clock) に上限は無く、待ちは CPU 時間に数えない。Workers VPC の HTTP 側に 120 秒より短い上限がある場合は
   そちらが先に来て `fetch` (502) になる — `wrangler dev --remote` で 120 秒近い取り込みを測って確かめる
@@ -549,7 +553,8 @@ dtako の会社ごとに Supabase / alc のテナントが違う。呼び手 (re
 | `POST /api/kintai/{timecard,wage-snapshot}` | Supabase | 通す |
 | `POST /api/dtako/autoload` | 社内 CakePHP | **403** |
 | `POST /api/dtako/autoload-pending` | 社内 CakePHP | **403** |
-| `GET /api/kintai/{daily,pdf-json}` | 社内 CakePHP | **403** |
+| `GET /api/kintai/{daily,pdf-json,ichiban-check}` | 社内 CakePHP | **403** |
+| `POST /api/dtako/makecsv` | 社内 CakePHP | **403** |
 | `GET /api/kintai/{events,rest-diff,reading-dates,tail-gap-probe,day-events}`・`GET /api/dtako/worktime` | 社内 MariaDB | **403** |
 | `GET /api/kintai/{kosoku-daily,version,timecard/drivers,timecard/events}` | 社内 MariaDB | **403** |
 | `PUT /api/restraint/summaries`・`GET /api/restraint/{wage-source,synced-months}` | D1 | **403** |
@@ -570,7 +575,7 @@ Service Binding 専用 (route・workers.dev・preview 無し)。資格情報は 
 
 - **読みの口 (GET 全部。`timecard/signatures`・`recalc` の preview・`stale-months` を含む) は認可なし** (ユーザー決定 2026-10-10、一番星と同じ)。関門は呼び手の側
   (relay の共有 secret、kyuyo-mcp の OAuth)
-- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`・`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`POST /api/dtako/autoload`・`POST /api/dtako/autoload-pending`・`PUT /api/restraint/summaries`) は Worker が共有 secret を照合する** (ユーザー決定
+- **書き込みの口 (`POST /api/kintai/timecard`・`POST /api/kintai/wage-snapshot`・`POST /api/kintai/recalc`・`POST /api/kintai/timecard/window`・`POST /api/dtako/autoload`・`POST /api/dtako/autoload-pending`・`POST /api/dtako/makecsv`・`PUT /api/restraint/summaries`) は Worker が共有 secret を照合する** (ユーザー決定
   2026-10-10。autoload は CakePHP を通して `dtako_events`・`time_card_dtako` を書き換えるので書き込みの口として扱い、`preview=true` も照合する)。読みのために binding を持つ呼び手が POST を転送しても書けないようにするため。ヘッダー `X-Kintai-Write-Token` を
   Secrets Store の `KINTAI_WRITE_TOKEN` と照合し (両方を sha256 にして 32 バイトを定数時間で比べる。`logic/src/write_auth.rs`)、
   無い・違う = 403 (固定文言)、binding が無い・読めない・空 = 503。値は repo に書かない (GCP の Secret Manager が正本)
