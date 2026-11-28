@@ -2427,18 +2427,19 @@ fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
 /// 起点は無い。打刻・社内 MariaDB の運行イベントを持つ乗務員は見ない (#317 の起点がある)。
 /// 乗務員の付いていない運行 (cd 0) も見ない (fold の母集団の外)。
 ///
-/// 2 つ目の戻り値は「最初の勤務が `from` (読んだ範囲の始まり) 以前から始まる乗務員、または行が全部 alc なのに運行の
-/// 境界が無い乗務員がいる」— 勤務 (運行) の途中から読んでいるので、呼び手は 1 日遡って読み直す ([`ALC_DAY_MINUTES`] の日締めは始業から数えるので、始業が見えるまで)。
+/// 2 つ目の戻り値は「最初の勤務が `from` (読んだ範囲の始まり) 以前から始まる乗務員 ([`EdgeReason::MidShift`])、または
+/// 行が全部 alc なのに運行の境界が無い乗務員 ([`EdgeReason::NoRunBounds`])」— 勤務 (運行) の途中から読んでいるので、呼び手は
+/// 1 日遡って読み直す ([`ALC_DAY_MINUTES`] の日締めは始業から数えるので、始業が見えるまで)。空なら遡らない。
 pub fn alc_open_shift_starts(
     rows: Vec<serde_json::Value>,
     month_start: NaiveDateTime,
     from: NaiveDateTime,
-) -> (BTreeMap<u64, NaiveDateTime>, bool) {
-    let mut at_edge = false;
+) -> (BTreeMap<u64, NaiveDateTime>, BTreeMap<u64, EdgeReason>) {
+    let mut edges = BTreeMap::new();
     let open = split_by_driver(rows)
         .into_iter()
-        // 乗務員の付いていない運行 (cd 0) は fold の母集団の外 (route_flow)。何台分もが束ねられて勤務が切れず、毎回
-        // 「途中から読んでいる」になって上限まで遡っていた (北海大運 / 2026-11 の fold 640 秒のうち 610 秒)
+        // 乗務員の付いていない運行 (cd 0) は fold の母集団の外 (route_flow)。何台分もが 1 人に束ねられるので、勤務が
+        // 切れずに「途中から読んでいる」と判定されうる (#p676)
         .filter(|(cd, _)| *cd > 0)
         .filter_map(|(cd, rows)| {
             let events = parse_events(&rows);
@@ -2446,20 +2447,43 @@ pub fn alc_open_shift_starts(
                 // 行が全部 alc なのに運行の境界 (運行開始・運行終了) が読んだ範囲に無い = 何日も続く運行の途中だけを
                 // 読んでいる。alc だけの乗務員と判定できないので、境界が見えるまで遡る (実測: 乗務員 3 / 2026-06 は
                 // 5/29 出庫 → 6/2 帰庫の運行の途中で、月初の前後 1 日には境界が無かった)
-                at_edge |= events.iter().all(|e| e.source == "dtako_events");
+                if events.iter().all(|e| e.source == "dtako_events") {
+                    edges.insert(cd, EdgeReason::NoRunBounds);
+                }
                 return None;
             }
             let shifts = final_shifts_aligned(&events);
             // 最初の勤務が読んだ範囲の端 (以前) から始まる = 勤務の途中から読んでいる。日締め (24 時間) の起点が
             // もっと前にあるかもしれない
-            at_edge |= shifts.first().is_some_and(|s| s.start <= from);
+            if shifts.first().is_some_and(|s| s.start <= from) {
+                edges.insert(cd, EdgeReason::MidShift);
+            }
             shifts
                 .into_iter()
                 .find(|s| s.start < month_start && s.end > month_start)
                 .map(|s| (cd, s.start))
         })
         .collect();
-    (open, at_edge)
+    (open, edges)
+}
+
+/// [`alc_open_shift_starts`] が乗務員ごとに遡りを求めた理由 (遡りの診断の warning に出す、#p676)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeReason {
+    /// 最初の勤務が読んだ範囲の始まり以前から始まる (勤務の途中から読んでいる)
+    MidShift,
+    /// 行が全部 alc なのに運行開始・運行終了が無い (運行の途中だけを読んでいる)
+    NoRunBounds,
+}
+
+impl EdgeReason {
+    /// warning の文面に入れる短い説明。
+    pub fn label(self) -> &'static str {
+        match self {
+            EdgeReason::MidShift => "勤務の途中から",
+            EdgeReason::NoRunBounds => "運行の境界なし",
+        }
+    }
 }
 
 /// 1 人ぶんの行から、**fold と同じ組み方の勤務** ([`final_shifts_aligned`]) と、alc だけの乗務員か ([`alc_only`]) を返す
@@ -5181,11 +5205,15 @@ mod tests {
             vec![(12, at("2026-06-30 16:50:00"))]
         );
         // どの乗務員も最初の勤務が読んだ範囲の始まりより後から始まる → 遡らない
-        assert!(!at_edge);
-        // 読んだ範囲の始まりが勤務の途中 (乗務員 12 の 16:50 始業より後) なら遡る
+        assert!(at_edge.is_empty());
+        // 読んだ範囲の始まりが勤務の途中 (乗務員 12 の 16:50 始業・乗務員 13 の 08:00 始業より後) なら遡る
         let (_, at_edge) =
             alc_open_shift_starts(rows, at("2026-07-01 00:00:00"), at("2026-06-30 17:00:00"));
-        assert!(at_edge);
+        assert_eq!(
+            at_edge.into_iter().collect::<Vec<_>>(),
+            vec![(12, EdgeReason::MidShift), (13, EdgeReason::MidShift)]
+        );
+        assert_eq!(EdgeReason::MidShift.label(), "勤務の途中から");
         // 行が全部 alc で運行の境界が無い (運行の途中だけを読んでいる) なら遡る。打刻・運行の写しを持つ乗務員は見ない
         let mut mid_run = vec![ev("2026-06-30 08:00:00", "2026-07-01 03:00:00", "運転")];
         mid_run[0]["driver_id"] = json!(20);
@@ -5195,7 +5223,11 @@ mod tests {
             at("2026-06-30 00:00:00"),
         );
         assert!(open.is_empty());
-        assert!(at_edge);
+        assert_eq!(
+            at_edge.into_iter().collect::<Vec<_>>(),
+            vec![(20, EdgeReason::NoRunBounds)]
+        );
+        assert_eq!(EdgeReason::NoRunBounds.label(), "運行の境界なし");
         let mut borrowed = vec![dtako("2026-06-30 08:00:00", "運行開始")];
         borrowed[0]["driver_id"] = json!(21);
         let (_, at_edge) = alc_open_shift_starts(
@@ -5203,7 +5235,7 @@ mod tests {
             at("2026-07-01 00:00:00"),
             at("2026-06-30 00:00:00"),
         );
-        assert!(!at_edge);
+        assert!(at_edge.is_empty());
     }
 
     /// 2 台が毎日交互に 26 時間の運行を重ね続ける (北海大運の未登録車両の形。運行の間に休息が 1 度も無い)。
@@ -5246,7 +5278,7 @@ mod tests {
                 .map(|(_, r)| r.clone())
                 .collect();
             let (_, at_edge) = alc_open_shift_starts(read, month_start, from);
-            if days >= 31 || !at_edge {
+            if days >= 31 || at_edge.is_empty() {
                 return days;
             }
             days += 1;
@@ -5256,8 +5288,8 @@ mod tests {
     #[test]
     fn alc_open_shift_starts_skips_the_unassigned_driver_0() {
         // #p676: 乗務員の付いていない運行 (driver_id 0) は何台分もが 1 人に束ねられ、休息が現れず勤務が月をまたいで続く。
-        // 毎回「勤務の途中から読んでいる」と判定されて上限 (31 日) まで遡り、北海大運の fold の 610 秒を食っていた。
-        // fold の母集団 (route_flow) は乗務員 0 を外しているので、遡りの判定と起点からも外す
+        // 毎回「勤務の途中から読んでいる」と判定されて上限 (31 日) まで遡りうる。fold の母集団 (route_flow) は乗務員 0 を
+        // 外しているので、遡りの判定と起点からも外す
         let month_start = dt("2026-11-01 00:00:00");
         // 乗務員の付いた勤務が同じ形なら、遡りは今までどおり上限まで続く (仕組みそのものは変えない)
         assert_eq!(
@@ -5269,7 +5301,7 @@ mod tests {
         let (open, at_edge) =
             alc_open_shift_starts(unassigned, month_start, month_start - Duration::days(1));
         assert!(open.is_empty());
-        assert!(!at_edge);
+        assert!(at_edge.is_empty());
     }
 
     #[test]

@@ -27,8 +27,10 @@ use kintai_kosoku::alc_events::{
 use kintai_kosoku::anchors::HeadAnchors;
 use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
 use kintai_kosoku::kintai_push::jst_at;
-use kintai_kosoku::kosoku::{alc_open_shift_starts, driver_shifts};
+use kintai_kosoku::kosoku::{alc_open_shift_starts, driver_shifts, EdgeReason};
 use kintai_kosoku::window::{month_head_anchors, HeadPunch};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 use crate::common::Fail;
 use crate::fold_routes::AlcEventsRequest;
@@ -63,10 +65,14 @@ pub trait PushedEventsRead {
 }
 
 /// 勤怠 Worker の fold の読み。`today` は月ゲートの末尾検知の切り下げに使う (JST の日付。呼び手が時計から作る)。
+///
+/// `lookback_notes` は遡りの診断の warning の置き場 ([`WorkerFoldEvents::alc_head_anchors`] が書き、
+/// [`FoldEventsIo::all_events_between`] が warnings の先頭に写す)。作るときは `Default::default()` でよい。
 pub struct WorkerFoldEvents<'a, A, P> {
     pub alc: &'a A,
     pub pushed: &'a P,
     pub today: NaiveDate,
+    pub lookback_notes: RefCell<Vec<Warning>>,
 }
 
 /// `[from, to)` の JST の壁時計を `TIMESTAMPTZ` に (root の `PgKintaiEventsRepo` と同じ `jst_at`。読めなければ 502)。
@@ -112,6 +118,29 @@ impl From<BadMonth> for Fail {
 /// 日数では決めない) が、勤務が切れないまま何十日も続くデータで読みを止めないための上限。実データでは 1〜3 日で止まる。
 pub const ALC_HEAD_LOOKBACK_MAX_DAYS: i64 = 31;
 
+/// 遡りの理由を warning に出す下限 (日)。これより浅い遡りは普段どおりなので出さない (#p676)。
+pub const ALC_HEAD_LOOKBACK_NOTE_DAYS: i64 = 3;
+
+/// 遡りの理由の warning に名前を出す乗務員の数。warnings は 20 件で切れるので 1 行にまとめる。
+const LOOKBACK_NOTE_DRIVERS: usize = 5;
+
+/// 遡りを最後まで求めた乗務員と理由の 1 行 (診断。封は止めない)。`days` はその乗務員が遡りを求めた最後の回。
+pub fn lookback_note(days: i64, edges: &BTreeMap<u64, EdgeReason>) -> Warning {
+    let named: Vec<String> = edges
+        .iter()
+        .take(LOOKBACK_NOTE_DRIVERS)
+        .map(|(cd, r)| format!("{cd} {}", r.label()))
+        .collect();
+    let rest = edges.len().saturating_sub(LOOKBACK_NOTE_DRIVERS);
+    let more = if rest > 0 {
+        format!(" ほか {rest} 人")
+    } else {
+        String::new()
+    };
+    let text = format!("遡りの理由 ({days} 日): {}", named.join("、"));
+    Warning::diagnostic(text + &more)
+}
+
 impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
     /// 打刻を持たない乗務員 (行が全部 alc) の遡り起点 = **月初の時点で開いている勤務の始まり**
     /// ([`alc_open_shift_starts`]、ユーザー決定 2026-10-16)。写しの起点 (#317) は運行・打刻の写しからしか作らない
@@ -120,19 +149,30 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
     /// 月初の前 1 日から月初の後 1 日までを読んで勤務を組み、月初をまたぐ勤務の始まりを起点にする。最初の勤務が読んだ
     /// 範囲の端から始まる乗務員がいれば、勤務 (日締めの起点) はもっと前から続いているかもしれないので 1 日ずつ遡って読み直す
     /// ([`ALC_HEAD_LOOKBACK_MAX_DAYS`] まで)。読みは写しの行も合わせるので、打刻のある乗務員 (大石) は対象にならない。
-    /// 乗務員の付いていない運行 (cd 0) も判定に入れない — 何台分もが束ねられて勤務が切れず上限まで遡っていた (#p676)。
+    /// 乗務員の付いていない運行 (cd 0) も判定に入れない — 何台分もが束ねられて勤務が切れず遡りうる (#p676)。
+    ///
+    /// 遡りを最後まで求めた乗務員と理由を、[`ALC_HEAD_LOOKBACK_NOTE_DAYS`] 日以上遡ったときだけ `lookback_notes` に
+    /// 置く ([`lookback_note`]。どの乗務員が読みを長引かせたかを名指しするため)。
     async fn alc_head_anchors(
         &self,
         month_start: NaiveDateTime,
-    ) -> Result<std::collections::BTreeMap<u64, NaiveDateTime>, Fail> {
+    ) -> Result<BTreeMap<u64, NaiveDateTime>, Fail> {
         let fmt = |t: NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
         let to = fmt(month_start + Duration::days(1));
         let mut days = 1;
+        let mut last = (0, BTreeMap::new());
         loop {
             let from = month_start - Duration::days(days);
             let (rows, _) = FoldEventsIo::all_events_between(self, &fmt(from), &to).await?;
-            let (open, at_edge) = alc_open_shift_starts(rows, month_start, from);
-            if days >= ALC_HEAD_LOOKBACK_MAX_DAYS || !at_edge {
+            let (open, edges) = alc_open_shift_starts(rows, month_start, from);
+            let stop = days >= ALC_HEAD_LOOKBACK_MAX_DAYS || edges.is_empty();
+            if !edges.is_empty() {
+                last = (days, edges);
+            }
+            if stop {
+                let notes =
+                    (last.0 >= ALC_HEAD_LOOKBACK_NOTE_DAYS).then(|| lookback_note(last.0, &last.1));
+                *self.lookback_notes.borrow_mut() = notes.into_iter().collect();
                 return Ok(open);
             }
             days += 1;
@@ -274,7 +314,10 @@ impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P>
         from: &str,
         to: &str,
     ) -> Result<(Vec<serde_json::Value>, Vec<Warning>), Fail> {
-        let (events, mut warnings) = fetch_all_events(self, from, to).await?;
+        let (events, fetched) = fetch_all_events(self, from, to).await?;
+        // 遡りの理由 (alc_head_anchors が置いた診断) を先頭に — MCP は warnings を 20 件で切るので埋もれさせない
+        let mut warnings = self.lookback_notes.borrow().clone();
+        warnings.extend(fetched);
         // 2 台の運行が同じ時間に重なっていたら重複として出す (重なった時間の勤務と実働は theearth と合わないことがある)
         warnings.extend(overlapping_operations(&events));
         let span = pushed_window(from, to)?;
