@@ -20,15 +20,15 @@
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime};
 use kintai_kosoku::alc_events::{
-    event_to_json, fetch_all_events, fetch_dtako_month_read, merge_all_rows,
-    overlapping_operations, AlcEventsError, AlcEventsGet, EventsPage, RawEvent, UpstreamAll,
-    UpstreamEtags,
+    date_chunks, event_to_json, fetch_all_events, fetch_dtako_month_read, merge_all_rows,
+    overlapping_operations, query_dates, AlcEventsError, AlcEventsGet, EventsPage, RawEvent,
+    UpstreamAll, UpstreamEtags, MAX_RANGE_DAYS_ALL,
 };
 use kintai_kosoku::anchors::HeadAnchors;
 use kintai_kosoku::fold_flow::{BadMonth, DtakoMonthRead, FoldEventsIo, Warning};
 use kintai_kosoku::kintai_push::jst_at;
 use kintai_kosoku::kosoku::{alc_open_shift_starts, driver_shifts, EdgeReason};
-use kintai_kosoku::window::{month_head_anchors, HeadPunch};
+use kintai_kosoku::window::{month_head_anchors, window_holds, HeadPunch};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -121,6 +121,26 @@ pub const ALC_HEAD_LOOKBACK_MAX_DAYS: i64 = 31;
 /// 遡りの理由を warning に出す下限 (日)。これより浅い遡りは普段どおりなので出さない (#p676)。
 pub const ALC_HEAD_LOOKBACK_NOTE_DAYS: i64 = 3;
 
+/// 遡りを広い読み 1 回 ([`wide_lookback_days`]) で賄い始める日数。これより浅い回は今までどおり 1 回ずつ読む
+/// (普段は 1〜2 日で止まるので、そこで止まる会社に広い読みを足さない)。
+pub const ALC_HEAD_WIDE_FROM_DAYS: i64 = 3;
+
+/// 広い読みで賄える一番深い遡り (日) — 上流に投げる期間が 1 chunk ([`MAX_RANGE_DAYS_ALL`] 日) に収まる最後の日。
+///
+/// 1 chunk の読みは「乗務員CD の順 → 出発の順」に運行を返すので、浅い回の読みはその中の運行を同じ順で抜き出したものになる
+/// (#p676)。2 chunk に割れる回は chunk ごとに順が切れて広い読みから再現できないので、今までどおり直接読む。
+pub fn wide_lookback_days(month_start: NaiveDateTime) -> i64 {
+    let to = month_start + Duration::days(1);
+    let one_chunk = |d: &i64| {
+        let (qf, qt) = query_dates(month_start - Duration::days(*d), to);
+        date_chunks(qf, qt, MAX_RANGE_DAYS_ALL).len() == 1
+    };
+    (1..=ALC_HEAD_LOOKBACK_MAX_DAYS)
+        .take_while(one_chunk)
+        .last()
+        .unwrap_or(0)
+}
+
 /// 遡りの理由の warning に名前を出す乗務員の数。warnings は 20 件で切れるので 1 行にまとめる。
 const LOOKBACK_NOTE_DRIVERS: usize = 5;
 
@@ -151,6 +171,10 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
     /// ([`ALC_HEAD_LOOKBACK_MAX_DAYS`] まで)。読みは写しの行も合わせるので、打刻のある乗務員 (大石) は対象にならない。
     /// 乗務員の付いていない運行 (cd 0) も判定に入れない — 何台分もが束ねられて勤務が切れず遡りうる (#p676)。
     ///
+    /// 読み直しは [`ALC_HEAD_WIDE_FROM_DAYS`] 日目から [`wide_lookback_days`] 日目まで、一番深い回の alc の読みを 1 回だけ取って
+    /// 回ごとの窓で絞る (#p676)。上流は「運行日か読取日が期間に入る運行」を選ぶので、深い回の運行は浅い回の運行を同じ順で全部含み、
+    /// 余分な運行の行は窓で落ちる。写しの 2 本は安いので回ごとに読む。
+    ///
     /// 遡りを最後まで求めた乗務員と理由を、[`ALC_HEAD_LOOKBACK_NOTE_DAYS`] 日以上遡ったときだけ `lookback_notes` に
     /// 置く ([`lookback_note`]。どの乗務員が読みを長引かせたかを名指しするため)。
     async fn alc_head_anchors(
@@ -158,12 +182,32 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
         month_start: NaiveDateTime,
     ) -> Result<BTreeMap<u64, NaiveDateTime>, Fail> {
         let fmt = |t: NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
-        let to = fmt(month_start + Duration::days(1));
+        let to_at = month_start + Duration::days(1);
+        let to = fmt(to_at);
+        let wide_days = wide_lookback_days(month_start);
+        let mut wide: Option<Vec<RawEvent>> = None;
         let mut days = 1;
         let mut last = (0, BTreeMap::new());
         loop {
             let from = month_start - Duration::days(days);
-            let (rows, _) = FoldEventsIo::all_events_between(self, &fmt(from), &to).await?;
+            let rows = match (ALC_HEAD_WIDE_FROM_DAYS..=wide_days).contains(&days) {
+                // 広い読みを 1 回だけ取り、その回の窓で絞る (#p676。1 日ずつ全部を読み直していた)
+                true => {
+                    if wide.is_none() {
+                        let wide_from = fmt(month_start - Duration::days(wide_days));
+                        wide = Some(fetch_all_events(self, &wide_from, &to).await?.0);
+                    }
+                    let held = wide.iter().flatten();
+                    let events = held.filter(|e| window_holds(e.start, e.end, from, to_at));
+                    let events = events.cloned().collect();
+                    self.merged_rows(events, &fmt(from), &to).await?
+                }
+                false => {
+                    FoldEventsIo::all_events_between(self, &fmt(from), &to)
+                        .await?
+                        .0
+                }
+            };
             let (open, edges) = alc_open_shift_starts(rows, month_start, from);
             let stop = days >= ALC_HEAD_LOOKBACK_MAX_DAYS || edges.is_empty();
             if !edges.is_empty() {
@@ -177,6 +221,21 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
             }
             days += 1;
         }
+    }
+
+    /// alc の行に写しの借りる行を合わせて並べ、休息の開始の補正を当てる (`all_events_between` の後半。遡りの広い読みも通る)。
+    async fn merged_rows(
+        &self,
+        events: Vec<RawEvent>,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<serde_json::Value>, Fail> {
+        let span = pushed_window(from, to)?;
+        let borrowed = self.pushed.pushed_all_events(span).await?;
+        let mut rows = merge_all_rows(events, Some(borrowed));
+        // 休息の直前の運転を、速度データで最後に車が動いた時刻で終える (theearth の管理表と同じ、rest_overrides)
+        apply_rest_start_overrides(&mut rows, &self.pushed.rest_start_overrides(span).await?);
+        Ok(rows)
     }
 }
 
@@ -320,12 +379,7 @@ impl<A: AlcRpc, P: PushedEventsRead> FoldEventsIo for WorkerFoldEvents<'_, A, P>
         warnings.extend(fetched);
         // 2 台の運行が同じ時間に重なっていたら重複として出す (重なった時間の勤務と実働は theearth と合わないことがある)
         warnings.extend(overlapping_operations(&events));
-        let span = pushed_window(from, to)?;
-        let borrowed = self.pushed.pushed_all_events(span).await?;
-        let mut rows = merge_all_rows(events, Some(borrowed));
-        // 休息の直前の運転を、速度データで最後に車が動いた時刻で終える (theearth の管理表と同じ、rest_overrides)
-        apply_rest_start_overrides(&mut rows, &self.pushed.rest_start_overrides(span).await?);
-        Ok((rows, warnings))
+        Ok((self.merged_rows(events, from, to).await?, warnings))
     }
 
     async fn dtako_month_read_since(
