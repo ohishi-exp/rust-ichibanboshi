@@ -120,6 +120,7 @@ impl<A: AlcRpc, P: PushedEventsRead> WorkerFoldEvents<'_, A, P> {
     /// 月初の前 1 日から月初の後 1 日までを読んで勤務を組み、月初をまたぐ勤務の始まりを起点にする。最初の勤務が読んだ
     /// 範囲の端から始まる乗務員がいれば、勤務 (日締めの起点) はもっと前から続いているかもしれないので 1 日ずつ遡って読み直す
     /// ([`ALC_HEAD_LOOKBACK_MAX_DAYS`] まで)。読みは写しの行も合わせるので、打刻のある乗務員 (大石) は対象にならない。
+    /// 乗務員の付いていない運行 (cd 0) も判定に入れない — 何台分もが束ねられて勤務が切れず上限まで遡っていた (#p676)。
     async fn alc_head_anchors(
         &self,
         month_start: NaiveDateTime,
