@@ -2425,6 +2425,7 @@ fn final_shifts_aligned(events: &[Event]) -> Vec<Shift> {
 ///
 /// 勤務の組み方は fold と同じ ([`final_shifts_aligned`])。月初をまたぐ勤務 (始まり < 月初 < 終わり) が無ければ
 /// 起点は無い。打刻・社内 MariaDB の運行イベントを持つ乗務員は見ない (#317 の起点がある)。
+/// 乗務員の付いていない運行 (cd 0) も見ない (fold の母集団の外)。
 ///
 /// 2 つ目の戻り値は「最初の勤務が `from` (読んだ範囲の始まり) 以前から始まる乗務員、または行が全部 alc なのに運行の
 /// 境界が無い乗務員がいる」— 勤務 (運行) の途中から読んでいるので、呼び手は 1 日遡って読み直す ([`ALC_DAY_MINUTES`] の日締めは始業から数えるので、始業が見えるまで)。
@@ -2436,6 +2437,9 @@ pub fn alc_open_shift_starts(
     let mut at_edge = false;
     let open = split_by_driver(rows)
         .into_iter()
+        // 乗務員の付いていない運行 (cd 0) は fold の母集団の外 (route_flow)。何台分もが束ねられて勤務が切れず、毎回
+        // 「途中から読んでいる」になって上限まで遡っていた (北海大運 / 2026-11 の fold 640 秒のうち 610 秒)
+        .filter(|(cd, _)| *cd > 0)
         .filter_map(|(cd, rows)| {
             let events = parse_events(&rows);
             if !alc_only(&events) {
@@ -5199,6 +5203,72 @@ mod tests {
             at("2026-07-01 00:00:00"),
             at("2026-06-30 00:00:00"),
         );
+        assert!(!at_edge);
+    }
+
+    /// 2 台が毎日交互に 26 時間の運行を重ね続ける (北海大運の未登録車両の形。運行の間に休息が 1 度も無い)。
+    fn overlapping_runs_without_rest(driver: u64) -> Vec<serde_json::Value> {
+        let day0 = dt("2026-09-20 06:00:00");
+        (0..45)
+            .flat_map(|d| {
+                let (s, e) = (
+                    day0 + Duration::days(d),
+                    day0 + Duration::days(d) + Duration::hours(26),
+                );
+                let f = |t: NaiveDateTime| t.format(FMT).to_string();
+                let unko = format!("{}{d}", if d % 2 == 0 { "A" } else { "B" });
+                let mut rows = vec![run(&f(s), &f(s), "運行開始", &unko)];
+                // 運転は 1 時間刻みの行 (実データも短い行が続く。1 行だと相手の運行の間に「運行の外」ができる)
+                rows.extend((0..26).map(|h| {
+                    let t = s + Duration::hours(h);
+                    run(&f(t), &f(t + Duration::hours(1)), "運転", &unko)
+                }));
+                rows.push(run(&f(e), &f(e), "運行終了", &unko));
+                rows
+            })
+            .map(|mut r| {
+                r["driver_id"] = json!(driver);
+                r
+            })
+            .collect()
+    }
+
+    /// 勤怠 Worker の `alc_head_anchors` と同じ遡り (上限 31 日)。読み窓は alc の読み (`window_holds`) と同じ。
+    fn lookback_days(rows: &[serde_json::Value], month_start: NaiveDateTime) -> i64 {
+        let to = month_start + Duration::days(1);
+        let mut days = 1;
+        loop {
+            let from = month_start - Duration::days(days);
+            let read: Vec<_> = parse_events(rows)
+                .into_iter()
+                .zip(rows)
+                .filter(|(e, _)| crate::window::window_holds(e.start, e.end, from, to))
+                .map(|(_, r)| r.clone())
+                .collect();
+            let (_, at_edge) = alc_open_shift_starts(read, month_start, from);
+            if days >= 31 || !at_edge {
+                return days;
+            }
+            days += 1;
+        }
+    }
+
+    #[test]
+    fn alc_open_shift_starts_skips_the_unassigned_driver_0() {
+        // #p676: 乗務員の付いていない運行 (driver_id 0) は何台分もが 1 人に束ねられ、休息が現れず勤務が月をまたいで続く。
+        // 毎回「勤務の途中から読んでいる」と判定されて上限 (31 日) まで遡り、北海大運の fold の 610 秒を食っていた。
+        // fold の母集団 (route_flow) は乗務員 0 を外しているので、遡りの判定と起点からも外す
+        let month_start = dt("2026-11-01 00:00:00");
+        // 乗務員の付いた勤務が同じ形なら、遡りは今までどおり上限まで続く (仕組みそのものは変えない)
+        assert_eq!(
+            lookback_days(&overlapping_runs_without_rest(30), month_start),
+            31
+        );
+        let unassigned = overlapping_runs_without_rest(0);
+        assert_eq!(lookback_days(&unassigned, month_start), 1);
+        let (open, at_edge) =
+            alc_open_shift_starts(unassigned, month_start, month_start - Duration::days(1));
+        assert!(open.is_empty());
         assert!(!at_edge);
     }
 
