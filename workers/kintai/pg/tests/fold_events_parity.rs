@@ -301,6 +301,7 @@ fn worker_events<'a>(
         alc,
         pushed: store,
         today: TODAY,
+        lookback_notes: Default::default(),
     }
 }
 

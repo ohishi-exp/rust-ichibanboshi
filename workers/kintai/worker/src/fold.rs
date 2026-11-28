@@ -63,6 +63,7 @@ fn fold_events<'a>(
         alc,
         pushed: store,
         today: jst_today(Date::now().as_millis()),
+        lookback_notes: Default::default(),
     }
 }
 

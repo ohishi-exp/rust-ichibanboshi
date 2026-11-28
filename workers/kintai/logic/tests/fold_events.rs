@@ -13,12 +13,13 @@ use std::task::{Context, Poll, Waker};
 use chrono::NaiveDate;
 use kintai_kosoku::alc_events::{AlcEventsGet, EventsPage};
 use kintai_kosoku::fold_flow::{month_anchors, BadMonth, DtakoMonthRead, FoldEventsIo};
+use kintai_kosoku::kosoku::EdgeReason;
 use kintai_kosoku::pushed_events::all_event_json;
 use kintai_kosoku::window::HeadPunch;
 use kintai_logic::common::Fail;
 use kintai_logic::fold_events::{
-    driver_alc_events, events_search, pushed_window, read_events, AlcRpc, PushedEventsRead, Span,
-    WorkerFoldEvents,
+    driver_alc_events, events_search, lookback_note, pushed_window, read_events, AlcRpc,
+    PushedEventsRead, Span, WorkerFoldEvents,
 };
 use kintai_logic::fold_routes::AlcEventsRequest;
 use kintai_logic::rest_overrides::RestStartOverride;
@@ -192,6 +193,7 @@ fn all_events_reads_alc_pages_then_the_pushed_copy() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let (rows, warnings) = block_on(w.all_events_between(FROM, TO)).unwrap();
     assert_eq!(
@@ -241,6 +243,7 @@ fn all_events_fails_on_any_non_2xx_before_reading_the_copy() {
             alc: &a,
             pushed: &m,
             today: TODAY,
+            lookback_notes: Default::default(),
         };
         let err = block_on(w.all_events_between(FROM, TO)).unwrap_err();
         let want = format!("alc dtako-events status {status}: nope");
@@ -260,6 +263,7 @@ fn all_events_passes_rpc_and_copy_failures_through() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     assert_eq!(
         block_on(w.all_events_between(FROM, TO)),
@@ -273,6 +277,7 @@ fn all_events_passes_rpc_and_copy_failures_through() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     assert_eq!(block_on(w.all_events_between(FROM, TO)), Err(boom));
 }
@@ -287,6 +292,7 @@ fn all_events_rejects_bad_windows_and_bodies() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let err = block_on(w.all_events_between("bad", TO)).unwrap_err();
     assert_eq!(err.status, 502);
@@ -346,6 +352,7 @@ fn month_head_anchors_reads_the_two_head_queries_from_the_copy() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let got = block_on(month_anchors(&w, "2026-06")).unwrap();
     assert_eq!(
@@ -379,6 +386,7 @@ fn month_head_anchors_passes_failures_through() {
         alc: &a,
         pushed: m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let boom = Fail::new(502, "kintai_events read failed: closed");
     let m = pushed(&log);
@@ -418,6 +426,7 @@ fn month_head_anchors_uses_the_punches_too() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let got = block_on(w.month_head_anchors(FROM, TO)).unwrap();
     assert_eq!(
@@ -467,6 +476,7 @@ fn month_head_anchors_adds_the_open_shift_start_from_alc_rows() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let got = block_on(w.month_head_anchors(FROM, TO)).unwrap();
     assert_eq!(
@@ -508,6 +518,7 @@ fn month_head_anchors_reads_further_back_while_the_open_shift_starts_at_the_edge
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let got = block_on(w.month_head_anchors(FROM, TO)).unwrap();
     assert_eq!(
@@ -517,6 +528,61 @@ fn month_head_anchors_reads_further_back_while_the_open_shift_starts_at_the_edge
     assert_eq!(
         log.borrow().last().map(String::as_str),
         Some("overrides 2026-05-30T00:00:00+09:00..2026-06-02T00:00:00+09:00")
+    );
+    // 2 日で止まる遡りは普段どおり — 遡りの理由は出さない
+    assert!(w.lookback_notes.borrow().is_empty());
+}
+
+/// 3 日以上遡ったら、最後まで遡りを求めた乗務員と理由を warnings の**先頭**に出す (#p676。MCP は 20 件で切る)。
+#[test]
+fn a_long_lookback_names_the_driver_first_in_the_warnings() {
+    let log = Log::default();
+    let a = alc(&log);
+    // 運転の 1 行が 5/28 12:00 から月初の後まで続く (状態の切り忘れの形)。5/29 からの読みまでは勤務の途中から読んでいて、
+    // 5/28 からの読み (4 日目) で行の始まりが見えて止まる
+    let long = alc_rows_body(
+        "12",
+        &[
+            ("2026/05/28 12:00:00", "2026/06/01 03:00:00", "運転"),
+            ("2026/06/01 03:00:00", "2026/06/01 03:00:00", "運行終了"),
+        ],
+    );
+    *a.events.borrow_mut() = (0..4).map(|_| Ok(res(200, &long))).collect();
+    let m = pushed(&log);
+    *m.runs.borrow_mut() = Some(Ok(vec![]));
+    *m.punches.borrow_mut() = Some(Ok(vec![]));
+    let w = WorkerFoldEvents {
+        alc: &a,
+        pushed: &m,
+        today: TODAY,
+        lookback_notes: Default::default(),
+    };
+    block_on(w.month_head_anchors(FROM, TO)).unwrap();
+    let (_, warnings) = block_on(w.all_events_between(FROM, TO)).unwrap();
+    assert_eq!(
+        warnings.first().map(|w| (w.text.as_str(), w.blocks_seal)),
+        Some(("遡りの理由 (3 日): 12 勤務の途中から", false))
+    );
+}
+
+/// 名前を出すのは 5 人まで。残りは人数だけ (warnings の 1 行に収める)。
+#[test]
+fn lookback_note_names_five_drivers_and_counts_the_rest() {
+    let edges = (1..=7)
+        .map(|cd| {
+            (
+                cd,
+                if cd == 2 {
+                    EdgeReason::NoRunBounds
+                } else {
+                    EdgeReason::MidShift
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        lookback_note(31, &edges).text,
+        "遡りの理由 (31 日): 1 勤務の途中から、2 運行の境界なし、3 勤務の途中から、4 勤務の途中から、5 勤務の途中から ほか 2 人"
     );
 }
 
@@ -537,6 +603,7 @@ fn dtako_month_read_reads_only_the_etags() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let read = block_on(w.dtako_month_read_since("2026-06", Some(d(2026, 5, 20)))).unwrap();
     assert_eq!(
@@ -566,6 +633,7 @@ fn dtako_month_read_degrades_only_on_404() {
             alc: &a,
             pushed: &m,
             today: TODAY,
+            lookback_notes: Default::default(),
         };
         block_on(w.dtako_month_read_since("2026-06", None))
     };
@@ -593,6 +661,7 @@ fn dtako_month_read_rejects_a_broken_month_before_any_request() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let err = block_on(w.dtako_month_read_since("nope", None)).unwrap_err();
     assert_eq!(err, Fail::new(502, "bad month: nope"));
@@ -610,6 +679,7 @@ fn alc_events_get_passes_the_dates_through() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     assert!(block_on(w.etags(d(2026, 1, 2), d(2026, 1, 3)))
         .unwrap()
@@ -674,6 +744,7 @@ fn driver_alc_events_returns_the_driver_rows_operations_and_shifts() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let got = block_on(driver_alc_events(&w, &alc_events_req())).unwrap();
     assert_eq!(got["driver"], 12);
@@ -713,6 +784,7 @@ fn driver_alc_events_of_no_rows_is_empty() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let got = block_on(driver_alc_events(&w, &alc_events_req())).unwrap();
     assert_eq!(got["alc_only"], false);
@@ -731,6 +803,7 @@ fn driver_alc_events_passes_read_failures_through() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     assert_eq!(
         block_on(driver_alc_events(&w, &alc_events_req()))
@@ -744,6 +817,7 @@ fn driver_alc_events_passes_read_failures_through() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     assert_eq!(
         block_on(driver_alc_events(&w, &alc_events_req()))
@@ -787,6 +861,7 @@ fn overlapping_operations_come_back_as_a_duplicate_warning() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let (_, warnings) = block_on(FoldEventsIo::all_events_between(&w, FROM, TO)).unwrap();
     assert_eq!(warnings.len(), 1);
@@ -802,6 +877,7 @@ fn overlapping_operations_come_back_as_a_duplicate_warning() {
         alc: &a,
         pushed: &m,
         today: TODAY,
+        lookback_notes: Default::default(),
     };
     let req = AlcEventsRequest {
         driver: 15,
@@ -853,6 +929,7 @@ fn rest_start_overrides_move_the_rest_start_in_the_fold_read() {
             alc: &a,
             pushed: &m,
             today: TODAY,
+            lookback_notes: Default::default(),
         };
         block_on(driver_alc_events(&w, &alc_events_req())).unwrap()
     };
